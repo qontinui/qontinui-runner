@@ -96,6 +96,20 @@ pub(crate) mod host_axes;
 /// ownership gate, exactly like [`resource_sample`].
 pub(crate) mod computer;
 
+/// The one door a runner report takes to `coord.device_status.details`:
+/// primary-only, a connected coord only, the paired device bearer, and never
+/// a `null` (plan `2026-11-27-devops-runner-database-degraded-is-invisible-to-coord`
+/// D2). Every NEW publisher of a coord runner-report key posts through it. The
+/// one exception is the older `coord_credential` publisher
+/// (`mcp/device_jwt_refresher.rs` `publish_coord_credential_status`), which
+/// posts on its own, ungated by the primary guard.
+pub(crate) mod status_report;
+
+/// The `runner_database` report: `/health`'s database block, published to
+/// coord every 60 s from the primary, so a runner running without its database
+/// is visible off the box (same plan, D1/D2).
+pub(crate) mod database_report;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -1043,6 +1057,15 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
 ///   checkouts (the same governed set the census walks), so every instance on
 ///   the box observes identical drift and a secondary can only duplicate an
 ///   alarm already attributed to the machine.
+/// * the **runner reports** sent through [`status_report`]: the
+///   `POST /coord/status` keys that coord turns into alerts
+///   (`runner_database`, once coord Phase 2 lists it). A secondary's report
+///   would raise or clear an alert on the primary's device, so a secondary
+///   omits the key. It never posts a `null`, which coord reads as a
+///   deletion. NOT gated yet: `coord_credential`, also a
+///   runner-report key coord alerts on. Its publisher
+///   (`mcp/device_jwt_refresher.rs` `publish_coord_credential_status`)
+///   predates [`status_report`] and consults no guard.
 ///
 /// Deliberately ONE predicate rather than one per writer. The lesson of the
 /// outage it fixes is that a rule keyed in a single place gets missed by the
@@ -8116,7 +8139,7 @@ mod tests {
     /// above the writers — so splitting on the attribute alone would silently
     /// truncate the scan to a prefix containing no call sites at all, and the
     /// pin would then pass or fail for reasons unrelated to the guard.
-    fn prod_part(src: &'static str) -> &'static str {
+    fn prod_part(src: &str) -> &str {
         src.split_once(
             "
 #[cfg(test)]
@@ -8154,11 +8177,13 @@ mod tests {",
         const GUARD: &str =
             "machine_state_publish_allowed(crate::instance::owns_shared_root_state())";
 
-        // (module, source, minimum guarded call sites, what they are)
+        // (module under src/, minimum guarded call sites, what they are). Each
+        // module is read at run time, as `every_phase4_entry_point_is_classified`
+        // reads its own, so a tree that lacks one fails THIS pin by name
+        // instead of failing the whole test build.
         let modules = [
             (
                 "fleet.rs",
-                include_str!("fleet.rs"),
                 5,
                 "the boot budget publish, the republisher, the heartbeat, and the tree \
                  publisher at BOTH its spawn and its write (`publish_tree_state`, which is \
@@ -8166,7 +8191,6 @@ mod tests {",
             ),
             (
                 "agent_worktree/census.rs",
-                include_str!("agent_worktree/census.rs"),
                 1,
                 "`runs_machine_census`, the module's one spelling of the rule. Its call \
                  sites — the periodic walk spawn, `ChunkPoster::resolve_dest` (the POST \
@@ -8176,23 +8200,37 @@ mod tests {",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
-                include_str!("agent_worktree/fs_backstop.rs"),
                 1,
                 "the canonical-drift tick, which scans the shared canonical checkouts and \
                  POSTs device-keyed",
             ),
             (
                 "main.rs",
-                include_str!("main.rs"),
                 1,
                 "the plan adapter's `ScanReportGate`, handed to `spawn_if_configured` — the \
                  scan-root reading is one web row per device, so a secondary's report would \
                  flip the machine's row (the lib crate cannot call the guard itself)",
             ),
+            (
+                "fleet/database_report.rs",
+                2,
+                "the `runner_database` publisher's spawn and EVERY tick (`publish_once`): a \
+                 temp runner shares the primary's device_id, so its report would raise or \
+                 clear a database alert on the primary's device",
+            ),
+            (
+                "fleet/status_report.rs",
+                1,
+                "`post_runner_report`, the one door every runner-report key leaves through \
+                 (`POST /coord/status`)",
+            ),
         ];
 
-        for (name, src, want, what) in modules {
-            let found = squeezed(prod_part(src)).matches(GUARD).count();
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (name, want, what) in modules {
+            let src = std::fs::read_to_string(src_root.join(name))
+                .unwrap_or_else(|e| panic!("{name}: cannot read the module ({e})"));
+            let found = squeezed(prod_part(&src)).matches(GUARD).count();
             assert!(
                 found >= want,
                 "{name}: expected at least {want} guarded call site(s) — {what} — but found \

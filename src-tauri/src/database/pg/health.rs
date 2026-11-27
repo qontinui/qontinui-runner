@@ -157,8 +157,34 @@ impl PgHealthSnapshot {
     }
 }
 
-/// The `/health` `database` block.
+/// The `/health` `database` block: [`database_health_json_with`] over this
+/// process's own arm, port and data root.
 pub fn database_health_json(s: &PgHealthSnapshot, now: Instant) -> serde_json::Value {
+    database_health_json_with(
+        s,
+        now,
+        crate::embedded_pg::db_arm(),
+        crate::embedded_pg::embedded_port(),
+        crate::embedded_pg::embedded_data_root(),
+    )
+}
+
+/// The ONE serializer of the database block, shared by `/health` and the
+/// `runner_database` report the runner publishes to coord
+/// (`fleet::database_report`, plan
+/// `2026-11-27-devops-runner-database-degraded-is-invisible-to-coord` D1), so
+/// the two cannot drift.
+///
+/// The arm, port and data root are process globals rather than snapshot
+/// fields, so they are arguments here: a test can render every arm without
+/// mutating a global that parallel tests read.
+pub fn database_health_json_with(
+    s: &PgHealthSnapshot,
+    now: Instant,
+    arm: crate::embedded_pg::DbArm,
+    embedded_port: Option<u16>,
+    embedded_data_root: Option<String>,
+) -> serde_json::Value {
     let (schema_ok, schema_detail) = s.schema(now);
     let breaker = s.breaker.as_ref().map(|b| {
         let open = b.state != CircuitState::Closed;
@@ -191,11 +217,11 @@ pub fn database_health_json(s: &PgHealthSnapshot, now: Instant) -> serde_json::V
         // reaches the PG block. Fixed at boot: it names the arm taken, not
         // current liveness, so a cluster that dies later flips `reachable`
         // and `breaker.state`, not `arm`.
-        "arm": crate::embedded_pg::db_arm().as_str(),
+        "arm": arm.as_str(),
         // The embedded cluster's loopback port, null off the embedded arms.
-        "embeddedPort": crate::embedded_pg::embedded_port(),
+        "embeddedPort": embedded_port,
         // WHICH data dir is behind that port. Null off the embedded arms.
-        "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
+        "embeddedDataRoot": embedded_data_root,
         // The duration of the LAST BACKGROUND probe (refresher, prober trial
         // or a /restart-readiness fresh read) — no longer a cost this
         // response paid. `/health` does no PG I/O at all.
