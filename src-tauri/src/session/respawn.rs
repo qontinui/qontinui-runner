@@ -960,6 +960,8 @@ async fn materialize(
             cap: crate::terminal::account_migration::MIGRATION_CAP,
         });
     }
+    // Every early return from here to the respawn gives the slot back.
+    let cap_slot = crate::terminal::account_migration::CapSlot::new(&claude_session_id, now_ms);
 
     // 6. The resume, through the shared seam, pinned via capture_hint.config_dir
     //    — and stamping `parent_session_id` so the child is one link in the
@@ -1023,6 +1025,7 @@ async fn materialize(
     //     closed and the respawn reported failed through the receiver's error
     //     path. The coord row does NOT stay pending: see step 6 and
     //     `RespawnError::Died`.
+    let cap_stamp = cap_slot.launch();
     let outcome = crate::terminal::respawn_liveness::confirm_respawn(
         &mut effects,
         lifecycle_store,
@@ -1030,7 +1033,12 @@ async fn materialize(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let terminal_id = proven_terminal(respawn.source_session_id, outcome)?;
+    let terminal_id = settle_respawn(
+        respawn.source_session_id,
+        &claude_session_id,
+        cap_stamp,
+        outcome,
+    )?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -1079,6 +1087,31 @@ async fn materialize(
     Ok(terminal_id)
 }
 
+/// The receiver's answer to a respawn it took a cap slot for at `cap_stamp`:
+/// the slot goes back when no CLI launched (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli` D4 — the first spawn
+/// failed after the cap was taken, or every attempt was a launch failure),
+/// through the one shared refund helper; then [`proven_terminal`].
+fn settle_respawn(
+    source: Uuid,
+    claude_session_id: &str,
+    cap_stamp: i64,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, RespawnError> {
+    if crate::terminal::account_migration::refund_cap_if_never_launched(
+        claude_session_id,
+        cap_stamp,
+        &outcome,
+    ) {
+        tracing::info!(
+            source = %source,
+            session = %claude_session_id,
+            "session respawn: the resumed CLI never launched — the cap slot was given back"
+        );
+    }
+    proven_terminal(source, outcome)
+}
+
 /// Pure: the terminal a respawn may go on with (claims, prompt), or the error
 /// the receiver reports. A death is [`RespawnError::Died`] — never success —
 /// so step 7 never re-acquires claims for a dead respawn.
@@ -1100,7 +1133,7 @@ fn proven_terminal(
             );
             Ok(terminal_id)
         }
-        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e)),
+        RespawnOutcome::NotSpawned(e) => Err(RespawnError::Spawn(e.to_string())),
         // An old-pane close is a migration's only (no old pane here).
         RespawnOutcome::ClosedByUser { .. } | RespawnOutcome::OldPaneClosed { .. } => {
             Err(RespawnError::ClosedByUser)
@@ -1113,6 +1146,7 @@ fn proven_terminal(
             exit_code,
             attempts,
             retry_spawn_error,
+            ..
         } => Err(RespawnError::Died(RespawnOutcome::died_detail(
             exit_code,
             attempts,
@@ -1149,17 +1183,22 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
         self.claude_session_id
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
+    async fn spawn_next(
+        &mut self,
+        _spawned: &[String],
+    ) -> Result<
+        crate::terminal::respawn_launch::SpawnedPane,
+        crate::terminal::respawn_launch::SpawnNextError,
+    > {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
             Some(bin) => bin,
-            None => {
-                crate::claude_cli_spawn::resolve_resume_claude_bin(
-                    &crate::claude_cli_spawn::RETRY_DELAYS,
-                )
-                .await?
-            }
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin(
+                &crate::claude_cli_spawn::RETRY_DELAYS,
+            )
+            .await
+            .map_err(crate::terminal::respawn_launch::SpawnNextError::Spawn)?,
         };
         // Whose policy body the respawn's system-prompt file carries: the
         // tenant a session in its working dir resolves to, awaited HERE because
@@ -1204,7 +1243,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for ReceiverRespawn<'_> {
                 policy_tenant,
             },
         )
-        .map(|(terminal_id, _coord_id)| terminal_id)
+        .map_err(crate::terminal::respawn_launch::SpawnNextError::Spawn)
     }
 
     async fn await_liveness(
@@ -1718,6 +1757,68 @@ mod tests {
     // Transcript materialization helpers
     // -----------------------------------------------------------------------
 
+    /// Plan `2026-11-10-migration-holds-for-missing-claude-cli` Phase 5: a
+    /// received respawn whose CLI never launched gives its cap slot back
+    /// (literal `cap_left`); one whose CLI launched and then died keeps it.
+    #[test]
+    fn a_received_respawn_that_never_launched_returns_its_cap_slot() {
+        use crate::terminal::account_migration::{
+            migration_cap_left, migration_cap_permits, MIGRATION_CAP,
+        };
+        use crate::terminal::respawn_launch::FirstSpawnError;
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let died = |all_launch_failures| RespawnOutcome::Died {
+            exit_code: Some(1),
+            attempts: 3,
+            retry_spawn_error: None,
+            all_launch_failures,
+        };
+        let stamp = 1_790_000_000_000i64;
+        for (i, (outcome, cap_left)) in [
+            (died(true), MIGRATION_CAP),
+            (
+                RespawnOutcome::NotSpawned(FirstSpawnError::Spawn("exec failed".into())),
+                MIGRATION_CAP,
+            ),
+            (died(false), MIGRATION_CAP - 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = format!("cap-refund-receiver-{i}");
+            assert!(
+                migration_cap_permits(&sid, stamp),
+                "the receiver takes a slot"
+            );
+            assert!(settle_respawn(Uuid::nil(), &sid, stamp, outcome).is_err());
+            assert_eq!(migration_cap_left(&sid, stamp + 10), cap_left, "case {i}");
+        }
+    }
+
+    /// Review A9: a slot the receiver took is given back when it never
+    /// reaches the respawn (an early `?` — no app handle, no managed state),
+    /// and kept once handed on to the respawn.
+    #[test]
+    fn a_cap_slot_dropped_before_the_respawn_is_given_back() {
+        use crate::terminal::account_migration::{
+            migration_cap_left, migration_cap_permits, CapSlot, MIGRATION_CAP,
+        };
+        let stamp = 1_791_000_000_000i64;
+        let early = "cap-slot-receiver-early-exit";
+        assert!(migration_cap_permits(early, stamp));
+        let exit_early = || -> Result<(), RespawnError> {
+            let _slot = CapSlot::new(early, stamp);
+            Err(RespawnError::NoAppHandle)
+        };
+        assert!(exit_early().is_err());
+        assert_eq!(migration_cap_left(early, stamp + 10), MIGRATION_CAP);
+
+        let launched = "cap-slot-receiver-launched";
+        assert!(migration_cap_permits(launched, stamp));
+        assert_eq!(CapSlot::new(launched, stamp).launch(), stamp);
+        assert_eq!(migration_cap_left(launched, stamp + 10), MIGRATION_CAP - 1);
+    }
+
     /// The receiver reports a respawn whose every attempt died as a failure —
     /// never success — and says it is not retried (review finding 2: coord's
     /// materialized-child filter counts the dead attempts).
@@ -1730,6 +1831,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: None,
+                all_launch_failures: false,
             },
         )
         .unwrap_err();
@@ -1749,6 +1851,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: Some("claude not found".into()),
+                all_launch_failures: false,
             },
         )
         .unwrap_err()
@@ -1760,7 +1863,12 @@ mod tests {
             "{msg}"
         );
         assert!(matches!(
-            proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
+            proven_terminal(
+                Uuid::nil(),
+                RespawnOutcome::NotSpawned(
+                    crate::terminal::respawn_launch::FirstSpawnError::Spawn("x".into())
+                )
+            ),
             Err(RespawnError::Spawn(_))
         ));
         // A running-but-unpainted pane holds the session: reported Ok, so the

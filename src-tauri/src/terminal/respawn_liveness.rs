@@ -62,6 +62,9 @@ use futures::future::BoxFuture;
 use tracing::{info, warn};
 
 use super::account_migration::{probe_idle_prompt, IdlePromptProbe, ReadyDebounce};
+use super::respawn_launch::{
+    death_was_launch_failure, FirstSpawnError, SpawnNextError, SpawnedPane,
+};
 use crate::session::session_lifecycle_store::{
     HeldClose, SessionLifecycleStore, TerminalSessionRecord, USER_CLOSE_REASON,
 };
@@ -72,6 +75,13 @@ pub(crate) const RESUME_LIVENESS_DEADLINE: Duration = Duration::from_secs(180);
 pub(crate) const RESUME_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// Respawn attempts in all (the first spawn included) before giving up.
 pub(crate) const MAX_RESPAWN_ATTEMPTS: usize = 3;
+/// How long a dead pane's SessionStart stamp may lag its death before the
+/// death counts as a launch failure (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli` D4): the stamp is
+/// re-read once after this, so a CLI that started and died before its hook's
+/// POST landed is not mistaken for one that never launched. Paid only by a
+/// death the first read already classes as a launch failure.
+pub(crate) const LAUNCH_STAMP_GRACE: Duration = Duration::from_secs(3);
 
 /// The pause before retry number `retry` (1-based), on the headless spawn
 /// helper's own budget ([`crate::claude_cli_spawn::RETRY_DELAYS`]); past its
@@ -234,13 +244,29 @@ pub(crate) trait RespawnEffects {
     /// respawn, from BEFORE the first spawn re-keys its row.
     fn claude_session_id(&self) -> &str;
     /// Spawn the next resumed pane (async binary pre-step, then the seam).
-    /// `Ok(terminal_id)`; the spawn re-keys the session's row onto it.
-    fn spawn_next(&mut self) -> impl Future<Output = Result<String, String>> + Send;
+    /// `Ok(pane)`; the spawn re-keys the session's row onto `pane.terminal_id`.
+    /// [`SpawnNextError::HoldAborted`] (a migration's CLI hold saw a user
+    /// close of the old pane or of a pane this respawn spawned, or, on the
+    /// first spawn, the old pane exit on its own) spawned nothing.
+    ///
+    /// `spawned` is every pane this respawn has spawned so far (empty on the
+    /// first spawn) — the close hold's own list, so a caller that watches
+    /// those panes reads the one copy rather than keeping a second.
+    fn spawn_next(
+        &mut self,
+        spawned: &[String],
+    ) -> impl Future<Output = Result<SpawnedPane, SpawnNextError>> + Send;
     /// Judge one pane ([`await_resumed_cli`] in production).
     fn await_liveness(&mut self, terminal_id: &str)
         -> impl Future<Output = LivenessVerdict> + Send;
     /// The pause before retry number `retry` (1-based).
     fn pause_before_retry(&mut self, retry: usize) -> impl Future<Output = ()> + Send;
+    /// The grace a dead pane's SessionStart stamp gets before its death is
+    /// read as a launch failure ([`LAUNCH_STAMP_GRACE`]): a CLI that started
+    /// and died at once can have its hook's POST still in flight.
+    fn await_launch_stamp_grace(&mut self) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(LAUNCH_STAMP_GRACE)
+    }
     /// Close / probe panes. An owned handle, so a CANCELLED respawn (whose
     /// `&mut self` is gone with its future) can still close its pane.
     fn panes(&self) -> Arc<dyn PaneOps>;
@@ -326,7 +352,7 @@ impl PaneOps for ManagerPanes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RespawnOutcome {
     /// The FIRST spawn failed: nothing moved, no pane was created.
-    NotSpawned(String),
+    NotSpawned(FirstSpawnError),
     /// The resumed CLI is painting on `terminal_id`. With an old pane, it has
     /// been marked superseded and closed.
     Alive {
@@ -362,6 +388,12 @@ pub(crate) enum RespawnOutcome {
         exit_code: Option<i32>,
         attempts: usize,
         retry_spawn_error: Option<String>,
+        /// Every attempt was a LAUNCH failure — a spawn error, or a pane that
+        /// died with no CLI start after it was created
+        /// ([`super::respawn_launch`], plan
+        /// `2026-11-10-migration-holds-for-missing-claude-cli` D4). Such a
+        /// respawn was never a hop, so its caller gives its cap slot back.
+        all_launch_failures: bool,
     },
 }
 
@@ -670,6 +702,7 @@ enum Failure {
     Died {
         exit_code: Option<i32>,
         retry_spawn_error: Option<String>,
+        all_launch_failures: bool,
     },
     /// The user closed a pane under proof; this is their close.
     ClosedByUser(HeldClose),
@@ -739,10 +772,12 @@ fn end_failed(
         Failure::Died {
             exit_code,
             retry_spawn_error,
+            all_launch_failures,
         } => RespawnOutcome::Died {
             exit_code,
             attempts,
             retry_spawn_error,
+            all_launch_failures,
         },
     }
 }
@@ -780,15 +815,29 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
             return RespawnOutcome::OldPaneClosed { attempts: 0 };
         }
     }
-    let mut current = match effects.spawn_next().await {
-        Ok(t) => t,
-        Err(e) => {
+    let mut current_pane = match effects.spawn_next(&[]).await {
+        Ok(pane) => pane,
+        // A migration's CLI hold saw the old pane close (or go): nothing was
+        // spawned, the same fact as the up-front check above.
+        Err(SpawnNextError::HoldAborted) => {
             hold.finish_replaying_all();
-            return RespawnOutcome::NotSpawned(e);
+            return RespawnOutcome::OldPaneClosed { attempts: 0 };
+        }
+        Err(SpawnNextError::CliUnavailable(c)) => {
+            hold.finish_replaying_all();
+            return RespawnOutcome::NotSpawned(FirstSpawnError::CliUnavailable(c));
+        }
+        Err(SpawnNextError::Spawn(e)) => {
+            hold.finish_replaying_all();
+            return RespawnOutcome::NotSpawned(FirstSpawnError::Spawn(e));
         }
     };
+    let mut current = current_pane.terminal_id.clone();
     hold.set_current(&current);
     let mut attempts = 1;
+    // One entry per attempt: was it a launch failure (D4)? A spawned pane is
+    // judged when it dies; a retry that could not spawn is one at once.
+    let mut launch_failures: Vec<bool> = Vec::new();
     'proof: loop {
         // The old pane can be closed by the user at any await (the spawn can
         // wait out a CLI install for minutes): checked before the 3-minute
@@ -929,6 +978,13 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                     attempt = attempts,
                     "respawn-liveness: resumed CLI exited before painting"
                 );
+                let stamp = || store.get(&session).and_then(|r| r.last_session_start_at);
+                let mut launch_failed = death_was_launch_failure(&current_pane, stamp());
+                if launch_failed {
+                    effects.await_launch_stamp_grace().await;
+                    launch_failed = death_was_launch_failure(&current_pane, stamp());
+                }
+                launch_failures.push(launch_failed);
                 let mut retry_spawn_error = None;
                 // Each retry consumes an attempt whether or not its spawn
                 // succeeds. A USER close of any pane of this respawn is checked
@@ -943,10 +999,12 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                         break;
                     }
                     attempts += 1;
-                    match effects.spawn_next().await {
+                    let spawned = hold.spawned.clone();
+                    match effects.spawn_next(&spawned).await {
                         Ok(next) => {
-                            let retired = hold.retire(&current, &next);
-                            current = next;
+                            let retired = hold.retire(&current, &next.terminal_id);
+                            current = next.terminal_id.clone();
+                            current_pane = next;
                             hold.set_current(&current);
                             // An old-pane close wins over a close of the
                             // retired pane landing in the same spawn: the top
@@ -969,9 +1027,20 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                             }
                             continue 'proof;
                         }
+                        // A migration's CLI hold saw the USER close the old
+                        // pane or a pane of this respawn (on a retry nothing
+                        // else aborts it): no further retry, and not a launch
+                        // attempt — the checks below end it as the user asked.
+                        Err(SpawnNextError::HoldAborted) => {
+                            // Nothing was attempted: uncount it.
+                            attempts -= 1;
+                            warn!(attempts, "respawn-liveness: a user close ended a retry's wait for the Claude CLI");
+                            break;
+                        }
                         Err(e) => {
                             warn!(attempt = attempts, error = %e, "respawn-liveness: retry spawn failed");
-                            retry_spawn_error = Some(e);
+                            launch_failures.push(true);
+                            retry_spawn_error = Some(e.to_string());
                         }
                     }
                 }
@@ -988,6 +1057,7 @@ pub(crate) async fn confirm_respawn<E: RespawnEffects>(
                     None => Failure::Died {
                         exit_code: code,
                         retry_spawn_error,
+                        all_launch_failures: launch_failures.iter().all(|f| *f),
                     },
                 };
                 return end_failed(hold, store, old, &current, attempts, failure);
@@ -1319,6 +1389,14 @@ mod tests {
         /// still carrying this session id, owning no open row) while each
         /// pane is being proven.
         user_close_stale_while_proving: bool,
+        /// Whether each spawned pane's argv carried `--settings`.
+        carried_settings: bool,
+        /// Panes (by spawn order, 1-based) whose CLI STARTED: the row's
+        /// SessionStart stamp is written when each is judged.
+        started: Vec<usize>,
+        /// Panes (1-based) whose SessionStart stamp lands only during the
+        /// launch-stamp grace, after the pane was judged dead.
+        stamp_in_grace: Vec<usize>,
     }
 
     impl Fake<'_> {
@@ -1351,6 +1429,9 @@ mod tests {
                 exit_on_first_alive: false,
                 user_close_retired_while_proving: false,
                 user_close_stale_while_proving: false,
+                carried_settings: false,
+                started: Vec::new(),
+                stamp_in_grace: Vec::new(),
             }
         }
     }
@@ -1359,7 +1440,7 @@ mod tests {
         fn claude_session_id(&self) -> &str {
             SID
         }
-        async fn spawn_next(&mut self) -> Result<String, String> {
+        async fn spawn_next(&mut self, _spawned: &[String]) -> Result<SpawnedPane, SpawnNextError> {
             if let Some(Some(e)) = self.spawn_errors.pop_front() {
                 if self.close_old_in_failing_retry_spawn && !self.spawned.is_empty() {
                     let o = self
@@ -1368,7 +1449,7 @@ mod tests {
                     self.exit_close_outcomes.push(o);
                     self.panes.gone.lock().unwrap().push("old".into());
                 }
-                return Err(e);
+                return Err(SpawnNextError::Spawn(e));
             }
             if self.old_vanishes_in_spawn && self.spawned.is_empty() {
                 self.panes.gone.lock().unwrap().push("old".into());
@@ -1406,10 +1487,27 @@ mod tests {
                 self.exit_close_outcomes.push(o);
             }
             self.spawned.push(id.clone());
-            Ok(id)
+            // Spawned "now"; a pane that STARTS its CLI stamps the row's
+            // SessionStart after this (see `stamp_on_await`).
+            let created_at_ms = chrono::Utc::now().timestamp_millis();
+            Ok(SpawnedPane {
+                terminal_id: id,
+                created_at_ms: Some(created_at_ms),
+                carried_settings: self.carried_settings,
+            })
         }
         async fn await_liveness(&mut self, terminal_id: &str) -> LivenessVerdict {
             self.awaited.push(terminal_id.to_string());
+            let nth = self
+                .spawned
+                .iter()
+                .position(|t| t == terminal_id)
+                .map(|i| i + 1);
+            if nth.is_some_and(|n| self.started.contains(&n)) {
+                // Strictly after the pane's `created_at`.
+                std::thread::sleep(Duration::from_millis(2));
+                self.store.note_session_start_hook(SID);
+            }
             let v = self
                 .verdicts
                 .pop_front()
@@ -1459,6 +1557,12 @@ mod tests {
                     let o = self.store.record_close_checked(SID, Some(prev), "explicit");
                     self.exit_close_outcomes.push(o);
                 }
+            }
+        }
+        async fn await_launch_stamp_grace(&mut self) {
+            if self.stamp_in_grace.contains(&self.spawned.len()) {
+                std::thread::sleep(Duration::from_millis(2));
+                self.store.note_session_start_hook(SID);
             }
         }
         fn panes(&self) -> Arc<dyn PaneOps> {
@@ -1558,7 +1662,8 @@ mod tests {
             RespawnOutcome::Died {
                 exit_code: Some(1),
                 attempts: 3,
-                retry_spawn_error: None
+                retry_spawn_error: None,
+                all_launch_failures: false,
             }
         );
         assert_eq!(fx.spawned.len(), 3);
@@ -1609,8 +1714,11 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
-                self.0.spawn_next().await
+            async fn spawn_next(
+                &mut self,
+                spawned: &[String],
+            ) -> Result<SpawnedPane, SpawnNextError> {
+                self.0.spawn_next(spawned).await
             }
             async fn await_liveness(&mut self, t: &str) -> LivenessVerdict {
                 let v = self.0.await_liveness(t).await;
@@ -1727,7 +1835,10 @@ mod tests {
         let mut fx = Fake::new(&store, vec![]);
         fx.spawn_errors = vec![Some("boom".into())].into();
         let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
-        assert_eq!(out, RespawnOutcome::NotSpawned("boom".into()));
+        assert_eq!(
+            out,
+            RespawnOutcome::NotSpawned(FirstSpawnError::Spawn("boom".into()))
+        );
         assert!(fx.closed().is_empty());
         assert_eq!(store.get(SID).unwrap().terminal_id, "old");
     }
@@ -1985,9 +2096,12 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
+            async fn spawn_next(
+                &mut self,
+                _spawned: &[String],
+            ) -> Result<SpawnedPane, SpawnNextError> {
                 self.0.record_open(record("new-1", "/dst"));
-                Ok("new-1".into())
+                Ok(SpawnedPane::bare("new-1"))
             }
             async fn await_liveness(&mut self, _t: &str) -> LivenessVerdict {
                 std::future::pending().await
@@ -2122,14 +2236,18 @@ mod tests {
             fn claude_session_id(&self) -> &str {
                 SID
             }
-            async fn spawn_next(&mut self) -> Result<String, String> {
-                let id = self.0.spawn_next().await?;
+            async fn spawn_next(
+                &mut self,
+                spawned: &[String],
+            ) -> Result<SpawnedPane, SpawnNextError> {
+                let pane = self.0.spawn_next(spawned).await?;
+                let id = pane.terminal_id.clone();
                 let mut rec = record(&id, "/dst");
                 rec.account_label = Some("dst-account".into());
                 rec.account_wrapper = Some("claude-dst".into());
                 rec.session_name = Some("renamed".into());
                 self.0.store.record_open(rec);
-                Ok(id)
+                Ok(pane)
             }
             async fn await_liveness(&mut self, t: &str) -> LivenessVerdict {
                 self.0.await_liveness(t).await
@@ -2679,5 +2797,389 @@ mod tests {
         );
         assert_eq!(store.held_session_count(), 0);
         drop(dir);
+    }
+
+    // ---- plan 2026-11-10-migration-holds-for-missing-claude-cli -----------
+
+    /// A probe for the migration's CLI hold: scripted looks (the last
+    /// repeats); on look number `close_old_at`, the USER closes the old pane.
+    struct HoldProbe<'s> {
+        store: &'s SessionLifecycleStore,
+        looks: VecDeque<crate::terminal::cli_availability::Look>,
+        close_old_at: Option<usize>,
+        calls: usize,
+    }
+
+    impl crate::terminal::cli_availability::CliProbe for HoldProbe<'_> {
+        async fn look(&mut self) -> crate::terminal::cli_availability::Look {
+            use crate::terminal::cli_availability::{LastSeen, Look};
+            self.calls += 1;
+            if self.close_old_at == Some(self.calls) {
+                let o = self
+                    .store
+                    .record_close_checked(SID, Some("old"), "explicit");
+                assert!(
+                    matches!(o, CloseOutcome::HeldInFlight { .. }),
+                    "fixture: {o:?}"
+                );
+            }
+            if self.looks.len() > 1 {
+                self.looks.pop_front().unwrap()
+            } else {
+                self.looks
+                    .front()
+                    .cloned()
+                    .unwrap_or(Look::Unlaunchable(LastSeen::Absent))
+            }
+        }
+    }
+
+    /// The migration's `spawn_next` shape — `launch_with_hold` with the OLD
+    /// pane's held close or absence as `abort` — over the scripted probe;
+    /// liveness and panes from the [`Fake`].
+    struct Holding<'a, 'b> {
+        fx: &'b mut Fake<'a>,
+        hold: crate::terminal::cli_availability::CliHold,
+        probe: HoldProbe<'a>,
+        spawned: Arc<std::sync::Mutex<Vec<String>>>,
+        announced: Vec<crate::terminal::cli_availability::LastSeen>,
+        /// The `spawned` list `confirm_respawn` passed to each `spawn_next`.
+        seen_spawned: Vec<Vec<String>>,
+        /// When set, the OLD pane vanishes on its own (no close) while the
+        /// first pane is being proven.
+        old_vanishes_in_first_proof: bool,
+    }
+
+    impl<'a, 'b> Holding<'a, 'b> {
+        fn new(
+            fx: &'b mut Fake<'a>,
+            looks: Vec<crate::terminal::cli_availability::Look>,
+            close_old_at: Option<usize>,
+        ) -> Self {
+            let store = fx.store;
+            Self {
+                fx,
+                hold: crate::terminal::cli_availability::CliHold::new(
+                    Duration::from_secs(30),
+                    Duration::from_secs(1),
+                ),
+                probe: HoldProbe {
+                    store,
+                    looks: looks.into(),
+                    close_old_at,
+                    calls: 0,
+                },
+                spawned: Arc::default(),
+                announced: Vec::new(),
+                seen_spawned: Vec::new(),
+                old_vanishes_in_first_proof: false,
+            }
+        }
+    }
+
+    impl RespawnEffects for Holding<'_, '_> {
+        fn claude_session_id(&self) -> &str {
+            SID
+        }
+        async fn spawn_next(&mut self, spawned: &[String]) -> Result<SpawnedPane, SpawnNextError> {
+            let store = self.fx.store;
+            let panes = self.fx.panes.clone();
+            self.seen_spawned.push(spawned.to_vec());
+            let close_hold_spawned = spawned.to_vec();
+            let spawned = Arc::clone(&self.spawned);
+            let announced = &mut self.announced;
+            // The migration's own abort (review r6 A3: the production rule,
+            // not a copy), over the close hold's list; the fixture's pane
+            // table stands in for the terminal manager's liveness.
+            let mut abort = || {
+                crate::terminal::account_migration::hold_aborts_for(
+                    store,
+                    SID,
+                    "old",
+                    panes.alive("old"),
+                    &close_hold_spawned,
+                )
+            };
+            crate::terminal::cli_availability::launch_with_hold(
+                &mut self.hold,
+                &mut self.probe,
+                &mut |seen| announced.push(seen),
+                &mut abort,
+                move |_bin| {
+                    let mut s = spawned.lock().unwrap();
+                    let id = format!("new-{}", s.len() + 1);
+                    store.record_open(record(&id, "/dst"));
+                    s.push(id.clone());
+                    std::future::ready(Ok(SpawnedPane::bare(id)))
+                },
+            )
+            .await
+        }
+        async fn await_liveness(&mut self, t: &str) -> LivenessVerdict {
+            let v = self.fx.await_liveness(t).await;
+            if self.old_vanishes_in_first_proof && t == "new-1" {
+                self.fx.panes.gone.lock().unwrap().push("old".into());
+            }
+            v
+        }
+        async fn pause_before_retry(&mut self, _r: usize) {}
+        fn panes(&self) -> Arc<dyn PaneOps> {
+            self.fx.panes()
+        }
+    }
+
+    /// Review A1: the old pane going away ON ITS OWN after the first spawn
+    /// does not abort a retry's hold — the respawn is the session's only
+    /// rescue, so the next retry still spawns and can prove alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_still_spawns_after_the_old_pane_vanishes_on_its_own() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(
+            &store,
+            vec![LivenessVerdict::Died(Some(127)), LivenessVerdict::Alive],
+        );
+        let mut h = Holding::new(&mut fx, vec![cli_hit()], None);
+        h.old_vanishes_in_first_proof = true;
+        let out = confirm_respawn(&mut h, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Alive {
+                terminal_id: "new-2".into(),
+                attempts: 2
+            }
+        );
+        assert_eq!(*h.spawned.lock().unwrap(), vec!["new-1", "new-2"]);
+        // Review r5 A8: the hold reads the close hold's own spawned list — empty
+        // for the first spawn, every pane spawned so far for a retry.
+        assert_eq!(
+            h.seen_spawned,
+            vec![Vec::<String>::new(), vec!["new-1".to_string()]]
+        );
+        assert_eq!(store.get(SID).unwrap().terminal_id, "new-2");
+    }
+
+    /// Review r3 A9: the user closing the old pane while a RETRY holds for the
+    /// CLI ends the migration as the user asked, and that retry — which never
+    /// spawned — is not counted as an attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_user_close_during_a_retrys_hold_is_not_counted_as_an_attempt() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Died(Some(127))]);
+        // Look 1 (first spawn) hits; look 2 (the retry) sees the user close
+        // the old pane and misses, so the next tick aborts the hold.
+        let mut h = Holding::new(&mut fx, vec![cli_hit(), cli_miss()], Some(2));
+        let out = confirm_respawn(&mut h, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 1 });
+        assert_eq!(*h.spawned.lock().unwrap(), vec!["new-1"]);
+        assert_eq!(
+            store.get(SID).unwrap().state,
+            "closed",
+            "closed as the user asked"
+        );
+    }
+
+    /// The same rule's other half: before ANY pane exists, an old pane gone
+    /// on its own ends the hold — nothing moved, nothing is left to migrate.
+    #[test]
+    fn the_hold_abort_rule() {
+        use crate::terminal::cli_availability::old_pane_aborts_hold;
+        assert!(old_pane_aborts_hold(true, true, true));
+        assert!(
+            old_pane_aborts_hold(true, true, false),
+            "a user close always ends it"
+        );
+        assert!(
+            old_pane_aborts_hold(false, true, true),
+            "gone before the first spawn"
+        );
+        assert!(
+            !old_pane_aborts_hold(false, true, false),
+            "gone on a retry: keep going"
+        );
+        assert!(!old_pane_aborts_hold(false, false, true));
+        assert!(!old_pane_aborts_hold(false, false, false));
+    }
+
+    fn cli_hit() -> crate::terminal::cli_availability::Look {
+        crate::terminal::cli_availability::Look::Launchable("/opt/claude".into())
+    }
+
+    fn cli_miss() -> crate::terminal::cli_availability::Look {
+        crate::terminal::cli_availability::Look::Unlaunchable(
+            crate::terminal::cli_availability::LastSeen::Absent,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_migration_that_holds_for_the_cli_then_proves_alive() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![LivenessVerdict::Alive]);
+        let mut h = Holding::new(&mut fx, vec![cli_miss(), cli_miss(), cli_hit()], None);
+        let out = confirm_respawn(&mut h, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(
+            out,
+            RespawnOutcome::Alive {
+                terminal_id: "new-1".into(),
+                attempts: 1
+            }
+        );
+        assert_eq!(
+            h.announced,
+            vec![crate::terminal::cli_availability::LastSeen::Absent],
+            "held once"
+        );
+        assert_eq!(
+            fx.closed(),
+            vec!["old".to_string()],
+            "the old pane closes only now"
+        );
+        assert_eq!(store.get(SID).unwrap().terminal_id, "new-1");
+        assert_eq!(store.held_session_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_ceiling_ends_cli_unavailable_with_the_old_pane_open_and_the_row_on_it() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![]);
+        let mut h = Holding::new(&mut fx, vec![cli_miss()], None);
+        let out = tokio::time::timeout(
+            Duration::from_secs(120),
+            confirm_respawn(&mut h, &store, Some(&old), MAX_RESPAWN_ATTEMPTS),
+        )
+        .await
+        .expect("the hold must end at its 30 s ceiling");
+        assert_eq!(
+            out,
+            RespawnOutcome::NotSpawned(FirstSpawnError::CliUnavailable(
+                crate::terminal::cli_availability::CliUnavailable {
+                    waited: Duration::from_secs(30),
+                    last_seen: crate::terminal::cli_availability::LastSeen::Absent,
+                }
+            ))
+        );
+        assert!(h.spawned.lock().unwrap().is_empty(), "no pane spawned");
+        assert!(fx.closed().is_empty(), "the old pane stays open");
+        let row = store.get(SID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("open", "old")
+        );
+        assert_eq!(store.held_session_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_user_closing_the_old_pane_mid_hold_spawns_nothing_and_closes_the_session() {
+        let (_d, store) = fresh_store();
+        let old = record("old", "/src");
+        let mut fx = Fake::new(&store, vec![]);
+        let mut h = Holding::new(&mut fx, vec![cli_miss()], Some(2));
+        let out = confirm_respawn(&mut h, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+        assert_eq!(out, RespawnOutcome::OldPaneClosed { attempts: 0 });
+        assert_eq!(
+            h.probe.calls, 2,
+            "the close is seen on the next tick, not at the ceiling"
+        );
+        assert!(h.spawned.lock().unwrap().is_empty(), "no pane spawned");
+        assert_eq!(
+            store.get(SID).unwrap().state,
+            "closed",
+            "the user's close is applied"
+        );
+        assert_eq!(store.held_session_count(), 0);
+    }
+
+    /// D4, per shape: `all_launch_failures` on a respawn whose every attempt
+    /// died (literal per row).
+    #[tokio::test]
+    async fn every_died_shape_reports_whether_any_attempt_launched() {
+        struct Row {
+            name: &'static str,
+            carried_settings: bool,
+            started: Vec<usize>,
+            stamp_in_grace: Vec<usize>,
+            verdicts: Vec<LivenessVerdict>,
+            spawn_errors: Vec<Option<String>>,
+            want: bool,
+        }
+        let died3 = || vec![LivenessVerdict::Died(Some(1)); 3];
+        let rows = vec![
+            Row {
+                name: "stub death: exit 1, no stamp, --settings present",
+                carried_settings: true,
+                started: vec![],
+                stamp_in_grace: vec![],
+                verdicts: died3(),
+                spawn_errors: vec![],
+                want: true,
+            },
+            Row {
+                name: "a launch-failure death, then every retry a spawn error",
+                carried_settings: true,
+                started: vec![],
+                stamp_in_grace: vec![],
+                verdicts: vec![LivenessVerdict::Died(Some(1))],
+                spawn_errors: vec![None, Some("exec failed".into()), Some("exec failed".into())],
+                want: true,
+            },
+            Row {
+                name: "mixed: the second pane's CLI started",
+                carried_settings: true,
+                started: vec![2],
+                stamp_in_grace: vec![],
+                verdicts: died3(),
+                spawn_errors: vec![],
+                want: false,
+            },
+            Row {
+                name: "every pane died after a SessionStart stamp",
+                carried_settings: true,
+                started: vec![1, 2, 3],
+                stamp_in_grace: vec![],
+                verdicts: died3(),
+                spawn_errors: vec![],
+                want: false,
+            },
+            Row {
+                name: "each pane's SessionStart stamp lands during the grace",
+                carried_settings: true,
+                started: vec![],
+                stamp_in_grace: vec![1, 2, 3],
+                verdicts: died3(),
+                spawn_errors: vec![],
+                want: false,
+            },
+            Row {
+                name: "empty settings args: hook delivery unknown",
+                carried_settings: false,
+                started: vec![],
+                stamp_in_grace: vec![],
+                verdicts: died3(),
+                spawn_errors: vec![],
+                want: false,
+            },
+        ];
+        for row in rows {
+            let (_d, store) = fresh_store();
+            let old = record("old", "/src");
+            let mut fx = Fake::new(&store, row.verdicts);
+            fx.carried_settings = row.carried_settings;
+            fx.started = row.started;
+            fx.stamp_in_grace = row.stamp_in_grace;
+            fx.spawn_errors = row.spawn_errors.into();
+            let out = confirm_respawn(&mut fx, &store, Some(&old), MAX_RESPAWN_ATTEMPTS).await;
+            let RespawnOutcome::Died {
+                all_launch_failures,
+                attempts: 3,
+                ..
+            } = out
+            else {
+                panic!("{}: expected Died after 3 attempts, got {out:?}", row.name);
+            };
+            assert_eq!(all_launch_failures, row.want, "{}", row.name);
+        }
     }
 }

@@ -39,21 +39,6 @@ pub(crate) const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(6),
 ];
 
-/// Back-off before each RETRY of an account migration's
-/// [`resolve_resume_claude_bin`]: 7 attempts over 45 s. Longer than [`RETRY_DELAYS`] because a PATH miss here is not one
-/// spawn's ~2 s rename window: an npm reinstall of the CLI has been measured to
-/// leave no launchable `claude` for longer than the identity shim's 10 s wait
-/// (coord finding 00525a01, 2026-11-14), and a `--resume` respawn that gives up
-/// early loses the session rather than one tick of a task.
-pub(crate) const RESUME_RESOLVE_DELAYS: [Duration; 6] = [
-    Duration::from_secs(1),
-    Duration::from_secs(3),
-    Duration::from_secs(6),
-    Duration::from_secs(10),
-    Duration::from_secs(10),
-    Duration::from_secs(15),
-];
-
 /// The head every exhausted transient failure carries, followed by the kind
 /// token. It matches the token the pending pre-claim deferral
 /// (qontinui-runner#1925) uses, `claude_cli_unavailable:<kind>`, so the runner
@@ -317,11 +302,12 @@ pub(crate) async fn spawn_tokio_with_retry(
 /// would only spend the retry budget on a window the runner itself opened. It
 /// returns at once when no install is running, which is the common case.
 ///
-/// `delays` is the caller's budget: [`RESUME_RESOLVE_DELAYS`] for an account
-/// migration, whose old pane is still alive and loses its session if the
-/// respawn gives up early; [`RETRY_DELAYS`] for the resume door and the respawn
-/// receiver, which walk many candidates in turn and whose session is already
-/// closed, so a missing CLI skips the candidate instead of stalling the batch.
+/// `delays` is the caller's budget: [`RETRY_DELAYS`] for the resume door and
+/// the respawn receiver, which walk many candidates in turn and whose session
+/// is already closed, so a missing CLI skips the candidate instead of stalling
+/// the batch. (An account migration does not come here: its old pane is still
+/// alive, so it HOLDS for a launchable CLI instead,
+/// `terminal::cli_availability`.)
 /// A batch does still wait out a RUNNING install: those callers wait on the
 /// flag before their own drain and duplicate-process checks, so this wait
 /// usually returns at once for them. When the install outlived that first
@@ -418,7 +404,7 @@ mod tests {
         let calls = RefCell::new(0u32);
         let slept = RefCell::new(Vec::new());
         let got = resolve_with_retry(
-            &RESUME_RESOLVE_DELAYS,
+            &RETRY_DELAYS,
             || {
                 *calls.borrow_mut() += 1;
                 let n = *calls.borrow();
@@ -429,7 +415,7 @@ mod tests {
         .await;
         assert_eq!(got.as_deref(), Ok("/opt/node/bin/claude"));
         assert_eq!(*calls.borrow(), 3);
-        assert_eq!(*slept.borrow(), RESUME_RESOLVE_DELAYS[..2].to_vec());
+        assert_eq!(*slept.borrow(), RETRY_DELAYS[..2].to_vec());
     }
 
     /// A persistent miss is a typed `claude_cli_unavailable:not_found` error
@@ -439,7 +425,7 @@ mod tests {
         let calls = RefCell::new(0u32);
         let slept = RefCell::new(Vec::new());
         let err = resolve_with_retry(
-            &RESUME_RESOLVE_DELAYS,
+            &RETRY_DELAYS,
             || {
                 *calls.borrow_mut() += 1;
                 std::future::ready(None)
@@ -452,17 +438,8 @@ mod tests {
             err.starts_with(&format!("{CLI_UNAVAILABLE_HEAD}not_found")),
             "{err}"
         );
-        assert_eq!(*calls.borrow(), RESUME_RESOLVE_DELAYS.len() as u32 + 1);
-        assert_eq!(*slept.borrow(), RESUME_RESOLVE_DELAYS.to_vec());
-    }
-
-    /// The resume budget outlasts the reinstall window measured in finding
-    /// 00525a01 (longer than the identity shim's 10 s), and is at least the
-    /// 45 s that window motivated.
-    #[test]
-    fn resume_resolve_budget_covers_the_measured_reinstall_window() {
-        let total: Duration = RESUME_RESOLVE_DELAYS.iter().sum();
-        assert!(total >= Duration::from_secs(45), "{total:?}");
+        assert_eq!(*calls.borrow(), RETRY_DELAYS.len() as u32 + 1);
+        assert_eq!(*slept.borrow(), RETRY_DELAYS.to_vec());
     }
 
     #[tokio::test]

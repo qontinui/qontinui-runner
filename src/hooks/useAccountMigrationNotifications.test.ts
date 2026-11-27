@@ -7,14 +7,17 @@
 import { describe, it, expect, vi } from "vitest";
 
 import {
-  LIMIT_BURST_MS,
+  abandonedToast,
   continuedBurstToast,
   createBurstCoalescer,
+  failedToast,
   formatDue,
   gaveUpBurstToast,
-  parkIsToasted,
+  heldToast,
+  LIMIT_BURST_MS,
   migratedToast,
   parkedBurstToast,
+  parkIsToasted,
   type MigratedPayload,
 } from "./useAccountMigrationNotifications";
 
@@ -207,5 +210,107 @@ describe("usage-limit park and continue toasts (plan 2026-11-05 Phase 2)", () =>
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("heldToast", () => {
+  it("says the migration is waiting for the Claude CLI, with both accounts and the ceiling", () => {
+    const toast = heldToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+      reason: "claude_cli_unavailable:absent",
+      ceilingSecs: 900,
+    });
+    expect(toast.message).toBe(
+      "Session 0c4e3025 is out of tokens on .claude-sales; moving it to .claude-support is waiting for the Claude CLI to come back (up to 15 min)",
+    );
+    expect(toast.type).toBe("info");
+  });
+
+  it("makes no out-of-tokens claim for a move the operator asked for", () => {
+    const toast = heldToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+      ceilingSecs: 900,
+      trigger: "operator",
+    });
+    expect(toast.message).toBe(
+      "Moving session 0c4e3025 from .claude-sales to .claude-support is waiting for the Claude CLI to come back (up to 15 min)",
+    );
+    expect(toast.message).not.toContain("out of tokens");
+    expect(toast.type).toBe("info");
+  });
+
+  it("names the usage limit for the automatic path", () => {
+    expect(
+      heldToast({ claudeSessionId: "0c4e3025", ceilingSecs: 900, trigger: "usage_limit" }).message,
+    ).toContain("is out of tokens on");
+  });
+
+  it("rounds a partial minute up, and names no bound when the payload has none", () => {
+    expect(heldToast({ ceilingSecs: 61 }).message).toContain("(up to 2 min)");
+    expect(heldToast({}).message).toBe(
+      "A session is out of tokens on unknown; moving it to unknown is waiting for the Claude CLI to come back",
+    );
+  });
+});
+
+describe("abandonedToast", () => {
+  // The two reasons the backend's `held_abandoned_reason` sends (review r6 A4).
+  it.each([
+    "the old pane closed or exited while the migration waited for the Claude CLI",
+    "the old pane was closed during the migration",
+  ])("ends a held toast with the backend's reason: %s", (reason) => {
+    const toast = abandonedToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+      reason,
+    });
+    expect(toast.message).toBe(
+      `Session 0c4e3025 was not moved from .claude-sales to .claude-support: ${reason}`,
+    );
+    expect(toast.type).toBe("info");
+  });
+
+  it("falls back to a reason that does not claim the user closed the pane", () => {
+    const toast = abandonedToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+    });
+    expect(toast.message).toBe(
+      "Session 0c4e3025 was not moved from .claude-sales to .claude-support: the old pane closed or exited during the migration",
+    );
+  });
+});
+
+describe("failedToast", () => {
+  it("closes a held operator move whose resumed CLI died, with no out-of-tokens claim", () => {
+    const toast = failedToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+      reason: "respawn-died: exit 1 after 3 attempts",
+    });
+    expect(toast.message).toBe(
+      "Moving session 0c4e3025 from .claude-sales to .claude-support failed: respawn-died: exit 1 after 3 attempts",
+    );
+    expect(toast.message).not.toContain("out of tokens");
+  });
+
+  it("closes a held operator move that failed", () => {
+    const toast = failedToast({
+      claudeSessionId: "0c4e3025-8c5c-4792-a3ca-201ad43e0113",
+      fromConfigDir: "/home/u/.claude-sales",
+      toConfigDir: "/home/u/.claude-support",
+      reason: "claude_cli_unavailable:absent after 900s — the session stays on the old pane",
+    });
+    expect(toast.message).toBe(
+      "Moving session 0c4e3025 from .claude-sales to .claude-support failed: claude_cli_unavailable:absent after 900s — the session stays on the old pane",
+    );
+    expect(toast.type).toBe("error");
   });
 });

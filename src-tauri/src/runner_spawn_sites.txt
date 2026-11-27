@@ -102,6 +102,9 @@ terminal/account_migration.rs | migrate_session_off_runtime | helper | migrate_s
 terminal/account_migration.rs | confirm_migration | helper | confirm_migration(
 terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane(
 terminal/account_migration.rs | spawn_next | helper | .spawn_next(
+# The migration's spawn_next holds for a launchable `claude` and then spawns through spawn_with
+# — plan 2026-11-10-migration-holds-for-missing-claude-cli Phase 4.
+terminal/account_migration.rs | spawn_with | helper | .spawn_with(
 # confirm_respawn drives each caller's own `spawn_next` (the first spawn and every retry after a
 # resumed CLI died) — plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn Phase 4.
 terminal/respawn_liveness.rs | confirm_respawn | helper | confirm_respawn(

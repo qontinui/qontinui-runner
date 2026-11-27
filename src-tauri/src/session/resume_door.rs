@@ -690,6 +690,8 @@ async fn resume_one(
     }) {
         return ResumeRow::skipped(&cand.id, why);
     }
+    // Every early return from here to the respawn gives the slot back.
+    let cap_slot = crate::terminal::account_migration::CapSlot::new(&cand.id, now_ms);
 
     // An operator resume is not a continuation. Drop the closed row's gate
     // identity when its outcome is already owned: bound by this process, or
@@ -715,6 +717,7 @@ async fn resume_one(
         registry: registry.clone(),
         cand: cand.clone(),
     };
+    let cap_stamp = cap_slot.launch();
     let outcome = crate::terminal::respawn_liveness::confirm_respawn(
         &mut effects,
         store,
@@ -722,7 +725,7 @@ async fn resume_one(
         crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
     )
     .await;
-    let terminal_id = match proven_terminal(&cand.id, outcome) {
+    let terminal_id = match settle_respawn(&cand.id, cap_stamp, outcome) {
         Ok(terminal_id) => terminal_id,
         Err(row) => return *row,
     };
@@ -740,6 +743,22 @@ async fn resume_one(
             }),
         ),
     }
+}
+
+/// The door's answer to a respawn it took a cap slot for at `cap_stamp`: the
+/// slot goes back when no CLI launched (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli` D4 — the spawn failed,
+/// or every attempt was a launch failure), through the one shared refund
+/// helper; then [`proven_terminal`].
+fn settle_respawn(
+    id: &str,
+    cap_stamp: i64,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, Box<ResumeRow>> {
+    if crate::terminal::account_migration::refund_cap_if_never_launched(id, cap_stamp, &outcome) {
+        info!(id = %id, "resume_door: the resumed CLI never launched — the cap slot was given back");
+    }
+    proven_terminal(id, outcome)
 }
 
 /// Pure: the terminal a proven respawn landed on, or the id's `failed` row.
@@ -772,6 +791,7 @@ fn proven_terminal(
             exit_code,
             attempts,
             retry_spawn_error,
+            ..
         } => Err(Box::new(ResumeRow::failed(
             id,
             RespawnOutcome::died_detail(exit_code, attempts, retry_spawn_error.as_deref()),
@@ -811,17 +831,22 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
         &self.cand.id
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
+    async fn spawn_next(
+        &mut self,
+        _spawned: &[String],
+    ) -> Result<
+        crate::terminal::respawn_launch::SpawnedPane,
+        crate::terminal::respawn_launch::SpawnNextError,
+    > {
         // The async pre-step: the ABSOLUTE binary, retried, never bare — the
         // one resolved before the cap check for the first spawn.
         let claude_bin = match self.first_bin.take() {
             Some(bin) => bin,
-            None => {
-                crate::claude_cli_spawn::resolve_resume_claude_bin(
-                    &crate::claude_cli_spawn::RETRY_DELAYS,
-                )
-                .await?
-            }
+            None => crate::claude_cli_spawn::resolve_resume_claude_bin(
+                &crate::claude_cli_spawn::RETRY_DELAYS,
+            )
+            .await
+            .map_err(crate::terminal::respawn_launch::SpawnNextError::Spawn)?,
         };
         let cand = &self.cand;
         // Model is sniffed off the row's transcript. The read is blocking
@@ -883,7 +908,7 @@ impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
                 policy_tenant,
             },
         )
-        .map(|(terminal_id, _coord_id)| terminal_id)
+        .map_err(crate::terminal::respawn_launch::SpawnNextError::Spawn)
     }
 
     async fn await_liveness(
@@ -1284,6 +1309,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: None,
+                all_launch_failures: false,
             },
         )
         .unwrap_err();
@@ -1298,6 +1324,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: Some("claude not found".into()),
+                all_launch_failures: false,
             },
         )
         .unwrap_err();
@@ -1403,6 +1430,41 @@ mod tests {
             admit(DrainGate::Allow, permits),
             Err("cap_reached".to_string())
         );
+    }
+
+    /// Plan `2026-11-10-migration-holds-for-missing-claude-cli` Phase 5: a
+    /// door respawn whose CLI never launched gives its cap slot back (literal
+    /// `cap_left`), and one whose CLI launched and then died keeps it.
+    #[test]
+    fn a_door_respawn_that_never_launched_returns_its_cap_slot() {
+        use crate::terminal::account_migration::{
+            migration_cap_left, migration_cap_permits, MIGRATION_CAP,
+        };
+        use crate::terminal::respawn_launch::FirstSpawnError;
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let died = |all_launch_failures| RespawnOutcome::Died {
+            exit_code: Some(1),
+            attempts: 3,
+            retry_spawn_error: None,
+            all_launch_failures,
+        };
+        let stamp = 1_790_000_000_000i64;
+        for (i, (outcome, cap_left)) in [
+            (died(true), MIGRATION_CAP),
+            (
+                RespawnOutcome::NotSpawned(FirstSpawnError::Spawn("exec failed".into())),
+                MIGRATION_CAP,
+            ),
+            (died(false), MIGRATION_CAP - 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("cap-refund-door-{i}");
+            assert!(migration_cap_permits(&id, stamp), "the door takes a slot");
+            assert!(settle_respawn(&id, stamp, outcome).is_err());
+            assert_eq!(migration_cap_left(&id, stamp + 10), cap_left, "case {i}");
+        }
     }
 
     fn cand() -> Candidate {
