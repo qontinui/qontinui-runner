@@ -1291,6 +1291,12 @@ mod tests {
             serde_json::to_value(schema_for!(SpecAssertionVerdict)).unwrap(),
             "SpecAssertionVerdict is registered as another type"
         );
+        assert_eq!(
+            schemas["UnknownCode"],
+            serde_json::to_value(schema_for!(qontinui_vision_core::observation::UnknownCode))
+                .unwrap(),
+            "UnknownCode is registered as another type"
+        );
     }
 
     /// The two Rust copies of the shared vocabulary — qontinui-types' AGPL
