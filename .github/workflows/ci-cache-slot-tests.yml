@@ -1,0 +1,48 @@
+name: ci-cache-slot tests
+
+# Fixture tests for .github/scripts/ci-cache-slot.sh, the slot pool `ci.yml`'s
+# `test` job draws its persistent self-hosted target from: slot selection,
+# cross-slot eviction, the legacy per-registration reap and the lock's
+# lifetime, over a temp-dir fixture tree. It also asserts that no workflow
+# keys a persistent path by $RUNNER_NAME again, which is why every workflow
+# edit triggers it. No network and no cargo. Linux only (flock), like the
+# helper; the test fails rather than skips under CI when flock is missing.
+# Plan: 2026-11-04-devops-ci-persistent-target-caches-keyed-per-registration-grow-without-bound-on-the-org-pool.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/scripts/ci-cache-slot.sh"
+      - "scripts/tests/test_ci_cache_slot.sh"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/scripts/ci-cache-slot.sh"
+      - "scripts/tests/test_ci_cache_slot.sh"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR-SCOPED SUPERSESSION, the same single-expression group as
+# oom-signature-tests.yml (which says why it is one expression).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  selftest:
+    name: ci-cache-slot selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Test the CI cache slot pool (fixture tree, no network)
+        shell: bash
+        run: bash scripts/tests/test_ci_cache_slot.sh
