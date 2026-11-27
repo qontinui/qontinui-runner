@@ -424,9 +424,13 @@ pub(crate) fn retire_client_allocation_body(client_allocation_id: uuid::Uuid) ->
 
 /// How long a first `404` for a run's id waits before it is asked once more.
 /// The attempt the runner gave up on may still be running on coord, which
-/// would commit its rows AFTER an immediate ask answered "no row". Longer than
-/// the runner's own 80 s allocate bound plus coord's 20 s mirror-refresh cap,
-/// so a re-ask after it sees anything that attempt went on to commit.
+/// would commit its rows AFTER an immediate ask answered "no row". This is a
+/// HEURISTIC, not a bound: it exceeds the runner's own 80 s allocate bound
+/// plus coord's 20 s mirror-refresh cap, but coord's allocate handler has no
+/// overall server-side timeout (intent derivation, the advisory lock and DB
+/// latency are unbounded), so an attempt slower than this can still commit
+/// after the re-ask. Such a row is not lost: it ages out through coord's
+/// worktree reclaim.
 #[cfg(not(test))]
 const ID_HANDBACK_RECHECK_DELAY: Duration = Duration::from_secs(120);
 #[cfg(test)]
