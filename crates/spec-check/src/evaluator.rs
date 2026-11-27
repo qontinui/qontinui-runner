@@ -41,8 +41,13 @@ pub const REASON_SPEC_VALIDATION_FAILED: &str = "spec_validation_failed";
 // Constants
 // ===========================================================================
 
-/// `result_schema_version` v1.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+/// `result_schema_version` this evaluator writes. v2 added the `unknown`
+/// assertion verdict (`{ "status": "unknown", "code": … }`, plan
+/// `2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass` D4);
+/// nothing else changed, so a v1 row is a valid v2 row and
+/// [`crate::result_migration`] reads it unchanged. See that module for what
+/// a reader predating v2 does with a v2 row.
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// Sentinel `snapshot_id` used when the evaluator runs directly on a
 /// pre-parsed snapshot (i.e. the caller didn't go through
@@ -684,7 +689,7 @@ mod tests {
         let spec = page_spec("page-1", vec![st]);
 
         let result = evaluate(&s, &spec);
-        assert_eq!(result.result_schema_version, 1);
+        assert_eq!(result.result_schema_version, 2);
         assert_eq!(result.spec_version, "1.0");
         assert_eq!(result.page_id, "page-1");
         assert_eq!(result.state_results.len(), 1);

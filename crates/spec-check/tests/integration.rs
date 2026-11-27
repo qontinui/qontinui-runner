@@ -21,7 +21,7 @@ fn smoke_evaluate_returns_full_match_on_matching_fixture() {
     let result = evaluate(&snapshot, &spec);
 
     // Top-level shape.
-    assert_eq!(result.result_schema_version, 1);
+    assert_eq!(result.result_schema_version, 2);
     assert_eq!(result.spec_version, "1.0");
     assert_eq!(result.page_id, "smoke-page");
     assert!(result.spec_content_hash.starts_with("sha256-"));

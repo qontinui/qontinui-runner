@@ -1506,7 +1506,7 @@ mod tests {
         assert_eq!(r.status, "ok");
         let result = r.result.expect("ok status carries a result");
         assert_eq!(result.page_id, "batch-page");
-        assert_eq!(result.result_schema_version, 1);
+        assert_eq!(result.result_schema_version, 2);
         // The caller-supplied fingerprint + snapshot identity flow through
         // instead of the in-process sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "test-app");
