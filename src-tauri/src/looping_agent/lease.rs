@@ -1271,9 +1271,7 @@ mod tests {
     }
 
     fn held() -> AcquireOutcome {
-        AcquireOutcome::Held {
-            current_holder: None,
-        }
+        AcquireOutcome::Held { holder: None }
     }
 
     #[test]
@@ -1581,12 +1579,7 @@ mod tests {
         assert_eq!(walk_verdict(&[]), WalkVerdict::NotWalked);
         // A `held` naming nobody is still held.
         assert_eq!(
-            walk_verdict(&[(
-                0,
-                AcquireOutcome::Held {
-                    current_holder: None
-                }
-            )]),
+            walk_verdict(&[(0, AcquireOutcome::Held { holder: None })]),
             WalkVerdict::AllHeld
         );
     }
@@ -1620,7 +1613,10 @@ mod tests {
             }
             match self.live_owner(key, now) {
                 Some(h) if h != owner => AcquireOutcome::Held {
-                    current_holder: Some(h.to_string()),
+                    holder: Some(SlotHolder {
+                        machine_id: h.to_string(),
+                        session: None,
+                    }),
                 },
                 _ => {
                     self.owners
@@ -1639,7 +1635,7 @@ mod tests {
                         .insert(key.to_string(), (owner.to_string(), now + TTL_MS));
                     HeartbeatOutcome::Ok
                 }
-                Some(_) => HeartbeatOutcome::Stolen,
+                Some(_) => HeartbeatOutcome::Stolen { holder: None },
                 None => HeartbeatOutcome::NotHeld,
             }
         }
