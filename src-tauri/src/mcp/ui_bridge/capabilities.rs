@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::StatusCode,
     response::Json,
 };
@@ -987,13 +987,24 @@ pub async fn ui_bridge_get_workflows_handler(
 pub async fn ui_bridge_get_element_state_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::mcp::element_state_projection::{ipc_args_for, StateProjection, REFUSAL_CODE};
     info!("UI Bridge API: Getting element state for {}", id);
+
+    let projection = match StateProjection::from_raw_query(raw.as_deref()) {
+        Ok(p) => p,
+        Err(refusal) => {
+            let mut body = api_error(refusal.message);
+            body.code = Some(REFUSAL_CODE.to_string());
+            return Err((StatusCode::BAD_REQUEST, Json(body)));
+        }
+    };
 
     match ui_bridge_request_sync(
         &state,
         "get_element_state",
-        serde_json::json!({ "elementId": id }),
+        ipc_args_for(projection.as_ref(), &id),
     )
     .await
     {

@@ -534,6 +534,9 @@ export interface UIBridgeRequestPayload {
    */
   timeout_ms?: number;
   elementId?: string;
+  /** `get_element_state` request-scoped projection (string once, array when repeated). */
+  properties?: string | string[];
+  attributes?: string | string[];
   componentId?: string;
   actionId?: string;
   action?: {

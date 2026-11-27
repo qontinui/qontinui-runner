@@ -1,5 +1,12 @@
 import { useCallback } from "react";
-import { getGlobalSpecStore, SpecExecutor } from "@qontinui/ui-bridge";
+import {
+  getGlobalSpecStore,
+  SpecExecutor,
+  isProjectionRequestError,
+  parseProjectionRequest,
+  projectElement,
+} from "@qontinui/ui-bridge";
+import type { ElementProjectionRequest } from "@qontinui/ui-bridge";
 import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
@@ -556,11 +563,38 @@ export function useDebugInspectEvents(
             });
             return true;
           }
+          // Request-scoped projection (`properties` / `attributes`), forwarded
+          // by the runner's element-state routes. Absent: byte-identical to the
+          // legacy answer. Present: validated whole (a malformed list is a typed
+          // refusal) and answered beside the unchanged state.
+          let projection: ElementProjectionRequest | undefined;
+          if (payload.properties !== undefined || payload.attributes !== undefined) {
+            try {
+              projection = parseProjectionRequest(
+                { properties: payload.properties, attributes: payload.attributes },
+                "query",
+              );
+            } catch (err) {
+              if (!isProjectionRequestError(err)) throw err;
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `element state ${err.message}`,
+                code: "UB-VALIDATION-ERROR",
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+          }
+          const stateData = stateEl.getState();
           await sendResponse({
             requestId,
             type,
             success: true,
-            data: stateEl.getState(),
+            data: projection
+              ? { ...stateData, projection: projectElement(stateEl.element, projection) }
+              : stateData,
             timestamp: Date.now(),
           });
           return true;
