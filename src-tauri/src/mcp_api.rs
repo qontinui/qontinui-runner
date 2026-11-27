@@ -6014,9 +6014,11 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// sha, the reviewer's `independence` object, and the coord finding that holds the
 /// review. The retract writes a newer row, because the newest row per pair wins,
 /// so nothing is deleted. coord reads a live attestation as a fourth `ClosedWork`
-/// evidence form. It counts only when the cited finding still resolves, the
-/// attested head is the PR's CURRENT head, the successor's land is terminal, and
-/// the finding's body contains both full shas. Otherwise it contributes nothing.
+/// evidence form. It counts only when the attested head is the PR's CURRENT head,
+/// the successor's land is `terminal` AT the attested land sha, and the cited
+/// finding still resolves with a body containing both full shas. A record that
+/// fails one of those contributes nothing. One whose successor land or finding
+/// cannot be read, or one read on a card with no head, reads `unknown`.
 /// coord refuses the write when the PR is not closed-unlanded, the successor has
 /// not landed, the caller's tenant does not own both repos, the head does not
 /// match, the finding does not resolve or lacks a sha, or `independence` is
@@ -6031,8 +6033,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// here). coord's grant (`mcp/agent_tool_access.rs`, beside
 /// `coord_declare_supersession`) is the authority on who may call it, and this
 /// list only forwards. The coord half is the same plan's Phase 2 and was not on
-/// coord `origin/main` when these entries were written. Until it deploys, coord
-/// answers both names as unknown tools, so forwarding them early is harmless.
+/// coord `origin/main` `674ddb8d7` (read 2026-11-27) when these entries were
+/// written. Until it deploys, coord answers both names as unknown tools, so
+/// forwarding them early is harmless.
 /// Re-verify the tool names against coord `origin/main` when editing this
 /// paragraph.
 ///
@@ -6518,7 +6521,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_origin",
     "coord_resolve_pr_author_session",
     "coord_resolve_session",
-    // Same plan/phase: the undo of `coord_attest_intent_carried`. It writes a
+    // Plan 2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished
+    // Phase 3: the undo of `coord_attest_intent_carried`. It writes a
     // retraction row (the newest row per pair wins) and never deletes one.
     "coord_retract_intent_attestation",
     "coord_secret_presence",
@@ -18006,13 +18010,14 @@ mod coord_mcp_body_gate_tests {
     }
 
     /// Plan `2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished`
-    /// Phase 3: coord's intent-attestation pair forwards. Each name sits in
-    /// sorted position, because membership is a `binary_search` and an
-    /// out-of-place entry would answer `-32601` while this list reads as if it
-    /// were open. Each passes the proxy's body gate as a `tools/call`, is not
-    /// also a deliberate exclusion, and is read back exactly once by the
-    /// source-text parser `build_drift` runs over this file. The comments above
-    /// the entries name the tools in backticks, so they must not add a phantom.
+    /// Phase 3: coord's intent-attestation pair forwards. Membership is a
+    /// `binary_search`, so an out-of-place entry would answer `-32601` while
+    /// this list reads as if it were open; sortedness is pinned by
+    /// `allowlist_tables_are_sorted`, not here. Each name passes the proxy's
+    /// body gate as a `tools/call`, is not also a deliberate exclusion, and is
+    /// read back exactly once by the source-text parser `build_drift` runs over
+    /// this file. The comments above the entries name the tools in backticks,
+    /// so they must not add a phantom.
     /// Both are WRITES: the transport-rung classifier must not file either
     /// under its read set.
     #[test]
@@ -18023,10 +18028,6 @@ mod coord_mcp_body_gate_tests {
             "coord_retract_intent_attestation",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
-            assert!(
-                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
-                "{tool} must sit in sorted position in COORD_MCP_ALLOWED_TOOLS"
-            );
             assert!(
                 !coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must not also be a deliberate exclusion"
