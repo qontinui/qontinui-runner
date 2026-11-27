@@ -964,6 +964,10 @@ pub async fn get_task_run_verification_results(
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
+    // Emptiness is judged on the unfiltered set: `failed_only` removes passing
+    // rows, and a verification with nothing to check never reports passed.
+    let nothing_checked = results_array.is_empty();
+
     // Filter by failed_only if requested
     let results_array: Vec<_> = if query.failed_only {
         results_array
@@ -997,7 +1001,7 @@ pub async fn get_task_run_verification_results(
             "passed": passed,
             "failed": failed,
             "critical_failed": critical_failed,
-            "all_passed": failed == 0
+            "all_passed": !nothing_checked && failed == 0
         },
         "query": {
             "iteration": query.iteration,
