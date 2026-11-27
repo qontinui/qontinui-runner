@@ -24,6 +24,14 @@
 //! unexplained kill to place and only for a unit its previous child listing
 //! proves was inside the slice.
 //!
+//! ## The kernel's own record (Phase 3)
+//!
+//! Where the kernel log is readable to this user, its `oom-kill:` line names
+//! the victim's cgroup (`task_memcg`, kernel-written, exact) and `comm`.
+//! Readability is probed (`journalctl -k -b -n 1` returning an entry), never
+//! assumed from an exit code. Nothing here widens host privilege: on a box
+//! with `dmesg_restrict` and no journal group the arm reads `unreadable`.
+//!
 //! ## Bounded and quiet
 //!
 //! One `journalctl` fork, only on a tick where a watched user-manager slice
@@ -214,6 +222,147 @@ pub(crate) async fn read_user(since: DateTime<Utc>, until: DateTime<Utc>) -> Jou
     user_read_from(out.as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: the kernel's own OOM record
+// ---------------------------------------------------------------------------
+
+/// Most recent kernel entries read per window. An OOM report prints its task
+/// dump BEFORE its `oom-kill:` line, so the newest entries hold the newest
+/// records.
+const KERNEL_MAX_ENTRIES: u32 = 2000;
+
+/// One kernel `oom-kill:` record, reduced to what placement uses.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct KernelOomRecord {
+    /// `task_memcg=`: the victim's cgroup, written by the kernel — exact.
+    pub(crate) task_memcg: String,
+    /// `task=`: the victim's `comm`.
+    pub(crate) comm: String,
+    pub(crate) realtime_usec: u64,
+    pub(crate) boot_id: String,
+}
+
+/// What the kernel-log read produced.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KernelRead {
+    /// The kernel log is readable here; these are its `oom-kill:` records in
+    /// the window (possibly none).
+    Read(Vec<KernelOomRecord>),
+    /// Not readable by this user (on a box with `dmesg_restrict` and no
+    /// journal group, an unprivileged `journalctl -k` exits 0 with ZERO
+    /// entries), or the read failed.
+    Unreadable,
+}
+
+/// The readability probe: the kernel log counts as readable iff this
+/// returns at least one entry. Only journald's own fields are asked for.
+/// PURE.
+pub(crate) fn kernel_probe_args() -> Vec<String> {
+    [
+        "-k",
+        "-b",
+        "-n",
+        "1",
+        "-o",
+        "json",
+        "--output-fields=_BOOT_ID",
+        "--no-pager",
+        "-q",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
+}
+
+/// The kernel-log query for `[since, until)`: `MESSAGE` is needed to read
+/// the `oom-kill:` line; only `task_memcg` and `task` of it are kept. PURE.
+pub(crate) fn kernel_journal_args(since: DateTime<Utc>, until: DateTime<Utc>) -> Vec<String> {
+    vec![
+        "-k".into(),
+        "-o".into(),
+        "json".into(),
+        "--output-fields=MESSAGE".into(),
+        "--no-pager".into(),
+        "-q".into(),
+        "--since".into(),
+        at_secs(since, false),
+        "--until".into(),
+        at_secs(until, true),
+        "-n".into(),
+        KERNEL_MAX_ENTRIES.to_string(),
+        "_TRANSPORT=kernel".into(),
+    ]
+}
+
+/// `(task_memcg, comm)` from a kernel
+/// `oom-kill:constraint=…,oom_memcg=…,task_memcg=<path>,task=<comm>,pid=<n>,uid=<n>`
+/// line. `comm` is split from the right (`,pid=`), since a process may name
+/// itself with a comma. `None` for any other line. PURE.
+pub(crate) fn parse_oom_kill_line(msg: &str) -> Option<(String, String)> {
+    let rest = msg.trim_start().strip_prefix("oom-kill:")?;
+    let at = rest
+        .match_indices("task_memcg=")
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || rest.as_bytes().get(i - 1) == Some(&b','))?;
+    let after = rest.get(at + "task_memcg=".len()..)?;
+    let cut = after.find(",task=")?;
+    let memcg = after.get(..cut)?;
+    let tail = after.get(cut + ",task=".len()..)?;
+    let comm = tail.get(..tail.rfind(",pid=")?)?;
+    let clean = |v: &str| !v.chars().any(char::is_control);
+    (memcg.starts_with('/') && clean(memcg) && !comm.is_empty() && comm.len() <= 64 && clean(comm))
+        .then(|| (memcg.to_string(), comm.to_string()))
+}
+
+/// The `oom-kill:` records in one kernel-log read; `None` when the output is
+/// unparseable. PURE.
+pub(crate) fn parse_kernel_journal(stdout: &str) -> Option<Vec<KernelOomRecord>> {
+    let mut out: Vec<KernelOomRecord> = json_lines(stdout)?
+        .iter()
+        .filter_map(|m| {
+            let (task_memcg, comm) = parse_oom_kill_line(&field_text(m.get("MESSAGE"))?)?;
+            let (realtime_usec, boot_id) = entry_time_and_boot(m)?;
+            Some(KernelOomRecord {
+                task_memcg,
+                comm,
+                realtime_usec,
+                boot_id,
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.realtime_usec);
+    Some(out)
+}
+
+/// Whether a probe's stdout proves the kernel log readable: at least one
+/// entry. PURE.
+pub(crate) fn kernel_readable(probe: Option<&str>) -> bool {
+    probe.and_then(json_lines).is_some_and(|l| !l.is_empty())
+}
+
+/// The kernel read from the probe's and the window read's stdout (`None` =
+/// that fork failed or was not run). PURE.
+pub(crate) fn kernel_read_from(probe: Option<&str>, window: Option<&str>) -> KernelRead {
+    if !kernel_readable(probe) {
+        return KernelRead::Unreadable;
+    }
+    window
+        .and_then(parse_kernel_journal)
+        .map_or(KernelRead::Unreadable, KernelRead::Read)
+}
+
+/// Phase 3's read of the kernel log over `[since, until)`: the probe, then —
+/// only when it proves the log readable — the window.
+pub(crate) async fn read_kernel(since: DateTime<Utc>, until: DateTime<Utc>) -> KernelRead {
+    let probe = run_journalctl("journalctl", &kernel_probe_args(), READ_TIMEOUT).await;
+    let window = if kernel_readable(probe.as_deref()) {
+        run_journalctl("journalctl", &kernel_journal_args(since, until), READ_TIMEOUT).await
+    } else {
+        None
+    };
+    kernel_read_from(probe.as_deref(), window.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +468,80 @@ mod tests {
                 unit: "x.scope".into(),
                 realtime_usec: 1,
                 boot_id: "ab".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn the_oom_kill_line_yields_task_memcg_and_comm() {
+        let line = "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice,task_memcg=/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-x.scope,task=rustc,pid=4242,uid=1000";
+        assert_eq!(
+            parse_oom_kill_line(line),
+            Some((
+                "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-x.scope".to_string(),
+                "rustc".to_string()
+            ))
+        );
+        // A comm with a comma is split from the right.
+        assert_eq!(
+            parse_oom_kill_line("oom-kill:constraint=CONSTRAINT_NONE,task_memcg=/a.slice/b.scope,task=a,b,pid=1,uid=0")
+                .map(|x| x.1),
+            Some("a,b".to_string())
+        );
+        assert_eq!(parse_oom_kill_line("Memory cgroup out of memory: Killed process 4242 (rustc)"), None);
+        assert_eq!(parse_oom_kill_line("oom-kill:constraint=X,task_memcg=relative,task=x,pid=1,uid=0"), None);
+        assert_eq!(parse_oom_kill_line("oom-kill:constraint=X,task_memcg=/a.slice,task=,pid=1,uid=0"), None);
+    }
+
+    #[test]
+    fn the_kernel_argv_reads_only_kernel_messages_of_the_window() {
+        assert_eq!(
+            kernel_probe_args(),
+            vec!["-k", "-b", "-n", "1", "-o", "json", "--output-fields=_BOOT_ID", "--no-pager", "-q"]
+        );
+        assert_eq!(
+            kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z")),
+            vec![
+                "-k",
+                "-o",
+                "json",
+                "--output-fields=MESSAGE",
+                "--no-pager",
+                "-q",
+                "--since",
+                "@1795738480",
+                "--until",
+                "@1795738510",
+                "-n",
+                "2000",
+                "_TRANSPORT=kernel",
+            ]
+        );
+    }
+
+    /// The kernel log is readable iff the probe returned an entry: an
+    /// unprivileged `journalctl -k` exits 0 with none.
+    #[test]
+    fn kernel_readability_is_probed_not_assumed() {
+        let probe = r#"{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#;
+        let window = concat!(
+            r#"{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"27cd98773ff347f083889880a31d5902","MESSAGE":"oom-kill:constraint=CONSTRAINT_MEMCG,task_memcg=/a.slice/b.scope,task=rustc,pid=9,uid=1000"}"#,
+            "\n",
+            r#"{"__REALTIME_TIMESTAMP":"1795738498277000","_BOOT_ID":"27cd98773ff347f083889880a31d5902","MESSAGE":"Tasks state (memory values in pages):"}"#,
+            "\n",
+        );
+        assert_eq!(kernel_read_from(Some(""), Some(window)), KernelRead::Unreadable, "empty probe");
+        assert_eq!(kernel_read_from(None, Some(window)), KernelRead::Unreadable, "failed probe");
+        assert_eq!(kernel_read_from(Some(probe), None), KernelRead::Unreadable, "failed window");
+        assert_eq!(kernel_read_from(Some(probe), Some("not json")), KernelRead::Unreadable);
+        assert_eq!(kernel_read_from(Some(probe), Some("")), KernelRead::Read(vec![]));
+        assert_eq!(
+            kernel_read_from(Some(probe), Some(window)),
+            KernelRead::Read(vec![KernelOomRecord {
+                task_memcg: "/a.slice/b.scope".into(),
+                comm: "rustc".into(),
+                realtime_usec: 1795738498277337,
+                boot_id: "27cd98773ff347f083889880a31d5902".into(),
             }])
         );
     }

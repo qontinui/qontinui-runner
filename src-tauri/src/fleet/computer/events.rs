@@ -160,6 +160,8 @@ pub(crate) struct ObsInput<'a> {
     /// Layer C's user-journal read (`journal_oom`), taken before the derive
     /// when `slice_oom::journal_window` asked for one.
     pub(crate) journal: Option<&'a super::journal_oom::JournalRead>,
+    /// Phase 3's kernel-log read (`journal_oom`), taken with the journal read.
+    pub(crate) kernel: Option<&'a super::journal_oom::KernelRead>,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -497,6 +499,7 @@ pub(crate) fn derive(
         prev: &prev.slices,
         read: input.slices,
         journal: input.journal,
+        kernel: input.kernel,
         unit_kills: &unit_kills,
         watched: &watched,
         rebooted,
@@ -942,6 +945,7 @@ mod tests {
             carry_oom_baseline: true,
             slices: None,
             journal: None,
+            kernel: None,
         }
     }
 
@@ -1090,6 +1094,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             carry_oom_baseline: true,
             slices: None,
             journal: None,
+            kernel: None,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -1119,6 +1124,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             carry_oom_baseline: true,
             slices: None,
             journal: None,
+            kernel: None,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -1141,6 +1147,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             carry_oom_baseline: true,
             slices: None,
             journal: None,
+            kernel: None,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(

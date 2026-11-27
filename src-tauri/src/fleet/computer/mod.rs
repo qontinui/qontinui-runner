@@ -133,6 +133,7 @@ pub(crate) fn obs_input(o: &Observed) -> ObsInput<'_> {
         carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
         slices: o.oom.slices.as_ref(),
         journal: o.oom.journal.as_ref(),
+        kernel: o.oom.kernel.as_ref(),
     }
 }
 
@@ -1431,6 +1432,7 @@ mod tests {
                 carry_oom_baseline: true,
                 slices: None,
                 journal: None,
+                kernel: None,
             }
         }
         let (_, obs0) = events::derive(None, &inp(&before, 5), t("2026-09-30T01:40:00Z"));

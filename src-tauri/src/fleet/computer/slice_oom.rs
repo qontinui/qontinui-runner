@@ -29,7 +29,14 @@
 //!   (`attribution: "user_journal_unit_oom"`, `count: 1` each). The read is
 //!   decided by [`journal_window`] — pure, over the previous state — before
 //!   the derive, and forked only then.
-//! * Whatever the slice delta has left after the watched units, B and C is ONE
+//! * **Kernel records** (Phase 3, `journal_oom`), where the kernel log is
+//!   readable: a record whose kernel-written `task_memcg` lies under the slice
+//!   places what would be the remainder (`attribution: "kernel_oom_record"`,
+//!   `victim_unit` = the path component under the slice), and an exact
+//!   `task_memcg` match names any slice event's `victim_comm`
+//!   (`victim_comm_source`: `kernel_log` / `not_found` / `unreadable`).
+//! * Whatever the slice delta has left after the watched units, B, C and the
+//!   kernel records is ONE
 //!   slice-level event with `victim_unit: null` — "inside this slice, child
 //!   not placed".
 //!
@@ -68,7 +75,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::events::{self, event_id, rfc3339, ComputerEvent, ComputerObs, ObsInput};
-use super::journal_oom::{boot_key, JournalRead, UnitOomEntry};
+use super::journal_oom::{boot_key, JournalRead, KernelOomRecord, KernelRead, UnitOomEntry};
 use crate::fleet::slice_telemetry;
 
 /// Children tracked per slice. Past it a child is untracked, its kills fall
@@ -161,6 +168,8 @@ pub(crate) struct OomReads {
     pub(crate) slices: Option<SliceOomRead>,
     /// Layer C's user-journal read; `None` = no window needed one.
     pub(crate) journal: Option<JournalRead>,
+    /// Phase 3's kernel-log read; `None` = no window needed one.
+    pub(crate) kernel: Option<KernelRead>,
 }
 
 /// A watched unit's OOM kill this tick, as the slice arithmetic subtracts it
@@ -363,13 +372,19 @@ pub(crate) async fn collect(prev: Option<&ComputerObs>, input: &ObsInput<'_>) ->
             });
         // Layer C forks only when the previous state says a user-manager
         // slice has a kill no counter will explain.
-        let journal = match journal_window(prev, input, &slices) {
-            Some(w) => Some(super::journal_oom::read_user(w.since, w.until).await),
-            None => None,
+        let window = journal_window(prev, input, &slices);
+        let journal = match window {
+            Some(w) if w.user => Some(super::journal_oom::read_user(w.since, w.until).await),
+            _ => None,
+        };
+        let kernel = match window {
+            Some(w) if w.kernel => Some(super::journal_oom::read_kernel(w.since, w.until).await),
+            _ => None,
         };
         OomReads {
             slices: Some(slices),
             journal,
+            kernel,
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -564,24 +579,122 @@ pub(crate) fn journal_window(
     if budget == 0 {
         return None;
     }
-    let since = read
+    let plans: Vec<SlicePlan<'_>> = read
         .slices
         .iter()
         .map(|s| plan_slice(prev.slices.get(&s.name), s, &kills, rebooted, read.read_at))
+        .collect();
+    // Layer C: a user-manager slice of this uid with a kill no counter names.
+    let user = plans
+        .iter()
         .filter(|p| p.unnamed() > 0 && door(p.read, read.euid, rebooted) == Door::Own)
         .filter_map(|p| p.since)
-        .min()?;
+        .min();
+    // The kernel arm: any slice event at all (its `victim_comm`, and the
+    // placement of a remainder). A reboot does not stop it: `task_memcg` is
+    // its own proof.
+    let kernel = plans
+        .iter()
+        .filter(|p| p.left > 0)
+        .filter_map(|p| p.since)
+        .min();
+    let since = user.into_iter().chain(kernel).min()?;
     (since < read.read_at).then_some(JournalWindow {
         since,
         until: read.read_at,
+        user: user.is_some(),
+        kernel: kernel.is_some(),
     })
 }
 
-/// `[since, until)` for Layer C's journal read.
+/// `[since, until)` for this tick's journal reads, and which of them to fork.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct JournalWindow {
     pub(crate) since: DateTime<Utc>,
     pub(crate) until: DateTime<Utc>,
+    /// Layer C's `journalctl --user` read.
+    pub(crate) user: bool,
+    /// Phase 3's `journalctl -k` read.
+    pub(crate) kernel: bool,
+}
+
+/// The kernel records of this boot inside a plan's `[since, until)`. PURE.
+fn records_in<'k>(
+    records: &'k [KernelOomRecord],
+    plan: &SlicePlan<'_>,
+    until: DateTime<Utc>,
+    boot: &str,
+) -> Vec<&'k KernelOomRecord> {
+    let Some(since) = plan.since else {
+        return Vec::new();
+    };
+    let boot = boot_key(boot);
+    let (from, to) = (micros(since), micros(until));
+    records
+        .iter()
+        .filter(|r| {
+            !boot.is_empty()
+                && boot_key(&r.boot_id) == boot
+                && r.realtime_usec >= from
+                && r.realtime_usec < to
+        })
+        .collect()
+}
+
+/// Kernel records placing what is left of a slice's delta: one kill each,
+/// for a unit directly under the slice that no watched unit, B or C already
+/// accounts for, at most `need`. PURE.
+fn place_kernel(
+    records: &[&KernelOomRecord],
+    plan: &SlicePlan<'_>,
+    journal: &[UnitOomEntry],
+    watched: &[&str],
+    kills: &[UnitKill],
+    need: u64,
+) -> Vec<(String, KernelOomRecord)> {
+    let slice = &plan.read.cgroup;
+    records
+        .iter()
+        .filter(|r| is_under(&r.task_memcg, slice))
+        .filter(|r| {
+            !kills.iter().any(|k| {
+                k.control_group
+                    .as_deref()
+                    .is_some_and(|cg| r.task_memcg == cg || is_under(&r.task_memcg, cg))
+            })
+        })
+        .filter_map(|r| {
+            let child = r.task_memcg.get(slice.len() + 1..)?.split('/').next()?;
+            let unit = [".scope", ".service", ".slice"]
+                .iter()
+                .any(|x| child.ends_with(x))
+                .then_some(child)?;
+            (!watched.contains(&unit)
+                && !plan.children.iter().any(|c| c.child == unit)
+                && !journal.iter().any(|e| e.unit == unit))
+            .then(|| (unit.to_string(), (*r).clone()))
+        })
+        .take(usize::try_from(need).unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// `(victim_comm, victim_comm_source)` for a slice event whose narrowest
+/// proven cgroup is `cgroup`: only an EXACT `task_memcg` match names a comm.
+/// `None` = the kernel log was not asked (the fields are left out). PURE.
+fn comm_for(
+    kernel: Option<&KernelRead>,
+    records: &[&KernelOomRecord],
+    cgroup: &str,
+) -> Option<(Option<String>, &'static str)> {
+    match kernel? {
+        KernelRead::Unreadable => Some((None, "unreadable")),
+        KernelRead::Read(_) => Some(
+            records
+                .iter()
+                .find(|r| r.task_memcg == cgroup)
+                .map_or((None, "not_found"), |r| (Some(r.comm.clone()), "kernel_log")),
+        ),
+    }
 }
 
 /// Microseconds since the epoch (0 before it). PURE.
@@ -647,6 +760,8 @@ pub(crate) struct SliceInput<'a> {
     pub(crate) read: Option<&'a SliceOomRead>,
     /// Layer C's read, when [`journal_window`] asked for one.
     pub(crate) journal: Option<&'a JournalRead>,
+    /// Phase 3's kernel-log read, when [`journal_window`] asked for one.
+    pub(crate) kernel: Option<&'a KernelRead>,
     pub(crate) unit_kills: &'a [UnitKill],
     /// The watched unit names this tick.
     pub(crate) watched: &'a [&'a str],
@@ -749,10 +864,19 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
                 (_, Door::Own, Some(JournalRead::Read(_))) => "read",
                 _ => "unreadable",
             };
+            let records = match a.kernel {
+                Some(KernelRead::Read(r)) => records_in(r, p, read.read_at, a.boot),
+                _ => Vec::new(),
+            };
+            let left = need - journal.len() as u64;
+            let kernel =
+                place_kernel(&records, p, &journal, a.watched, a.unit_kills, left);
             Draft {
                 children: p.children.clone(),
-                remainder: need - journal.len() as u64,
+                remainder: left - kernel.len() as u64,
                 journal,
+                kernel,
+                records,
                 journal_word,
                 clamped: p.clamped,
             }
@@ -774,6 +898,11 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
             }
         }
         for d in drafts.iter_mut() {
+            while excess > 0 && d.kernel.pop().is_some() {
+                excess -= 1;
+            }
+        }
+        for d in drafts.iter_mut() {
             let before: u64 = d.children.iter().map(|c| c.count).sum();
             trim_children(&mut d.children, excess.min(before));
             excess -= excess.min(before);
@@ -785,7 +914,7 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
         let s = p.read;
         let clamped = d.clamped || tick_clamped;
         let detail = |unit: Option<&str>, cgroup: &str, count: u64, how: &str, journal: &str| {
-            json!({
+            let mut v = json!({
                 "victim_unit": unit,
                 "victim_slice": s.name,
                 "victim_cgroup": cgroup,
@@ -798,7 +927,12 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
                 "oom_kill_total": a.oom_kill_total,
                 "slice_oom_kill_total": s.oom_kill,
                 "previous_slice_oom_kill_total": p.base,
-            })
+            });
+            if let Some((comm, source)) = comm_for(a.kernel, &d.records, cgroup) {
+                v["victim_comm"] = json!(comm);
+                v["victim_comm_source"] = json!(source);
+            }
+            v
         };
         for c in &d.children {
             let how = "cgroup_memory_events";
@@ -838,6 +972,25 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
                     how,
                     "read",
                 ),
+            });
+        }
+        for (unit, r) in &d.kernel {
+            let how = "kernel_oom_record";
+            let at = i64::try_from(r.realtime_usec)
+                .ok()
+                .and_then(DateTime::<Utc>::from_timestamp_micros)
+                .map_or_else(|| a.now_s.to_string(), rfc3339);
+            let mut v = detail(Some(unit), &r.task_memcg, 1, how, d.journal_word);
+            v["victim_comm"] = json!(r.comm);
+            v["victim_comm_source"] = json!("kernel_log");
+            events.push(ComputerEvent {
+                client_event_id: event_id(
+                    "oom_kill",
+                    &[a.boot, unit, how, &r.realtime_usec.to_string()],
+                ),
+                kind: "oom_kill".into(),
+                observed_at: at,
+                detail: v,
             });
         }
         if d.remainder > 0 {
@@ -880,20 +1033,25 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
 }
 
 /// One slice's events before they are built.
-struct Draft {
+struct Draft<'k> {
     children: Vec<ChildKill>,
     /// Layer C's accepted entries, one kill each.
     journal: Vec<UnitOomEntry>,
+    /// Kernel records placing a kill each, by the unit under the slice.
+    kernel: Vec<(String, KernelOomRecord)>,
+    /// This slice's kernel records in its window, for `victim_comm`.
+    records: Vec<&'k KernelOomRecord>,
     /// `journal` on this slice's remainder event.
     journal_word: &'static str,
     remainder: u64,
     clamped: bool,
 }
 
-impl Draft {
+impl Draft<'_> {
     fn total(&self) -> u64 {
         self.children.iter().map(|c| c.count).sum::<u64>()
             + self.journal.len() as u64
+            + self.kernel.len() as u64
             + self.remainder
     }
 }
@@ -966,6 +1124,7 @@ mod tests {
             carry_oom_baseline: true,
             slices,
             journal: None,
+            kernel: None,
         }
     }
 
@@ -1817,6 +1976,7 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let w = journal_window(Some(&o0), &input(&[], Some(34079), Some(&r1)), &r1).unwrap();
         assert_eq!(w.since, t("2026-11-27T00:14:40Z"));
         assert_eq!(w.until, t("2026-11-27T00:15:10Z"));
+        assert!(w.user && w.kernel);
 
         let boot = "27cd98773ff347f083889880a31d5902";
         let j = journal(&[
@@ -1868,7 +2028,9 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "2026-11-27T00:15:10Z",
             vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
         );
-        assert_eq!(journal_window(Some(&o0), &input(&[], Some(34079), Some(&r1)), &r1), None);
+        let w = journal_window(Some(&o0), &input(&[], Some(34079), Some(&r1)), &r1).unwrap();
+        assert!(!w.user, "no user-journal read: {w:?}");
+        assert!(w.kernel, "the kernel arm still names the child's comm");
     }
 
     /// Plan test 3: a child born and killed inside one tick was never listed,
@@ -2056,7 +2218,8 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             let r0 = read("2026-11-27T00:14:40Z", vec![slice("agent-builds.slice", cgroup, 3, &[("x.scope", Some(0))])]);
             let (_, o0) = derive(None, &input(&[], Some(20), Some(&r0)), t("2026-11-27T00:14:40Z"));
             let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", cgroup, 4, &[])]);
-            assert_eq!(journal_window(Some(&o0), &input(&[], Some(21), Some(&r1)), &r1), None, "{cgroup}");
+            let w = journal_window(Some(&o0), &input(&[], Some(21), Some(&r1)), &r1).unwrap();
+            assert!(!w.user, "no user-journal fork for {cgroup}");
             let j = journal(&[jline("x.scope", 1795738500000000, BOOT)]);
             let (ev, _) = derive(Some(&o0), &with_journal(input(&[], Some(21), Some(&r1)), &j), t("2026-11-27T00:15:10Z"));
             assert_eq!(ev.len(), 1, "{ev:?}");
@@ -2079,7 +2242,8 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             booted_at: Some("2026-11-27T03:00:00Z"),
             ..input(&[], Some(1), Some(&r1))
         };
-        assert_eq!(journal_window(Some(&o0), &base, &r1), None);
+        let w = journal_window(Some(&o0), &base, &r1).unwrap();
+        assert!(!w.user, "no user-journal fork after a reboot");
         let j = journal(&[jline(SCOPE, 1795748410000000, "11111111222243338444555555555555")]);
         let (ev, _) = derive(Some(&o0), &with_journal(base, &j), t("2026-11-27T03:01:00Z"));
         let o = ooms(&ev);
@@ -2108,5 +2272,237 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         assert_eq!(run(34081), vec![s("cgroup_memory_events", 1), s("user_journal_unit_oom", 1), s("slice_memory_events", 1)]);
         assert_eq!(run(34080), vec![s("cgroup_memory_events", 1), s("user_journal_unit_oom", 1)]);
         assert_eq!(run(34079), vec![s("cgroup_memory_events", 1)]);
+    }
+
+    // ---- kernel records (Phase 3) ---------------------------------------
+
+    fn krec(memcg: &str, comm: &str, realtime: u64, boot: &str) -> KernelOomRecord {
+        KernelOomRecord {
+            task_memcg: memcg.into(),
+            comm: comm.into(),
+            realtime_usec: realtime,
+            boot_id: boot.into(),
+        }
+    }
+
+    fn with_kernel<'a>(base: ObsInput<'a>, k: &'a KernelRead) -> ObsInput<'a> {
+        ObsInput {
+            kernel: Some(k),
+            ..base
+        }
+    }
+
+    /// Plan test 15: an exact `task_memcg` match names `victim_comm`; a
+    /// record elsewhere names nothing (`not_found`); an unreadable kernel log
+    /// says so; a log never asked leaves both fields out.
+    #[test]
+    fn victim_comm_comes_only_from_an_exact_task_memcg_match() {
+        let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+        );
+        let at = 1795738498277337; // 00:14:58Z
+        let exact = KernelRead::Read(vec![krec(
+            "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-a.scope",
+            "rustc",
+            at,
+            "27cd98773ff347f083889880a31d5902",
+        )]);
+        let elsewhere = KernelRead::Read(vec![krec(
+            "/system.slice/postgres.service",
+            "postgres",
+            at,
+            "27cd98773ff347f083889880a31d5902",
+        )]);
+        let unreadable = KernelRead::Unreadable;
+        let one = |k: Option<&KernelRead>| {
+            let inp = ObsInput {
+                kernel: k,
+                ..input(&[], Some(34079), Some(&r1))
+            };
+            let (ev, _) = derive(Some(&o0), &inp, t("2026-11-27T00:15:10Z"));
+            assert_eq!(ev.len(), 1, "{ev:?}");
+            assert_eq!(ev[0].detail["attribution"], "cgroup_memory_events");
+            ev[0].detail.clone()
+        };
+        let d = one(Some(&exact));
+        assert_eq!(d["victim_comm"], "rustc");
+        assert_eq!(d["victim_comm_source"], "kernel_log");
+        let d = one(Some(&elsewhere));
+        assert_eq!(d["victim_comm"], serde_json::Value::Null);
+        assert_eq!(d["victim_comm_source"], "not_found");
+        let d = one(Some(&unreadable));
+        assert_eq!(d["victim_comm"], serde_json::Value::Null);
+        assert_eq!(d["victim_comm_source"], "unreadable");
+        let d = one(None);
+        assert!(d.get("victim_comm").is_none() && d.get("victim_comm_source").is_none(), "{d}");
+    }
+
+    /// Plan test 26: a readable record whose `task_memcg` is under the slice
+    /// places what would have been the remainder — the unit directly under
+    /// the slice — with its comm.
+    #[test]
+    fn a_kernel_record_places_the_remainder() {
+        let o0 = baseline(&[]);
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let boot = "27cd98773ff347f083889880a31d5902";
+        let k = KernelRead::Read(vec![
+            krec(
+                "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-x.scope",
+                "rustc",
+                1795738498277337,
+                boot,
+            ),
+            // Before the baseline (00:14:40Z): not this tick's kill.
+            krec(
+                "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-old.scope",
+                "cc1plus",
+                1795738470000000,
+                boot,
+            ),
+        ]);
+        let (ev, _) = derive(
+            Some(&o0),
+            &with_kernel(input(&[], Some(34080), Some(&r1)), &k),
+            t("2026-11-27T00:15:10Z"),
+        );
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        let d = &ev[0].detail;
+        assert_eq!(d["victim_unit"], "agent-build-x.scope");
+        assert_eq!(d["attribution"], "kernel_oom_record");
+        assert_eq!(d["count"], 1);
+        assert_eq!(d["victim_comm"], "rustc");
+        assert_eq!(d["victim_comm_source"], "kernel_log");
+        assert_eq!(d["victim_slice"], "agent-builds.slice");
+        assert_eq!(
+            d["victim_cgroup"],
+            "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice/agent-build-x.scope"
+        );
+        assert_eq!(ev[0].observed_at, "2026-11-27T00:14:58Z");
+        assert_eq!(
+            ev[0].client_event_id,
+            event_id(
+                "oom_kill",
+                &[
+                    "27cd9877-3ff3-47f0-8388-9880a31d5902",
+                    "agent-build-x.scope",
+                    "kernel_oom_record",
+                    "1795738498277337"
+                ]
+            )
+        );
+        // The second kill stays the remainder; its slice path matches no
+        // record exactly.
+        assert_eq!(ev[1].detail["attribution"], "slice_memory_events");
+        assert_eq!(ev[1].detail["count"], 1);
+        assert_eq!(ev[1].detail["victim_comm_source"], "not_found");
+    }
+
+    /// Plan test 23 (Phase 3 part): readable with no match is `not_found`,
+    /// unreadable is `unreadable`, and the residual outside every slice was
+    /// never asked, so it carries no `victim_comm_source`.
+    #[test]
+    fn the_comm_states_stay_distinguishable() {
+        let o0 = baseline(&[]);
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        for (k, want) in [
+            (KernelRead::Read(vec![]), "not_found"),
+            (KernelRead::Unreadable, "unreadable"),
+        ] {
+            let (ev, _) = derive(
+                Some(&o0),
+                &with_kernel(input(&[], Some(34080), Some(&r1)), &k),
+                t("2026-11-27T00:15:10Z"),
+            );
+            assert_eq!(ev.len(), 2, "{ev:?}");
+            assert_eq!(ev[0].detail["attribution"], "slice_memory_events");
+            assert_eq!(ev[0].detail["victim_comm_source"], want);
+            assert_eq!(ev[1].detail["attribution"], "vmstat_delta");
+            assert!(ev[1].detail.get("victim_comm_source").is_none());
+        }
+    }
+
+    /// A kernel record never re-places a kill a watched unit, B or C already
+    /// accounts for, and never one from another boot.
+    #[test]
+    fn a_kernel_record_places_only_what_nothing_else_named() {
+        let units = watched(RUNNER_SERVICE, Some(0));
+        let killed = watched(RUNNER_SERVICE, Some(1));
+        let r0 = read(
+            "2026-11-27T00:14:40Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[("b.scope", Some(0)), ("c.scope", Some(0))])],
+        );
+        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 8, &[("b.scope", Some(1))])],
+        );
+        let boot = "27cd98773ff347f083889880a31d5902";
+        let at = 1795738498000000;
+        let k = KernelRead::Read(vec![
+            krec(&format!("{RUNNER_SLICE}/qontinui-runner.service"), "qontinui-runner", at, boot),
+            krec(&format!("{RUNNER_SLICE}/b.scope"), "rustc", at + 1, boot),
+            krec(&format!("{RUNNER_SLICE}/c.scope"), "ld", at + 2, boot),
+            krec(&format!("{RUNNER_SLICE}/d.scope"), "cc", at + 3, "0000000000000000000000000000beef"),
+        ]);
+        let j = journal(&[jline("c.scope", at + 2, boot)]);
+        let inp = ObsInput {
+            kernel: Some(&k),
+            journal: Some(&j),
+            ..input(&killed, Some(14), Some(&r1))
+        };
+        let (ev, _) = derive(Some(&o0), &inp, t("2026-11-27T00:15:10Z"));
+        let got: Vec<(String, String)> = ooms(&ev)
+            .iter()
+            .map(|e| {
+                (
+                    e.detail["attribution"].as_str().unwrap().to_string(),
+                    e.detail["victim_unit"].as_str().unwrap_or("-").to_string(),
+                )
+            })
+            .collect();
+        // Delta 4 = the watched unit 1 + B (b) 1 + C (c) 1 + one unplaced.
+        assert_eq!(
+            got,
+            vec![
+                ("cgroup_memory_events".to_string(), "qontinui-runner.service".to_string()),
+                ("cgroup_memory_events".to_string(), "b.scope".to_string()),
+                ("user_journal_unit_oom".to_string(), "c.scope".to_string()),
+                ("slice_memory_events".to_string(), "-".to_string()),
+            ],
+            "{ev:?}"
+        );
+        let b = &ooms(&ev)[1].detail;
+        assert_eq!(b["victim_comm"], "rustc");
+        let c = &ooms(&ev)[2].detail;
+        assert_eq!(c["victim_comm"], "ld");
+    }
+
+    /// After a reboot the kernel record still places a kill: `task_memcg` is
+    /// its own proof, unlike a listing from the previous boot.
+    #[test]
+    fn after_a_reboot_a_kernel_record_still_places() {
+        let o0 = baseline(&[]);
+        let new_boot = "11111111-2222-4333-8444-555555555555";
+        let r1 = read("2026-11-27T03:01:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let base = ObsInput {
+            boot_id: Some(new_boot),
+            booted_at: Some("2026-11-27T03:00:00Z"),
+            ..input(&[], Some(1), Some(&r1))
+        };
+        let w = journal_window(Some(&o0), &base, &r1).unwrap();
+        assert!(w.kernel && !w.user, "{w:?}");
+        let k = KernelRead::Read(vec![krec(
+            &format!("{AGENT}/agent-build-y.scope"),
+            "rustc",
+            1795748410000000,
+            "11111111222243338444555555555555",
+        )]);
+        let (ev, _) = derive(Some(&o0), &with_kernel(base, &k), t("2026-11-27T03:01:00Z"));
+        let o = ooms(&ev);
+        assert_eq!(o.len(), 1, "{ev:?}");
+        assert_eq!(o[0].detail["attribution"], "kernel_oom_record");
+        assert_eq!(o[0].detail["victim_unit"], "agent-build-y.scope");
     }
 }
