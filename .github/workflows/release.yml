@@ -70,10 +70,18 @@ jobs:
   # that edits it out, is not bound by it. Closing that needs the signing
   # secrets moved into a deployment environment that only main and protected v*
   # tags may use — a repository-settings change, not something this file can do.
+  #
+  # It is also the ONE place the release version is resolved. create-release
+  # consumes its `version` / `tag` outputs rather than re-deriving them, so the
+  # tag this job proved is on main is, by construction, the tag the release is
+  # created under — not a second parse that merely happens to agree.
   require-landed-on-main:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.prove.outputs.version }}
+      tag: ${{ steps.prove.outputs.tag }}
     steps:
       # Full commit history, because merge-base cannot answer across a shallow
       # boundary. blob:none skips historical file contents, which ancestry does
@@ -85,6 +93,7 @@ jobs:
           filter: blob:none
 
       - name: Refuse a release whose commit is not on main
+        id: prove
         env:
           # Bound through env rather than spliced in with ${{ }}: a dispatch
           # input is caller-supplied text (same reasoning as create-release's
@@ -96,6 +105,31 @@ jobs:
             echo "::error::release refused: $*"
             exit 1
           }
+          # The ONE release-version grammar in this workflow. Sets `tag`.
+          require_version() {
+            if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+              refuse "$1"
+            fi
+            tag="v${version}"
+          }
+
+          # Resolve the release version ONCE, for both events. create-release
+          # reads it from this step's outputs instead of re-parsing it.
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              version="${INPUT_VERSION#v}"
+              ;;
+            push)
+              if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+                refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — a push run must be a v* tag push."
+              fi
+              version="${GITHUB_REF#refs/tags/}"
+              version="${version#v}"
+              ;;
+            *)
+              version=""
+              ;;
+          esac
 
           case "${GITHUB_EVENT_NAME}" in
             workflow_dispatch)
@@ -103,11 +137,9 @@ jobs:
                 refuse "${GITHUB_REF} (${GITHUB_SHA}) is not on main. A manual release tags and ships the commit it was dispatched from, so it must be dispatched from main — a published version must already be landed on the default branch."
               fi
 
-              version="${INPUT_VERSION#v}"
-              if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-                refuse "cannot tell which commit the release tag names: the version input '${INPUT_VERSION}' is not of the form X.Y.Z."
-              fi
-              tag="v${version}"
+              # Newlines stripped before echoing caller-supplied text: an
+              # ::error:: line carrying one would start a second workflow command.
+              require_version "cannot tell which commit the release tag names: the version input '${INPUT_VERSION//[$'\r\n']/ }' is not of the form X.Y.Z."
 
               rc=0
               git ls-remote --exit-code --tags origin "refs/tags/${tag}" > /dev/null || rc=$?
@@ -132,6 +164,8 @@ jobs:
               ;;
 
             push)
+              require_version "${GITHUB_REF} (${GITHUB_SHA}): the tag does not look like vX.Y.Z, so no release version can be resolved from it."
+
               git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main \
                 || refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — origin/main could not be fetched."
               rc=0
@@ -154,6 +188,9 @@ jobs:
               refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — event '${GITHUB_EVENT_NAME}' is neither a v* tag push nor a workflow_dispatch from main."
               ;;
           esac
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
   # Build Python executor for bundling (optional). Opt-in via workflow_dispatch
   # only — tag releases skip it to cut build-failure surface (the macOS Python
@@ -200,22 +237,19 @@ jobs:
       - name: Resolve release version
         id: get_version
         env:
-          # Bound through env rather than spliced in with ${{ }}: a dispatch
-          # input is caller-supplied text, and interpolating it directly into a
-          # run block would make it shell code.
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+          # The version require-landed-on-main resolved, validated and proved
+          # (with its tag) to name a commit of main. It is NOT re-derived here:
+          # a second parse could only disagree with the proof, never improve
+          # on it. Bound through env rather than spliced in with ${{ }}: on
+          # workflow_dispatch it is caller-supplied text.
+          PROVEN_VERSION: ${{ needs.require-landed-on-main.outputs.version }}
+          PROVEN_TAG: ${{ needs.require-landed-on-main.outputs.tag }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            version="${GITHUB_REF#refs/tags/}"
-            version="${version#v}"
-          else
-            version="${INPUT_VERSION#v}"
-          fi
-
-          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Could not resolve a release version (got '${version}'). On a tag push the tag must look like vX.Y.Z; on workflow_dispatch pass the 'version' input, e.g. 1.0.8."
+          version="${PROVEN_VERSION}"
+          if [[ -z "${version}" || "${PROVEN_TAG}" != "v${version}" ]]; then
+            echo "::error::require-landed-on-main handed over no usable release version (version='${version}', tag='${PROVEN_TAG}'). It resolves and proves the version for both events; an empty or inconsistent pair means that job's outputs were lost, so nothing is released."
             exit 1
           fi
 
