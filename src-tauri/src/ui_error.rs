@@ -398,8 +398,10 @@ fn record_event_pong_at(now_ms: u64) {
         // racing pongs can pair the newest stamp with another pong's snapshot,
         // in EITHER direction (a preempted older pong can store a later total
         // after a newer pong stored its own). The error is bounded by the
-        // starvation accrued during that preemption window: small against the
-        // 90 s dead window, and it can shift starved-since either way.
+        // starvation accrued during that preemption window (normally small
+        // against the 90 s dead window, though OS descheduling on a thrashing
+        // box is not bounded by anything here), and it can shift
+        // starved-since either way.
         // This pong is the newest: pair it with `app-rt`'s cumulative starved
         // time, so a later reader can tell how much of the pong's age was
         // starvation ([`app_runtime_starved_since_last_event_pong_ms`]).
@@ -1458,7 +1460,9 @@ pub struct NativeUiLiveness {
 /// starved, never forever — and as a hard cap NEITHER arm (starved-now or
 /// post-episode) applies once the pong is older than 3 ×
 /// [`UI_EVENT_DEAD_AFTER_MS`] ([`STARVATION_WITHDRAW_CAP_MS`]), so a hung main
-/// thread that also starves `app-rt` cannot hide the wedge forever. No starvation since the
+/// thread that also starves `app-rt` cannot hide the wedge forever — UNLESS a
+/// Win32 probe answered `Some(false)` (see the guard in the body, the one place
+/// that exemption is stated). No starvation since the
 /// pong (`Some(0)`), `starved_since_pong_ms` of `None` (UNKNOWN) and an
 /// unknown pong age change nothing on this arm.
 ///
@@ -1479,12 +1483,15 @@ pub fn apply_app_runtime_starvation(
     if !v.events_undelivered {
         return v;
     }
-    // The hard cap binds BOTH arms: a hung native main thread can starve
-    // `app-rt` too (blocked sync window calls), and off Windows no Win32 probe
-    // would ever measure it — so starvation never hides a pong this old. It
-    // binds only where the loop is UNMEASURED: a Win32 probe that answered
+    // The hard cap, the ONE place it is applied to both arms: a hung native
+    // main thread can starve `app-rt` too (blocked sync window calls), and off
+    // Windows no Win32 probe would ever measure it — so starvation never hides
+    // a pong this old. The single exemption: a Win32 probe that answered
     // `Some(false)` measured the loop pumping, and an unmeasured stale pong
-    // must not override that measurement.
+    // must not override that measurement, on either arm. Known hole: that
+    // answer is a cached atom with no freshness bound, so a stalled probe-loop
+    // thread under persistent starvation keeps reading `pumping` (the wedge
+    // watchdog reports the monitor stall separately).
     if v.probe_wedged != Some(false) && pong_past_starvation_cap(&v) {
         return v;
     }
@@ -1507,7 +1514,8 @@ pub fn apply_app_runtime_starvation(
 
 /// The hard cap on [`apply_app_runtime_starvation`], shared by its starved-now
 /// and post-episode arms: an event pong older than 3 × [`UI_EVENT_DEAD_AFTER_MS`]
-/// is never withdrawn, whatever the runtime-lag probe says.
+/// is not withdrawn, whatever the runtime-lag probe says, unless a Win32 probe
+/// measured the loop pumping (the exemption in that function's body).
 const STARVATION_WITHDRAW_CAP_MS: u64 = UI_EVENT_DEAD_AFTER_MS.saturating_mul(3);
 
 /// Is the verdict's event pong past [`STARVATION_WITHDRAW_CAP_MS`]? An unknown
@@ -1518,9 +1526,9 @@ fn pong_past_starvation_cap(v: &NativeUiLiveness) -> bool {
 }
 
 /// The post-episode arm of [`apply_app_runtime_starvation`]: some starvation
-/// since the pong, the pong no older than the 3 × dead hard cap, and its
-/// un-starved age (`pong_age - starved_since_pong`) under dead + one ping
-/// interval.
+/// since the pong, and its un-starved age (`pong_age - starved_since_pong`)
+/// under dead + one ping interval. The hard cap is applied by the caller, not
+/// here, so its probe exemption covers this arm too.
 fn stale_pong_is_from_a_starvation_episode(
     v: &NativeUiLiveness,
     starved_since_pong_ms: Option<u64>,
@@ -1528,7 +1536,7 @@ fn stale_pong_is_from_a_starvation_episode(
     let (Some(starved), Some(pong_age)) = (starved_since_pong_ms, v.event_pong_age_ms) else {
         return false;
     };
-    if starved == 0 || pong_age > STARVATION_WITHDRAW_CAP_MS {
+    if starved == 0 {
         return false;
     }
     let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
@@ -1949,6 +1957,41 @@ mod tests {
         assert!(!v.events_undelivered);
         assert_eq!(v.wedged, Some(false));
         assert_eq!(v.reason, "pumping");
+    }
+
+    /// The exemption covers the post-episode arm too: once the episode has
+    /// ended, a probe that answered `Some(false)` still keeps a recently
+    /// starved pong past the cap withdrawn.
+    #[test]
+    fn post_episode_past_the_cap_a_probe_that_answered_pumping_still_withdraws() {
+        let cap = UI_EVENT_DEAD_AFTER_MS * 3;
+        let mut past = fired_by_events(Some(false));
+        past.event_pong_age_ms = Some(cap + 1);
+        // Starved for all but 10 s of the pong's age: the un-starved age is small.
+        let v = apply_app_runtime_starvation(past, Some(false), Some(cap + 1 - 10_000));
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, Some(false));
+        assert_eq!(v.reason, "pumping");
+
+        // Without the measurement the cap still binds on this arm.
+        let mut unmeasured = fired_by_events(None);
+        unmeasured.event_pong_age_ms = Some(cap + 1);
+        let v = apply_app_runtime_starvation(unmeasured, Some(false), Some(cap + 1 - 10_000));
+        assert!(
+            v.events_undelivered,
+            "past the cap an unmeasured loop still fires"
+        );
+    }
+
+    /// A probe that measured the loop WEDGED past the cap keeps the rung.
+    #[test]
+    fn past_the_cap_a_probe_that_answered_wedged_keeps_the_rung() {
+        let cap = UI_EVENT_DEAD_AFTER_MS * 3;
+        let mut past = fired_by_events(Some(true));
+        past.event_pong_age_ms = Some(cap + 1);
+        let v = apply_app_runtime_starvation(past, Some(true), None);
+        assert!(v.events_undelivered);
+        assert_eq!(v.wedged, Some(true));
     }
 
     #[test]
