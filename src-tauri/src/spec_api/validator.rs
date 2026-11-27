@@ -120,15 +120,33 @@ impl FailingVerdict {
     }
 }
 
-/// The `FlywheelProposalDemoted` locator a gate-B red emits:
-/// `(failing_state_id, failing_assertion_id, failing_assertion_verdict)`.
-/// `None` (a red from a policy `Indeterminate` over an empty in-scope set)
-/// emits empty strings, so the wire shape stays uniform; a reader tells
-/// that apart from an older emitter's absent verdict by the empty id.
-pub fn demote_locator(failing: Option<FailingAssertion>) -> (String, String, &'static str) {
-    match failing {
-        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str()),
-        None => (String::new(), String::new(), ""),
+/// The `FlywheelProposalDemoted` event a gate-B red emits. The named
+/// assertion's state, id and verdict ("fail" / "unknown") land in their own
+/// named fields; `None` (a red from a policy `Indeterminate` over an empty
+/// in-scope set) emits empty strings, so the wire shape stays uniform, and a
+/// reader tells that apart from an older emitter's absent verdict by the
+/// empty id.
+pub fn demoted_event(
+    app_id: String,
+    proposal_id: String,
+    page_id: String,
+    failing: Option<FailingAssertion>,
+    snapshot_id: String,
+    at_ms: u64,
+) -> qontinui_types::spec_api_events::SpecApiEvent {
+    let (failing_state_id, failing_assertion_id, failing_assertion_verdict) = match failing {
+        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str().to_string()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    qontinui_types::spec_api_events::SpecApiEvent::FlywheelProposalDemoted {
+        app_id,
+        proposal_id,
+        page_id,
+        failing_assertion_id,
+        failing_state_id,
+        failing_assertion_verdict,
+        snapshot_id,
+        at_ms,
     }
 }
 
@@ -927,25 +945,52 @@ mod tests {
         );
     }
 
-    /// The demote event's locator keeps each id in its own field and says
-    /// which verdict named the assertion. Mutation: swapping the two ids,
-    /// hardcoding `"fail"`, or emitting a verdict for `None` reds this.
+    /// The demote event puts each locator part in its own named field and
+    /// says which verdict named the assertion. Mutation: swapping the state
+    /// and assertion ids, hardcoding `"fail"`, or emitting a verdict for
+    /// `None` reds this.
     #[test]
-    fn demote_locator_names_state_assertion_and_verdict() {
+    fn demoted_event_names_state_assertion_and_verdict() {
+        use qontinui_types::spec_api_events::SpecApiEvent;
         let named = |verdict| FailingAssertion {
             state_id: "s1".to_string(),
             assertion_id: "a1".to_string(),
             verdict,
         };
+        let fields = |failing| match demoted_event(
+            "app".to_string(),
+            "prop".to_string(),
+            "page".to_string(),
+            failing,
+            "snap".to_string(),
+            7,
+        ) {
+            SpecApiEvent::FlywheelProposalDemoted {
+                failing_state_id,
+                failing_assertion_id,
+                failing_assertion_verdict,
+                snapshot_id,
+                at_ms,
+                ..
+            } => (
+                failing_state_id,
+                failing_assertion_id,
+                failing_assertion_verdict,
+                snapshot_id,
+                at_ms,
+            ),
+            other => panic!("expected FlywheelProposalDemoted, got {other:?}"),
+        };
+        let s = |v: &str| v.to_string();
         assert_eq!(
-            demote_locator(Some(named(FailingVerdict::Fail))),
-            ("s1".to_string(), "a1".to_string(), "fail")
+            fields(Some(named(FailingVerdict::Fail))),
+            (s("s1"), s("a1"), s("fail"), s("snap"), 7)
         );
         assert_eq!(
-            demote_locator(Some(named(FailingVerdict::Unknown))),
-            ("s1".to_string(), "a1".to_string(), "unknown")
+            fields(Some(named(FailingVerdict::Unknown))),
+            (s("s1"), s("a1"), s("unknown"), s("snap"), 7)
         );
-        assert_eq!(demote_locator(None), (String::new(), String::new(), ""));
+        assert_eq!(fields(None), (s(""), s(""), s(""), s("snap"), 7));
     }
 
     // -------- All-gates-pass smoke --------------------------------------

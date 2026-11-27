@@ -926,26 +926,35 @@ pub async fn post_sweep_pending(
                 // rather than a failed one, so the event says which in
                 // `failing_assertion_verdict` ("fail" / "unknown", "" when none
                 // is named).
-                let (failing_state_id, failing_assertion_id, failing_verdict) =
-                    crate::spec_api::validator::demote_locator(failing_assertion);
-                info!(
-                    proposal_id = %prop.id,
-                    spec_id = %spec_id,
-                    detail = %detail,
-                    failing_assertion_id = %failing_assertion_id,
-                    verdict = failing_verdict,
-                    "post_sweep_pending: demoted"
+                let event = crate::spec_api::validator::demoted_event(
+                    app_id.clone(),
+                    prop.id.clone(),
+                    spec_id.clone(),
+                    failing_assertion,
+                    red_snapshot_id,
+                    events::now_ms(),
                 );
-                events::emit(SpecApiEvent::FlywheelProposalDemoted {
-                    app_id: app_id.clone(),
-                    proposal_id: prop.id.clone(),
-                    page_id: spec_id.clone(),
-                    failing_assertion_id,
+                if let SpecApiEvent::FlywheelProposalDemoted {
                     failing_state_id,
-                    failing_assertion_verdict: failing_verdict.to_string(),
-                    snapshot_id: red_snapshot_id,
-                    at_ms: events::now_ms(),
-                });
+                    failing_assertion_id,
+                    failing_assertion_verdict,
+                    snapshot_id,
+                    ..
+                } = &event
+                {
+                    info!(
+                        proposal_id = %prop.id,
+                        app_id = %app_id,
+                        spec_id = %spec_id,
+                        snapshot_id = %snapshot_id,
+                        failing_state_id = %failing_state_id,
+                        failing_assertion_id = %failing_assertion_id,
+                        failing_assertion_verdict = %failing_assertion_verdict,
+                        detail = %detail,
+                        "post_sweep_pending: demoted"
+                    );
+                }
+                events::emit(event);
             }
             Err(other) => {
                 // SnapshotFetchFailed et al. — infra error, no state change
