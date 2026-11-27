@@ -512,9 +512,8 @@ pub(crate) fn derive(
         let d = &mut events[*i].detail;
         d["victim_slice"] = json!(sliced.slice_of(kill.control_group.as_deref()));
         d["slices"] = json!(sliced.status);
-        if let Some(cg) = &kill.control_group {
-            d["victim_cgroup"] = json!(cg);
-        }
+        // `null` = no ControlGroup was ever known for the unit.
+        d["victim_cgroup"] = json!(kill.control_group);
     }
     attributed = attributed.saturating_add(sliced.attributed);
     events.extend(sliced.events);

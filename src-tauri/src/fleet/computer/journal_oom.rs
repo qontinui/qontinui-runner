@@ -11,7 +11,7 @@
 //!
 //! ## What this never reads
 //!
-//! `--output-fields=USER_UNIT,_SOURCE_REALTIME_TIMESTAMP` keeps the
+//! `--output-fields=USER_UNIT` keeps the
 //! `MESSAGE` text and every unit `Description` (which carries argv, and argv
 //! can carry secrets) out of this process entirely, and the parser keeps only
 //! `USER_UNIT`, `__REALTIME_TIMESTAMP` and `_BOOT_ID` of what does arrive.
@@ -32,13 +32,22 @@
 //! assumed from an exit code. Nothing here widens host privilege: on a box
 //! with `dmesg_restrict` and no journal group the arm reads `unreadable`.
 //!
+//! ## Readability is probed, on both arms
+//!
+//! An unprivileged `journalctl` that cannot read a journal exits 0 with zero
+//! entries, so an empty window proves nothing by itself. Each arm forks a
+//! one-entry probe beside its window read; only a probe that returns an entry
+//! makes an empty window a real "nothing in the window".
+//!
 //! ## Bounded and quiet
 //!
-//! One `journalctl` fork, only on a tick where a watched user-manager slice
-//! has a kill no counter explained, forked as `access.rs` forks `tailscale`:
-//! no window, killed on drop, a 5 s timeout. A missing binary, a non-zero
-//! exit, a timeout and unparseable output are all `unreadable`, and the tick
-//! goes on.
+//! The forks run only on a tick where a watched slice has a kill to place,
+//! forked as `access.rs` forks `tailscale` (no window, killed on drop), and
+//! all of them run CONCURRENTLY under one overall deadline ([`READ_TIMEOUT`]),
+//! so a tick waits at most that long for every journal read together. A
+//! missing binary, a non-zero exit, a timeout and unparseable output are all
+//! `unreadable`, and the tick goes on. The binary is a [`Journalctl`] value,
+//! so a test drives the whole path with a fake one.
 
 // Exercised by tests on every OS but forked in production only on Linux.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -48,16 +57,17 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 /// systemd's "a process of this unit has been killed by the OOM killer"
-/// (`SD_MESSAGE_UNIT_OOM_KILLED`).
+/// (`SD_MESSAGE_UNIT_OUT_OF_MEMORY`, `sd-messages.h`).
 pub(crate) const UNIT_OOM_MESSAGE_ID: &str = "fe6faa94e7774663a0da52717891d8ef";
 
-/// The only fields asked for. `MESSAGE` and `Description` are not among them.
-pub(crate) const USER_OUTPUT_FIELDS: &str = "USER_UNIT,_SOURCE_REALTIME_TIMESTAMP";
+/// The only field asked for (journald adds its own `__REALTIME_TIMESTAMP`,
+/// `_BOOT_ID` and cursor). `MESSAGE` and `Description` are not among them.
+pub(crate) const USER_OUTPUT_FIELDS: &str = "USER_UNIT";
 
 /// Most recent entries read per window.
 const USER_MAX_ENTRIES: u32 = 200;
 
-/// Bound on one `journalctl` fork.
+/// Bound on every journal read of one tick, together.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One unit-OOM journal entry, reduced to what Layer C uses.
@@ -187,10 +197,39 @@ pub(crate) fn parse_user_journal(stdout: &str) -> JournalRead {
     JournalRead::Read(out)
 }
 
-/// The user-journal read from one fork's stdout (`None` = the fork failed).
+/// A one-entry probe of the user journal: readable iff it returns an entry.
+/// Only journald's own fields are asked for. PURE.
+pub(crate) fn user_probe_args() -> Vec<String> {
+    [
+        "--user",
+        "-n",
+        "1",
+        "-o",
+        "json",
+        "--output-fields=_BOOT_ID",
+        "--no-pager",
+        "-q",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
+}
+
+/// Whether a probe's stdout proves a journal readable: at least one entry.
 /// PURE.
-pub(crate) fn user_read_from(stdout: Option<&str>) -> JournalRead {
-    stdout.map_or(JournalRead::Unreadable, parse_user_journal)
+pub(crate) fn readable(probe: Option<&str>) -> bool {
+    probe.and_then(json_lines).is_some_and(|l| !l.is_empty())
+}
+
+/// The user-journal read from the probe's and the window's stdout (`None` =
+/// that fork failed). An unreadable journal answers an empty window with
+/// exit 0, so only a probe that returned an entry makes the window count.
+/// PURE.
+pub(crate) fn user_read_from(probe: Option<&str>, window: Option<&str>) -> JournalRead {
+    if !readable(probe) {
+        return JournalRead::Unreadable;
+    }
+    window.map_or(JournalRead::Unreadable, parse_user_journal)
 }
 
 /// Fork `bin args`, bounded by `timeout`: its stdout when it exited 0,
@@ -216,20 +255,92 @@ pub(crate) async fn run_journalctl(
     }
 }
 
-/// Layer C's read of the user journal over `[since, until)`.
-pub(crate) async fn read_user(since: DateTime<Utc>, until: DateTime<Utc>) -> JournalRead {
-    let out = run_journalctl("journalctl", &user_journal_args(since, until), READ_TIMEOUT).await;
-    user_read_from(out.as_deref())
+/// The `journalctl` to fork: a program and the arguments that lead every
+/// call. Production forks `journalctl`; a test forks `sh <fake script>`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Journalctl {
+    pub(crate) program: String,
+    pub(crate) leading: Vec<String>,
+}
+
+impl Journalctl {
+    /// The real binary, from `PATH`.
+    pub(crate) fn live() -> Self {
+        Self {
+            program: "journalctl".into(),
+            leading: Vec::new(),
+        }
+    }
+
+    async fn run(&self, args: Vec<String>, timeout: Duration) -> Option<String> {
+        let mut all = self.leading.clone();
+        all.extend(args);
+        run_journalctl(&self.program, &all, timeout).await
+    }
+}
+
+/// Layer C's read of the user journal over `[since, until)`: the probe and
+/// the window, concurrently.
+pub(crate) async fn read_user(
+    jc: &Journalctl,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    timeout: Duration,
+) -> JournalRead {
+    let (probe, window) = tokio::join!(
+        jc.run(user_probe_args(), timeout),
+        jc.run(user_journal_args(since, until), timeout),
+    );
+    user_read_from(probe.as_deref(), window.as_deref())
+}
+
+/// Every journal read one tick asked for, concurrently, under ONE deadline:
+/// `(user, kernel)`, each `None` when not asked. A read the deadline cut is
+/// `Unreadable`, never a stalled tick.
+pub(crate) async fn read_all(
+    jc: &Journalctl,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    user: bool,
+    kernel: bool,
+    deadline: Duration,
+) -> (Option<JournalRead>, Option<KernelRead>) {
+    let user_read = async {
+        if user {
+            Some(read_user(jc, since, until, deadline).await)
+        } else {
+            None
+        }
+    };
+    let kernel_read = async {
+        if kernel {
+            Some(read_kernel(jc, since, until, deadline).await)
+        } else {
+            None
+        }
+    };
+    match tokio::time::timeout(deadline, async { tokio::join!(user_read, kernel_read) }).await {
+        Ok(both) => both,
+        Err(_) => (
+            user.then_some(JournalRead::Unreadable),
+            kernel.then_some(KernelRead::Unreadable),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 3: the kernel's own OOM record
 // ---------------------------------------------------------------------------
 
-/// Most recent kernel entries read per window. An OOM report prints its task
-/// dump BEFORE its `oom-kill:` line, so the newest entries hold the newest
-/// records.
-const KERNEL_MAX_ENTRIES: u32 = 2000;
+/// Most recent `oom-kill:` entries read per window when journalctl can
+/// filter by pattern (`--grep`).
+const KERNEL_MAX_RECORDS: u32 = 200;
+
+/// Most recent kernel entries per window when it cannot (a build without
+/// PCRE2). An OOM report prints its task dump BEFORE its `oom-kill:` line,
+/// so the newest entries hold the newest records; older ones in a long
+/// window may fall outside this bound, and their kills stay the remainder.
+const KERNEL_MAX_ENTRIES: u32 = 5000;
 
 /// One kernel `oom-kill:` record, reduced to what placement uses.
 #[derive(Debug, Clone, PartialEq)]
@@ -275,9 +386,15 @@ pub(crate) fn kernel_probe_args() -> Vec<String> {
 }
 
 /// The kernel-log query for `[since, until)`: `MESSAGE` is needed to read
-/// the `oom-kill:` line; only `task_memcg` and `task` of it are kept. PURE.
-pub(crate) fn kernel_journal_args(since: DateTime<Utc>, until: DateTime<Utc>) -> Vec<String> {
-    vec![
+/// the `oom-kill:` line; only `task_memcg` and `task` of it are kept. With
+/// `grep`, journalctl returns only the `oom-kill:` lines, so a task dump
+/// cannot push an earlier record out of the bound. PURE.
+pub(crate) fn kernel_journal_args(
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    grep: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
         "-k".into(),
         "-o".into(),
         "json".into(),
@@ -289,9 +406,18 @@ pub(crate) fn kernel_journal_args(since: DateTime<Utc>, until: DateTime<Utc>) ->
         "--until".into(),
         at_secs(until, true),
         "-n".into(),
-        KERNEL_MAX_ENTRIES.to_string(),
-        "_TRANSPORT=kernel".into(),
-    ]
+        if grep {
+            KERNEL_MAX_RECORDS
+        } else {
+            KERNEL_MAX_ENTRIES
+        }
+        .to_string(),
+    ];
+    if grep {
+        args.push("--grep=^oom-kill:".into());
+    }
+    args.push("_TRANSPORT=kernel".into());
+    args
 }
 
 /// `(task_memcg, comm)` from a kernel
@@ -334,16 +460,10 @@ pub(crate) fn parse_kernel_journal(stdout: &str) -> Option<Vec<KernelOomRecord>>
     Some(out)
 }
 
-/// Whether a probe's stdout proves the kernel log readable: at least one
-/// entry. PURE.
-pub(crate) fn kernel_readable(probe: Option<&str>) -> bool {
-    probe.and_then(json_lines).is_some_and(|l| !l.is_empty())
-}
-
 /// The kernel read from the probe's and the window read's stdout (`None` =
 /// that fork failed or was not run). PURE.
 pub(crate) fn kernel_read_from(probe: Option<&str>, window: Option<&str>) -> KernelRead {
-    if !kernel_readable(probe) {
+    if !readable(probe) {
         return KernelRead::Unreadable;
     }
     window
@@ -351,14 +471,25 @@ pub(crate) fn kernel_read_from(probe: Option<&str>, window: Option<&str>) -> Ker
         .map_or(KernelRead::Unreadable, KernelRead::Read)
 }
 
-/// Phase 3's read of the kernel log over `[since, until)`: the probe, then —
-/// only when it proves the log readable — the window.
-pub(crate) async fn read_kernel(since: DateTime<Utc>, until: DateTime<Utc>) -> KernelRead {
-    let probe = run_journalctl("journalctl", &kernel_probe_args(), READ_TIMEOUT).await;
-    let window = if kernel_readable(probe.as_deref()) {
-        run_journalctl("journalctl", &kernel_journal_args(since, until), READ_TIMEOUT).await
-    } else {
-        None
+/// Phase 3's read of the kernel log over `[since, until)`: the probe and the
+/// pattern-filtered window concurrently; a journalctl that cannot filter
+/// (`--grep` refused) is asked again without the filter.
+pub(crate) async fn read_kernel(
+    jc: &Journalctl,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    timeout: Duration,
+) -> KernelRead {
+    let (probe, grepped) = tokio::join!(
+        jc.run(kernel_probe_args(), timeout),
+        jc.run(kernel_journal_args(since, until, true), timeout),
+    );
+    if !readable(probe.as_deref()) {
+        return KernelRead::Unreadable;
+    }
+    let window = match grepped {
+        Some(w) => Some(w),
+        None => jc.run(kernel_journal_args(since, until, false), timeout).await,
     };
     kernel_read_from(probe.as_deref(), window.as_deref())
 }
@@ -371,8 +502,8 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    /// Plan test 16 (argv half): the read asks for exactly two fields —
-    /// never `MESSAGE` or a `Description` — of the unit-OOM message only.
+    /// Plan test 16 (argv half): the read asks for one field — never
+    /// `MESSAGE` or a `Description` — of the unit-OOM message only.
     #[test]
     fn the_user_journal_argv_asks_for_unit_and_timestamp_only() {
         let args = user_journal_args(t("2026-11-27T00:14:40.5Z"), t("2026-11-27T00:15:10.25Z"));
@@ -382,7 +513,7 @@ mod tests {
                 "--user",
                 "-o",
                 "json",
-                "--output-fields=USER_UNIT,_SOURCE_REALTIME_TIMESTAMP",
+                "--output-fields=USER_UNIT",
                 "--no-pager",
                 "-q",
                 "--since",
@@ -444,26 +575,28 @@ mod tests {
     /// Plan test 4: the four ways a read fails — the binary is absent, it
     /// exits non-zero, it outlives the timeout, or it prints something that
     /// is not JSON — are all `Unreadable`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn every_failed_read_is_unreadable() {
         let none: Vec<String> = Vec::new();
+        let probe = Some(r#"{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#);
         let absent = run_journalctl("/nonexistent/qontinui-test/journalctl", &none, READ_TIMEOUT).await;
-        assert_eq!(user_read_from(absent.as_deref()), JournalRead::Unreadable, "absent");
+        assert_eq!(user_read_from(probe, absent.as_deref()), JournalRead::Unreadable, "absent");
         let nonzero = run_journalctl("false", &none, READ_TIMEOUT).await;
-        assert_eq!(user_read_from(nonzero.as_deref()), JournalRead::Unreadable, "non-zero");
+        assert_eq!(user_read_from(probe, nonzero.as_deref()), JournalRead::Unreadable, "non-zero");
         let started = std::time::Instant::now();
         let slow = run_journalctl("sleep", &["5".to_string()], Duration::from_millis(200)).await;
-        assert_eq!(user_read_from(slow.as_deref()), JournalRead::Unreadable, "timed out");
+        assert_eq!(user_read_from(probe, slow.as_deref()), JournalRead::Unreadable, "timed out");
         assert!(started.elapsed() < Duration::from_secs(4), "the timeout bounds the fork");
         assert_eq!(
-            user_read_from(Some("journalctl: hint: you are not in the systemd-journal group\n")),
+            user_read_from(probe, Some("journalctl: hint: you are not in the systemd-journal group\n")),
             JournalRead::Unreadable,
             "unparseable"
         );
         // And a clean exit with JSON is a read.
         let ok = run_journalctl("echo", &[r#"{"USER_UNIT":"x.scope","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#.to_string()], READ_TIMEOUT).await;
         assert_eq!(
-            user_read_from(ok.as_deref()),
+            user_read_from(probe, ok.as_deref()),
             JournalRead::Read(vec![UnitOomEntry {
                 unit: "x.scope".into(),
                 realtime_usec: 1,
@@ -500,7 +633,7 @@ mod tests {
             vec!["-k", "-b", "-n", "1", "-o", "json", "--output-fields=_BOOT_ID", "--no-pager", "-q"]
         );
         assert_eq!(
-            kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z")),
+            kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), true),
             vec![
                 "-k",
                 "-o",
@@ -513,10 +646,13 @@ mod tests {
                 "--until",
                 "@1795738510",
                 "-n",
-                "2000",
+                "200",
+                "--grep=^oom-kill:",
                 "_TRANSPORT=kernel",
             ]
         );
+        let plain = kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), false);
+        assert_eq!(&plain[10..], &["-n", "5000", "_TRANSPORT=kernel"]);
     }
 
     /// The kernel log is readable iff the probe returned an entry: an
@@ -537,6 +673,92 @@ mod tests {
         assert_eq!(kernel_read_from(Some(probe), Some("")), KernelRead::Read(vec![]));
         assert_eq!(
             kernel_read_from(Some(probe), Some(window)),
+            KernelRead::Read(vec![KernelOomRecord {
+                task_memcg: "/a.slice/b.scope".into(),
+                comm: "rustc".into(),
+                realtime_usec: 1795738498277337,
+                boot_id: "27cd98773ff347f083889880a31d5902".into(),
+            }])
+        );
+    }
+
+    /// Plan A7: an unreadable user journal answers the window with exit 0 and
+    /// no entries; only a probe that returned an entry makes it a read.
+    #[test]
+    fn an_empty_user_window_is_a_read_only_when_the_probe_answered() {
+        let probe = r#"{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#;
+        assert_eq!(user_read_from(Some(""), Some("")), JournalRead::Unreadable);
+        assert_eq!(user_read_from(None, Some("")), JournalRead::Unreadable);
+        assert_eq!(user_read_from(Some(probe), Some("")), JournalRead::Read(vec![]));
+        assert_eq!(user_read_from(Some(probe), None), JournalRead::Unreadable);
+        assert_eq!(
+            user_probe_args(),
+            vec!["--user", "-n", "1", "-o", "json", "--output-fields=_BOOT_ID", "--no-pager", "-q"]
+        );
+    }
+
+    /// A fake `journalctl`: `sh <script>`, so no freshly written file is ever
+    /// exec'd (no ETXTBSY race with a concurrent fork).
+    #[cfg(unix)]
+    pub(crate) fn fake_journalctl(dir: &std::path::Path, body: &str) -> Journalctl {
+        let script = dir.join("journalctl.sh");
+        std::fs::write(&script, body).unwrap();
+        Journalctl {
+            program: "sh".into(),
+            leading: vec![script.to_string_lossy().into_owned()],
+        }
+    }
+
+    /// Review A3: the user read and the kernel probe and window run
+    /// concurrently under ONE deadline; a journalctl that never answers costs
+    /// the tick the deadline, once, and every read it cut is `Unreadable`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_read_is_bounded_by_one_deadline() {
+        let d = tempfile::tempdir().unwrap();
+        let jc = fake_journalctl(d.path(), "sleep 10\n");
+        let started = std::time::Instant::now();
+        let (u, k) = read_all(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            true,
+            true,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(u, Some(JournalRead::Unreadable));
+        assert_eq!(k, Some(KernelRead::Unreadable));
+        // Not asked is None, never Unreadable.
+        let (u, k) = read_all(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            false,
+            false,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!((u, k), (None, None));
+    }
+
+    /// Review A8: a journalctl that refuses `--grep` (no PCRE2) is asked again
+    /// without it, and its records still parse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_journalctl_without_grep_falls_back_to_the_plain_window() {
+        let d = tempfile::tempdir().unwrap();
+        let body = r#"case "$*" in
+  *"-b -n 1"*) echo '{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}' ;;
+  *--grep*) echo "Compiled without pattern matching support" >&2; exit 1 ;;
+  *) echo '{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"27cd98773ff347f083889880a31d5902","MESSAGE":"oom-kill:constraint=CONSTRAINT_MEMCG,task_memcg=/a.slice/b.scope,task=rustc,pid=9,uid=1000"}' ;;
+esac
+"#;
+        let jc = fake_journalctl(d.path(), body);
+        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        assert_eq!(
+            k,
             KernelRead::Read(vec![KernelOomRecord {
                 task_memcg: "/a.slice/b.scope".into(),
                 comm: "rustc".into(),

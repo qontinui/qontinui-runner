@@ -1516,6 +1516,7 @@ mod tests {
                             "memory_peak": 21474836480_u64,
                             "runner_name": "fleetbox",
                             "victim_slice": null,
+                            "victim_cgroup": null,
                             "slices": "not_supported"
                         }
                     },
