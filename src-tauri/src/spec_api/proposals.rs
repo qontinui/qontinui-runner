@@ -927,13 +927,14 @@ pub async fn post_sweep_pending(
                 // `failing_assertion_verdict` ("fail" / "unknown", "" when none
                 // is named).
                 let (failing_state_id, failing_assertion_id, failing_verdict) =
-                    match failing_assertion {
-                        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str()),
-                        None => (String::new(), String::new(), ""),
-                    };
+                    crate::spec_api::validator::demote_locator(failing_assertion);
                 info!(
-                    "post_sweep_pending: demoted {} (spec_id={}): {}; named={:?} verdict={:?}",
-                    prop.id, spec_id, detail, failing_assertion_id, failing_verdict
+                    proposal_id = %prop.id,
+                    spec_id = %spec_id,
+                    detail = %detail,
+                    failing_assertion_id = %failing_assertion_id,
+                    verdict = failing_verdict,
+                    "post_sweep_pending: demoted"
                 );
                 events::emit(SpecApiEvent::FlywheelProposalDemoted {
                     app_id: app_id.clone(),

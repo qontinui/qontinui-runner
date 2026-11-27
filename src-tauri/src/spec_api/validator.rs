@@ -120,6 +120,18 @@ impl FailingVerdict {
     }
 }
 
+/// The `FlywheelProposalDemoted` locator a gate-B red emits:
+/// `(failing_state_id, failing_assertion_id, failing_assertion_verdict)`.
+/// `None` (a red from a policy `Indeterminate` over an empty in-scope set)
+/// emits empty strings, so the wire shape stays uniform; a reader tells
+/// that apart from an older emitter's absent verdict by the empty id.
+pub fn demote_locator(failing: Option<FailingAssertion>) -> (String, String, &'static str) {
+    match failing {
+        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str()),
+        None => (String::new(), String::new(), ""),
+    }
+}
+
 /// Short, stable reason code for each variant. Used as the `reason` field
 /// of the `/spec/proposals/{id}/execute` validator-rejected response shape.
 pub fn validator_error_reason(e: &ValidatorError) -> &'static str {
@@ -913,6 +925,27 @@ mod tests {
             detail.ends_with("miss_count=0, unknown_count=1"),
             "{detail}"
         );
+    }
+
+    /// The demote event's locator keeps each id in its own field and says
+    /// which verdict named the assertion. Mutation: swapping the two ids,
+    /// hardcoding `"fail"`, or emitting a verdict for `None` reds this.
+    #[test]
+    fn demote_locator_names_state_assertion_and_verdict() {
+        let named = |verdict| FailingAssertion {
+            state_id: "s1".to_string(),
+            assertion_id: "a1".to_string(),
+            verdict,
+        };
+        assert_eq!(
+            demote_locator(Some(named(FailingVerdict::Fail))),
+            ("s1".to_string(), "a1".to_string(), "fail")
+        );
+        assert_eq!(
+            demote_locator(Some(named(FailingVerdict::Unknown))),
+            ("s1".to_string(), "a1".to_string(), "unknown")
+        );
+        assert_eq!(demote_locator(None), (String::new(), String::new(), ""));
     }
 
     // -------- All-gates-pass smoke --------------------------------------
