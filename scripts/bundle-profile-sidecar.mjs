@@ -46,23 +46,15 @@ import { copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { executablesFromCargoJson } from "./lib/build-profile.mjs";
 import { nativeExecutableProblem } from "./lib/native-exe.mjs";
+// The roster lives in ONE place, shared with build-exe.mjs (the primary's
+// build); a build.rs test pins its SIDECAR_BINS to tauri.conf.json.
+import { SIDECAR_BINS, SIDECAR_PACKAGES } from "./lib/sidecars.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const runnerRoot = resolve(scriptDir, "..");
 const srcTauri = join(runnerRoot, "src-tauri");
-
-// Keep in sync with `tauri.conf.json` `bundle.externalBin` and
-// `src-tauri/build.rs` `EXTERNAL_BIN_SIDECARS` (a build.rs test pins the
-// latter to tauri.conf.json).
-const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr", "qontinui-pty-holder"];
-
-// The cargo PACKAGES those bins live in. `qontinui-pty-holder` (plan
-// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2:
-// the per-pane PTY holder the runner spawns from beside its own exe) is a bin
-// of `crates/pty-holder`, not of this crate, so the build selects both
-// packages; cargo applies the `--bin` filters across every selected package.
-const SIDECAR_PACKAGES = ["qontinui-runner", "qontinui-pty-holder"];
 
 function fail(msg) {
   console.error(`\n[bundle-profile-sidecar] ERROR: ${msg}\n`);
@@ -122,25 +114,8 @@ try {
 
 // 3. Extract each executable path from the last matching compiler-artifact
 //    message — the authoritative locations cargo actually wrote them to.
-const builtExes = new Map(); // bin name -> executable path
-for (const line of stdout.split("\n")) {
-  const s = line.trim();
-  if (!s.startsWith("{")) continue;
-  let msg;
-  try {
-    msg = JSON.parse(s);
-  } catch {
-    continue;
-  }
-  if (
-    msg.reason === "compiler-artifact" &&
-    msg.target &&
-    SIDECAR_BINS.includes(msg.target.name) &&
-    msg.executable
-  ) {
-    builtExes.set(msg.target.name, msg.executable);
-  }
-}
+//    The same parser build:exe uses (scripts/lib/build-profile.mjs).
+const builtExes = executablesFromCargoJson(stdout, SIDECAR_BINS); // bin name -> executable path
 
 // 4. Copy each to the triple-suffixed path Tauri's externalBin resolver expects.
 const binariesDir = join(srcTauri, "binaries");
