@@ -704,10 +704,11 @@ impl SchedulerService {
         // The walk awaits between this tick's snapshot and here, so the row
         // may have stopped being true: a run that finalized mid-walk, an
         // edit, a disable. Mark first, then re-read under the mark (see
-        // `scheduler_start_recheck`). A refusal here after a Fire discards
-        // that met verdict (the edit or unreadable row that refused it is
-        // re-evaluated next tick); the unmarked look above keeps the common
-        // case, a consumed slot, from spending one.
+        // `scheduler_start_recheck`). A refusal here after a Fire loses that
+        // met probe verdict until the probe's next poll (`poll_seconds`): a
+        // "Run now" or a finalize that lands during the gate's inline probe
+        // wait. The unmarked look above keeps the common case, a slot
+        // consumed before the gate, from spending one.
         let verdict = self
             .mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))
             .await;
@@ -5626,6 +5627,42 @@ mod stale_snapshot_tests {
             svc.get_running_tasks().await.is_empty(),
             "no mark is left behind"
         );
+    }
+
+    /// Positive control for the stale-snapshot refusals: an UNCHANGED real
+    /// row is started through the same path. (A Script run releases its
+    /// mark from its own poller, after this call returns.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tick_starts_a_task_whose_row_is_unchanged() {
+        // The started Script run resolves the workspace root; keep it off
+        // the operator's config.
+        let _amb = crate::test_env::isolated_ambient();
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "unchanged-snapshot-control".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+        let snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
+
+        assert!(started, "an unchanged row is started");
     }
 
     /// A probe-gated copy whose slot is already gone is refused BEFORE its
