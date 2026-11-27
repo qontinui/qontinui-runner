@@ -115,7 +115,10 @@ describe("useAccountMigrationNotifications", () => {
         "Moving session 0c4e3025 from .claude-sales to .claude-support is waiting for the Claude CLI to come back (up to 15 min)",
         "info",
       ],
-      ["Moving session 0c4e3025 from .claude-sales to .claude-support failed: exec failed", "error"],
+      [
+        "Moving session 0c4e3025 from .claude-sales to .claude-support failed: exec failed",
+        "error",
+      ],
     ]);
   });
 
@@ -126,6 +129,9 @@ describe("useAccountMigrationNotifications", () => {
       "session-account-migration-skipped",
       "session-account-migration-abandoned",
       "session-account-migration-failed",
+      "session-limit-parked",
+      "session-limit-reset-continued",
+      "session-limit-reset-continue-gave-up",
     ];
     // Each name is one the hook really listens to (review r8 A1).
     for (const event of events) {

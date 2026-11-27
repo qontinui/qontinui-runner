@@ -404,7 +404,6 @@ export function createBurstCoalescer<T>(
   };
 }
 
-
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
     const unlistenMigrated = listen<MigratedPayload>("session-account-migrated", (event) => {
