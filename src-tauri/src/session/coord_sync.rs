@@ -8857,46 +8857,11 @@ mod tests {
 
     #[test]
     fn session_outbox_health_is_unknown_until_observed_and_camel_cased() {
-        let unobserved = render_session_outbox_health(&SessionOutboxHealth::default());
-        assert!(
-            unobserved["pending"].is_null(),
-            "no tick yet is UNKNOWN, not zero"
-        );
-        assert!(unobserved["lastFailure"].is_null());
-        for key in [
-            "heartbeatsSuperseded",
-            "heartbeatsDroppedOnFailure",
-            "heartbeatsDroppedOnFailureByKind",
-        ] {
-            assert!(
-                unobserved[key].is_null(),
-                "sessionOutbox.{key} before the first tick is UNKNOWN, not zero"
-            );
-        }
-
-        let at = Utc::now();
-        let observed = render_session_outbox_health(&SessionOutboxHealth {
-            observed_at: Some(at),
-            pending: 3,
-            oldest_unacked_at: Some(at),
-            last_ack_at: Some(at),
-            last_failure: Some(OutboxFailure {
-                kind: "server_error",
-                status: Some(503),
-                at,
-            }),
-            retrying_sessions: 1,
-            quarantined_sessions: 0,
-            heartbeats_superseded: 2,
-            heartbeats_dropped_on_failure: 3,
-            heartbeats_dropped_on_failure_by_kind: BTreeMap::from([
-                ("server_error", 2),
-                ("not_found", 1),
-            ]),
-            quarantine_rotations: 1,
-            finished_unconfirmed: 0,
-        });
-        for key in [
+        // The whole `/health` `sessionOutbox` key set, spelled out. Both
+        // renders are compared against it EXACTLY: indexing an absent key
+        // yields `Null`, so an `is_null()` check on a key the render no longer
+        // emits passes forever. A renamed, added or deleted key must red here.
+        const KEYS: [&str; 12] = [
             "pending",
             "oldestUnackedAt",
             "lastAckAt",
@@ -8909,30 +8874,112 @@ mod tests {
             "quarantineRotations",
             "finishedUnconfirmed",
             "observedAt",
-        ] {
+        ];
+        let expected_keys: std::collections::BTreeSet<String> =
+            KEYS.iter().map(|k| k.to_string()).collect();
+        let rendered_keys = |v: &JsonValue| -> std::collections::BTreeSet<String> {
+            v.as_object()
+                .expect("sessionOutbox renders as an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+
+        let unobserved = render_session_outbox_health(&SessionOutboxHealth::default());
+        assert_eq!(
+            rendered_keys(&unobserved),
+            expected_keys,
+            "the unobserved sessionOutbox key set"
+        );
+        for key in KEYS {
+            // The counters are gated on `observed_at` (UNKNOWN, not zero,
+            // before the first tick); the timestamps and `lastFailure` are
+            // `None` in a default snapshot. Either way the render is null.
             assert!(
-                !observed[key].is_null(),
-                "sessionOutbox.{key} must be present"
+                unobserved[key].is_null(),
+                "sessionOutbox.{key} renders null in a never-observed snapshot"
             );
         }
+
+        // Every field carries a DISTINCT value, so a render that cross-wires
+        // two fields (one counter rendered from another's source) reds.
+        let observed_at = Utc::now();
+        let oldest_unacked_at = observed_at - chrono::Duration::seconds(30);
+        let last_ack_at = observed_at - chrono::Duration::seconds(20);
+        let failed_at = observed_at - chrono::Duration::seconds(10);
+        let observed = render_session_outbox_health(&SessionOutboxHealth {
+            observed_at: Some(observed_at),
+            pending: 3,
+            oldest_unacked_at: Some(oldest_unacked_at),
+            last_ack_at: Some(last_ack_at),
+            last_failure: Some(OutboxFailure {
+                kind: "server_error",
+                status: Some(503),
+                at: failed_at,
+            }),
+            retrying_sessions: 4,
+            quarantined_sessions: 5,
+            heartbeats_superseded: 2,
+            heartbeats_dropped_on_failure: 6,
+            heartbeats_dropped_on_failure_by_kind: BTreeMap::from([
+                ("server_error", 4),
+                ("not_found", 2),
+            ]),
+            quarantine_rotations: 7,
+            finished_unconfirmed: 8,
+        });
+        assert_eq!(
+            rendered_keys(&observed),
+            expected_keys,
+            "the observed sessionOutbox key set"
+        );
         assert_eq!(observed["pending"], 3);
+        assert_eq!(observed["oldestUnackedAt"], json!(oldest_unacked_at));
+        assert_eq!(observed["lastAckAt"], json!(last_ack_at));
+        assert_eq!(observed["retryingSessions"], 4);
+        assert_eq!(observed["quarantinedSessions"], 5);
         assert_eq!(observed["heartbeatsSuperseded"], 2);
-        assert_eq!(observed["quarantineRotations"], 1);
-        assert_eq!(observed["heartbeatsDroppedOnFailure"], 3);
+        assert_eq!(observed["heartbeatsDroppedOnFailure"], 6);
         assert_eq!(
             observed["heartbeatsDroppedOnFailureByKind"],
-            json!({ "server_error": 2, "not_found": 1 })
+            json!({ "server_error": 4, "not_found": 2 })
         );
-        // Observed with nothing dropped on failure: an empty object, not null.
+        assert_eq!(observed["quarantineRotations"], 7);
+        assert_eq!(observed["finishedUnconfirmed"], 8);
+        assert_eq!(observed["observedAt"], json!(observed_at));
+        assert_eq!(
+            observed["lastFailure"],
+            json!({ "kind": "server_error", "status": 503, "at": failed_at }),
+            "lastFailure's whole object, so an added or renamed key reds too"
+        );
+
+        // Observed with nothing counted: every counter is 0 and the per-kind
+        // map is an empty object, never null; the unset timestamps and
+        // `lastFailure` stay null.
         let quiet = render_session_outbox_health(&SessionOutboxHealth {
-            observed_at: Some(at),
+            observed_at: Some(observed_at),
             ..SessionOutboxHealth::default()
         });
-        assert_eq!(quiet["heartbeatsDroppedOnFailure"], 0);
+        assert_eq!(rendered_keys(&quiet), expected_keys, "the quiet key set");
+        for key in [
+            "pending",
+            "retryingSessions",
+            "quarantinedSessions",
+            "heartbeatsSuperseded",
+            "heartbeatsDroppedOnFailure",
+            "quarantineRotations",
+            "finishedUnconfirmed",
+        ] {
+            assert_eq!(
+                quiet[key], 0,
+                "an observed sessionOutbox.{key} is 0, not null"
+            );
+        }
         assert_eq!(quiet["heartbeatsDroppedOnFailureByKind"], json!({}));
-        assert_eq!(observed["lastFailure"]["kind"], "server_error");
-        assert_eq!(observed["lastFailure"]["status"], 503);
-        assert!(observed["lastFailure"]["at"].is_string());
+        for key in ["oldestUnackedAt", "lastAckAt", "lastFailure"] {
+            assert!(quiet[key].is_null(), "an unset sessionOutbox.{key} is null");
+        }
+        assert_eq!(quiet["observedAt"], json!(observed_at));
     }
 
     /// Item 1: a confirmed registration — coord 2xx → the id is returned, the
