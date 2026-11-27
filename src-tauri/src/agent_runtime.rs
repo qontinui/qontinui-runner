@@ -9856,8 +9856,9 @@ async fn acquire_continuation_workdir(
         // head coord re-offers on its bounded schedule (plan
         // `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
         // D2). Gate continuations only: a work-unit dispatch posts no outcome on
-        // an `Err` and would wait unbounded for a reconnect, so it keeps the
-        // fallback plus the note. Reaching here at all means it asked for
+        // an `Err` and would wait unbounded for a reconnect, and a legacy
+        // (`ConsumeTarget::None`) one is spawned once with no ack, so nothing
+        // would ever re-deliver it; both keep the fallback plus the note. Reaching here at all means it asked for
         // isolation: `repos` is non-empty, and with worktree mode off the
         // acquire answers `Ok(None)`.
         if let Some(refusal) = policy
@@ -9868,8 +9869,9 @@ async fn acquire_continuation_workdir(
             warn!(
                 intent = %intent,
                 agent_session_id = ?agent_session_id,
-                "agent_runtime: gate-continuation acquire refused ({refusal}); \
-                 NOT taking the fallback cwd"
+                continuation_target = policy.target,
+                "agent_runtime: continuation acquire refused ({refusal}); \
+                 refusing the unisolated fallback"
             );
             return Err(anyhow::anyhow!(refusal));
         }
@@ -9882,8 +9884,10 @@ async fn acquire_continuation_workdir(
             warn!(
                 intent = %intent,
                 agent_session_id = ?agent_session_id,
-                "agent_runtime: gate-continuation acquire failed ({cause}); \
-                 taking the fallback cwd"
+                continuation_target = policy.target,
+                "agent_runtime: continuation acquire failed (target={}) ({cause}); \
+                 taking the fallback cwd",
+                policy.target
             );
             no_worktree_cause = Some(cause.clone());
         }
@@ -9987,8 +9991,14 @@ struct ContinuationAcquirePolicy {
     /// Refuse (an `Err` headed `worktree_allocate_unavailable:`) rather than
     /// fall back when the allocate stayed unavailable through the budget. Set
     /// for gate continuations only, whose `Err` posts `spawn_failed` and is
-    /// re-offered by coord; a work-unit dispatch posts nothing on an `Err`.
+    /// re-offered by coord. A work-unit dispatch posts nothing on an `Err` (it
+    /// would wait unbounded for a reconnect), and a legacy
+    /// `ConsumeTarget::None` continuation is spawned once with no ack, so
+    /// nothing re-delivers it at all: both fall back.
     refuse_unisolated_fallback: bool,
+    /// The target's label in the acquire's log lines: `gate`, `work_unit` or
+    /// `legacy`.
+    target: &'static str,
 }
 
 impl ContinuationAcquirePolicy {
@@ -9996,6 +10006,11 @@ impl ContinuationAcquirePolicy {
         Self {
             transport_retry: crate::agent_worktree::acquire_retry::CONTINUATION_TRANSPORT_RETRY,
             refuse_unisolated_fallback: matches!(target, ConsumeTarget::Gate(..)),
+            target: match target {
+                ConsumeTarget::Gate(..) => "gate",
+                ConsumeTarget::Dispatch(_) => "work_unit",
+                ConsumeTarget::None => "legacy",
+            },
         }
     }
 }
@@ -14218,7 +14233,8 @@ mod tests {
     /// an isolated continuation whose allocate stayed unavailable through the
     /// whole retry budget is REFUSED with the typed head, and the posted
     /// `spawn_failed` detail BEGINS with it (coord's retriable class matches
-    /// it there). It takes no fallback cwd: `acquire_continuation_workdir`
+    /// it there). For a GATE target it takes no fallback cwd (other targets
+    /// fall back; see the entry-level test below): `acquire_continuation_workdir`
     /// returns on `refusal()` before `continuation_fallback_workdir` runs.
     #[test]
     fn an_unavailable_allocate_refuses_the_fallback_with_a_typed_head() {
@@ -14251,7 +14267,9 @@ mod tests {
     #[tokio::test]
     async fn an_exhausted_allocate_refuses_a_gate_continuation_but_not_a_work_unit() {
         use crate::agent_worktree::test_coord::{isolate, ScriptedCoord};
-        let amb = isolate();
+        // Named type: the env-lock guard credits `IsolatedAmbient`, not the
+        // `isolate()` wrapper (it is a cross-file helper it cannot see into).
+        let amb: crate::test_env::IsolatedAmbient = isolate();
         amb.write_machine_json(&format!(r#"{{"device_id":"{}"}}"#, uuid::Uuid::now_v7()));
         let coord = ScriptedCoord::start(vec![
             ("/agents/allocate", vec![(503, "{}".to_string())]),
@@ -14263,6 +14281,7 @@ mod tests {
         let policy = |gate: bool| super::ContinuationAcquirePolicy {
             transport_retry: std::time::Duration::from_secs(3),
             refuse_unisolated_fallback: gate,
+            target: if gate { "gate" } else { "work_unit" },
         };
 
         let gate = super::acquire_continuation_workdir(
@@ -14304,6 +14323,40 @@ mod tests {
         );
         let cause = unit.no_worktree_cause.expect("the session is told why");
         assert!(cause.contains("returned 503"), "{cause}");
+    }
+
+    /// Only a gate target refuses the unisolated fallback; every target gets
+    /// the continuation budget and its own log label.
+    #[test]
+    fn the_acquire_policy_refuses_the_fallback_for_gate_targets_only() {
+        use crate::agent_worktree::acquire_retry::CONTINUATION_TRANSPORT_RETRY;
+        let cases = [
+            (
+                super::ConsumeTarget::Gate(uuid::Uuid::new_v4(), 0),
+                true,
+                "gate",
+            ),
+            (
+                super::ConsumeTarget::Gate(uuid::Uuid::new_v4(), 2),
+                true,
+                "gate",
+            ),
+            (
+                super::ConsumeTarget::Dispatch(uuid::Uuid::new_v4()),
+                false,
+                "work_unit",
+            ),
+            (super::ConsumeTarget::None, false, "legacy"),
+        ];
+        for (target, refuses, label) in cases {
+            let p = super::ContinuationAcquirePolicy::for_target(target);
+            assert_eq!(p.refuse_unisolated_fallback, refuses, "{target:?}");
+            assert_eq!(p.target, label, "{target:?}");
+            assert_eq!(
+                p.transport_retry, CONTINUATION_TRANSPORT_RETRY,
+                "{target:?}"
+            );
+        }
     }
 
     /// D2's other half: every failure that is NOT an exhausted allocate keeps
