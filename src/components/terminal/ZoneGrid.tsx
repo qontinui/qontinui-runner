@@ -803,7 +803,12 @@ function ZoneGridInner({
                 }
               }
             }}
-            onRestart={onRestartInZone ? () => onRestartInZone(menu.zoneIndex) : undefined}
+            onRestart={
+              // No restart for a remote tab (`remoteParity.ts`, row `restart`).
+              onRestartInZone && cmTab?.remote == null
+                ? () => onRestartInZone(menu.zoneIndex)
+                : undefined
+            }
           />
         );
       })()

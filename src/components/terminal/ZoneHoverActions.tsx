@@ -55,6 +55,24 @@ import {
 } from "lucide-react";
 
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
+import { REMOTE_RESTART_REFUSAL } from "./remoteParity";
+
+/**
+ * The action roster of this cluster — one id per top-level button, rendered as
+ * `data-zone-action`. The local-vs-remote parity matrix (`remoteParity.ts`) is
+ * pinned against it (`remoteParity.test.ts`). Overflow-menu and popover
+ * entries carry `data-zone-submenu` instead: they duplicate a roster action.
+ */
+export const ZONE_HOVER_ACTIONS = {
+  maximize: "zone.maximize",
+  restart: "zone.restart",
+  label: "zone.label",
+  export: "zone.export",
+  sendToWindow: "zone.send-to-window",
+  close: "zone.close",
+} as const;
+
+export type ZoneHoverActionId = (typeof ZONE_HOVER_ACTIONS)[keyof typeof ZONE_HOVER_ACTIONS];
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
 import { RemoteTabEndAction } from "./RemoteSessionEndFlow";
@@ -225,7 +243,12 @@ export function ZoneHoverActions({
   // nothing there, so it is not offered.
   const canMaximize = zoneLayout.workMode !== "tmux";
   const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
-  const canRestart = !!tabId && (state === "completed" || state === "error");
+  // A remote tab is never restartable from here: a restart spawns a LOCAL
+  // terminal and retires the tab (see `restartInZone`), which for a remote pane
+  // only detaches it. `handleRestartInZone` refuses it too; this greys the
+  // button and says why.
+  const isRemote = !!tabId && tabs.some((t) => t.id === tabId && t.remote != null);
+  const canRestart = !!tabId && !isRemote && (state === "completed" || state === "error");
   const hasTab = !!tabId;
   // Set only for a tab mirroring a session on ANOTHER device — it gets the
   // "End on remote session" action beside close.
@@ -587,6 +610,7 @@ export function ZoneHoverActions({
         {canMaximize && (
           <button
             type="button"
+            data-zone-action={ZONE_HOVER_ACTIONS.maximize}
             onClick={handleMaximize}
             className={`p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors${fullOnly}`}
             title={isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"}
@@ -599,6 +623,7 @@ export function ZoneHoverActions({
         {/* Restart — visually gated */}
         <button
           type="button"
+          data-zone-action={ZONE_HOVER_ACTIONS.restart}
           onClick={handleRestart}
           disabled={!canRestart}
           className={`p-1 rounded transition-colors ${
@@ -607,9 +632,11 @@ export function ZoneHoverActions({
               : "text-[#414868] cursor-not-allowed"
           }${fullOnly}`}
           title={
-            canRestart
-              ? "Restart session (Ctrl+Shift+R)"
-              : `Restart available only when session is completed or errored (currently: ${state})`
+            isRemote
+              ? REMOTE_RESTART_REFUSAL
+              : canRestart
+                ? "Restart session (Ctrl+Shift+R)"
+                : `Restart available only when session is completed or errored (currently: ${state})`
           }
           aria-label="Restart session"
           aria-disabled={!canRestart}
@@ -621,6 +648,7 @@ export function ZoneHoverActions({
         {labelZone !== null && (
           <button
             type="button"
+            data-zone-action={ZONE_HOVER_ACTIONS.label}
             onClick={openLabel}
             className={`p-1 rounded transition-colors ${
               showLabelInput
@@ -639,6 +667,7 @@ export function ZoneHoverActions({
         <div className={`relative${fullOnly}`} ref={exportRef}>
           <button
             type="button"
+            data-zone-action={ZONE_HOVER_ACTIONS.export}
             onClick={openExportMenu}
             disabled={!onExportZone}
             className={`p-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
@@ -658,6 +687,7 @@ export function ZoneHoverActions({
                 <button
                   key={format}
                   type="button"
+                  data-zone-submenu="overflow-or-popover"
                   onClick={(e) => handleExport(e, format)}
                   className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
                 >
@@ -672,6 +702,7 @@ export function ZoneHoverActions({
         <div className={`relative${fullOnly}`} ref={windowMenuRef}>
           <button
             type="button"
+            data-zone-action={ZONE_HOVER_ACTIONS.sendToWindow}
             onClick={openWindowMenu}
             disabled={!hasTab}
             className={`p-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
@@ -689,6 +720,7 @@ export function ZoneHoverActions({
             <div className="absolute top-full right-0 mt-1 w-40 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-hidden">
               <button
                 type="button"
+                data-zone-submenu="overflow-or-popover"
                 onClick={handlePopOutNew}
                 className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
               >
@@ -700,6 +732,7 @@ export function ZoneHoverActions({
                   <button
                     key={w.label}
                     type="button"
+                    data-zone-submenu="overflow-or-popover"
                     onClick={(e) => handleMoveTo(e, w.label)}
                     className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
                   >
@@ -724,6 +757,7 @@ export function ZoneHoverActions({
             <button
               ref={overflowButtonRef}
               type="button"
+              data-zone-submenu="overflow-or-popover"
               onClick={toggleOverflowMenu}
               className={`p-1 rounded transition-colors ${
                 showOverflowMenu
@@ -754,6 +788,7 @@ export function ZoneHoverActions({
               {canMaximize && (
                 <button
                   type="button"
+                  data-zone-submenu="overflow-or-popover"
                   role="menuitem"
                   onClick={fromOverflow(handleMaximize)}
                   className={OVERFLOW_ITEM_CLASS}
@@ -771,14 +806,17 @@ export function ZoneHoverActions({
               )}
               <button
                 type="button"
+                data-zone-submenu="overflow-or-popover"
                 role="menuitem"
                 onClick={fromOverflow(handleRestart, !canRestart)}
                 aria-disabled={!canRestart}
                 className={OVERFLOW_ITEM_CLASS}
                 title={
-                  canRestart
-                    ? "Restart session (Ctrl+Shift+R)"
-                    : `Available only when the session is completed or errored (currently: ${state})`
+                  isRemote
+                    ? REMOTE_RESTART_REFUSAL
+                    : canRestart
+                      ? "Restart session (Ctrl+Shift+R)"
+                      : `Available only when the session is completed or errored (currently: ${state})`
                 }
               >
                 <RefreshCw className="w-3 h-3 shrink-0" aria-hidden />
@@ -787,6 +825,7 @@ export function ZoneHoverActions({
               {labelZone !== null && (
                 <button
                   type="button"
+                  data-zone-submenu="overflow-or-popover"
                   role="menuitem"
                   onClick={fromOverflow(openLabel)}
                   className={OVERFLOW_ITEM_CLASS}
@@ -797,6 +836,7 @@ export function ZoneHoverActions({
               )}
               <button
                 type="button"
+                data-zone-submenu="overflow-or-popover"
                 role="menuitem"
                 onClick={toggleMenuExpand("export", !!onExportZone)}
                 aria-disabled={!onExportZone}
@@ -813,6 +853,7 @@ export function ZoneHoverActions({
                     <button
                       key={format}
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow((e) => handleExport(e, format))}
                       className={OVERFLOW_SUBITEM_CLASS}
@@ -824,6 +865,7 @@ export function ZoneHoverActions({
               )}
               <button
                 type="button"
+                data-zone-submenu="overflow-or-popover"
                 role="menuitem"
                 onClick={toggleMenuExpand("window", hasTab)}
                 aria-disabled={!hasTab}
@@ -838,6 +880,7 @@ export function ZoneHoverActions({
                 <div role="group" aria-label="Windows">
                   <button
                     type="button"
+                    data-zone-submenu="overflow-or-popover"
                     role="menuitem"
                     onClick={fromOverflow(handlePopOutNew)}
                     className={OVERFLOW_SUBITEM_CLASS}
@@ -850,6 +893,7 @@ export function ZoneHoverActions({
                       <button
                         key={w.label}
                         type="button"
+                        data-zone-submenu="overflow-or-popover"
                         role="menuitem"
                         onClick={fromOverflow((e) => handleMoveTo(e, w.label))}
                         className={OVERFLOW_SUBITEM_CLASS}
@@ -864,6 +908,7 @@ export function ZoneHoverActions({
                   {headerActions.onTogglePin && (
                     <button
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow(headerActions.onTogglePin)}
                       className={OVERFLOW_ITEM_CLASS}
@@ -875,6 +920,7 @@ export function ZoneHoverActions({
                   {headerActions.onToggleFilter && (
                     <button
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow(headerActions.onToggleFilter)}
                       className={OVERFLOW_ITEM_CLASS}
@@ -886,6 +932,7 @@ export function ZoneHoverActions({
                   {headerActions.onTogglePrompts && (
                     <button
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow(headerActions.onTogglePrompts)}
                       className={OVERFLOW_ITEM_CLASS}
@@ -897,6 +944,7 @@ export function ZoneHoverActions({
                   {headerActions.onToggleReview && (
                     <button
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow(headerActions.onToggleReview)}
                       className={OVERFLOW_ITEM_CLASS}
@@ -908,6 +956,7 @@ export function ZoneHoverActions({
                   {headerActions.onScrollToBottom && (
                     <button
                       type="button"
+                      data-zone-submenu="overflow-or-popover"
                       role="menuitem"
                       onClick={fromOverflow(headerActions.onScrollToBottom)}
                       className={OVERFLOW_ITEM_CLASS}
@@ -934,6 +983,7 @@ export function ZoneHoverActions({
             stamp is always on a visible button. */}
         <button
           type="button"
+          data-zone-action={ZONE_HOVER_ACTIONS.close}
           onClick={handleClose}
           disabled={!hasTab}
           {...(hasTab && tabId ? { "data-ui-bridge-id": `terminal.close-session-${tabId}` } : {})}
