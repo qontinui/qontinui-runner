@@ -921,8 +921,23 @@ pub async fn post_sweep_pending(
                 // when the red came from policy `Indeterminate` over an
                 // empty-in-scope assertion set — emit empty-string locator
                 // in that case so the wire shape stays uniform.
-                let (failing_state_id, failing_assertion_id) =
-                    failing_assertion.unwrap_or_default();
+                //
+                // The named assertion may be an UNKNOWN one (never evaluated)
+                // rather than a failed one. `FlywheelProposalDemoted` is
+                // declared in qontinui-schemas (`spec_api_events.rs`) and has
+                // no field to say which yet, so until it gains
+                // `failing_assertion_verdict` the verdict reaches only the log
+                // line below: an SSE subscriber reading `failing_assertion_id`
+                // cannot tell the two apart.
+                let (failing_state_id, failing_assertion_id, failing_verdict) =
+                    match failing_assertion {
+                        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str()),
+                        None => (String::new(), String::new(), ""),
+                    };
+                info!(
+                    "post_sweep_pending: demoted {} (spec_id={}): {}; named={:?} verdict={:?}",
+                    prop.id, spec_id, detail, failing_assertion_id, failing_verdict
+                );
                 events::emit(SpecApiEvent::FlywheelProposalDemoted {
                     app_id: app_id.clone(),
                     proposal_id: prop.id.clone(),
@@ -932,10 +947,6 @@ pub async fn post_sweep_pending(
                     snapshot_id: red_snapshot_id,
                     at_ms: events::now_ms(),
                 });
-                info!(
-                    "post_sweep_pending: demoted {} (spec_id={}): {}",
-                    prop.id, spec_id, detail
-                );
             }
             Err(other) => {
                 // SnapshotFetchFailed et al. — infra error, no state change
