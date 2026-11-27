@@ -1944,7 +1944,7 @@ mod tests {
         // Hand-construct three SpecCheckResults with deterministic outcomes
         // to exercise the rate-mean + outcome-bucket math.
         let mk = |outcome: MatchOutcome, rate: f32| SpecCheckResult {
-            result_schema_version: 1,
+            result_schema_version: spec_check::evaluator::RESULT_SCHEMA_VERSION,
             snapshot_id: String::new(),
             snapshot_sha256: None,
             spec_content_hash: String::new(),

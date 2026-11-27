@@ -576,7 +576,7 @@ mod tests {
 
     fn make_result(states: Vec<StateMatchResult>, outcome: MatchOutcome) -> SpecCheckResult {
         SpecCheckResult {
-            result_schema_version: 1,
+            result_schema_version: crate::evaluator::RESULT_SCHEMA_VERSION,
             snapshot_id: "scs_test".to_string(),
             snapshot_sha256: None,
             spec_content_hash: "sha256-test".to_string(),
