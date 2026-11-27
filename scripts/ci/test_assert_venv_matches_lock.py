@@ -14,10 +14,12 @@ LOCK = {
         {"name": "yarl", "version": "1.20.0", "groups": ["main"]},
         {"name": "colorama", "version": "0.4.6", "groups": ["main"],
          "markers": {"main": 'sys_platform == "win32"'}},
+        {"name": "sibling", "version": "0.1.1", "groups": ["main"],
+         "source": {"type": "directory", "url": "../../sibling"}},
         {"name": "torch-extra", "version": "1.0", "groups": ["ml"]},
     ]
 }
-OK = {"pillow": "13.0.0", "yarl": "1.20.0"}
+OK = {"pillow": "13.0.0", "yarl": "1.20.0", "sibling": "0.1.1"}
 LINUX = {"sys_platform": "linux"}
 
 
@@ -34,7 +36,13 @@ def test_version_drift_is_named():
 
 
 def test_missing_locked_package_is_named():
-    assert run({"pillow": "13.0.0"}) == ["yarl: locked 1.20.0 but not installed"]
+    assert run({"pillow": "13.0.0", "sibling": "0.1.1"}) == [
+        "yarl: locked 1.20.0 but not installed"
+    ]
+
+
+def test_path_dependency_version_is_the_siblings_own():
+    assert run({**OK, "sibling": "0.2.0"}) == []
 
 
 def test_unlisted_distribution_is_named_but_build_tooling_is_not():

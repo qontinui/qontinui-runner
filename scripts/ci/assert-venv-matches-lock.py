@@ -76,15 +76,20 @@ def check(
     problems: list[str] = []
     locked: dict[str, str] = {}
     required: set[str] = set()
+    # Path dependencies are installed from a sibling checkout's HEAD, so their
+    # version is the sibling's own and is not a property of this lock.
+    path_deps: set[str] = set()
     for pkg in lock["package"]:
         name = norm(pkg["name"])
         locked[name] = pkg["version"]
+        if pkg.get("source", {}).get("type") in ("directory", "file"):
+            path_deps.add(name)
         in_groups = set(pkg.get("groups", ["main"])) & groups
         if in_groups and _applies(pkg.get("markers"), in_groups, env):
             required.add(name)
     for name, want in sorted(locked.items()):
         have = installed.get(name)
-        if have is not None and have != want:
+        if have is not None and have != want and name not in path_deps:
             problems.append(f"{name}: installed {have}, lock {want}")
     for name in sorted(required - installed.keys()):
         problems.append(f"{name}: locked {locked[name]} but not installed")

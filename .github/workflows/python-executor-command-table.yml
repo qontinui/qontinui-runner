@@ -125,7 +125,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: qontinui-runner/python-bridge/.venv
-          key: bridge-test-venv-${{ runner.os }}-${{ hashFiles('qontinui-runner/python-bridge/poetry.lock') }}
+          key: bridge-test-venv-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-py312-${{ hashFiles('qontinui-runner/python-bridge/poetry.lock') }}
 
       - name: Install from the lock
         working-directory: qontinui-runner/python-bridge
@@ -152,6 +152,9 @@ jobs:
         working-directory: qontinui-runner/python-bridge
         run: |
           if ! command -v xvfb-run >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+            sudo -n apt-get update -qq && sudo -n apt-get install -y -qq xvfb || {
+              echo "::error::xvfb-run is missing and cannot be installed here (no passwordless sudo): provision xvfb on this runner pool"
+              exit 1
+            }
           fi
           xvfb-run -a .venv/bin/python -m pytest tests -q --basetemp "$RUNNER_TEMP/pytest-tmp"
