@@ -638,7 +638,13 @@ pub(crate) fn provision_fleet_skills_into(
 
     // Keep what this pass wrote out of the checkout's `git status` (see
     // `crate::provision_exclude`). Best-effort: never fails the pass.
-    crate::provision_exclude::exclude_written_paths("fleet_skills", skills_dir, &written, &tracked);
+    crate::provision_exclude::exclude_written_paths(
+        "fleet_skills",
+        skills_dir,
+        &written,
+        &[],
+        &tracked,
+    );
 
     if out.written == 0 {
         // Nothing landed at all — a stated outcome, not a claim that the
