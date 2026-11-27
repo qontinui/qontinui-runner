@@ -437,3 +437,60 @@ fn provision_agent_defs_unexclude_an_unreadable_retired_copy() {
         "what sits at the retired name reads untracked again"
     );
 }
+
+/// Plan `2026-11-26-runner-provisioned-subagent-definitions-dirty-every-tree-they-are-written-into`
+/// Phase 1: a retired copy kept only because `.claude/agents` is reached
+/// through a symlink (`LinkedElsewhere`) is still the runner's shipped copy,
+/// so it is NOT disowned: the line an earlier pass wrote for it stays, and the
+/// copy keeps reading clean. Only edited or unreadable copies are disowned.
+#[cfg(unix)]
+#[test]
+fn provision_agent_defs_keep_a_linked_retired_copys_line() {
+    let (body, line) = retired_fixture();
+    let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+    let wt = tempfile::tempdir().unwrap();
+    git_init(wt.path());
+    let inner = wt.path().join("shared").join("agents");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("retired-agent.md"), body).unwrap();
+    std::fs::create_dir(wt.path().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&inner, wt.path().join(".claude").join("agents")).unwrap();
+    let linked_line = "/shared/agents/retired-agent.md";
+    let exclude_path = wt.path().join(".git").join("info").join("exclude");
+    let mut seeded = agent_defs_exclude(wt.path());
+    seeded.push_str(&format!(
+        "{}\n{linked_line}\n",
+        crate::provision_exclude::PROVISIONED_EXCLUDE_MARKER,
+    ));
+    std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+    std::fs::write(&exclude_path, seeded).unwrap();
+
+    let wt_cwd = wt.path().to_string_lossy().into_owned();
+    let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+    assert!(
+        report
+            .retained_retired
+            .iter()
+            .any(|r| r.unit == "retired-agent.md"
+                && matches!(
+                    r.reason,
+                    crate::capability_manifest::RetainedReason::LinkedElsewhere(_)
+                )),
+        "the linked retired copy is retained as LinkedElsewhere: {:?}",
+        report.retained_retired
+    );
+    assert!(inner.join("retired-agent.md").is_file());
+    let exclude = agent_defs_exclude(wt.path());
+    assert!(
+        exclude.lines().any(|l| l == linked_line),
+        "a linked shipped copy is not disowned, so its line stays: {exclude}"
+    );
+    assert!(
+        !agent_defs_untracked(wt.path())
+            .iter()
+            .any(|l| l.contains("shared/agents/retired-agent.md")),
+        "the linked shipped copy keeps reading clean: {:?}",
+        agent_defs_untracked(wt.path())
+    );
+}
