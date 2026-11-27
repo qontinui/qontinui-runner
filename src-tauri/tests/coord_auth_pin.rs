@@ -168,6 +168,14 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // is safe only because every caller is a path where the session definitively
     // did not spawn.
     ("agent_runtime.rs", "capability-token", 1),
+    // `spawn_exited_request`'s agent arm (plan
+    // `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+    // Phase 4): the clean-exit report presents the agent's OWN coord JWT, which
+    // coord's reporter check accepts when the JWT's device_id is one of the
+    // allocation's devices (as the launching device is), so the exit row is
+    // recorded verified even where the default binding is not that device.
+    // Its device-token fallback arm is the `session-noop` 7 -> 8 below.
+    ("agent_runtime.rs", "agent-jwt", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     // ops lane (plan 2026-10-19 Phase 4): the result POST is authorised by the
@@ -915,7 +923,11 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     // sparse-to-derive-a-terminal-state Phase 4) — POST /agents/{agent_id}/session;
     // coord resolves the tenant from the allocation's own rows (like post_log); route
     // and its reporter_owns_allocation check land in qontinui-coord#2746.
-    ("agent_runtime.rs", "session-noop", 7),
+    // 8th: `spawn_exited_request`'s device-token fallback arm (plan
+    // 2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer
+    // Phase 4) — POST /agents/{agent_id}/spawn-exited; coord resolves and persists
+    // the tenant from the path agent_id, like its spawn-failed sibling.
+    ("agent_runtime.rs", "session-noop", 8),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
     ("claude_session/trust_gate.rs", "device", 1),
@@ -1077,9 +1089,15 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// artifact-keyed posture as its parent's forwards and the same E3 open
 /// question — web derives `organization_id` from the device principal. So
 /// `work-owed` 8 -> 9.
+///
+/// Plan `2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer`
+/// Phase 4 added `agent_runtime`'s `spawn-exited` clean-exit report. Its
+/// device-token fallback arm is `session-noop` for the same reason as its
+/// `spawn-failed` sibling: keyed by the path `agent_id`, the tenant resolved
+/// server-side. So `session-noop` 11 -> 12.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
-    ("session-noop", 11),
+    ("session-noop", 12),
     ("session-owed", 0),
     ("work-owed", 9),
     ("escalated", 1),
@@ -1240,8 +1258,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 44,
+        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1302,7 +1320,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
          family's five qontinui-web routes, the same session-less posture as its parent's \
          forwards): 42 + 1 = 43. \
-         Found {sites}. A change here \
+         Plan \
+         2026-10-21-a-silent-red-main-fixer-is-unobservable-and-its-page-has-no-consumer \
+         Phase 4 then added agent_runtime's spawn_exited_request device-token fallback (POST \
+         /agents/{{agent_id}}/spawn-exited, session-noop, the spawn-failed sibling's posture): \
+         43 to 44. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
