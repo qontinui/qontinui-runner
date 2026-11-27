@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 use super::services::WatchedUnit;
 use super::services_bound::OverBound;
+use super::slice_oom;
 
 /// Upper bound on unsent events per computer. Beyond it the OLDEST are
 /// dropped and a `telemetry_gap` marker says how many — a silent drop would
@@ -56,6 +57,12 @@ pub(crate) struct UnitObs {
     /// no `service_recovered` has closed it yet.
     #[serde(default)]
     pub(crate) failed_open: bool,
+    /// The unit's last NON-EMPTY `ControlGroup=`. A unit that died on the
+    /// `unit_result` arm reports an empty one (its cgroup is gone), so this
+    /// is what places its kill inside a watched slice (`slice_oom`). Absent
+    /// in a state file written before it existed.
+    #[serde(default)]
+    pub(crate) control_group: Option<String>,
 }
 
 /// The last observation of one computer.
@@ -74,6 +81,11 @@ pub(crate) struct ComputerObs {
     /// `host` | `wsl_guest` | … — set by the reporter.
     #[serde(default)]
     pub(crate) kind: Option<String>,
+    /// Per watched slice: its `memory.events` `oom_kill` baseline and its
+    /// tracked children (`slice_oom`). Absent in a state file written before
+    /// it existed, which loads as "no baseline yet".
+    #[serde(default)]
+    pub(crate) slices: BTreeMap<String, slice_oom::SliceObs>,
 }
 
 /// How far two `booted_at` readings may disagree and still be the same boot.
@@ -141,6 +153,10 @@ pub(crate) struct ObsInput<'a> {
     /// a guest that loses ownership must CLEAR its baseline — carrying it would
     /// produce a bogus delta if it regains ownership later.
     pub(crate) carry_oom_baseline: bool,
+    /// This tick's watched-slice read (`slice_oom`). `None` = this lane never
+    /// reads slices (a non-Linux host, a WSL guest): every `oom_kill` event
+    /// says `slices: "not_supported"` and the slice baselines are kept.
+    pub(crate) slices: Option<&'a slice_oom::SliceOomRead>,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -170,22 +186,12 @@ fn is_down(state: Option<&str>) -> bool {
     matches!(state, Some("failed" | "inactive"))
 }
 
-/// Derive this tick's events and the next observation.
-pub(crate) fn derive(
-    prev: Option<&ComputerObs>,
-    input: &ObsInput<'_>,
-    now: DateTime<Utc>,
-) -> (Vec<ComputerEvent>, ComputerObs) {
-    let now_s = rfc3339(now);
-    let empty = ComputerObs::default();
-    let first_ever = prev.is_none();
-    let prev = prev.unwrap_or(&empty);
-    let boot = input.boot_id.unwrap_or("");
-    let mut events = Vec::new();
-
-    // ---- reboot ---------------------------------------------------------
-    // By boot id where both readings have one; otherwise (Windows) by a
-    // `booted_at` that moved by more than the uptime jitter.
+/// Whether this observation is a new boot relative to `prev`:
+/// `(by_boot_id, by_booted_at)`. By boot id where both readings have one;
+/// otherwise (Windows) by a `booted_at` that moved by more than the uptime
+/// jitter. PURE — `derive` and the pre-derive journal window
+/// (`slice_oom::journal_window`) both decide it here.
+pub(crate) fn reboot_detected(prev: &ComputerObs, input: &ObsInput<'_>) -> (bool, bool) {
     let by_boot_id = matches!(
         (prev.boot_id.as_deref(), input.boot_id),
         (Some(a), Some(b)) if a != b
@@ -198,6 +204,70 @@ pub(crate) fn derive(
             (Some(a), Some(b)) => (b - a).num_seconds().abs() > BOOTED_AT_TOLERANCE_SECS,
             _ => false,
         };
+    (by_boot_id, by_booted_at)
+}
+
+/// The `/proc/vmstat` `oom_kill` window `(baseline, current)` this tick can
+/// compute a delta over, or `None` (the first observation ever, or no
+/// reading on either side). After a reboot the counter restarted at 0, so
+/// the baseline is 0: kills between boot and this first tick (an early-boot
+/// OOM loop) are reported rather than silently absorbed. PURE.
+pub(crate) fn vmstat_window(
+    prev: Option<&ComputerObs>,
+    rebooted: bool,
+    input: &ObsInput<'_>,
+) -> Option<(u64, u64)> {
+    let prev = prev?;
+    let baseline = if rebooted {
+        Some(0)
+    } else {
+        prev.oom_kill_total
+    };
+    baseline.zip(input.oom_kill_total)
+}
+
+/// A watched unit's OOM kill on this transition: `(count, attribution)`. A
+/// cgroup `memory.events` delta while the cgroup lives, else the unit's own
+/// `Result=oom-kill` on this transition (with `OOMPolicy=stop` the cgroup is
+/// gone by the next tick — exactly the 2026-09-30 shape). PURE.
+pub(crate) fn unit_oom_victim(
+    p: &UnitObs,
+    w: &WatchedUnit,
+    rebooted: bool,
+) -> Option<(u64, &'static str)> {
+    let r = &w.row;
+    let cg_delta = match (p.cgroup_oom_kill, w.cgroup_oom_kill) {
+        (Some(a), Some(b)) if b > a && !rebooted => Some(b - a),
+        _ => None,
+    };
+    if let Some(n) = cg_delta {
+        Some((n, "cgroup_memory_events"))
+    } else if r.result.as_deref() == Some("oom-kill")
+        && is_down(r.active_state.as_deref())
+        && (p.result.as_deref() != Some("oom-kill") || p.state_changed_at != r.state_changed_at)
+    {
+        Some((1, "unit_result"))
+    } else {
+        None
+    }
+}
+
+/// Derive this tick's events and the next observation.
+pub(crate) fn derive(
+    prev: Option<&ComputerObs>,
+    input: &ObsInput<'_>,
+    now: DateTime<Utc>,
+) -> (Vec<ComputerEvent>, ComputerObs) {
+    let now_s = rfc3339(now);
+    let empty = ComputerObs::default();
+    let first_ever = prev.is_none();
+    let prev_opt = prev;
+    let prev = prev.unwrap_or(&empty);
+    let boot = input.boot_id.unwrap_or("");
+    let mut events = Vec::new();
+
+    // ---- reboot ---------------------------------------------------------
+    let (by_boot_id, by_booted_at) = reboot_detected(prev, input);
     let rebooted = by_boot_id || by_booted_at;
     if rebooted {
         let id = if by_boot_id {
@@ -231,6 +301,10 @@ pub(crate) fn derive(
     // ---- per-unit: OOM attribution and state transitions -----------------
     let mut units = prev.units.clone();
     let mut attributed: u64 = 0;
+    // Each watched unit's kill: the event's index, for the slice placement
+    // below, and what the slices subtract from their own deltas.
+    let mut unit_events: Vec<usize> = Vec::new();
+    let mut unit_kills: Vec<slice_oom::UnitKill> = Vec::new();
     if let Some(current) = input.services {
         units.retain(|name, _| {
             current.iter().any(|w| &w.row.unit == name)
@@ -254,6 +328,7 @@ pub(crate) fn derive(
                         n_restarts: r.n_restarts,
                         cgroup_oom_kill: w.cgroup_oom_kill,
                         failed_open: cur_state == Some("failed"),
+                        control_group: w.control_group.clone(),
                     },
                 );
                 continue;
@@ -262,38 +337,21 @@ pub(crate) fn derive(
             let transition_at = r.state_changed_at.clone().unwrap_or(now_s.clone());
             let changed =
                 p.state_changed_at != r.state_changed_at || p.active_state != r.active_state;
+            let control_group = w.control_group.clone().or_else(|| p.control_group.clone());
 
-            // OOM victim: a cgroup `memory.events` delta while the cgroup
-            // lives, else the unit's own `Result=oom-kill` on this transition
-            // (with `OOMPolicy=stop` the cgroup is gone by the next tick —
-            // exactly the 2026-09-30 shape).
-            let cg_delta = match (p.cgroup_oom_kill, w.cgroup_oom_kill) {
-                (Some(a), Some(b)) if b > a && !rebooted => Some(b - a),
-                _ => None,
-            };
-            let victim = if let Some(n) = cg_delta {
-                Some((
-                    n,
-                    "cgroup_memory_events",
-                    now_s.clone(),
-                    w.cgroup_oom_kill.unwrap_or(0).to_string(),
-                ))
-            } else if r.result.as_deref() == Some("oom-kill")
-                && is_down(cur_state)
-                && (p.result.as_deref() != Some("oom-kill")
-                    || p.state_changed_at != r.state_changed_at)
-            {
-                Some((
-                    1,
-                    "unit_result",
-                    transition_at.clone(),
-                    transition_at.clone(),
-                ))
-            } else {
-                None
-            };
-            if let Some((count, how, at, key)) = victim {
+            if let Some((count, how)) = unit_oom_victim(p, w, rebooted) {
+                let (at, key) = if how == "unit_result" {
+                    (transition_at.clone(), transition_at.clone())
+                } else {
+                    (now_s.clone(), w.cgroup_oom_kill.unwrap_or(0).to_string())
+                };
                 attributed = attributed.saturating_add(count);
+                unit_events.push(events.len());
+                unit_kills.push(slice_oom::UnitKill {
+                    unit: r.unit.clone(),
+                    count,
+                    control_group: control_group.clone(),
+                });
                 events.push(ComputerEvent {
                     client_event_id: event_id("oom_kill", &[boot, &r.unit, how, &key]),
                     kind: "oom_kill".into(),
@@ -388,43 +446,70 @@ pub(crate) fn derive(
                     n_restarts: r.n_restarts,
                     cgroup_oom_kill: w.cgroup_oom_kill,
                     failed_open,
+                    control_group,
                 },
             );
         }
     }
 
-    // ---- machine-wide OOM kills no watched unit accounts for ------------
-    // After a reboot the counter restarted at 0, so the baseline is 0: kills
-    // between boot and this first tick (an early-boot OOM loop) are reported
-    // rather than silently absorbed into the new baseline.
-    if !first_ever {
-        let baseline = if rebooted {
-            Some(0)
-        } else {
-            prev.oom_kill_total
-        };
-        if let (Some(a), Some(b)) = (baseline, input.oom_kill_total) {
-            if b > a {
-                let unattributed = (b - a).saturating_sub(attributed);
-                if unattributed > 0 {
-                    let how = if rebooted {
-                        "vmstat_since_boot"
-                    } else {
-                        "vmstat_delta"
-                    };
-                    events.push(ComputerEvent {
-                        client_event_id: event_id("oom_kill", &[boot, "", &b.to_string()]),
-                        kind: "oom_kill".into(),
-                        observed_at: now_s.clone(),
-                        detail: json!({
-                            "victim_unit": null,
-                            "count": unattributed,
-                            "attribution": how,
-                            "oom_kill_total": b,
-                            "previous_oom_kill_total": a,
-                        }),
-                    });
-                }
+    // ---- kills inside the watched slices (`slice_oom`) --------------------
+    // Consumed only on a tick whose vmstat delta is computable, so a kill is
+    // never counted by a slice now and again by the residual next tick; the
+    // slice events together never exceed what vmstat says is left after the
+    // watched units.
+    let v_window = vmstat_window(prev_opt, rebooted, input);
+    let watched: Vec<&str> = input
+        .services
+        .unwrap_or(&[])
+        .iter()
+        .map(|w| w.row.unit.as_str())
+        .collect();
+    let sliced = slice_oom::attribute(&slice_oom::SliceInput {
+        prev: &prev.slices,
+        read: input.slices,
+        unit_kills: &unit_kills,
+        watched: &watched,
+        rebooted,
+        budget: v_window.map(|(a, b)| b.saturating_sub(a).saturating_sub(attributed)),
+        boot,
+        now_s: &now_s,
+        oom_kill_total: input.oom_kill_total,
+    });
+    for (i, kill) in unit_events.iter().zip(&unit_kills) {
+        let d = &mut events[*i].detail;
+        d["victim_slice"] = json!(sliced.slice_of(kill.control_group.as_deref()));
+        d["slices"] = json!(sliced.status);
+        if let Some(cg) = &kill.control_group {
+            d["victim_cgroup"] = json!(cg);
+        }
+    }
+    attributed = attributed.saturating_add(sliced.attributed);
+    events.extend(sliced.events);
+
+    // ---- machine-wide OOM kills nothing above accounts for ---------------
+    if let Some((a, b)) = v_window {
+        if b > a {
+            let unattributed = (b - a).saturating_sub(attributed);
+            if unattributed > 0 {
+                let how = if rebooted {
+                    "vmstat_since_boot"
+                } else {
+                    "vmstat_delta"
+                };
+                events.push(ComputerEvent {
+                    client_event_id: event_id("oom_kill", &[boot, "", &b.to_string()]),
+                    kind: "oom_kill".into(),
+                    observed_at: now_s.clone(),
+                    detail: json!({
+                        "victim_unit": null,
+                        "victim_slice": null,
+                        "slices": sliced.status,
+                        "count": unattributed,
+                        "attribution": how,
+                        "oom_kill_total": b,
+                        "previous_oom_kill_total": a,
+                    }),
+                });
             }
         }
     }
@@ -445,6 +530,7 @@ pub(crate) fn derive(
             .or(prev.booted_at.clone()),
         last_seen_at: Some(now_s),
         kind: prev.kind.clone(),
+        slices: sliced.next,
     };
     (events, next)
 }
@@ -811,6 +897,7 @@ mod tests {
             .map(|p| WatchedUnit {
                 row: row_from_props(p, None),
                 cgroup_oom_kill: cgroup,
+                control_group: p.control_group.clone(),
             })
             .collect()
     }
@@ -823,6 +910,7 @@ mod tests {
             services: Some(units),
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
+            slices: None,
         }
     }
 
@@ -969,6 +1057,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
+            slices: None,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -996,6 +1085,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
+            slices: None,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -1016,6 +1106,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: None,
             complete_kinds: &[],
             carry_oom_baseline: true,
+            slices: None,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(
