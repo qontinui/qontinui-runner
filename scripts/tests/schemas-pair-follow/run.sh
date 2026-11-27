@@ -557,6 +557,51 @@ else
   grep -q CLORINDE_AUTOCOMMIT_TOKEN "$FX/stderr" && ok "push: no PAT for an https remote -> red, naming CLORINDE_AUTOCOMMIT_TOKEN" || bad "no-PAT message" "$(cat "$FX/stderr")"
 fi
 
+echo "# compute + push: TRANSIENT is a named no-op, never a failed leg"
+# merge-and-pin: the containment compare runs out of retries -> MODE=TRANSIENT, exit 0.
+git_setup trncompute plain
+gh_fx "repos/$SC/compare/$A...$OLD" '__TRN__'
+mp="$(spf_git merge-and-pin "$G/compute" "$G/decide.json" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -eq 0 ] && grep -qx "MODE=TRANSIENT" <<<"$mp" && ok "merge-and-pin: transient compare -> MODE=TRANSIENT (exit 0, not a failed leg)" || bad "merge-and-pin transient" "rc=$rc $mp $(cat "$FX/stderr")"
+grep -q '^MODE=FOLLOW\|^MODE=MERGE_ONLY' <<<"$mp" && bad "  ...a later step would run on TRANSIENT" || ok "  ...no FOLLOW / MERGE_ONLY, so no lock, commit or bundle follows"
+git -C "$G/compute" checkout -q --detach "$GHEAD"
+mp="$(GITHUB_ACTIONS=true spf_git merge-and-pin "$G/compute" "$G/decide.json" 2>"$FX/stderr")"
+grep -q '::warning::TRANSIENT' "$FX/stderr" && ! grep -q '::warning::' <<<"$mp" && ok "  ...the warning goes to stderr, never into the MODE= stdout the workflow appends to GITHUB_OUTPUT" || bad "  ...warning stream" "$mp / $(cat "$FX/stderr")"
+# A real containment UNKNOWN still fails the leg.
+git_setup unkcompute plain
+gh_fx "repos/$SC/compare/$A...$OLD" '__ERR__'
+if spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>"$FX/stderr"; then bad "a non-transient compare failure must still fail merge-and-pin"; else ok "merge-and-pin: non-transient compare failure -> still red"; fi
+
+# push: the PR re-read runs out of retries -> RESULT=TRANSIENT, nothing written or pushed.
+git_setup trnreread plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+gh_fx "repos/$R/pulls/100" '__TRN__'
+before="$(remote_tip)"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -eq 0 ] && [ "$pr" = "RESULT=TRANSIENT pr-re-read" ] && [ "$(remote_tip)" = "$before" ] && [ ! -s "$FX/writes.log" ] && ok "push: transient PR re-read -> RESULT=TRANSIENT, nothing written, nothing pushed" || bad "push re-read transient" "rc=$rc $pr $(cat "$FX/stderr") $(cat "$FX/writes.log" 2>/dev/null)"
+gh_fx "repos/$R/pulls/100" '__ERR__'
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "a non-transient re-read failure must still fail the push leg"; else ok "  ...a non-transient re-read failure is still red"; fi
+
+# push: the pushed tip's containment compare runs out of retries (merge-only: tip pin M2).
+git_setup trntip mainpin
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" MERGE_ONLY >/dev/null 2>&1
+gh_fx "repos/$SC/compare/$A...$M2" '__TRN__'
+# A form-2 label is present, so a write would show up as a label DELETE in writes.log.
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"}]}"
+before="$(remote_tip)"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -eq 0 ] && [ "$pr" = "RESULT=TRANSIENT containment-read" ] && [ "$(remote_tip)" = "$before" ] && [ ! -s "$FX/writes.log" ] && ok "push: transient tip containment read -> RESULT=TRANSIENT, label kept, nothing pushed" || bad "push tip transient" "rc=$rc $pr $(cat "$FX/stderr")"
+
+# push: the refusal path's comment read runs out of retries -> TRANSIENT, no comment.
+git_setup trnrefuse plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+LOCK_CMD="sed -i 's/^checksum = \"abc\"$/checksum = \"evil\"/' Cargo.lock" spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+gh_fx "repos/$R/issues/100/comments?per_page=100" '__TRN__'
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -eq 0 ] && [ "$pr" = "RESULT=TRANSIENT refusal-comment-read" ] && ! grep -q "schemas-pair-follow:refused" "$FX/writes.log" 2>/dev/null && ok "push: transient refusal-comment read -> RESULT=TRANSIENT, no comment posted (the next tick tells it once)" || bad "refusal transient" "rc=$rc $pr $(cat "$FX/stderr")"
+
 echo "# gh retry (stubbed gh on PATH, the real gh_get path — no SPF_FIXTURES)"
 # The stub answers each `gh api <path>` from $STUB/<fxname path>.seq: line N is
 # the Nth call's outcome — ok (print .body), 502, 503, 429, rl403 (a secondary
