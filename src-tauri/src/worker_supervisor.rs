@@ -912,6 +912,11 @@ mod tests {
                 "fleet.budget_republisher",
             ),
             (
+                "fleet/database_report.rs",
+                "pub fn spawn_database_report_publisher()",
+                "fleet.database_report_publisher",
+            ),
+            (
                 "fleet.rs",
                 "pub fn spawn_tree_publisher()",
                 "fleet.tree_publisher",

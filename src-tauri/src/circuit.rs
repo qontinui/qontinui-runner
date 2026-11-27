@@ -155,6 +155,14 @@ pub struct CircuitSnapshot {
     pub state: CircuitState,
     /// When the CURRENT outage began (the original trip). `None` while Closed.
     pub since: Option<SystemTime>,
+    /// The same trip on the MONOTONIC clock (the instant [`Circuit::since_instant`]
+    /// reads), taken under the same lock as the rest of this snapshot. `None`
+    /// while Closed. It is for measuring how long the breaker has been open:
+    /// [`Self::since`] is wall-clock, and a trip at boot can predate the NTP
+    /// step that corrects a clock that was behind. On Linux `Instant` is
+    /// `CLOCK_MONOTONIC`, which stops during a suspend, so a duration measured
+    /// from it understates the time open across one.
+    pub since_instant: Option<Instant>,
     pub cause: Option<String>,
     pub last_error: Option<String>,
     /// How long until the next trial may run. `None` while Closed.
@@ -585,6 +593,7 @@ impl Circuit {
         CircuitSnapshot {
             state: g.state,
             since: if open { g.since_wall } else { None },
+            since_instant: if open { g.since } else { None },
             cause: if open { g.cause.clone() } else { None },
             last_error: g.last_error.clone(),
             retry_after: if open {
@@ -707,6 +716,47 @@ mod tests {
         }
         assert_eq!(c.snapshot().failed_trials, 5);
         assert_eq!(c.snapshot().trips, 1, "a failed trial is not a new trip");
+    }
+
+    /// A rejected admission carries the breaker's onset on the MONOTONIC
+    /// clock, the instant `since_instant()` reads, and keeps it through a
+    /// failed trial: the runner's database report to coord measures how long
+    /// the breaker has been open from the snapshot, so the outage runs from
+    /// the ORIGINAL trip. Closed, the snapshot carries none. Read through
+    /// `Debug`, which every field reaches.
+    #[test]
+    fn a_snapshot_carries_the_monotonic_onset_of_the_original_trip() {
+        let (c, clock) = manual(pg_config());
+        c.record(Outcome::TripFailure("refused".into()));
+        let onset = c.since_instant();
+        assert!(onset.is_some(), "open since the first trip");
+        let carried = format!("since_instant: {onset:?}");
+        // `allow()` is the admission `pg_circuit` asks for; an open breaker
+        // rejects with its snapshot.
+        let open = format!("{:?}", c.allow());
+        assert!(
+            open.starts_with("Reject(") && open.contains(&carried),
+            "open admission lacks {carried}: {open}"
+        );
+
+        clock.advance(Duration::from_secs(20));
+        let trial = c.begin_trial().expect("a trial slot while open");
+        c.finish_trial(trial, Err("still refused".into()));
+        assert_eq!(c.since_instant(), onset, "a failed trial keeps the onset");
+        let reopened = format!("{:?}", c.allow());
+        assert!(
+            reopened.starts_with("Reject(") && reopened.contains(&carried),
+            "re-opened admission lacks {carried}: {reopened}"
+        );
+
+        let trial = c.begin_trial().expect("a trial slot while open");
+        c.finish_trial(trial, Ok(()));
+        assert_eq!(c.state(), CircuitState::Closed);
+        let closed = format!("{:?}", c.snapshot());
+        assert!(
+            closed.contains("since_instant: None"),
+            "closed snapshot: {closed}"
+        );
     }
 
     #[test]

@@ -709,9 +709,11 @@ pub(crate) struct CoordCredentialBag {
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
     /// [`COORD_CREDENTIAL_STALE_AFTER_PASSES`] × [`REFRESH_CHECK_INTERVAL`], in
-    /// seconds. Coord's status upsert replaces `details` wholesale and stamps
-    /// `updated_at`, so the row's age IS this bag's age — and a runner that went
-    /// offline while `ok: true` would otherwise read `live` forever. Declared
+    /// seconds. Coord's status upsert MERGES `details` per top-level key and
+    /// stamps each key it receives into `_coord_received_at`, so this bag's
+    /// age is that stamp, not the row's `updated_at` (which any other poster
+    /// advances) — and a runner that went offline while `ok: true` would
+    /// otherwise read `live` forever. Declared
     /// here, beside the cadence it is derived from, so the console keeps no
     /// constant of its own (the fleet-health `sample_stale_after_secs` pattern).
     pub stale_after_secs: u64,

@@ -2156,6 +2156,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `fleet::spawn_budget_republisher` for why a one-shot boot
                 // publish left a clobbered capacity column stuck for six days.
                 fleet::spawn_budget_republisher(fleet::MachineRole::Agent);
+                // The `runner_database` report rides this thread too: it must
+                // keep reporting when the box is in trouble, which is exactly
+                // when the publishers runtime is blocked.
+                fleet::database_report::spawn_database_report_publisher();
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
