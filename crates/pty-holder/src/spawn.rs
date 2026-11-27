@@ -189,13 +189,19 @@ pub fn cgroup_is_in_systemd_unit(cgroup_file: &str) -> bool {
 /// when that unit stops: the holder's path is the unit's own path or below it
 /// (a unit's stop kills its whole subtree, a leaf the runner moved itself
 /// into included). A runner outside any unit has no unit to share. The
-/// comparison is on the unified (`0::`) line's path, falling back to the
-/// cgroup-v1 `name=systemd` line's path when there is none (the hierarchy
+/// comparison is on the unified (`0::`) line's path when it names a unit,
+/// falling back to the cgroup-v1 `name=systemd` line's path otherwise (the hierarchy
 /// systemd places units in); a file with neither has no unit path.
 pub fn shares_runner_unit_cgroup(runner_cgroup: &str, holder_cgroup: &str) -> bool {
+    fn names_unit(p: &str) -> bool {
+        p.split('/')
+            .any(|c| c.ends_with(".service") || c.ends_with(".scope"))
+    }
     fn path(c: &str) -> &str {
+        // A `0::` path naming no unit (a stray cgroup2 mount on a legacy-v1
+        // host reads `0::/`) does not hide the v1 `name=systemd` unit.
         c.lines()
-            .find_map(|l| l.strip_prefix("0::"))
+            .find_map(|l| l.strip_prefix("0::").filter(|p| names_unit(p.trim())))
             .or_else(|| {
                 c.lines().find_map(|l| {
                     let mut f = l.splitn(3, ':');
@@ -1472,6 +1478,9 @@ mod tests {
             &v1_runner,
             &v1("/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-pty-holder-p1.scope")
         ));
+        // A stray cgroup2 mount's `0::/` does not hide the v1 unit.
+        let hybrid = format!("{v1_runner}0::/\n");
+        assert!(shares_runner_unit_cgroup(&hybrid, &hybrid));
     }
 
     /// Off Linux there is no unit to share: an adopted holder reads the same
