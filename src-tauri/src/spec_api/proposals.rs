@@ -923,12 +923,9 @@ pub async fn post_sweep_pending(
                 // in that case so the wire shape stays uniform.
                 //
                 // The named assertion may be an UNKNOWN one (never evaluated)
-                // rather than a failed one. `FlywheelProposalDemoted` is
-                // declared in qontinui-schemas (`spec_api_events.rs`) and has
-                // no field to say which yet, so until it gains
-                // `failing_assertion_verdict` the verdict reaches only the log
-                // line below: an SSE subscriber reading `failing_assertion_id`
-                // cannot tell the two apart.
+                // rather than a failed one, so the event says which in
+                // `failing_assertion_verdict` ("fail" / "unknown", "" when none
+                // is named).
                 let (failing_state_id, failing_assertion_id, failing_verdict) =
                     match failing_assertion {
                         Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str()),
@@ -944,6 +941,7 @@ pub async fn post_sweep_pending(
                     page_id: spec_id.clone(),
                     failing_assertion_id,
                     failing_state_id,
+                    failing_assertion_verdict: failing_verdict.to_string(),
                     snapshot_id: red_snapshot_id,
                     at_ms: events::now_ms(),
                 });
