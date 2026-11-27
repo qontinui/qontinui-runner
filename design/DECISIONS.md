@@ -1,7 +1,7 @@
 # Generated style guide: what the hand-written guide carried and where it went
 
 `src/design-system/qontinui-runner.styleguide.uibridge.json` is `design-kit
-compile` output of `design/language.dtcg.json` (kit `v0.1.1`). It replaced a
+compile` output of `design/language.dtcg.json` (kit `v0.2.1`). It replaced a
 hand-written guide. This file records, per key and rule of that hand-written
 guide, whether it is carried and why. Authored values cite notification
 `3588ba69-6fc1-4b6a-9e9b-9d23729abc6f`.
