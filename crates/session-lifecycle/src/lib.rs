@@ -11,9 +11,36 @@
 //! lines (in each platform's [`Argv`] form) and a second, fresh table, and
 //! passes all three in.
 
+//!
+//! **Out of scope here.** The interim-host narrowing conjuncts I2 (composer
+//! witness), I3 (continuation-permit pacing), I4 (root-cwd move), I5 (close rate
+//! limit) and I7 (tenant proof) belong to Phases 52 and 54, where the interim
+//! host exists; this kernel carries only I1, I6 and I8 (see [`guard`]).
+
 pub mod classify_child;
+pub mod decide;
+pub mod evaluate;
+pub mod guard;
+pub mod model;
+pub mod state;
+pub mod stray;
+#[cfg(test)]
+mod testkit;
 
 pub use classify_child::{
-    classify_child, classify_session, Argv, ChildClass, ChildVerdict, Platform, ProcRow, ProcTable,
-    SessionVerdict,
+    classify_child, classify_child_with_strays, classify_session, classify_session_with_strays,
+    Argv, ChildClass, ChildVerdict, Platform, ProcRow, ProcTable, SessionVerdict,
+};
+pub use decide::{
+    closed_by_creator, decide, item_facts, operator_provenance, owed_facts, relayed_exit,
+    resume_would_restore_schedule, Owed, BLOCKS_PER_HOUR, CONTINUE_WINDOW, MIGRATION_CAP,
+    RESUME_ATTEMPTS_CAP,
+};
+pub use evaluate::*;
+pub use guard::{close_action, evaluate as evaluate_guard, GuardReport};
+pub use model::*;
+pub use state::*;
+pub use stray::{
+    stray_verdict, FileFacts, NotStray, StrayClass, StrayContext, StrayEvidence, StrayFacts,
+    StrayProc, StrayVerdict,
 };

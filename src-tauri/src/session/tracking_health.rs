@@ -4048,6 +4048,10 @@ mod tests {
             class,
             chain: None,
             reason: String::new(),
+            // Deliberately None even for a pid the test treats as a stray:
+            // `replace_boot_window_for_finished` takes stray-ness from its
+            // separate `strays` set and never reads `ChildVerdict::stray`.
+            stray: None,
         }
     }
 
@@ -4065,6 +4069,7 @@ mod tests {
                 admit,
                 children,
                 refusal: None,
+                pinned_by_strays: false,
             },
         )
     }
