@@ -144,6 +144,27 @@ impl RemovalReport {
                 .all(|(_, o)| matches!(o, TreeOutcome::Removed))
     }
 
+    /// The trees that no longer hold this allocation's work: removed, or a
+    /// shared-branch checkout put back on its prior ref. The second now holds
+    /// the operator's branch, so diffing it against the allocation's
+    /// `parent_sha` would file their commits as this agent's edits.
+    pub(crate) fn no_longer_the_allocations(&self) -> Vec<PathBuf> {
+        self.trees
+            .iter()
+            .filter(|(_, o)| {
+                matches!(
+                    o,
+                    TreeOutcome::Removed
+                        | TreeOutcome::Kept(KeepReason::SharedBranchCheckout(
+                            super::shared_branch_restore::RestoreOutcome::Restored
+                        ))
+                )
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn removed_paths(&self) -> Vec<PathBuf> {
         self.trees
             .iter()

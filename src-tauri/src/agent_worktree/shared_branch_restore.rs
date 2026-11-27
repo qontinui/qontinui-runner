@@ -27,9 +27,11 @@
 //!    provisioned artifacts are kept out of that listing at their source,
 //!    by [`prepare_canonical_excludes`], never by filtering here.
 //!
-//! Then `git switch --no-guess <prior>` (or `git switch --detach <sha>` when
-//! the checkout was detached), with no `--force` / `--discard-changes`, and a
-//! read-back of HEAD. The agent branch is never deleted, even one this
+//! Then `git switch --no-guess --no-overwrite-ignore <prior>` (or `--detach
+//! <sha>` when the checkout was detached), with no `--force` /
+//! `--discard-changes`, and a read-back of HEAD. `--no-overwrite-ignore`
+//! turns an ignored file at a path the prior ref tracks into
+//! [`RestoreKeep::SwitchFailed`] instead of git's default silent overwrite. The agent branch is never deleted, even one this
 //! allocation created: it may already be pushed or claimed.
 //!
 //! The caller ([`super::remove_unspawned`]) runs this while the allocation's
@@ -116,9 +118,11 @@ impl RestoreKeep {
 const GIT_TIMEOUT: std::time::Duration = super::dirty::RECLAIM_DIRTY_PROBE_TIMEOUT;
 
 /// The full-cleanliness listing proof 3 requires empty: every untracked file,
-/// whatever `status.showUntrackedFiles` says, and ignored paths left out
-/// (ignored content is not carried or clobbered by a switch to a ref that
-/// does not track it, and the runner's excluded artifacts are ignored).
+/// whatever `status.showUntrackedFiles` says, and ignored paths left out (the
+/// runner's excluded artifacts are ignored). Ignored content is safe only
+/// because the switch runs with `--no-overwrite-ignore`: by default git
+/// silently OVERWRITES an ignored file at a path the prior ref tracks, so
+/// without the flag an operator's ignored file would be lost to a restore.
 const PORCELAIN_FULL: &[&str] = &[
     "status",
     "--porcelain",
@@ -217,8 +221,8 @@ fn judge_and_switch(
         Err(k) => return keep(k),
     };
     let switch_args: Vec<&str> = match &target {
-        Prior::Branch => vec!["switch", "--no-guess", prior_ref],
-        Prior::Detached => vec!["switch", "--detach", prior_ref],
+        Prior::Branch => vec!["switch", "--no-guess", "--no-overwrite-ignore", prior_ref],
+        Prior::Detached => vec!["switch", "--no-overwrite-ignore", "--detach", prior_ref],
     };
     if let Err(e) = git_stdout(checkout, &switch_args, "shared_branch_restore: switch") {
         return keep(SwitchFailed(e));
@@ -357,9 +361,26 @@ pub(crate) fn prepare_canonical_excludes(canonical: &Path, prior_ref: &str, bran
         &["ls-files", "--", ".claude"],
         "shared_branch_restore: ls-files .claude",
     );
+    // `prior_ref` is a bare branch name or a sha. A bare name passed to
+    // `ls-tree` resolves a same-named TAG before the branch, so name the
+    // branch in full; a prior that resolves to neither is UNKNOWN and adds
+    // nothing, the same as an unanswered read.
+    let prior = match resolve_prior(canonical, prior_ref) {
+        Ok(Prior::Branch) => format!("refs/heads/{prior_ref}"),
+        Ok(Prior::Detached) => prior_ref.to_string(),
+        Err(why) => {
+            warn!(
+                checkout = %canonical.display(),
+                prior = ?why,
+                "shared_branch_restore: the prior ref does not resolve — the \
+                 provisioned-bundle excludes are not added"
+            );
+            return;
+        }
+    };
     let prior = git_stdout(
         canonical,
-        &["ls-tree", "-r", "--name-only", prior_ref, "--", ".claude"],
+        &["ls-tree", "-r", "--name-only", &prior, "--", ".claude"],
         "shared_branch_restore: ls-tree .claude",
     );
     match (index, prior) {

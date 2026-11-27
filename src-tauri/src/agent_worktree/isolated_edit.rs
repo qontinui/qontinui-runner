@@ -97,8 +97,10 @@ pub struct IsolatedEditContext {
     // D1). A worktree with no entry reads `Unrecorded` and is never removed.
     provenance: HashMap<String, TreeProvenance>,
 
-    // Worktrees `remove_unspawned` took off disk. `Drop`'s fs-observer push
-    // and edit-effect verify skip them: both would read a tree that is gone.
+    // Worktrees `remove_unspawned` took off disk, and shared-branch checkouts
+    // it put back on their prior ref. `Drop`'s fs-observer push and
+    // edit-effect verify skip them: both would read a tree that is gone, or
+    // the operator's branch as this agent's work.
     removed_worktrees: Vec<PathBuf>,
 
     // How long `Drop`'s credential cleanup waits for an install still in
@@ -473,7 +475,7 @@ impl IsolatedEditContext {
             allocated_root,
         )
         .await;
-        self.removed_worktrees = report.removed_paths();
+        self.removed_worktrees = report.no_longer_the_allocations();
         report
     }
 
