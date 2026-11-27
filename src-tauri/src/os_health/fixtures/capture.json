@@ -1,0 +1,40 @@
+{
+  "windows_build": "10.0.26300.9974",
+  "layout": {
+    "process_entry_bytes": 256,
+    "thread_entry_bytes": 80
+  },
+  "base_address": 2516578926720,
+  "base_address_hex": "0x249efcb0080",
+  "buffer_bytes": 934328,
+  "process_total": 443,
+  "thread_total": 8066,
+  "processes": [
+    {
+      "pid": 1348,
+      "image": "smss.exe",
+      "handle_count": 59
+    },
+    {
+      "pid": 1964,
+      "image": "csrss.exe",
+      "handle_count": 777
+    },
+    {
+      "pid": 1292,
+      "image": "csrss.exe",
+      "handle_count": 1589
+    },
+    {
+      "pid": 1940,
+      "image": "services.exe",
+      "handle_count": 940
+    }
+  ],
+  "scrub": {
+    "names_replaced": 438,
+    "names_kept": 4,
+    "process_entries": 443,
+    "thread_entries": 8066
+  }
+}
