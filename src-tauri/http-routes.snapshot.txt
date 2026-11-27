@@ -625,6 +625,7 @@ GET /ui-bridge/control/changes/since ui_bridge_get_changes_since_handler
 GET /ui-bridge/control/clipboard ui_bridge_clipboard_read_handler
 GET /ui-bridge/control/clipboard/read ui_bridge_clipboard_read_handler
 GET /ui-bridge/control/component/{id} ui_bridge_get_component_handler
+GET /ui-bridge/control/component/{id}/capture ui_bridge_get_component_capture_handler
 GET /ui-bridge/control/component/{id}/state ui_bridge_get_component_state_handler
 GET /ui-bridge/control/components ui_bridge_get_components_handler
 GET /ui-bridge/control/console-errors ui_bridge_get_console_errors_handler
@@ -632,6 +633,7 @@ GET /ui-bridge/control/design/element/{id}/styles ui_bridge_design_element_style
 GET /ui-bridge/control/design/evaluate/contexts ui_bridge_design_evaluate_contexts_handler
 GET /ui-bridge/control/design/style-guide ui_bridge_design_get_style_guide_handler
 GET /ui-bridge/control/element/{id} ui_bridge_get_element_handler
+GET /ui-bridge/control/element/{id}/capture ui_bridge_get_element_capture_handler
 GET /ui-bridge/control/element/{id}/history ui_bridge_get_element_history_handler
 GET /ui-bridge/control/element/{id}/react-state ui_bridge_get_element_react_state_handler
 GET /ui-bridge/control/element/{id}/state ui_bridge_get_element_state_handler
@@ -730,6 +732,7 @@ GET /ui-bridge/sdk/capabilities handle_capabilities
 GET /ui-bridge/sdk/check-health handle_check_health
 GET /ui-bridge/sdk/clipboard handle_clipboard_read
 GET /ui-bridge/sdk/component/{id} handle_component
+GET /ui-bridge/sdk/component/{id}/capture handle_component_capture
 GET /ui-bridge/sdk/component/{id}/state handle_component_state
 GET /ui-bridge/sdk/components handle_components
 GET /ui-bridge/sdk/connections handle_connections
@@ -742,10 +745,12 @@ GET /ui-bridge/sdk/console/timeline handle_console_timeline
 GET /ui-bridge/sdk/control/browser-events handle_console_browser_events
 GET /ui-bridge/sdk/control/clipboard handle_clipboard_read
 GET /ui-bridge/sdk/control/component/{id} handle_component
+GET /ui-bridge/sdk/control/component/{id}/capture handle_component_capture
 GET /ui-bridge/sdk/control/component/{id}/state handle_component_state
 GET /ui-bridge/sdk/control/components handle_components
 GET /ui-bridge/sdk/control/console-errors handle_console_errors
 GET /ui-bridge/sdk/control/element/{id} handle_element
+GET /ui-bridge/sdk/control/element/{id}/capture handle_element_capture
 GET /ui-bridge/sdk/control/element/{id}/history handle_element_history
 GET /ui-bridge/sdk/control/element/{id}/state handle_element_state
 GET /ui-bridge/sdk/control/element/{id}/state-generic handle_element_state_generic
@@ -785,6 +790,7 @@ GET /ui-bridge/sdk/design/evaluate/contexts handle_quality_contexts
 GET /ui-bridge/sdk/design/style-guide handle_design_get_style_guide
 GET /ui-bridge/sdk/diagnostics handle_diagnostics
 GET /ui-bridge/sdk/element/{id} handle_element
+GET /ui-bridge/sdk/element/{id}/capture handle_element_capture
 GET /ui-bridge/sdk/element/{id}/state handle_element_state
 GET /ui-bridge/sdk/elements handle_elements
 GET /ui-bridge/sdk/error-report handle_error_report
@@ -831,6 +837,8 @@ GET /ui-bridge/test/coord-mcp/agent-token/{agent_id} agent_token_view_handler
 GET /ui-bridge/views ui_bridge_views_handler
 GET /ui-bridge/vision/baselines vision_baselines_list_handler
 GET /ui-bridge/vision/cache/{sha256} vision_cache_get_handler
+GET /ui-bridge/vision/component-baseline vision_component_baseline_get_handler
+GET /ui-bridge/vision/component-baselines vision_component_baselines_list_handler
 GET /ui-bridge/vision/health vision_health_handler
 GET /uitars-extraction/results get_uitars_extraction_results
 GET /uitars-extraction/status get_uitars_extraction_status
@@ -1727,6 +1735,7 @@ POST /ui-bridge/vision/annotate vision_annotate_handler
 POST /ui-bridge/vision/assert vision_assert_handler
 POST /ui-bridge/vision/baseline vision_baseline_handler
 POST /ui-bridge/vision/capture vision_capture_handler
+POST /ui-bridge/vision/component-baseline vision_component_baseline_store_handler
 POST /ui-bridge/vision/describe vision_describe_handler
 POST /ui-bridge/vision/diff vision_diff_handler
 POST /ui-bridge/vision/extract vision_extract_handler

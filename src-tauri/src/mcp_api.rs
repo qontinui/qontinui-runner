@@ -12161,6 +12161,34 @@ pub fn create_router(
         app_state.clone(),
     );
 
+    // Phase 3 vision pipeline (cache + concurrency).
+    // Cache root = the instance-scoped DataLocal dir
+    // `<data_local>/com.qontinui.runner/vision_cache[/instance-<name>]`,
+    // never the source checkout or the process CWD; unresolvable = loud
+    // failure (plan 2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary D2).
+    // Cap = 512 MB per plan §3.5.
+    let vision_cache = {
+        let data_local_base = qontinui_runner_lib::instance_env::runner_data_local_base();
+        let root = crate::mcp::ui_bridge::vision_capture_access::vision_cache_root_from(
+            data_local_base,
+            crate::instance::scope_path,
+        )
+        .unwrap_or_else(|e| panic!("vision cache init: {e}"));
+        Arc::new(
+            qontinui_vision_core::VisionCache::new(&root, 512 * 1024 * 1024)
+                .unwrap_or_else(|e| panic!("vision cache init at {}: {e}", root.display())),
+        )
+    };
+    // Durable component baselines (`matches_isolated_render`), beside the
+    // vision cache in the same per-instance root: they must survive a restart,
+    // unlike `vision_baselines` below (plan
+    // 2026-11-13-ui-bridge-matches-isolated-render-assertion, Phase 3).
+    let vision_component_baselines = Arc::new(
+        crate::mcp::ui_bridge::component_baseline_store::ComponentBaselineStore::under_vision_cache_root(
+            vision_cache.root(),
+        ),
+    );
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -12208,24 +12236,8 @@ pub fn create_router(
         supervision_state: crate::git_supervision::SupervisionState::new(),
         // D4+D6 Blind-Spot Recommender Phase 2 — read-through observer facade.
         observer_registry,
-        // Phase 3 vision pipeline (cache + concurrency).
-        // Cache root = the instance-scoped DataLocal dir
-        // `<data_local>/com.qontinui.runner/vision_cache[/instance-<name>]`,
-        // never the source checkout or the process CWD; unresolvable = loud
-        // failure (plan 2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary D2).
-        // Cap = 512 MB per plan §3.5.
-        vision_cache: {
-            let data_local_base = qontinui_runner_lib::instance_env::runner_data_local_base();
-            let root = crate::mcp::ui_bridge::vision_capture_access::vision_cache_root_from(
-                data_local_base,
-                crate::instance::scope_path,
-            )
-            .unwrap_or_else(|e| panic!("vision cache init: {e}"));
-            Arc::new(
-                qontinui_vision_core::VisionCache::new(&root, 512 * 1024 * 1024)
-                    .unwrap_or_else(|e| panic!("vision cache init at {}: {e}", root.display())),
-            )
-        },
+        // Phase 3 vision pipeline (cache + concurrency) — built above.
+        vision_cache,
         // 2 permits — xcap is GDI-bound, fits-2-parallel pattern per
         // proj_supervisor_build_pool.md.
         vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -12239,6 +12251,7 @@ pub fn create_router(
         vision_last_fallback: Arc::new(std::sync::Mutex::new(None)),
         // Phase 6 baselines registry — in-process, non-persistent.
         vision_baselines: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        vision_component_baselines,
     });
 
     // Publish the capture-backend telemetry handles so the device-scoped 30s

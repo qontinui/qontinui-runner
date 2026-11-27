@@ -385,6 +385,15 @@ pub struct ApiState {
             >,
         >,
     >,
+    /// Durable component baselines for `matches_isolated_render`: name →
+    /// [`qontinui_vision_core::ComponentBaseline`], one JSON file per name
+    /// under `<vision cache root>/component_baselines/`. Written by
+    /// `POST /ui-bridge/vision/component-baseline`, read by `vision/assert`.
+    /// Separate from `vision_baselines` on purpose: those are operational and
+    /// die with the process; these are captured on one page (a story) and
+    /// asserted on another, so they persist across restarts.
+    pub vision_component_baselines:
+        Arc<crate::mcp::ui_bridge::component_baseline_store::ComponentBaselineStore>,
 }
 
 /// Response for API endpoints

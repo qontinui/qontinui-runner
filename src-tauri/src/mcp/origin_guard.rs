@@ -264,6 +264,24 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/ui-bridge/sdk/clipboard",
     "/ui-bridge/sdk/control/clipboard",
     "GET /ui-bridge/control/element/{id}/react-state",
+    // The structural captures carry the component's `state()` and its
+    // (scrubbed) props — the react-state class above. No browser caller.
+    "GET /ui-bridge/control/component/{id}/capture",
+    "GET /ui-bridge/control/element/{id}/capture",
+    // The same captures relayed from the active SDK app.
+    "GET /ui-bridge/sdk/component/{id}/capture",
+    "GET /ui-bridge/sdk/element/{id}/capture",
+    "GET /ui-bridge/sdk/control/component/{id}/capture",
+    "GET /ui-bridge/sdk/control/element/{id}/capture",
+    // A stored component baseline IS a capture (state and props included);
+    // the POST also writes it to disk.
+    "GET /ui-bridge/vision/component-baseline",
+    "POST /ui-bridge/vision/component-baseline",
+    // `matches_isolated_render` in an assert reads stored baselines and
+    // fetches in-situ captures (props too, from the webview or a signed
+    // phone), and a props finding carries both prop values in its detail: the
+    // same data as the doors above, so the assert route is one too.
+    "POST /ui-bridge/vision/assert",
     "GET /sessions/{id}/transcript",
     // Returns the pre-edit snapshot text AND the current on-disk text of every
     // file a session touched — local source content, the same class as the
