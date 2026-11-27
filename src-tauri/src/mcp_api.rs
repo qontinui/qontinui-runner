@@ -6269,6 +6269,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Plan 2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy
     // Phase 3: the agent upstream-adopt (identical body, latest publication only).
     "coord_adopt_upstream_prompt_document",
+    // The operator's agent-action exception list, read-only (coord plan
+    // `2026-11-27-every-action-is-agent-performable-unless-on-the-operator-exception-list`
+    // Phase 2).
+    "coord_agent_action_exceptions",
     "coord_agent_registry_effective",
     // Plan 2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type
     // Phase 4: admits the report the agent-spawn guard hook is to send (plan
