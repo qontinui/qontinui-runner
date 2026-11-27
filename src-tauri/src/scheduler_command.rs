@@ -1187,7 +1187,12 @@ mod tests {
             // The probe plays a runner that leads its own process group.
             cmd.process_group(0);
         }
-        let mut probe = cmd.spawn().expect("re-exec the test binary");
+        // Every exit from this test — a pass or any panic below — ends the
+        // probe and both children it reported (`Cleanup`'s Drop).
+        let mut cleanup = Cleanup {
+            probe: Some(cmd.spawn().expect("re-exec the test binary")),
+            pids: Vec::new(),
+        };
 
         // The probe plays a runner a supervisor started: inside the
         // supervisor's job shape. It waits for `go`, so it has spawned
@@ -1197,7 +1202,7 @@ mod tests {
             let outer = qontinui_runner_win32::holder_spawn::OuterKillOnCloseJob::create(true)
                 .expect("a supervisor-shaped outer job");
             outer
-                .assign(&probe)
+                .assign(cleanup.probe.as_ref().unwrap())
                 .expect("assign the probe to the outer job");
             outer
         };
@@ -1207,7 +1212,6 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while !pids_path.exists() {
             if let Ok(e) = std::fs::read_to_string(dir.path().join("error")) {
-                let _ = probe.kill();
                 #[cfg(windows)]
                 if e.starts_with("detach refused")
                     && qontinui_runner_win32::holder_spawn::current_process_in_job()
@@ -1216,8 +1220,18 @@ mod tests {
                     // This test process itself sits in a job that forbids
                     // breakaway (some CI hosts), so the probe inherits it and
                     // nothing it starts can break away; the launch refused
-                    // loudly, as designed.
-                    eprintln!("skipped: the test host's own job forbids breakaway: {e}");
+                    // loudly, as designed. That proves nothing about detach,
+                    // so it FAILS unless the host is explicitly declared one.
+                    assert!(
+                        std::env::var(ALLOW_NO_BREAKAWAY_ENV).as_deref() == Ok("1"),
+                        "this test host's own job forbids breakaway, so detach cannot be \
+                         tested here ({e}). Set {ALLOW_NO_BREAKAWAY_ENV}=1 to accept that \
+                         on this host."
+                    );
+                    eprintln!(
+                        "skipped under {ALLOW_NO_BREAKAWAY_ENV}=1: the host's job forbids \
+                         breakaway: {e}"
+                    );
                     return;
                 }
                 panic!("the detached launch failed in the probe: {e}");
@@ -1231,26 +1245,65 @@ mod tests {
         let pids = std::fs::read_to_string(&pids_path).unwrap();
         let (detached, plain) = pids.trim().split_once(' ').expect("two pids");
         let (detached, plain): (i32, i32) = (detached.parse().unwrap(), plain.parse().unwrap());
+        cleanup.pids = vec![detached, plain];
         assert!(alive(detached) && alive(plain), "both children start alive");
 
         // The runner's grouping ends.
         #[cfg(unix)]
         // SAFETY: the probe leads its own group (process_group(0) above).
         unsafe {
-            libc::killpg(probe.id() as i32, libc::SIGKILL);
+            libc::killpg(cleanup.probe.as_ref().unwrap().id() as i32, libc::SIGKILL);
         }
         #[cfg(windows)]
         drop(outer);
-        let _ = probe.wait();
+        // The probe itself must have been killed by that, well inside its own
+        // 120 s wait.
+        let probe = cleanup.probe.as_mut().unwrap();
+        let probe_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let probe_ended = loop {
+            match probe.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if std::time::Instant::now() < probe_deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                _ => break false,
+            }
+        };
+        assert!(
+            probe_ended,
+            "the probe outlived the end of its own grouping (group kill / outer job close)"
+        );
 
         let plain_gone = wait_gone(plain, Duration::from_secs(15));
         let detached_alive = alive(detached);
-        kill_pid(detached);
-        kill_pid(plain);
         assert!(
             plain_gone,
             "the non-detached child survived its runner's end"
         );
         assert!(detached_alive, "the detached child died with its runner");
+    }
+
+    /// The opt-out for [`a_detached_child_outlives_the_runners_group_or_job_and_one_left_in_it_does_not`]
+    /// on a Windows host whose OWN job forbids breakaway.
+    #[cfg(windows)]
+    const ALLOW_NO_BREAKAWAY_ENV: &str = "QONTINUI_TEST_ALLOW_NO_BREAKAWAY";
+
+    /// Kills the probe and every child it reported when the test ends, pass or
+    /// panic, so a failing run leaves no 120 s sleeper behind.
+    struct Cleanup {
+        probe: Option<std::process::Child>,
+        pids: Vec<i32>,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(mut probe) = self.probe.take() {
+                let _ = probe.kill();
+                let _ = probe.wait();
+            }
+            for pid in self.pids.drain(..) {
+                kill_pid(pid);
+            }
+        }
     }
 }

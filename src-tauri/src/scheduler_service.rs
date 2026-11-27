@@ -932,12 +932,26 @@ impl SchedulerService {
                     .await;
                 return;
             }
-            ScheduledTaskType::Command { .. } => {
+            ScheduledTaskType::Command {
+                program,
+                args,
+                working_directory,
+                timeout_seconds,
+                output,
+                detach,
+            } => {
                 // Plan `2026-09-13-move-fleet-scheduling-into-qontinui` Phase 2:
                 // exec the argv in-binary on THIS async arm, so a long command
                 // never stalls the tick's serial walk of due tasks.
-                let spec = crate::scheduler_command::CommandSpec::from_task(&task_name, &task.task)
-                    .expect("a Command task yields a CommandSpec");
+                let spec = crate::scheduler_command::CommandSpec {
+                    task_name: task_name.clone(),
+                    program: program.clone(),
+                    args: args.clone(),
+                    working_directory: working_directory.clone(),
+                    timeout: crate::scheduler_command::effective_timeout(*timeout_seconds),
+                    output: *output,
+                    detach: *detach,
+                };
                 self.clone()
                     .launch_and_await_command(
                         task_id,
@@ -5850,6 +5864,10 @@ mod command_task_tests {
         let marker = dir.path().join("ran");
         let mut task = command_task("denied", "touch", &[&marker.display().to_string()]);
         task.auto_fix_on_failure = true;
+        // A backoff base this large makes a backoff, had one been applied,
+        // land at the 24 h cap — far past the task's own 6 h interval — so
+        // the next_run bounds below can tell the two apart.
+        task.launch_failure_backoff_seconds = 7 * 86_400;
         pg.insert_scheduled_task(&task).await.unwrap();
 
         let mut strict = crate::security::SecurityPolicy::permissive();
@@ -5892,13 +5910,17 @@ mod command_task_tests {
             stored.consecutive_launch_failures, 0,
             "a denial is no launch-failure streak"
         );
-        // The task's own 6-hourly cadence, not a backoff pushed past it.
+        // The task's own 6-hourly cadence (now + 6 h), not the 24 h backoff
+        // the large base above would have produced.
         let next = DateTime::parse_from_rfc3339(stored.next_run.as_deref().expect("next_run"))
             .unwrap()
             .with_timezone(&Utc);
+        let after = Utc::now();
         assert!(
-            next <= before + chrono::Duration::seconds(21600 + 60),
-            "next_run {next} is past the task's own interval"
+            next >= before + chrono::Duration::seconds(21600 - 60)
+                && next <= after + chrono::Duration::seconds(21600 + 60),
+            "next_run {next} is not the task's own 6 h cadence from {before}..{after} \
+             (a launch-failure backoff would put it ~24 h out)"
         );
 
         // And by construction: the denial path never reaches either lever.

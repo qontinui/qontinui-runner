@@ -8,6 +8,7 @@ import { Clock, CheckCircle, XCircle, SkipForward, Loader2, AlertTriangle } from
 import type { ScheduledTask, TaskExecutionRecord } from "../../types/scheduler";
 import { getStatusColor } from "../../types/scheduler";
 import { getAccentColors, getStatusColors } from "@/design-system";
+import { historyMessage } from "./historyMessageHelpers";
 
 interface SchedulerHistoryProps {
   tasks: ScheduledTask[];
@@ -183,11 +184,22 @@ export function SchedulerHistory({
                         <div>Ended: {new Date(record.endedAt).toLocaleString()}</div>
                       )}
                     </div>
-                    {record.errorMessage && (
-                      <div className="mt-2 text-sm text-destructive whitespace-pre-wrap break-words">
-                        Error: {record.errorMessage}
-                      </div>
-                    )}
+                    {(() => {
+                      const message = historyMessage(record);
+                      return (
+                        message && (
+                          <div
+                            className={`mt-2 text-sm whitespace-pre-wrap break-words ${
+                              message.tone === "error"
+                                ? "text-destructive"
+                                : "text-muted-foreground"
+                            }`}
+                          >
+                            {message.label}: {message.text}
+                          </div>
+                        )
+                      );
+                    })()}
                     {record.sessionId && (
                       <div className="mt-2 text-xs text-muted-foreground">
                         Session: {record.sessionId}
