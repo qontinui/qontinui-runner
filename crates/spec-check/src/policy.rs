@@ -249,8 +249,10 @@ fn evaluate_rule(
         }
 
         ConjunctRule::MaxFailures { count } => {
-            // MaxFailures is meaningful even on empty scope (0 failures
-            // trivially ≤ count), so no indeterminate here.
+            // An EMPTY scope is not indeterminate here, unlike `AllPass` and
+            // `FailureRateBelow`: it passes vacuously (0 failures ≤ count,
+            // with no unknown to straddle the limit). A non-empty scope is
+            // `Indeterminate` when the unknowns could break the limit.
             let tally = VerdictTally::of(scope);
             let max = *count as usize;
             if tally.failed > max {
