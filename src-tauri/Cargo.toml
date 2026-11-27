@@ -160,7 +160,7 @@ qontinui-db = { path = "./clorinde" }
 # `bundled` embeds the PG archive at COMPILE time — no runtime download, offline
 # first run. Provisioning only; the tokio-postgres/clorinde query layer above is
 # unchanged. Version resolves via the POSTGRESQL_VERSION build env, which is
-# PINNED in src-tauri/.cargo/config.toml. Unset, it floats to upstream's newest
+# PINNED in the repo-root .cargo/config.toml. Unset, it floats to upstream's newest
 # release (see that file for why it must not); keep it consistent across builds
 # for on-disk cluster compatibility.
 postgresql_embedded = { version = "0.20.2", features = ["bundled"] }

@@ -15,6 +15,10 @@ fn main() {
     // own), i.e. a binary that compiles and then panics on startup.
     guard_tokio_console_cfg();
 
+    // Refuse a build whose environment does not carry the bundled PostgreSQL
+    // pin from the repo-root `.cargo/config.toml` -- see the function.
+    guard_bundled_postgres_pin();
+
     // `cfg(coord_egress_sibling)`: a sibling qontinui-coord checkout declares
     // `EGRESS_DOMAINS`, so the runner's egress drift test can run (and fail)
     // instead of being reported as an UNKNOWN-ignored test.
@@ -925,6 +929,104 @@ fn guard_tokio_console_cfg() {
     );
 }
 
+/// The repo-root `.cargo/config.toml`, which holds the bundled PostgreSQL pin.
+const ROOT_CARGO_CONFIG: &str = include_str!("../.cargo/config.toml");
+
+/// Refuse to build when `POSTGRESQL_VERSION` -- which `postgresql_embedded`'s
+/// `bundled` build script reads to choose the release it embeds -- is not the
+/// pin in the repo-root `.cargo/config.toml`.
+///
+/// Cargo applies that file's `[env]` only to runs started inside the repo. A
+/// run started elsewhere (`cargo build --manifest-path <repo>/src-tauri/Cargo.toml`)
+/// reads no file there, so the variable is unset and the crate embeds upstream's
+/// NEWEST release. On 2026-11-24 a primary runner built from outside
+/// `src-tauri/` (where the pin then lived) embedded PG 19.0.0, could not start its
+/// PG 18 cluster, and booted without a database for over a day. Both build
+/// scripts see the same cargo-provided environment, so this proves which release
+/// the crate was ASKED for. It does not prove what it embeds: the crate's build
+/// script keeps an archive already in its OUT_DIR, so a warm target dir can
+/// still embed an older choice. `embedded_pg::bootstrap` compares the embedded
+/// release with this pin at runtime, and `scripts/ci/purge-stale-bundled-postgres.mjs`
+/// drops such OUT_DIRs.
+fn guard_bundled_postgres_pin() {
+    println!("cargo:rerun-if-env-changed=POSTGRESQL_VERSION");
+    println!("cargo:rerun-if-changed=../.cargo/config.toml");
+    let env = std::env::var("POSTGRESQL_VERSION").ok();
+    match bundled_postgres_pin_verdict(pinned_postgres_version(ROOT_CARGO_CONFIG), env.as_deref()) {
+        Ok(None) => {}
+        Ok(Some(warning)) => println!("cargo:warning={warning}"),
+        Err(reason) => panic!(
+            "\n\nqontinui-runner: {reason}\n\n\
+             Start cargo inside the qontinui-runner checkout (its .cargo/config.toml \
+             sets the pin), or export the pin yourself, e.g.\n\
+             \x20   POSTGRESQL_VERSION='=18.6.0' cargo build --manifest-path ...\n\n\
+             A runner that embeds another PostgreSQL major cannot open an existing \
+             cluster's data dir.\n"
+        ),
+    }
+}
+
+/// The `"=X.Y.Z"` value of the `POSTGRESQL_VERSION = "..."` line in a cargo
+/// config, or `None` when there is no such line.
+fn pinned_postgres_version(config_toml: &str) -> Option<&str> {
+    config_toml.lines().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix("POSTGRESQL_VERSION")?
+            .trim_start()
+            .strip_prefix('=')?
+            .trim();
+        value.strip_prefix('"')?.split('"').next()
+    })
+}
+
+/// The major of an exact `=X.Y.Z` requirement.
+fn exact_requirement_major(req: &str) -> Option<u64> {
+    let rest = req.trim().strip_prefix('=')?.trim();
+    let mut parts = rest.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let exact = parts.count() == 2 && rest.split('.').all(|p| p.parse::<u64>().is_ok());
+    exact.then_some(major)
+}
+
+/// Pure verdict for [`guard_bundled_postgres_pin`]: `Err` refuses the build,
+/// `Ok(Some)` builds with a warning, `Ok(None)` is the pinned build.
+fn bundled_postgres_pin_verdict(
+    pinned: Option<&str>,
+    env: Option<&str>,
+) -> Result<Option<String>, String> {
+    let pinned = pinned.ok_or_else(|| {
+        "the repo-root .cargo/config.toml has no POSTGRESQL_VERSION = \"=X.Y.Z\" pin".to_string()
+    })?;
+    let pinned_major = exact_requirement_major(pinned).ok_or_else(|| {
+        format!("the repo-root .cargo/config.toml pins POSTGRESQL_VERSION = {pinned:?}, not an exact =X.Y.Z")
+    })?;
+    let env = match env.map(str::trim) {
+        None | Some("") => {
+            return Err(format!(
+                "POSTGRESQL_VERSION is not set, so postgresql_embedded would embed upstream's \
+                 newest PostgreSQL instead of the pinned {pinned}. Cargo did not read the \
+                 repo-root .cargo/config.toml (it was started outside the repo)"
+            ))
+        }
+        Some(v) => v,
+    };
+    if env == pinned {
+        return Ok(None);
+    }
+    match exact_requirement_major(env) {
+        Some(m) if m == pinned_major => Ok(Some(format!(
+            "POSTGRESQL_VERSION={env} overrides the pinned {pinned} (same major)"
+        ))),
+        Some(_) => Err(format!(
+            "POSTGRESQL_VERSION={env} is a different major than the pinned {pinned}"
+        )),
+        None => Err(format!(
+            "POSTGRESQL_VERSION={env:?} is not an exact =X.Y.Z requirement (pinned: {pinned})"
+        )),
+    }
+}
+
 /// Does the build actually carry `--cfg tokio_unstable`?
 ///
 /// Pure — a function of the two environment strings alone — so the parsing this
@@ -1559,6 +1661,50 @@ mod tests {
             None,
             Some("  --cfg   tokio_unstable  ")
         ));
+    }
+}
+
+#[cfg(test)]
+mod bundled_postgres_pin_tests {
+    use super::*;
+
+    #[test]
+    fn the_root_config_carries_an_exact_pin() {
+        let pin = pinned_postgres_version(ROOT_CARGO_CONFIG).expect("pin line");
+        assert!(exact_requirement_major(pin).is_some(), "{pin}");
+    }
+
+    #[test]
+    fn an_unset_or_blank_pin_is_refused() {
+        for env in [None, Some(""), Some("  ")] {
+            let err = bundled_postgres_pin_verdict(Some("=18.6.0"), env).unwrap_err();
+            assert!(err.contains("not set"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_pinned_value_builds_silently() {
+        assert_eq!(
+            bundled_postgres_pin_verdict(Some("=18.6.0"), Some("=18.6.0")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_same_major_override_warns_and_a_major_change_or_float_refuses() {
+        assert!(matches!(
+            bundled_postgres_pin_verdict(Some("=18.6.0"), Some("=18.5.0")),
+            Ok(Some(_))
+        ));
+        assert!(bundled_postgres_pin_verdict(Some("=18.6.0"), Some("=19.0.0")).is_err());
+        assert!(bundled_postgres_pin_verdict(Some("=18.6.0"), Some("*")).is_err());
+        assert!(bundled_postgres_pin_verdict(Some("=18.6.0"), Some("18")).is_err());
+    }
+
+    #[test]
+    fn a_missing_or_inexact_pin_is_refused() {
+        assert!(bundled_postgres_pin_verdict(None, Some("=18.6.0")).is_err());
+        assert!(bundled_postgres_pin_verdict(Some("18.6"), Some("=18.6.0")).is_err());
     }
 }
 

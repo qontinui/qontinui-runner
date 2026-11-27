@@ -699,6 +699,134 @@ fn release_without_stopping(handle: PostgreSQL) {
     std::mem::forget(handle);
 }
 
+/// The major version of the initialized cluster in `data_dir`, read from the
+/// `PG_VERSION` file `initdb` writes; `None` when the cluster is not
+/// initialized or the file does not parse.
+fn read_cluster_major(data_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(data_dir.join("PG_VERSION"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Every release already extracted under `install_root` (`pg-install/<X.Y.Z>/bin`).
+fn installed_releases(install_root: &Path) -> Vec<postgresql_embedded::Version> {
+    let Ok(entries) = std::fs::read_dir(install_root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("bin").is_dir())
+        .filter_map(|e| postgresql_embedded::Version::parse(&e.file_name().to_string_lossy()).ok())
+        .collect()
+}
+
+/// Which release must serve a cluster of major `cluster_major`, given the
+/// bundled requirement and the releases already installed.
+///
+/// `Ok(None)`: the bundled release is the cluster's major (the normal case).
+/// `Ok(Some(req))`: it is not, and `req` pins the newest installed release of
+/// the cluster's major. `Err`: it is not, and no such release is installed.
+///
+/// A server of another major cannot open the cluster at all: PG 19's `pg_ctl`
+/// reads a PG 18 control file as "control file appears to be corrupt", and its
+/// `postgres` rejects settings the older `postgresql.conf` holds. On
+/// 2026-11-24 a build whose `POSTGRESQL_VERSION` pin was not applied bundled
+/// PG 19.0.0; it extracted that release next to the cluster's 18.6.0 and booted
+/// the runner on device bcf4751a without its database for over a day. A major
+/// upgrade needs `pg_upgrade`, which this module does not do. So the runner
+/// prefers the matching release that is still on disk, and otherwise refuses
+/// before it extracts or starts anything.
+fn cluster_compatible_requirement(
+    cluster_major: u64,
+    bundled: &postgresql_embedded::VersionReq,
+    installed: &[postgresql_embedded::Version],
+) -> Result<Option<postgresql_embedded::VersionReq>, String> {
+    let Some(bundled_major) = bundled.comparators.first().map(|c| c.major) else {
+        return Ok(None);
+    };
+    if bundled_major == cluster_major {
+        return Ok(None);
+    }
+    let best = installed
+        .iter()
+        .filter(|v| v.major == cluster_major)
+        .max()
+        .ok_or_else(|| {
+            format!(
+                "the embedded cluster is PostgreSQL {cluster_major}, but this runner bundles \
+                 PostgreSQL {bundled} and no PostgreSQL {cluster_major} release is installed. \
+                 A server of another major version cannot open the cluster, and a major \
+                 upgrade needs pg_upgrade. Run a runner build that bundles PostgreSQL \
+                 {cluster_major} (POSTGRESQL_VERSION in .cargo/config.toml)"
+            )
+        })?;
+    postgresql_embedded::VersionReq::parse(&format!("={best}"))
+        .map(Some)
+        .map_err(|e| format!("cannot pin installed PostgreSQL {best}: {e}"))
+}
+
+/// The `POSTGRESQL_VERSION` pin this crate was COMPILED under. Cargo's `[env]`
+/// reaches rustc as well as build scripts, so this is the pin the build asked
+/// `postgresql_embedded` for.
+const BUILD_POSTGRES_PIN: Option<&str> = option_env!("POSTGRESQL_VERSION");
+
+/// Compare the release the binary actually embeds with the pin it was built
+/// under. They can differ even when the build-time guard in `build.rs` passed:
+/// the crate's build script keeps an archive already in a warm OUT_DIR.
+///
+/// `Err` only when a FRESH cluster would be initialized by a release of
+/// another major than the pin. That would create a cluster no correctly pinned
+/// build can open. An existing cluster is protected by
+/// [`select_cluster_compatible_install`] instead, so a mismatch there is only a
+/// warning (`Ok(Some)`).
+fn embedded_release_verdict(
+    pin: Option<&str>,
+    embedded: &postgresql_embedded::VersionReq,
+    cluster_initialized: bool,
+) -> Result<Option<String>, String> {
+    let embedded_str = embedded.to_string();
+    let Some(pin) = pin.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(Some(format!(
+            "this runner was built without a POSTGRESQL_VERSION pin; it embeds PostgreSQL {embedded_str}"
+        )));
+    };
+    if pin == embedded_str {
+        return Ok(None);
+    }
+    let pin_major = postgresql_embedded::VersionReq::parse(pin)
+        .ok()
+        .and_then(|r| r.comparators.first().map(|c| c.major));
+    let embedded_major = embedded.comparators.first().map(|c| c.major);
+    if !cluster_initialized && pin_major.is_some() && pin_major != embedded_major {
+        return Err(format!(
+            "this runner embeds PostgreSQL {embedded_str} but was built under the pin {pin}; \
+             refusing to initialize a new cluster with another major. Rebuild after running \
+             `node scripts/ci/purge-stale-bundled-postgres.mjs <target-dir>`"
+        ));
+    }
+    Ok(Some(format!(
+        "this runner embeds PostgreSQL {embedded_str} but was built under the pin {pin} \
+         (a stale postgresql_embedded OUT_DIR)"
+    )))
+}
+
+/// [`cluster_compatible_requirement`] applied to `settings`' data and install dirs.
+/// An uninitialized data dir has no major yet, so it takes the bundled release.
+fn select_cluster_compatible_install(
+    settings: &Settings,
+) -> Result<Option<postgresql_embedded::VersionReq>, String> {
+    let Some(major) = read_cluster_major(&settings.data_dir) else {
+        return Ok(None);
+    };
+    cluster_compatible_requirement(
+        major,
+        &settings.version,
+        &installed_releases(&settings.installation_dir),
+    )
+}
+
 /// Boot a managed PostgreSQL under `data_root`, provision the cluster on first
 /// run, ensure `db_name` exists, and return the running handle + connection URL.
 ///
@@ -848,6 +976,29 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
                 ));
             }
         }
+    }
+
+    // Never start a server of a different MAJOR than the cluster on disk, and
+    // never initialize a new cluster with a release the build pin did not ask
+    // for. See [`embedded_release_verdict`] and [`select_cluster_compatible_install`].
+    if let Some(warning) = embedded_release_verdict(
+        BUILD_POSTGRES_PIN,
+        &settings.version,
+        read_cluster_major(&settings.data_dir).is_some() || cluster_initialized,
+    )? {
+        tracing::warn!("embedded Postgres: {warning}");
+    }
+    if let Some(req) = select_cluster_compatible_install(&settings)? {
+        tracing::warn!(
+            "embedded Postgres: this binary bundles PostgreSQL {} but the cluster at {} \
+             is major {}; using the already-installed release {req} instead",
+            settings.version,
+            settings.data_dir.display(),
+            read_cluster_major(&settings.data_dir)
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        );
+        settings.version = req;
     }
 
     // Build the URL before `settings` is moved into `PostgreSQL::new`. The port
@@ -1226,7 +1377,7 @@ mod tests {
     // ---- Bundled PostgreSQL release pin ----
 
     /// The exact requirement `POSTGRESQL_VERSION = "=X.Y.Z"` declares in
-    /// `src-tauri/.cargo/config.toml`, or `None` when no such line exists.
+    /// the repo-root `.cargo/config.toml`, or `None` when no such line exists.
     fn pinned_postgres_requirement(config_toml: &str) -> Option<&str> {
         config_toml.lines().find_map(|line| {
             let value = line
@@ -1250,8 +1401,8 @@ mod tests {
     /// release the pin no longer names.
     #[test]
     fn bundled_postgres_is_the_pinned_release() {
-        let pin = pinned_postgres_requirement(include_str!("../.cargo/config.toml"))
-            .expect("src-tauri/.cargo/config.toml must pin POSTGRESQL_VERSION = \"=X.Y.Z\"");
+        let pin = pinned_postgres_requirement(include_str!("../../.cargo/config.toml"))
+            .expect("the repo-root .cargo/config.toml must pin POSTGRESQL_VERSION = \"=X.Y.Z\"");
         assert!(
             pin.starts_with('=') && pin.matches('.').count() == 2,
             "POSTGRESQL_VERSION must be an exact `=X.Y.Z` requirement, got {pin:?}"
@@ -1263,6 +1414,104 @@ mod tests {
              POSTGRESQL_VERSION is set in the build environment (it overrides the \
              [env] pin), or a stale postgresql_embedded OUT_DIR survived a pin change: \
              run `node scripts/ci/purge-stale-bundled-postgres.mjs <target-dir>` and rebuild"
+        );
+    }
+
+    fn req(s: &str) -> postgresql_embedded::VersionReq {
+        postgresql_embedded::VersionReq::parse(s).unwrap()
+    }
+
+    fn ver(s: &str) -> postgresql_embedded::Version {
+        postgresql_embedded::Version::parse(s).unwrap()
+    }
+
+    /// The 2026-11-24 bcf4751a shape: the binary bundles 19.0.0, the cluster
+    /// is 18, and 18.6.0 is still extracted beside it. The runner must serve
+    /// the cluster with 18.6.0, never start 19 against it.
+    #[test]
+    fn a_cluster_of_another_major_is_served_by_its_installed_release() {
+        let picked = cluster_compatible_requirement(
+            18,
+            &req("=19.0.0"),
+            &[ver("19.0.0"), ver("18.5.0"), ver("18.6.0")],
+        )
+        .unwrap();
+        assert_eq!(picked, Some(req("=18.6.0")));
+    }
+
+    #[test]
+    fn a_cluster_of_another_major_with_no_matching_release_is_refused() {
+        let err =
+            cluster_compatible_requirement(18, &req("=19.0.0"), &[ver("19.0.0")]).unwrap_err();
+        assert!(err.contains("PostgreSQL 18"), "{err}");
+        assert!(err.contains("pg_upgrade"), "{err}");
+    }
+
+    #[test]
+    fn a_stale_embedded_release_of_another_major_never_initializes_a_cluster() {
+        assert!(embedded_release_verdict(Some("=18.6.0"), &req("=19.0.0"), false).is_err());
+        // An existing cluster is the major guard's job: warn only.
+        assert!(matches!(
+            embedded_release_verdict(Some("=18.6.0"), &req("=19.0.0"), true),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            embedded_release_verdict(Some("=18.6.0"), &req("=18.5.0"), false),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            embedded_release_verdict(None, &req("=19.0.0"), false),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            embedded_release_verdict(Some("=18.6.0"), &req("=18.6.0"), false),
+            Ok(None)
+        );
+    }
+
+    /// This build's compile-time pin is the one the repo-root config declares.
+    #[test]
+    fn the_compiled_pin_is_the_root_config_pin() {
+        assert_eq!(
+            BUILD_POSTGRES_PIN,
+            pinned_postgres_requirement(include_str!("../../.cargo/config.toml"))
+        );
+    }
+
+    #[test]
+    fn a_cluster_of_the_bundled_major_keeps_the_bundled_release() {
+        assert_eq!(
+            cluster_compatible_requirement(18, &req("=18.6.0"), &[ver("18.5.0")]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_cluster_major_and_installed_releases_are_read_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("pg-data");
+        let install = root.path().join("pg-install");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(install.join("18.6.0/bin")).unwrap();
+        std::fs::create_dir_all(install.join("19.0.0/bin")).unwrap();
+        // A dir with no bin/ is a half-extracted release, not an install.
+        std::fs::create_dir_all(install.join("17.0.0")).unwrap();
+        assert_eq!(read_cluster_major(&data), None);
+        std::fs::write(data.join("PG_VERSION"), "18\n").unwrap();
+        assert_eq!(read_cluster_major(&data), Some(18));
+        let mut found = installed_releases(&install);
+        found.sort();
+        assert_eq!(found, vec![ver("18.6.0"), ver("19.0.0")]);
+
+        let settings = Settings {
+            installation_dir: install,
+            data_dir: data,
+            version: req("=19.0.0"),
+            ..Settings::default()
+        };
+        assert_eq!(
+            select_cluster_compatible_install(&settings).unwrap(),
+            Some(req("=18.6.0"))
         );
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Drop cached `postgresql_embedded` build units whose embedded PostgreSQL
-// release is not the one pinned in src-tauri/.cargo/config.toml
+// release is not the one pinned in the repo-root .cargo/config.toml
 // (POSTGRESQL_VERSION).
 //
 // WHY: the crate's `bundled` build script returns early when its OUT_DIR
@@ -25,7 +25,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const config = join(root, "src-tauri", ".cargo", "config.toml");
+const config = join(root, ".cargo", "config.toml");
 const target = resolve(process.argv[2] || process.env.CARGO_TARGET_DIR || join(root, "target"));
 
 const pinLine = readFileSync(config, "utf8")
