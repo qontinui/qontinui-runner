@@ -1731,12 +1731,22 @@ impl TerminalSession {
         // `Ok(())`; below the critical floor it returns the typed refusal that
         // `src/lib/resourceGuard.ts` turns into the "Start anyway" dialog. Any
         // unreadable sensor proceeds silently.
-        crate::resource_guard::admit_spawn(
+        // `admit_spawn_observed` keeps the refusal's observation, so an
+        // unattended caller (the gate continuation) can stamp the lane's real
+        // numbers; the text is `admit_spawn`'s, byte for byte.
+        crate::resource_guard::admit_spawn_observed(
             "terminal session",
             resource_override,
             Some(&app_handle),
         )
-        .map_err(SpawnFailure::before_child)?;
+        .map_err(|refusal| {
+            SpawnFailure::before_child(refusal.message).with_cause(Some(
+                super::spawn_refusal::SpawnSeamCause::ResourceGuard {
+                    severity: "critical",
+                    observation: refusal.observation,
+                },
+            ))
+        })?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
         // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
@@ -1977,10 +1987,28 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
+        //
+        // A LOCAL exec failure keeps its text verbatim and gains a typed cause
+        // only when the exec predicate names one for the argv's own program
+        // (see `exec_failure_cause`). The holder arm gains none: its failures
+        // include refusals that are not exec failures at all (a holder still
+        // running its command), where re-probing a program an auto-update has
+        // just renamed aside would misread a live child as an unlaunchable CLI.
+        let program: Option<String> = spawn_argv.first().cloned();
+        let exec_cause = || {
+            super::spawn_refusal::exec_failure_cause(
+                program.as_deref(),
+                &super::pane_io::probe_launchable,
+            )
+        };
         let sealed = ScrubbedCommand::seal(cmd);
         let io: Arc<dyn PaneIo> = match opened {
             // A local spawn that fails started no child.
-            Some(opened) => Arc::new(opened.spawn(sealed).map_err(SpawnFailure::before_child)?),
+            Some(opened) => Arc::new(
+                opened
+                    .spawn(sealed)
+                    .map_err(|m| SpawnFailure::before_child(m).with_cause(exec_cause()))?,
+            ),
             // A holder failure has already been through the holder AND its
             // in-process fallback; a holder process may have started before
             // its attach was refused, so it is not proven child-free.

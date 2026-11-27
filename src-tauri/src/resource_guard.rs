@@ -2852,6 +2852,31 @@ pub(crate) fn admit_spawn(
     resource_override: bool,
     app: Option<&AppHandle>,
 ) -> Result<(), String> {
+    admit_spawn_observed(what, resource_override, app).map_err(|refusal| refusal.message)
+}
+
+/// An un-overridden CRITICAL refusal from [`admit_spawn_observed`]: the exact
+/// text [`admit_spawn`] returns, beside the observation that produced it.
+///
+/// The observation travels with the text so an unattended caller can classify
+/// the refusal STRUCTURALLY — which lane, what reading, against what limit —
+/// instead of parsing the operator-facing sentence back apart (plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CriticalRefusal {
+    /// [`CRITICAL_REFUSAL_PREFIX`]-tagged, byte-identical to [`admit_spawn`]'s.
+    pub(crate) message: String,
+    pub(crate) observation: GateObservation,
+}
+
+/// [`admit_spawn`] with the refusal kept typed. Same verdict, same notices,
+/// same log lines — `admit_spawn` is this function with the observation
+/// dropped.
+pub(crate) fn admit_spawn_observed(
+    what: &str,
+    resource_override: bool,
+    app: Option<&AppHandle>,
+) -> Result<(), CriticalRefusal> {
     match probe_for_spawn() {
         SpawnGate::Proceed => Ok(()),
         SpawnGate::Warn(observation) => {
@@ -2896,7 +2921,10 @@ pub(crate) fn admit_spawn(
                 what = %what,
                 "resource_guard: refusing to spawn past the session critical limit"
             );
-            Err(critical_refusal(what, &observation))
+            Err(CriticalRefusal {
+                message: critical_refusal(what, &observation),
+                observation,
+            })
         }
     }
 }

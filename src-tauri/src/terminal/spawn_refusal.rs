@@ -47,6 +47,35 @@ use serde_json::Value;
 pub(crate) struct SpawnFailure {
     pub(crate) child_started: bool,
     pub(crate) message: String,
+    /// The typed cause behind `message`, for the two refusals an unattended
+    /// caller may RETRY rather than record as a failure. `None` for every other
+    /// failure. Carried beside the text, never parsed out of it (see
+    /// [`SpawnSeamCause`]).
+    pub(crate) cause: Option<SpawnSeamCause>,
+}
+
+/// The typed cause of a [`SpawnFailure`], when the seam knows one.
+///
+/// Why a value beside the text rather than a parsed string: both causes are
+/// produced by runner code at the seam (the resource gate's CRITICAL refusal,
+/// and an exec whose program the exec predicate rejects), so they can be
+/// carried structurally, and the stamp an unattended caller posts needs the
+/// lane's numbers, which the operator-facing sentence does not carry in a
+/// parseable form. Plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnSeamCause {
+    /// [`crate::resource_guard::admit_spawn_observed`] refused at CRITICAL.
+    ResourceGuard {
+        severity: &'static str,
+        observation: crate::resource_guard::GateObservation,
+    },
+    /// The PTY child's ABSOLUTE program failed the exec seam's own predicate
+    /// ([`crate::terminal::pane_io::probe_launchable`]) after the spawn failed.
+    ProgramUnlaunchable {
+        program: String,
+        fault: crate::terminal::pane_io::ExecFault,
+    },
 }
 
 impl SpawnFailure {
@@ -55,6 +84,7 @@ impl SpawnFailure {
         Self {
             child_started: false,
             message: message.into(),
+            cause: None,
         }
     }
 
@@ -63,8 +93,43 @@ impl SpawnFailure {
         Self {
             child_started: true,
             message: message.into(),
+            cause: None,
         }
     }
+
+    /// The same failure with its typed cause attached. The text is unchanged.
+    pub(crate) fn with_cause(mut self, cause: Option<SpawnSeamCause>) -> Self {
+        self.cause = cause;
+        self
+    }
+}
+
+/// Classify an exec failure at the PTY seam. PURE over the injected probe so
+/// both arms are unit-testable without a real file.
+///
+/// Only an ABSOLUTE program is classified: that is the branch of
+/// `portable-pty`'s `search_path` that runs `access(X_OK)` and bails, and
+/// re-running the same predicate here names the SAME fault. A relative or
+/// bare program is searched on the child's PATH by the seam, so a failed
+/// probe of it relative to this process's cwd would name the wrong file — it
+/// keeps no cause. A probe that now PASSES (the file came back between the
+/// spawn and here) also keeps no cause: the failure is then unexplained, and
+/// an unexplained failure is recorded as one.
+pub(crate) fn exec_failure_cause(
+    program: Option<&str>,
+    probe: &dyn Fn(&std::path::Path) -> Result<(), crate::terminal::pane_io::ExecFault>,
+) -> Option<SpawnSeamCause> {
+    let program = program?;
+    let path = std::path::Path::new(program);
+    if !path.is_absolute() {
+        return None;
+    }
+    probe(path)
+        .err()
+        .map(|fault| SpawnSeamCause::ProgramUnlaunchable {
+            program: program.to_string(),
+            fault,
+        })
 }
 
 impl std::fmt::Display for SpawnFailure {

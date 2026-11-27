@@ -187,6 +187,7 @@ async fn refuse_headless(
                 f.agent_id,
                 &f.tree.to_string_lossy(),
                 "p",
+                &super::claude_bin_path(),
                 AnchorReservation::none(),
                 uuid::Uuid::new_v4(),
                 Some(f.ctx),
