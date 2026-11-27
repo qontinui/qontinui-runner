@@ -97,6 +97,7 @@ describe("toPtySequence — SDK descriptor array", () => {
     expect(toPtySequence([{ key: "ArrowLeft", modifiers: { ctrl: true } }])).toBe("\x1b[1;5D");
     // Shift+Up — bitmask 1 + 1 = 2.
     expect(toPtySequence([{ key: "ArrowUp", modifiers: { shift: true } }])).toBe("\x1b[1;2A");
+    expect(toPtySequence([{ key: "Tab", modifiers: { shift: true } }])).toBe("\x1b[Z");
   });
 
   it("emits the CSI-modified form for a tilde-terminated key", () => {
@@ -169,6 +170,15 @@ describe("toPtySequence — a malformed `modifiers` is REJECTED, never ignored (
     expect(() => toPtySequence([{ key: "c", modifiers: mods as never }])).toThrow(
       SEND_KEYS_INVALID,
     );
+  });
+
+  it("refuses a key named after an Object.prototype member, writing nothing", () => {
+    // These used to resolve to the inherited member, so `constructor` wrote
+    // "function Object() { [native code] }" into the PTY and reported success.
+    for (const key of ["constructor", "__proto__"]) {
+      expect(() => toPtySequence([key])).toThrow(/unknown key/);
+      expect(() => toPtySequence([{ key }])).toThrow(/unknown key/);
+    }
   });
 
   it("does NOT let an array's Array.prototype.shift read as Shift", () => {

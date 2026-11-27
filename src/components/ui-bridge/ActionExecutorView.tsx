@@ -40,7 +40,7 @@ interface ActionExecutorViewProps {
   disabled?: boolean;
 }
 
-interface ActionConfig {
+export interface ActionConfig {
   id: string;
   label: string;
   icon: React.ReactNode;
@@ -131,6 +131,67 @@ const SELECT_ACTIONS: ActionConfig[] = [
   },
 ];
 
+// `setValue` writes the value field's text straight into the element (the
+// SDK's `{ value }` param — the same field `select` reads). Since
+// `@qontinui/ui-bridge` 0.46 every auto-registered text input advertises it, so
+// the inspector offers it wherever it is advertised. With no advertised list the
+// kind fallback offers it on `input` / `textarea` only, beside `type`.
+const SET_VALUE_ACTION: ActionConfig = {
+  id: "setValue",
+  label: "Set Value",
+  icon: <Type className="w-4 h-4" />,
+  requiresParams: true,
+  paramType: "value",
+  description: "Set the element's value directly",
+};
+
+/** Every verb this view has a control for, each once. */
+const ALL_ACTIONS: ActionConfig[] = [
+  ...COMMON_ACTIONS,
+  ...INPUT_ACTIONS,
+  ...CHECKBOX_ACTIONS,
+  ...SELECT_ACTIONS,
+  SET_VALUE_ACTION,
+];
+
+/**
+ * The verbs to offer for an element, in this view's order.
+ *
+ * An element that advertises its verbs is offered each verb this view has a
+ * control for that it advertises, and no other. Since `@qontinui/ui-bridge`
+ * 0.46 every producer reads them from ONE table that also reads the node's
+ * structure (`core/element-kind.ts`), so the list is authoritative — a
+ * `<input role="combobox">` takes `type` AND `select`, which no switch on
+ * `type` would offer — and the runner refuses anything outside it anyway.
+ *
+ * With no advertised list, the kind decides.
+ */
+export function availableActionsFor(
+  element: Pick<UIBridgeElement, "type" | "actions">,
+): ActionConfig[] {
+  if (element.actions && element.actions.length > 0) {
+    const advertised = element.actions;
+    return ALL_ACTIONS.filter((a) => advertised.includes(a.id));
+  }
+
+  const actions: ActionConfig[] = [...COMMON_ACTIONS];
+  switch (element.type) {
+    case "input":
+    case "textarea":
+      actions.push(...INPUT_ACTIONS, SET_VALUE_ACTION);
+      break;
+    case "checkbox":
+    case "radio":
+      actions.push(...CHECKBOX_ACTIONS);
+      break;
+    case "select":
+    case "combobox":
+      actions.push(...SELECT_ACTIONS);
+      break;
+  }
+  return actions;
+}
+
 export function ActionExecutorView({
   element,
   onExecuteAction,
@@ -146,34 +207,10 @@ export function ActionExecutorView({
   const [valueParam, setValueParam] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // Get available actions based on element type
-  const getAvailableActions = useCallback((): ActionConfig[] => {
-    if (!element) return [];
-
-    const actions: ActionConfig[] = [...COMMON_ACTIONS];
-
-    // Add type-specific actions
-    switch (element.type) {
-      case "input":
-      case "textarea":
-        actions.push(...INPUT_ACTIONS);
-        break;
-      case "checkbox":
-      case "radio":
-        actions.push(...CHECKBOX_ACTIONS);
-        break;
-      case "select":
-        actions.push(...SELECT_ACTIONS);
-        break;
-    }
-
-    // Filter to only available actions if element specifies them
-    if (element.actions && element.actions.length > 0) {
-      return actions.filter((a) => element.actions!.includes(a.id));
-    }
-
-    return actions;
-  }, [element]);
+  const getAvailableActions = useCallback(
+    (): ActionConfig[] => (element ? availableActionsFor(element) : []),
+    [element],
+  );
 
   // Execute action
   const handleExecute = useCallback(
@@ -329,16 +366,16 @@ export function ActionExecutorView({
             </div>
           )}
 
-          {/* Value input for select action */}
+          {/* Value input for select / setValue */}
           {paramActions.some((a) => a.paramType === "value") && (
             <div className="mb-3">
-              <label className="text-xs text-muted-foreground mb-1 block">Option value:</label>
+              <label className="text-xs text-muted-foreground mb-1 block">Value:</label>
               <div className="flex gap-2">
                 <input
                   type="text"
                   value={valueParam}
                   onChange={(e) => setValueParam(e.target.value)}
-                  placeholder="Enter option value..."
+                  placeholder="Enter value..."
                   className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
                   disabled={disabled || executing}
                 />

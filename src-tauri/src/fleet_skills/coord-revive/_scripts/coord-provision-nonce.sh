@@ -551,9 +551,12 @@ resolve_loopback_key_file() {
 # The cwd binds the nonce to this session's workdir - it is how coord attributes
 # the session, so it is not decoration. Emit it as JSON with the reader that is
 # already present rather than hand-escaping.
-# The field is `tenant` - the runner's ProvisionSessionBody (qontinui-runner
-# mcp_api.rs) has no `tenant_id` and IGNORES unknown fields, so a `tenant_id`
-# key is dropped and the nonce silently mints for the machine's tenant.
+# The field is `tenant` - the one spelling every runner build with a selector
+# reads. ProvisionSessionBody (qontinui-runner mcp_api.rs) took `tenant_id` as an
+# alias and began REFUSING unknown fields only at 6b2346280 (400
+# COORD_MCP_PROVISION_INVALID_BODY); a build predating that IGNORES them, so a
+# `tenant_id` key is dropped there and the nonce silently mints for the machine's
+# tenant.
 # `tenant` rides only when --tenant was given, so a caller that names no
 # tenant sends the byte-identical `{cwd}` body every runner build understands.
 if [ "$JSON_READER" = "jq" ]; then

@@ -24,7 +24,7 @@
 # The process table cannot be stale and cannot be wedged. It is ground truth.
 #
 # THE SOURCE, PER OS (one normalized table, one classifier):
-#   linux    ps -eo pid=,ppid=,etime=,args=      (+ /proc/<pid>/environ, cwd)
+#   linux    ps -eo pid=,ppid=,etime=,args=      (+ /proc/<pid>/environ, cwd, fd/*)
 #   macos    ps -axo pid=,ppid=,etime=,args=
 #   windows  powershell -NoProfile, ONE pass emitting
 #            {Processes, Services, ServicesError}:
@@ -213,10 +213,17 @@
 #                name, origin, age_s, nested_under_agent, launched_by,
 #                ide_check (true | false on a build row, null otherwise),
 #                build_attribution (a non-IDE build row: {pid, name, cwd,
-#                manifest_path, target_dir, target_dir_source, env_read} of
-#                its build ROOT -- see build_attribution(); null otherwise),
-#                ancestry, account, cwd, idle_min, session_id, activity,
-#                activity_evidence}], activity:{status (ok |
+#                manifest_path, target_dir, target_dir_source, env_read,
+#                fd_session_ids ([{id, source (build_fd | shell_fd:<pid> |
+#                cwd)}], every distinct id), fd_session_id /
+#                fd_session_source (its first entry, or null)} of its build
+#                ROOT -- see build_attribution() and build_fd_sessions(); null
+#                otherwise),
+#                ancestry, account, cwd, idle_min, session_id,
+#                argv_session_id (a claude row's `--session-id`, else the
+#                uuid its `--resume`/`-r` names -- see argv_session_ids();
+#                else null),
+#                activity, activity_evidence}], activity:{status (ok |
 #                not_observable_on_this_os), counts:{working, idle, stale,
 #                unknown} over non-self agents, active_minutes,
 #                cpu_sample_seconds, cpu_floor_pct, cpu_sampled,
@@ -242,7 +249,7 @@
 #   SESSION_CENSUS_OS        linux | macos | windows   (default: uname)
 #   SESSION_CENSUS_PS_FILE   canned process table in that OS's source format
 #   SESSION_CENSUS_SELF_PID  self-walk start pid(s), in the table's pid space
-#   SESSION_CENSUS_PROC      a /proc root for the Linux environ/cwd reads
+#   SESSION_CENSUS_PROC      a /proc root for the Linux environ/cwd/cmdline reads
 #   SESSION_CENSUS_NOW       epoch seconds used as "now"
 #   SESSION_CENSUS_REGISTRY_DIRS  colon-separated session-record dirs (a fixture
 #                            run reads none unless this is set)
@@ -686,8 +693,165 @@ SCRATCH_SID_RE = re.compile(
 
 # `claude --session-id <uuid>` (how the runner spawns a session): a third
 # source for the id when the process has no record and no scratchpad fd.
+# Read as TOKENS where a cmdline exists (session_id_of_tokens, below), exactly
+# as the resume source is, so a prompt whose text names `--session-id <uuid>`
+# is not an id. ARGV_SID_RE is the flattened-text fallback for a pid with no
+# readable cmdline: there a Windows command line may quote the flag, the
+# value, or the pair as one token (`--session-id "<uuid>"`,
+# `"--session-id=<uuid>"`), and the optional `"`s accept each of those.
 ARGV_SID_RE = re.compile(
-    r"(?:^|\s)--session-id[\s=]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s|$)")
+    r'(?:^|\s)"?--session-id"?[\s=]+"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"?(?:\s|$)')
+
+# `claude --resume <uuid>` / `--resume=<uuid>` / `-r <uuid>` (how a session is
+# resumed, the runner's own resume door included): a FOURTH source, after the
+# record, the scratchpad fd and `--session-id`. Plan 2026-11-20-session-census-
+# ignores-resume-argv-so-a-resumed-runner-session-blocks-every-repo, Phase 1:
+# on nilan 2026-11-20, 29 of 29 live processes carrying `--resume <uuid>` had a
+# record whose sessionId EQUALS that uuid, so the resumed id is the live id
+# (coord finding a681bb81-8ff7-43a9-84fd-217a0a153836).
+# The rules are the fleet session roster's `argv_session` rules, uuid-only:
+# `--fork-session` ANYWHERE yields nothing (a fork takes a NEW id), a bare
+# `--resume` (the picker, or followed by the next flag) yields nothing, and a
+# value that is not a uuid yields nothing. The first resume flag decides.
+# TOKENS, not text (as the fleet successor probe does, coord finding 49b104c5): a
+# prompt whose TEXT carries `--resume <uuid>` is not a resume. So on Linux the
+# argv is <proc root>/<pid>/cmdline split on NUL; the flattened-text regex
+# below is used ONLY when no cmdline can be read for that pid (a ps fixture
+# with no cmdline file, macOS, Windows), where the text is all there is.
+# When the PROGRAM is node, both paths start AFTER the first
+# `.../claude-code/cli.js` token, so a node option before the script
+# (`node -r preload.js .../cli.js --resume <uuid>`; node's own `-r` is
+# --require) is never read as claude's `-r`. A native `claude` starts at 0, so
+# a prompt that merely NAMES cli.js cannot move the scan past a real --resume.
+# Both paths strip surrounding quotes from the value before the uuid match, and
+# the text path also accepts a quoted flag token (`"--resume=<uuid>"`,
+# `"--resume" "<uuid>"`), since a Windows command line quotes its arguments.
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+RESUME_FLAGS = ("--resume", "-r")
+RESUME_TEXT_RE = re.compile(
+    r'(?:^|\s)"?(?:--resume"?[\s=]+|-r"?\s+)(\S+)')
+# Loosened exactly as RESUME_TEXT_RE is, so a quoted `"--fork-session"` still
+# cancels a quoted `"--resume=<uuid>"` on the same line. The closing `"` it
+# accepts also matches a quoted PROMPT that ends in `--fork-session`, which
+# then cancels the resume: that errs toward no id, never a wrong one, and is
+# one more case of the text fallback's prompt-reads-as-argv limit above.
+FORK_TEXT_RE = re.compile(r'(?:^|\s)"?--fork-session(?:[\s="]|$)')
+CLI_JS_RE = re.compile(r"claude-code/cli\.m?js[\"']?$", re.IGNORECASE)
+CLI_JS_TEXT_RE = re.compile(r"claude-code/cli\.m?js[\"']?(?=\s|$)", re.IGNORECASE)
+
+
+def unquote(v):
+    """`"<uuid>"` / `'<uuid>'` -> `<uuid>`; anything else unchanged."""
+    return v.strip("\"'")
+
+
+SCRIPT_HOSTS = {"node"}
+
+
+def program_is_script_host(prog):
+    """True when the argv[0] / first command-line token names node (classify() reads node-hosted claude only)."""
+    return norm_name(basename(prog or "")) in SCRIPT_HOSTS
+
+
+def text_program(cmd):
+    """The program token of a flattened command line, honouring a leading
+    double-quoted path (`"C:\\Program Files\\nodejs\\node.exe" ...`). An
+    UNQUOTED path with a space is cut at the space, so it is not read as node
+    and the scan starts at 0 (the pre-gate behaviour); Windows launchers quote
+    such paths."""
+    cmd = (cmd or "").lstrip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        return cmd[1:end] if end > 0 else cmd[1:]
+    return cmd.split(None, 1)[0] if cmd else ""
+
+
+def claude_args_start(argv):
+    """Index of the first argument claude itself parses: just after the first
+    `.../claude-code/cli.js` token when node runs the script, else 0."""
+    if not argv or not program_is_script_host(argv[0]):
+        return 0
+    for i, arg in enumerate(argv):
+        if CLI_JS_RE.search(arg.replace("\\", "/")):
+            return i + 1
+    return 0
+
+
+def resume_sid_of_tokens(argv):
+    """The session id a claude argv RESUMES, or None (the rules above)."""
+    if "--fork-session" in argv or any(a.startswith("--fork-session=") for a in argv):
+        return None
+    start = claude_args_start(argv)
+    for i in range(start, len(argv)):
+        arg = argv[i]
+        for flag in RESUME_FLAGS:
+            if flag.startswith("--") and arg.startswith(flag + "="):
+                v = arg.split("=", 1)[1]
+            elif arg == flag:
+                # `--resume --model x` is the picker followed by the next flag.
+                # The roster parser skips a `-`-led next token explicitly; here
+                # the uuid fullmatch below already refuses one, so no branch.
+                v = argv[i + 1] if i + 1 < len(argv) else ""
+            else:
+                continue
+            v = unquote(v)
+            return v if UUID_RE.fullmatch(v) else None
+    return None
+
+
+def session_id_of_tokens(argv):
+    """The `--session-id <uuid>` / `--session-id=<uuid>` a claude argv
+    carries, or None. Same start and quote rules as resume_sid_of_tokens."""
+    start = claude_args_start(argv)
+    for i in range(start, len(argv)):
+        arg = argv[i]
+        if arg.startswith("--session-id="):
+            v = arg.split("=", 1)[1]
+        elif arg == "--session-id":
+            v = argv[i + 1] if i + 1 < len(argv) else ""
+        else:
+            continue
+        v = unquote(v)
+        return v if UUID_RE.fullmatch(v) else None
+    return None
+
+
+def resume_sid_of_text(cmd):
+    """The flattened-text fallback, for a pid with no readable cmdline."""
+    if FORK_TEXT_RE.search(cmd):
+        return None
+    cli = (CLI_JS_TEXT_RE.search(cmd.replace("\\", "/"))
+           if program_is_script_host(text_program(cmd)) else None)
+    m = RESUME_TEXT_RE.search(cmd, cli.end() if cli else 0)
+    if not m:
+        return None
+    v = unquote(m.group(1))
+    return v if UUID_RE.fullmatch(v) else None
+
+
+def linux_cmdline(pid):
+    """<proc root>/<pid>/cmdline as NUL-split tokens; None when unreadable or
+    empty (a zombie's is empty), so the caller falls back to the text."""
+    try:
+        with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    toks = [t.decode("utf-8", "replace") for t in raw.split(b"\0")]
+    while toks and toks[-1] == "":
+        toks.pop()
+    return toks or None
+
+
+def argv_session_ids(pid, cmd):
+    """(the `--session-id` id, the `--resume` id) a claude argv carries. The
+    cmdline is read ONCE, so both sources judge the same argv; with no
+    readable cmdline both fall back to the flattened text."""
+    toks = linux_cmdline(pid) if os_name == "linux" else None
+    if toks is not None:
+        return session_id_of_tokens(toks), resume_sid_of_tokens(toks)
+    m = ARGV_SID_RE.search(cmd or "")
+    return (m.group(1) if m else None), resume_sid_of_text(cmd or "")
 
 
 def linux_fd_session_id(pid):
@@ -705,6 +869,28 @@ def linux_fd_session_id(pid):
         if m:
             return m.group(1)
     return None
+
+
+def linux_fd_session_ids(pid):
+    """EVERY distinct session id the fd targets of `pid` name, in fd order --
+    the build attribution's reader (a build can hold several scratchpads open;
+    stopping at the first could name a dead session while a live one is also
+    there). A claude row keeps linux_fd_session_id (the first match)."""
+    fd_dir = os.path.join(proc_root, str(pid), "fd")
+    try:
+        fds = sorted(os.listdir(fd_dir), key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else 0, x))
+    except OSError:
+        return []
+    out = []
+    for fd in fds:
+        try:
+            tgt = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        m = SCRATCH_SID_RE.search(tgt)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
 
 
 def linux_idle_min(sid, acct):
@@ -976,11 +1162,51 @@ def _flag_value(tokens, flag):
     return None
 
 
-def build_attribution(p, anc):
-    top = p
-    for a in anc:
+# A build's SESSION, from fd targets and cwd only (plan 2026-11-09-devops-
+# orphan-build-reaper-reads-a-live-sessions, D1). A session that detaches its
+# own build (`nohup cargo-guard.sh test > <scratchpad>/test1.log &`) leaves it
+# reparented to init or the per-user systemd, with no agent in its ancestry --
+# but its stdout/stderr still name the session's scratchpad, whose path carries
+# the session id (SCRATCH_SID_RE). EVERY distinct id is collected, in this
+# order: the build ROOT's fd targets (`build_fd`), each launcher shell on its
+# ancestry above the root, nearest first (`shell_fd:<pid>`; the walk ends at
+# the first hop that is neither a build hop nor a launcher shell), then the
+# build root's cwd (`cwd`). `fd_session_ids` is the whole list of {id, source};
+# `fd_session_id` / `fd_session_source` are its FIRST entry. A consumer must
+# read the list: the first id can be a dead session while a later one is live.
+# Empty / null when nothing matches, and always so off Linux. Never
+# /proc/<pid>/environ: a readlink names a path, not a secret.
+LAUNCHER_SHELLS = {"bash", "sh", "dash", "zsh", "env", "timeout", "nohup", "setsid",
+                   "flock", "xargs", "git", "make", "nice", "ionice", "stdbuf", "tee",
+                   "time"}
+
+
+def build_fd_sessions(top, above, cwd):
+    """[{id, source}] -- every distinct id, first source wins for an id."""
+    if os_name != "linux":
+        return []
+    found = [(sid, "build_fd") for sid in linux_fd_session_ids(top["pid"])]
+    for a in above:
         if a["kind"] == "build" or a["norm"] in BUILD_HOPS or a["norm"].startswith("build-script-"):
-            top = a
+            continue
+        if a["norm"] not in LAUNCHER_SHELLS:
+            break
+        found += [(sid, "shell_fd:%d" % a["pid"]) for sid in linux_fd_session_ids(a["pid"])]
+    m = SCRATCH_SID_RE.search(cwd or "")
+    if m:
+        found.append((m.group(1), "cwd"))
+    out = []
+    for sid, src in found:
+        if sid not in [e["id"] for e in out]:
+            out.append({"id": sid, "source": src})
+    return out  # every-id
+
+
+def build_attribution(p, anc):
+    top, above = p, anc
+    for i, a in enumerate(anc):
+        if a["kind"] == "build" or a["norm"] in BUILD_HOPS or a["norm"].startswith("build-script-"):
+            top, above = a, anc[i + 1:]
             continue
         break
     try:
@@ -997,13 +1223,18 @@ def build_attribution(p, anc):
             if env.get(k):
                 target, source = env[k], "env:" + k
                 break
+    cwd = linux_cwd(top["pid"]) if os_name == "linux" else None
+    fd_sids = build_fd_sessions(top, above, cwd)
     return {"pid": top["pid"], "name": top["name"],
-            "cwd": linux_cwd(top["pid"]) if os_name == "linux" else None,
+            "cwd": cwd,
             "manifest_path": _flag_value(toks, "--manifest-path"),
             "target_dir": target, "target_dir_source": source,
             # Whether the ENVIRONMENT was readable at all: a null target_dir
             # with env_read true means cargo's default (<workspace>/target).
-            "env_read": bool(env) if os_name == "linux" else False}
+            "env_read": bool(env) if os_name == "linux" else False,
+            "fd_session_id": fd_sids[0]["id"] if fd_sids else None,
+            "fd_session_source": fd_sids[0]["source"] if fd_sids else None,
+            "fd_session_ids": fd_sids}
 
 
 rows = []
@@ -1048,8 +1279,7 @@ for p in sorted(procs.values(), key=lambda x: x["pid"]):
             break
     acct = env.get("CLAUDE_CONFIG_DIR") if env else None
     fd_sid = linux_fd_session_id(p["pid"]) if os_name == "linux" and kind == "claude" else None
-    m = ARGV_SID_RE.search(p["cmd"] or "") if kind == "claude" else None
-    argv_sid = m.group(1) if m else None
+    argv_sid, resume_sid = argv_session_ids(p["pid"], p["cmd"]) if kind == "claude" else (None, None)
     rows.append({
         "pid": p["pid"],
         "ppid": p["ppid"],
@@ -1066,11 +1296,17 @@ for p in sorted(procs.values(), key=lambda x: x["pid"]):
         "cwd": linux_cwd(p["pid"]) if os_name == "linux" and kind in AGENTS else None,
         "idle_min": linux_idle_min(fd_sid, acct) if os_name == "linux" and kind == "claude" else None,
         "session_id": None,
+        # The id a claude row's own command line names -- `--session-id <uuid>`,
+        # else the `--resume <uuid>` it resumes -- exported so a consumer can
+        # match a build's fd_session_id against it (D2; reap-orphan-builds.sh
+        # agent_row_sids); null on every other kind.
+        "argv_session_id": argv_sid or resume_sid,
         "activity": None,
         "activity_evidence": None,
         "_acct": acct,
         "_fd_sid": fd_sid,
         "_argv_sid": argv_sid,
+        "_resume_sid": resume_sid,
         "_created": p["created"],
     })
 
@@ -1144,7 +1380,8 @@ for r in rows:
     else:
         rsid = None
         r["_rec"], r["_why"], r["_msg"] = None, why, (None, False, None)
-    for src, v in (("record", rsid), ("scratchpad_fd", r["_fd_sid"]), ("argv", r["_argv_sid"])):
+    for src, v in (("record", rsid), ("scratchpad_fd", r["_fd_sid"]), ("argv", r["_argv_sid"]),
+                   ("argv_resume", r["_resume_sid"])):
         if v:
             r["session_id"], ev["session_id_source"] = v, src
             break

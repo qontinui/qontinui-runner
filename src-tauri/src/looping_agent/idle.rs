@@ -33,10 +33,16 @@
 //! checks scan the same [`DIALOG_CHROME_MARKERS`] within the same
 //! [`DIALOG_SCAN_ROWS`], anchored on the cursor row it has and this does not.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.
 /// Sourced from the Claude Code TUI working line ("… esc to interrupt") and
-/// its transient status lines; conservative — any hit vetoes idle.
+/// its transient status lines; conservative — any hit vetoes idle. An
+/// indicator found only inside Claude Code's idle `/clear` hint
+/// ([`CLEAR_HINT`]) does not count.
 pub const PROCESSING_INDICATORS: &[&str] = &[
     "esc to interrupt",
     "to interrupt)",
@@ -47,6 +53,28 @@ pub const PROCESSING_INDICATORS: &[&str] = &[
     "compacting",
     "summarizing",
 ];
+
+/// Claude Code's IDLE footer hint, `new task? /clear to save 320.4k tokens ·
+/// …`, matched lowercased. It carries the `"tokens ·"` working indicator's
+/// text, so a finished pane at an empty prompt read as busy for as long as
+/// the hint was painted (plan
+/// `2026-11-04-runner-finished-close-closes-nothing-on-any-box` cause 4:
+/// 5 of 48 finished sessions held at `grid_busy` on one box; runner#2369:
+/// 42 of 43 on another, together with the turn-done line). Only the hint
+/// itself is masked, never the rest of its line.
+static CLEAR_HINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/clear to save [0-9][0-9.,]*[kmb]? tokens").expect("CLEAR_HINT is a valid regex")
+});
+
+/// Does `ind` occur in the lowercased row `lower` OUTSIDE the idle `/clear`
+/// hint? `false` both when it does not occur at all and when every
+/// occurrence lies inside the hint.
+fn indicator_outside_clear_hint(lower: &str, ind: &str) -> bool {
+    if !lower.contains("/clear") {
+        return lower.contains(ind);
+    }
+    CLEAR_HINT.replace_all(lower, "").contains(ind)
+}
 
 /// Spinner glyphs the Claude Code TUI animates while working. Their presence
 /// on screen is a strong "busy" signal independent of the text indicators
@@ -65,45 +93,206 @@ pub const PROMPT_MARKER: char = '❯';
 ///
 /// 1. NO processing-indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]).
-/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted).
-/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
+/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), save on
+///    the static completed-turn line ([`is_completed_turn_line`]).
+/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible; the
+///    bottom-most such row is the input box.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    idle_veto(lines, cursor_row).is_none()
+}
+
+/// Which of [`snapshot_looks_idle`]'s checks vetoes idle on this snapshot, as
+/// a short human-readable reason; `None` exactly when the snapshot looks idle.
+/// The same checks in the same order — the diagnostic for a pane that keeps
+/// reading busy (restart-prep's told-but-busy log line, #2569, reads it).
+pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
     // (1) any processing-indicator text ⇒ busy.
-    for line in lines {
+    for (row, line) in lines.iter().enumerate() {
         let lower = line.to_ascii_lowercase();
-        for ind in PROCESSING_INDICATORS {
-            if lower.contains(ind) {
-                return false;
-            }
+        if let Some(ind) = PROCESSING_INDICATORS
+            .iter()
+            .find(|ind| indicator_outside_clear_hint(&lower, ind))
+        {
+            return Some(format!("processing indicator `{ind}` on row {row}"));
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy.
-    for line in lines {
-        for ch in line.chars() {
-            if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
-                return false;
-            }
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy — except on the static
+    // completed-turn line Claude Code leaves under a finished turn.
+    for (row, line) in lines.iter().enumerate() {
+        if is_completed_turn_line(line) {
+            continue;
+        }
+        if let Some(ch) = line
+            .chars()
+            .find(|ch| *ch != '·' && SPINNER_GLYPHS.contains(ch))
+        {
+            return Some(format!(
+                "spinner glyph `{ch}` on row {row}: {}",
+                line.trim()
+            ));
         }
     }
 
-    // (3) prompt marker visible — remember its row for (4).
-    let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
+    // (3) prompt marker visible — remember its row for (4). The BOTTOM-most
+    // `❯` row is the input box (as `snapshot_shows_dialog` reads it): an
+    // earlier one is transcript — a `❯ <your message>` echo in scrollback —
+    // and taking it would make (4) pass for a cursor up in streaming output.
+    // Bottom-most is never below the top-most, so this only ever vetoes more.
+    let Some(prompt_row) = lines.iter().rposition(|l| l.contains(PROMPT_MARKER)) else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
-        return false;
+        return Some("no `❯` prompt row on screen".to_string());
     };
 
     // (4) cursor in the input area (at/below the prompt row).
-    (cursor_row as usize) >= prompt_row
+    ((cursor_row as usize) < prompt_row)
+        .then(|| format!("cursor on row {cursor_row}, above the `❯` prompt row {prompt_row}"))
+}
+
+/// Is `line` the static line Claude Code leaves on screen once a turn has
+/// FINISHED — `✻ Cogitated for 9m 42s · done 6:36 AM`,
+/// `✻ Churned for 1m 31s · done 7:49 AM` (2.1.310; shape
+/// `<glyph> <Verb>ed for <duration>[ · done <time>]`)?
+///
+/// It carries the same glyph as the live spinner, so a glyph-only veto read
+/// every finished session as busy for as long as the line stayed painted —
+/// i.e. forever, until the next turn. The live spinner line differs in shape,
+/// never only in glyph: a present-tense verb with an ellipsis and an elapsed
+/// counter in parentheses (`✻ Cogitating… (12s · ↑ 1.2k tokens · esc to
+/// interrupt)`). So this accepts ONLY the exact completed shape:
+///
+/// * a spinner glyph, then ONE alphabetic word (the verb — not checked for an
+///   `-ed` ending, because Claude Code's verb list includes irregular forms),
+/// * then `for` and a duration made solely of `<digits><unit>` tokens
+///   (`h`/`m`/`s`, e.g. `9m 42s`, `45s`, `1h 2m 3s`),
+/// * then nothing, or `· done` followed by the clock time.
+///
+/// Any ellipsis, parenthesis or other text anywhere on the line rejects it, so
+/// a live spinner can never match. Conservative: a line that is not exactly
+/// this shape keeps vetoing idle as before.
+pub fn is_completed_turn_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('│').trim();
+    if trimmed.contains('…') || trimmed.contains("...") || trimmed.contains('(') {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let Some(glyph) = chars.next() else {
+        return false;
+    };
+    if glyph == '·' || !SPINNER_GLYPHS.contains(&glyph) {
+        return false;
+    }
+    let rest = chars.as_str();
+    // Split off an optional `· done <time>` tail.
+    let (head, tail) = match rest.split_once('·') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    if let Some(tail) = tail {
+        let mut words = tail.split_whitespace();
+        if words.next() != Some("done") {
+            return false;
+        }
+        // The clock time: `6:36 AM`, `18:02`. Digits, colons and an AM/PM.
+        // A turn that ended on an earlier day dates it first, in the locale's
+        // words: `done Tuesday 9:26 PM`, `done Wednesday, Oct 28, 9:26 PM`,
+        // `done Mittwoch, 21:26` (shapes from runner#2369) — so before the
+        // clock, and only before it, a run of letters or of digits, each
+        // optionally ending in `,`, is the date.
+        let mut saw_time = false;
+        for w in words {
+            let is_clock = w.contains(':') && w.chars().all(|c| c.is_ascii_digit() || c == ':');
+            let is_meridiem = matches!(w.to_ascii_uppercase().as_str(), "AM" | "PM");
+            let date_word = w.strip_suffix(',').unwrap_or(w);
+            let is_date = !saw_time
+                && !date_word.is_empty()
+                && (date_word.chars().all(char::is_alphabetic)
+                    || date_word.chars().all(|c| c.is_ascii_digit()));
+            if is_clock {
+                saw_time = true;
+            } else if !is_meridiem && !is_date {
+                return false;
+            }
+        }
+        if !saw_time {
+            return false;
+        }
+    }
+    // `<Verb>ed for <duration>`, tolerating a missing space after the glyph,
+    // between the verb and `for`, and between `for` and the duration — a
+    // grid row can lose a blank column (an orphaned wide-glyph half under a
+    // cursor-forward move read `✻Brewed for2m 39s`). Every other check stays.
+    let head = head.trim_start();
+    let verb_end = head
+        .char_indices()
+        .find(|(_, c)| !c.is_alphabetic())
+        .map_or(head.len(), |(i, _)| i);
+    let (verb, after) = head.split_at(verb_end);
+    let after = after.trim_start();
+    let duration = if let Some(d) = after.strip_prefix("for") {
+        if verb.is_empty() {
+            return false;
+        }
+        d
+    } else if after.starts_with(|c: char| c.is_ascii_digit()) {
+        // `Brewedfor2m`: the verb run swallowed `for`.
+        match verb.strip_suffix("for") {
+            Some(v) if !v.is_empty() => after,
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+    // The duration must follow `for` directly or after blanks, never another
+    // letter (`format`, `fortune`).
+    if !duration.starts_with(|c: char| c.is_ascii_digit() || c.is_whitespace()) {
+        return false;
+    }
+    let mut saw_duration = false;
+    for w in duration.split_whitespace() {
+        if !is_duration_token(w) {
+            return false;
+        }
+        saw_duration = true;
+    }
+    saw_duration
+}
+
+/// `9m`, `42s`, `1h`, `1d`, or several glued together (`2m39s`).
+fn is_duration_token(w: &str) -> bool {
+    let mut saw_unit = false;
+    let mut digits = 0usize;
+    for c in w.chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else if matches!(c, 'd' | 'h' | 'm' | 's') && digits > 0 {
+            digits = 0;
+            saw_unit = true;
+        } else {
+            return false;
+        }
+    }
+    saw_unit && digits == 0
 }
 
 /// Key hints Claude Code prints beneath a dialog's choices — its own CHROME,
 /// not prose, so they do not turn up in an ordinary finished turn. Shared with
 /// `terminal::graceful_exit`'s prompt-ready checks, which scan for the same
 /// hints. Lowercased before match.
-pub const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+///
+/// The last five are the other dialogs' key hints (a select list, a detail
+/// view, a menu that closes or exits, a nested step), ported from runner#2369.
+pub const DIALOG_CHROME_MARKERS: &[&str] = &[
+    "esc to cancel",
+    "enter to confirm",
+    "enter to select",
+    "enter to view",
+    "esc to close",
+    "esc to exit",
+    "esc to go back",
+];
 
 /// Literal text of Claude Code's workspace-trust dialog (both the current
 /// "Quick safety check" wording and the older "Do you trust the files" one).
@@ -285,6 +474,190 @@ mod tests {
         assert!(snapshot_looks_idle(&lines(&["a · b", "❯ "]), 1));
     }
 
+    /// The 2.1.310 finished-turn screen: the completed-turn line stays painted
+    /// above the input box after every finished turn, with the same `✻` glyph
+    /// the live spinner uses. It must read idle, or no session ever pauses.
+    #[test]
+    fn completed_turn_line_does_not_veto_idle() {
+        for done in [
+            "✻ Cogitated for 9m 42s · done 6:36 AM",
+            "✻ Churned for 1m 31s · done 7:49 AM",
+            "✻ Worked for 45s · done 18:02",
+            "✻ Baked for 1h 2m 3s",
+            "  ✻ Sautéed for 12s · done 9:01 pm",
+            // A turn that ended on an earlier day (runner#2369's shapes).
+            "✻ Brewed for 1d 2h 3m",
+            "✻ Cooked for 9s · done Tuesday 9:26 PM",
+            "✻ Cooked for 9s · done Wednesday, Oct 28, 9:26 PM",
+            "✻ Cooked for 9s · done Mittwoch, 21:26",
+        ] {
+            let grid = lines(&[
+                "● Done — the change is committed.",
+                "",
+                done,
+                "",
+                "────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]);
+            assert!(is_completed_turn_line(done), "completed shape: {done:?}");
+            assert!(snapshot_looks_idle(&grid, 5), "must be idle with: {done:?}");
+        }
+    }
+
+    /// E2E: a hidden pane's grid lost blank columns (an orphaned wide-glyph
+    /// half under a cursor-forward move). The completed-turn line still reads
+    /// idle with those spaces missing; a live spinner missing them still reads
+    /// busy.
+    #[test]
+    fn completed_turn_line_tolerates_missing_spaces() {
+        for done in [
+            "✻Brewed for2m 39s · done 11:46 AM",
+            "✻ Brewedfor 2m 39s · done 11:46 AM",
+            "✻Brewedfor2m39s · done 11:46 AM",
+            "✻ Brewed for 2m 39s · done 11:46 AM",
+        ] {
+            assert!(is_completed_turn_line(done), "completed: {done:?}");
+            assert!(snapshot_looks_idle(&lines(&[done, "❯ "]), 1), "{done:?}");
+        }
+        for busy in [
+            "✻Brewing…(2m 39s · esc to interrupt)",
+            "✻Brewing… (2m 39s)",
+            "✻Brewed format",
+            "✻ for2m 39s",
+            "✻Brewed for2mx",
+            "✻Brewed fortune 2m",
+        ] {
+            assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
+            assert!(!snapshot_looks_idle(&lines(&[busy, "❯ "]), 1), "{busy:?}");
+        }
+    }
+
+    /// The live spinner keeps vetoing idle — with or without the
+    /// `esc to interrupt` text — and so does anything that merely resembles
+    /// the completed line.
+    #[test]
+    fn live_spinner_shapes_still_veto_idle() {
+        for busy in [
+            "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)",
+            "✻ Cogitating… (2m 3s · ↓ 4.5k tokens)",
+            "✶ Pondering…",
+            "✢ Reticulating... (5s)",
+            "✻ Cogitated for 9m 42s · done 6:36 AM (esc to interrupt)",
+            "✻ Cogitated for a while",
+            "✻ Cogitated for 9m 42s · still going",
+            "✻ Cogitated for",
+            "✻ working",
+            "✻ Thinking for 3s…",
+            // A finished turn that left background work running is NOT idle
+            // (main's `is_completed_turn_summary` read both of these as done).
+            "✻ Worked for 1m 2s · 1 shell still running",
+            "✻ Cogitated for 9m 42s · done 6:36 AM · 1 shell still running",
+            "✻ Waiting for 1 background agent to finish",
+            // Date words are read only BEFORE the clock, and a clock is still
+            // required.
+            "✻ Cooked for 9s · done 9:26 PM still running",
+            "✻ Cooked for 9s · done Tuesday",
+            "✻ Cooked for 9s · done Tuesday, 3 shells",
+            "✻ Brewed for 1x 2h",
+        ] {
+            assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
+            let grid = lines(&[busy, "❯ "]);
+            assert!(!snapshot_looks_idle(&grid, 1), "must be busy: {busy:?}");
+        }
+        // A completed line from the last turn does not hide a live spinner
+        // painted for the next one.
+        let grid = lines(&[
+            "✻ Cogitated for 9m 42s · done 6:36 AM",
+            "✶ Pondering… (3s)",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 2));
+    }
+
+    /// A `❯ <message>` echo in scrollback is not the input box: with the
+    /// cursor up in streaming output, between the echo and the real prompt,
+    /// the screen is busy.
+    #[test]
+    fn a_scrollback_prompt_echo_does_not_stand_in_for_the_input_row() {
+        let grid = lines(&[
+            "❯ Run the shell command and report back",
+            "  streaming answer text",
+            "  more streaming answer text",
+            "❯ ",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 1), "cursor in streaming output");
+        assert!(idle_veto(&grid, 1).unwrap().contains("prompt row 3"));
+        assert!(snapshot_looks_idle(&grid, 3), "cursor on the input row");
+    }
+
+    #[test]
+    fn idle_veto_names_the_check_that_fired() {
+        let v = |rows: &[&str], c: u16| idle_veto(&lines(rows), c);
+        assert_eq!(v(&["done", "❯ "], 1), None);
+        assert!(v(&["  12.3k tokens · esc to interrupt", "❯ "], 1)
+            .unwrap()
+            .starts_with("processing indicator `esc to interrupt`"));
+        assert!(v(&["✶ Pondering", "❯ "], 1)
+            .unwrap()
+            .starts_with("spinner glyph `✶` on row 0"));
+        assert_eq!(v(&["out"], 0).unwrap(), "no `❯` prompt row on screen");
+        assert_eq!(
+            v(&["a", "❯ "], 0).unwrap(),
+            "cursor on row 0, above the `❯` prompt row 1"
+        );
+        // The completed-turn line names no veto.
+        assert_eq!(v(&["✻ Cooked for 16s · done 10:30 AM", "❯ "], 1), None);
+    }
+
+    #[test]
+    fn a_completed_turn_summary_row_does_not_veto_idle() {
+        // Real rows Claude Code leaves in the scrollback after a turn ends.
+        for done in [
+            "✻ Worked for 1m 23s · done 1:44 PM",
+            "✻ Churned for 40s",
+            "  ✶ Cooked for 2h 3m 4s",
+        ] {
+            assert!(
+                snapshot_looks_idle(&lines(&[done, "", "❯ "]), 2),
+                "a finished-turn summary must not read as a spinner: {done}"
+            );
+        }
+        // A LIVE spinner row still vetoes, even beside a summary row.
+        assert!(!snapshot_looks_idle(
+            &lines(&["✻ Worked for 1m 23s", "✢ Beaming… (34s)", "❯ "]),
+            2
+        ));
+        // A glyph row that merely mentions "for" is not a summary.
+        assert!(!snapshot_looks_idle(
+            &lines(&["✻ working for you", "❯ "]),
+            1
+        ));
+        assert!(!snapshot_looks_idle(&lines(&["✻ Worked for", "❯ "]), 1));
+    }
+
+    #[test]
+    fn the_merge_shepherd_idle_screen_with_a_non_ascii_verb_reads_idle() {
+        // The settled screen the merge shepherd's tab sat on for two days
+        // (2026-11-03 to 2026-11-05) while a pre-def4c43e8 runner never nudged
+        // it, replayed from the tab's own PTY bytes. Claude Code's past-tense
+        // verbs are not all ASCII ("Sautéed"), so the summary-row test must
+        // stay Unicode-aware; the footer rows are the real ones too.
+        let grid = lines(&[
+            "  - Clauses not followed: none.",
+            "",
+            "✻ Sautéed for 4m 36s · done 3:36 PM",
+            "",
+            "──────────────────────────────── loop-Merge Shepherd ─",
+            "❯ ",
+            "───────────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)   ✔ Update installed · Restart to apply",
+            "new task? /clear to save 188k tokens",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 7));
+    }
+
     #[test]
     fn cursor_above_prompt_row_is_not_idle() {
         let grid = lines(&["streaming output", "more", "❯ "]);
@@ -420,6 +793,21 @@ mod tests {
     }
 
     #[test]
+    fn every_dialog_key_hint_is_a_dialog() {
+        for hint in [
+            "Esc to cancel",
+            "Enter to confirm · Esc to cancel",
+            "↑/↓ to navigate · Enter to select · Esc to go back",
+            "Enter to view",
+            "Esc to close",
+            "Esc to exit",
+        ] {
+            let grid = lines(&[" Select a model", "   Sonnet", "❯ Opus", "", hint]);
+            assert!(snapshot_shows_dialog(&grid).is_some(), "{hint}");
+        }
+    }
+
+    #[test]
     fn the_idle_input_prompt_is_not_a_dialog() {
         let grid = lines(&[
             "● Cycle 12 complete — 3 PRs shepherded, journal updated.",
@@ -453,6 +841,89 @@ mod tests {
         // ...but the same text within reach of the prompt is.
         let near = lines(&["Enter to confirm · Esc to cancel", "│ ❯ │"]);
         assert_eq!(snapshot_shows_dialog(&near), Some("esc to cancel"));
+    }
+
+    // ── the idle `/clear` hint ───────────────────────────────────────────
+
+    /// Claude Code's idle footer carries `tokens ·`, the working indicator's
+    /// text. A finished pane at an empty prompt showing it must read idle
+    /// (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`
+    /// Phase 3; adopted from runner#2369).
+    #[test]
+    fn the_clear_hint_footer_reads_idle() {
+        for hint in [
+            "  new task? /clear to save 320.4k tokens · Checking for updates",
+            "  new task? /clear to save 1.2M tokens · ✔ Update installed · Restart to apply",
+            "  new task? /clear to save 87,512 tokens · Checking for updates",
+            "  new task? /clear to save 912 tokens · …",
+            // Truncated to the pane's width: no `tokens ·` survives, so this
+            // guards against a false busy rather than exercising the mask.
+            "  new task? /clear to save 320.4… · Checking for updates",
+        ] {
+            let grid = lines(&[
+                "● Done — the change is committed.",
+                "",
+                hint,
+                "────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]);
+            assert!(snapshot_looks_idle(&grid, 4), "must be idle with: {hint}");
+            assert_eq!(snapshot_shows_dialog(&grid), None, "{hint}");
+        }
+    }
+
+    /// Only the hint is masked: a real working indicator still vetoes, on
+    /// the hint's own row or on any other.
+    #[test]
+    fn the_clear_hint_does_not_mask_real_work() {
+        let hint = "  new task? /clear to save 320.4k tokens · Checking for updates";
+        for busy in [
+            "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)",
+            "  12.3k tokens · esc to interrupt",
+            "  4.5k tokens · thinking)",
+            "Compacting conversation",
+        ] {
+            assert!(
+                !snapshot_looks_idle(&lines(&[busy, hint, "❯ "]), 2),
+                "must be busy with: {busy}"
+            );
+        }
+        // An indicator on the hint's own row, outside the hint.
+        let same_row = "new task? /clear to save 320.4k tokens · 2.0k tokens · esc";
+        assert!(!snapshot_looks_idle(&lines(&[same_row, "❯ "]), 1));
+        // `tokens ·` with no hint around it still vetoes.
+        assert!(!snapshot_looks_idle(&lines(&["  2.0k tokens · ", "❯ "]), 1));
+        // A hint-like string with no token count is not the hint.
+        assert!(!snapshot_looks_idle(
+            &lines(&["/clear to save tokens · now", "❯ "]),
+            1
+        ));
+    }
+
+    /// The hint can sit above a genuine dialog. Masking it must not make the
+    /// dialog guard pass: the dialog is still a dialog.
+    #[test]
+    fn a_dialog_under_the_clear_hint_is_still_a_dialog() {
+        let grid = lines(&[
+            "  new task? /clear to save 320.4k tokens · Checking for updates",
+            " Bash command",
+            "   gh pr list --state open",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No, and tell Claude what to do differently (esc)",
+            "",
+            " Enter to confirm · Esc to cancel",
+        ]);
+        // With the hint masked the idle predicate reads this screen idle
+        // (cursor on the `❯ 1. Yes` row), which is exactly why the dialog
+        // guard must be the conjunct that refuses it.
+        assert!(snapshot_looks_idle(&grid, 4));
+        assert_eq!(
+            snapshot_shows_dialog(&grid),
+            Some("selected numbered choice on a `❯` row")
+        );
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────

@@ -7,8 +7,10 @@
 //!    (already minted by `qontinui_profile device init`).
 //! 2. Detects local resources (cpu_cores, memory_gb, disk_total_gb)
 //!    via `sysinfo`.
-//! 3. Derives the agent-side budget per §3.2:
-//!    `max_concurrent_agents = floor((memory_gb - 4) / 4)`.
+//! 3. Derives the agent-side budget with [`derive_max_agents`] — the minimum
+//!    of a session-memory term and a CPU term, a mirror of coord's
+//!    `fleet::derive_agent_capacity` (coord stores its own derivation on
+//!    ingest, so this number is advisory).
 //! 4. POSTs the budget columns it OWNS — not `role`, which the supervisor
 //!    owns; see [`DeviceBudgetRequest`] — to
 //!    `POST /coord/devices/{device_id}/budget` via coord HTTP. Phase 3
@@ -51,6 +53,11 @@ use crate::database::pg::PgDb;
 /// Appended in [`host_capabilities`].
 pub(crate) mod imagegen_probe;
 
+/// The `cred` family's regional half: fetches coord's probe catalogue, treats it
+/// as untrusted input, and runs what may run through the family's probe machinery
+/// (plan `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 3).
+mod cred_probe_specs;
+
 /// The periodic coord heartbeat loop: drives [`heartbeat_to_coord`] under a
 /// per-tick timeout, warns on stalls, and logs a 10-minute summary (plan
 /// `2026-10-29-a-drained-device-is-alerted-as-no-runner-online`, Phase 3).
@@ -75,6 +82,19 @@ pub(crate) mod socket_census;
 /// Phase 0b). Consumed by [`resource_sample`]'s host lane; off Linux it reports
 /// `not_supported` rather than zeroes.
 pub(crate) mod slice_telemetry;
+
+/// Kernel pressure axes for the host lane — load 1/5/15, PSI, the `oom_kill`
+/// counter and `boot_id`, each with a `measured` manifest (plan
+/// `2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity-and-coord-has-no-resource-model`
+/// §3.4). Consumed by [`resource_sample`] and [`computer`].
+pub(crate) mod host_axes;
+
+/// The fleet computer as a first-class entity: identity, static capacity,
+/// watched services, events and `POST /coord/computers/report` (same plan,
+/// Phase 2 + the runner half of Phase 6). Ticked from
+/// [`spawn_budget_republisher`] so it inherits that function's shared-state
+/// ownership gate, exactly like [`resource_sample`].
+pub(crate) mod computer;
 
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
@@ -103,11 +123,146 @@ pub struct Resources {
     pub disk_total_gb: u64,
 }
 
-/// §3.2 default policy: a dev workstation reserves 4 GiB for the OS +
-/// 4 GiB per agent steady-state. Underflow saturates at 0 for tiny
-/// machines.
-pub fn derive_max_agents(memory_gb: u32) -> u32 {
-    memory_gb.saturating_sub(4) / 4
+// Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
+// (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
+// coord is the authority: its budget ingest replaces a non-zero
+// `max_concurrent_agents` this runner publishes with coord's own derivation
+// from the same publish's `memory_gb` / `cpu_cores` / `ci_reserved_gib`, keeps
+// the last stored value when `ci_reserved_gib` is omitted, and stores an
+// explicit `0` (the Build role's) verbatim, so a drift here changes only this
+// runner's own log
+// line and `last_budget.json`, never a cap. The worked-example test below is the
+// same table coord pins; keep the two in step.
+
+/// MiB of RAM one interactive agent session is charged.
+const SESSION_COST_MEM_MIB: u32 = 512;
+/// Milli-cores one interactive session is charged.
+const SESSION_COST_CPU_MILLI: u32 = 200;
+/// GiB no session may eat into (OS, runner, proxies).
+const OS_RESERVE_GIB: u32 = 8;
+/// GiB one build slot is charged.
+const BUILD_MEM_GIB: u32 = 4;
+/// The derivation never answers below this.
+const MIN_DEVICE_AGENTS: u32 = 3;
+
+/// `min(memory_gb / 4, cpu_cores / 4)` — coord's `derive_max_builds`.
+fn derive_max_builds(memory_gb: u32, cpu_cores: u32) -> u32 {
+    (memory_gb / BUILD_MEM_GIB).min(cpu_cores / 4)
+}
+
+/// How many concurrent agent sessions this machine can carry:
+/// `max(MIN_DEVICE_AGENTS, min(mem_term, cpu_term))`, where
+/// `mem_term = (memory_gb − 8 − builds × 4 − ci_reserved_gib) / 0.5 GiB` and
+/// `cpu_term = (cpu_cores − max(2, ceil(cores / 10))) / 0.2`.
+pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32, ci_reserved_gib: u32) -> u32 {
+    let build_reserve = derive_max_builds(memory_gb, cpu_cores).saturating_mul(BUILD_MEM_GIB);
+    let session_mem_gib = memory_gb
+        .saturating_sub(OS_RESERVE_GIB)
+        .saturating_sub(build_reserve)
+        .saturating_sub(ci_reserved_gib);
+    let mem_term = u64::from(session_mem_gib) * 1024 / u64::from(SESSION_COST_MEM_MIB);
+    let session_cores = cpu_cores.saturating_sub(cpu_cores.div_ceil(10).max(2));
+    let cpu_term = u64::from(session_cores) * 1000 / u64::from(SESSION_COST_CPU_MILLI);
+    let derived = mem_term.min(cpu_term).min(u64::from(u32::MAX)) as u32;
+    derived.max(MIN_DEVICE_AGENTS)
+}
+
+/// GiB one CI job slot is charged off Linux, where no cgroup bound can be read:
+/// the 16 GB size of the hosted runner the CI jobs are written for (coord's
+/// `fleet_placement::C1_SLOT_MEM_GIB`).
+const CI_JOB_MEM_GIB: u32 = 16;
+
+/// What this host's cgroup tree says CI may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiReservation {
+    /// The sum of each `ci.slice/*.slice` bound, rounded UP to a GiB; `0` when
+    /// the host has no `ci.slice`.
+    Bounded(u32),
+    /// A CI slice exists with neither `memory.high` nor `memory.max` set, so
+    /// CI may take the whole box: the reservation is UNKNOWN, never zero.
+    Unbounded,
+    /// No unified cgroup v2 tree to read (Windows, macOS, cgroup v1).
+    NoCgroup,
+}
+
+/// A slice's memory bound in bytes: `memory.high` when numeric, else
+/// `memory.max` when numeric. cgroup v2 spells "no limit" as `max`.
+fn slice_bound_bytes(dir: &std::path::Path) -> Option<u64> {
+    ["memory.high", "memory.max"].iter().find_map(|f| {
+        std::fs::read_to_string(dir.join(f))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// [`CiReservation`] read from a cgroup v2 root (`/sys/fs/cgroup` in
+/// production; a fixture directory in tests).
+pub(crate) fn ci_reservation_from_root(root: &std::path::Path) -> CiReservation {
+    if !root.join("cgroup.controllers").exists() {
+        return CiReservation::NoCgroup;
+    }
+    let ci = root.join("ci.slice");
+    if !ci.is_dir() {
+        return CiReservation::Bounded(0);
+    }
+    let mut children: Vec<std::path::PathBuf> = std::fs::read_dir(&ci)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir() && p.extension().is_some_and(|x| x == "slice"))
+                .collect()
+        })
+        .unwrap_or_default();
+    children.sort();
+    // The parent's own bound caps everything under it. With no child slices,
+    // CI runs (if at all) directly in `ci.slice`, so only its own bound can
+    // answer: an unbounded `ci.slice` is UNKNOWN, never zero — zero is only
+    // the answer for a host with no `ci.slice` at all.
+    let parent = slice_bound_bytes(&ci);
+    let children_total: Option<u64> = if children.is_empty() {
+        None
+    } else {
+        children
+            .iter()
+            .map(|c| slice_bound_bytes(c))
+            .try_fold(0u64, |acc, b| b.map(|b| acc.saturating_add(b)))
+    };
+    let total = match (parent, children_total) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (Some(p), None) => Some(p),
+        (None, c) => c,
+    };
+    match total {
+        Some(bytes) => {
+            let gib = bytes.div_ceil(1024 * 1024 * 1024);
+            CiReservation::Bounded(gib.min(u64::from(u32::MAX)) as u32)
+        }
+        None => CiReservation::Unbounded,
+    }
+}
+
+/// This host's [`CiReservation`].
+fn probe_ci_reservation() -> CiReservation {
+    if cfg!(target_os = "linux") {
+        ci_reservation_from_root(std::path::Path::new("/sys/fs/cgroup"))
+    } else {
+        CiReservation::NoCgroup
+    }
+}
+
+/// The `ci_reserved_gib` this runner publishes: the cgroup bound on Linux,
+/// the CI job slots × [`CI_JOB_MEM_GIB`] where no cgroup can be read, and
+/// `None` (omitted, so coord keeps its last stored agent count) when a CI
+/// slice is unbounded. The slots are the node's configured or STATIC
+/// partition, never the capacity model's current answer: the plan makes the
+/// reservation one of the model's inputs (Phase 5), and feeding the model's
+/// output back into it would move the reservation, and the agent cap derived
+/// from it, inversely to load.
+fn published_ci_reserved_gib(reservation: CiReservation, ci_jobs: u32) -> Option<u32> {
+    match reservation {
+        CiReservation::Bounded(gib) => Some(gib),
+        CiReservation::Unbounded => None,
+        CiReservation::NoCgroup => Some(ci_jobs.saturating_mul(CI_JOB_MEM_GIB)),
+    }
 }
 
 /// Detect cpu_cores / memory_gb / disk_total_gb on the current host.
@@ -475,6 +630,29 @@ static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
 > = std::sync::OnceLock::new();
 
+/// Act on one heartbeat reconcile pass: log and `notify` when it changed local
+/// binding state, then flag each binding only coord holds. The reconcile drops
+/// bindings with no user action, so without the notify the tenant list and its
+/// credential notes keep showing a binding the device has lost until the app
+/// restarts. `notify` is a parameter so a test can count it; the heartbeat
+/// passes [`crate::commands::web_integration::notify_tenant_bindings_changed`].
+fn apply_binding_reconcile_report(
+    report: qontinui_runner_lib::pair::BindingReconcileReport,
+    notify: impl FnOnce(),
+) {
+    if report.changed() {
+        info!(
+            "fleet::heartbeat: reconciled bindings against coord \
+             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+            report.dropped, report.dropped_slots, report.default_repointed
+        );
+        notify();
+    }
+    for (t, slot) in report.coord_only {
+        warn_coord_only_binding_once(t, slot);
+    }
+}
+
 fn warn_coord_only_binding_once(tenant: uuid::Uuid, slot: qontinui_runner_lib::auth::SlotState) {
     let set = COORD_ONLY_BINDINGS_WARNED
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
@@ -583,7 +761,7 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
 /// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
 /// | `max_concurrent_ci_jobs` | runner | always sent |
-/// | `max_concurrent_agents` | runner | always sent |
+/// | `max_concurrent_agents` | **coord** (for a non-zero value it stores its own derivation from this payload's `memory_gb`/`cpu_cores`/`ci_reserved_gib`, or keeps the last stored value when `ci_reserved_gib` is absent; see the per-session cost-model note above `SESSION_COST_MEM_MIB`) | always sent: an advisory derived value for the Agent role, an explicit `0` (stored verbatim) for the Build role |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
 /// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
@@ -652,6 +830,12 @@ struct DeviceBudgetRequest {
     disk_total_gb: i64,
     disk_reserved_gb: i64,
     max_concurrent_agents: i32,
+    /// GiB of host memory this host's CI may take ([`published_ci_reserved_gib`]).
+    /// coord derives the stored `max_concurrent_agents` from it, and OMITTED
+    /// (an unbounded CI slice) means "unknown": coord then keeps its last
+    /// stored value rather than reading CI as zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ci_reserved_gib: Option<u32>,
     /// CI job slots — the column this runner unambiguously owns, read only by
     /// coord's `ci_dispatch` for devices advertising the `ci_node` capability.
     ///
@@ -680,9 +864,20 @@ struct DeviceBudgetRequest {
 /// three copies of it was two too many.
 use crate::util::error_chain::error_chain;
 
-/// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
-/// Returns Ok on first success; returns Err with the last error if every
-/// attempt fails. The caller decides whether to surface or swallow.
+/// How a budget publish is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetDelivery {
+    /// The boot publish and the periodic re-assert: retried with backoff.
+    Retry,
+    /// A change-triggered publish on the sample loop: one attempt, so a
+    /// failing budget route can never hold that loop for minutes.
+    Once,
+}
+
+/// POST the budget payload — under [`BudgetDelivery::Retry`] with exponential
+/// backoff (2s, 4s, 8s, 16s, 32s, 60s), under [`BudgetDelivery::Once`] one
+/// attempt. Returns Ok on first success; returns Err with the last error if
+/// every attempt fails. The caller decides whether to surface or swallow.
 ///
 /// Per the runner-bootable-when-coord-down property, this is the ONLY
 /// place we busy-wait on coord HTTP; the caller wraps this in
@@ -691,6 +886,7 @@ async fn post_budget_with_retry(
     coord_base: &str,
     device_id: &str,
     body: &DeviceBudgetRequest,
+    delivery: BudgetDelivery,
 ) -> Result<(), String> {
     let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
     let client = reqwest::Client::builder()
@@ -698,7 +894,10 @@ async fn post_budget_with_retry(
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;
     let mut last_err = String::new();
-    let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
+    let backoff_ms: &[u64] = match delivery {
+        BudgetDelivery::Retry => &[2_000, 4_000, 8_000, 16_000, 32_000, 60_000],
+        BudgetDelivery::Once => &[0],
+    };
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
         // coord-tenant-scope(device): device_id (:481) is the only identity in scope; the budget row is device-keyed and coord's handler reads no tenant at all.
         match crate::auth::attach_device_auth(client.post(&url).json(body))
@@ -881,6 +1080,13 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
 /// `role` is consumed here (it decides the agent cap) but deliberately never
 /// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
 /// owns that column.
+///
+/// `suggested` is the CI node's suggestion for an unset capacity, resolved by
+/// the caller ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]:
+/// the capacity model's Lane B total when it answers, else the static formula)
+/// so this function stays pure; `host` gives the static partition the
+/// reservation is sized from.
+#[allow(clippy::too_many_arguments)]
 fn build_budget_request(
     hostname: &str,
     role: MachineRole,
@@ -888,7 +1094,20 @@ fn build_budget_request(
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
     host: crate::ci_node::host_sizing::HostCapacity,
+    suggested: u32,
+    ci_reservation: CiReservation,
 ) -> DeviceBudgetRequest {
+    let (ci_jobs, reserved_jobs) = if ci.enabled {
+        (
+            ci.configured_or(suggested),
+            ci.configured_or(crate::ci_node::host_sizing::suggested_concurrent_builds(
+                host,
+            )),
+        )
+    } else {
+        (0, 0)
+    };
+    let ci_reserved_gib = published_ci_reserved_gib(ci_reservation, reserved_jobs);
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
         cpu_cores: resources.cpu_cores.min(i32::MAX as u32) as i32,
@@ -896,22 +1115,28 @@ fn build_budget_request(
         disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
         disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
         max_concurrent_agents: match role {
-            MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
+            // Advisory: coord stores its own derivation (and keeps its last
+            // stored value when `ci_reserved_gib` is omitted).
+            MachineRole::Agent => derive_max_agents(
+                resources.memory_gb,
+                resources.cpu_cores,
+                ci_reserved_gib.unwrap_or(0),
+            ) as i32,
             MachineRole::Build => 0,
         },
+        ci_reserved_gib,
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
-        // (`ci_node.max_concurrent_builds`; unset ⇒ the host suggestion for
-        // `host`) — resolved through the same accessor `ci_node/admission.rs`
-        // admits against, so the advertised and admitted numbers cannot
-        // diverge. It is deliberately not renamed. It is operator-visible, and
-        // the split is about which coord COLUMN carries the number, not about
-        // what the node calls its own capacity. `host` is passed in rather than
-        // probed here so this function stays pure over its arguments.
-        max_concurrent_ci_jobs: if ci.enabled {
-            ci.configured_or_suggested_builds(host).min(i32::MAX as u32) as i32
-        } else {
-            0
-        },
+        // (`ci_node.max_concurrent_builds`; unset ⇒ `suggested`) — resolved
+        // through the same accessor `ci_node/admission.rs` admits against
+        // (`CiNodeSettings::configured_or`). The capacity model's answer moves
+        // between budget periods, so the republisher re-publishes whenever this
+        // number changes (`spawn_budget_republisher`): the advertised number
+        // trails the admitted one by at most one sample interval. It is
+        // deliberately not renamed. It is operator-visible, and the split is
+        // about which coord COLUMN carries the number, not about what the node
+        // calls its own capacity. `host` and `suggested` are passed in rather
+        // than probed here so this function stays pure over its arguments.
+        max_concurrent_ci_jobs: ci_jobs.min(i32::MAX as u32) as i32,
     }
 }
 
@@ -945,6 +1170,16 @@ pub async fn publish_budget(
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
+    publish_budget_with(role, resources, disk_reserved_gb, BudgetDelivery::Retry).await
+}
+
+/// [`publish_budget`] with its delivery chosen ([`BudgetDelivery`]).
+async fn publish_budget_with(
+    role: MachineRole,
+    resources: Resources,
+    disk_reserved_gb: u64,
+    delivery: BudgetDelivery,
+) -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
             instance = ?crate::instance::instance_name(),
@@ -961,6 +1196,7 @@ pub async fn publish_budget(
                 "fleet::publish_budget: ~/.qontinui/machine.json missing — \
                  run `qontinui_profile device init` to register identity. Skipping budget publish."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -971,19 +1207,33 @@ pub async fn publish_budget(
             warn!(
                 "fleet::publish_budget: machine.json device_id is not a valid UUID ({e}). Skipping."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
     let device_id_str = device_id_uuid.to_string();
 
     let ci = crate::settings::get_ci_node_settings();
+    let host = crate::ci_node::host_sizing::probe();
+    // The capacity model is read only when its answer is used: a CI node
+    // with no explicit capacity (`configured_or_suggested_builds` reads
+    // nothing for an explicit one). A disabled node publishes 0 CI jobs and
+    // `build_budget_request` ignores `suggested`, so it reads no model and logs
+    // no D9 records for a consumer that is off on this box.
+    let suggested = if ci.enabled {
+        ci.configured_or_suggested_builds(host)
+    } else {
+        0
+    };
     let body = build_budget_request(
         &device.hostname,
         role,
         resources,
         disk_reserved_gb,
         &ci,
-        crate::ci_node::host_sizing::probe(),
+        host,
+        suggested,
+        probe_ci_reservation(),
     );
 
     // Cache the payload regardless of whether the POST succeeds — this is
@@ -996,12 +1246,17 @@ pub async fn publish_budget(
             warn!(
                 "fleet::publish_budget: active profile has no coord_url; skipping budget publish (cache written)"
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
 
-    match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
+    match post_budget_with_retry(&coord_base, &device_id_str, &body, delivery).await {
         Ok(()) => {
+            // Recorded only once coord took it: a failed publish leaves the
+            // old value, so `advertised_ci_jobs_changed` retries on the next
+            // sample tick with one attempt (`BudgetDelivery::Once`).
+            record_advertised_ci_jobs(body.max_concurrent_ci_jobs);
             // Columns this runner does NOT own are named as `not published`,
             // so the ownership split is visible in the log rather than
             // inferable only from the wire. Silence about which fields were
@@ -1018,6 +1273,17 @@ pub async fn publish_budget(
                 body.disk_total_gb,
                 body.max_concurrent_agents,
                 body.max_concurrent_ci_jobs
+            );
+            Ok(())
+        }
+        // A one-attempt change publish fails again on every sample tick until
+        // coord takes it (its value stays unrecorded), so it logs at debug:
+        // warning per tick would flood the log while coord is down. The
+        // retried boot publish and the periodic re-assert keep the warning.
+        Err(e) if delivery == BudgetDelivery::Once => {
+            tracing::debug!(
+                "fleet::publish_budget: one-attempt change publish failed ({e}); \
+                 next sample tick retries, payload cached at ~/.qontinui/last_budget.json"
             );
             Ok(())
         }
@@ -1053,6 +1319,71 @@ fn budget_republish_secs() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(BUDGET_REPUBLISH_DEFAULT_SECS)
         .max(60)
+}
+
+/// The `max_concurrent_ci_jobs` the last SUCCESSFUL budget publish carried;
+/// [`CI_JOBS_NEVER_PUBLISHED`] = none yet in this process,
+/// [`CI_JOBS_UNPUBLISHABLE`] = none, because a publish found nothing to
+/// publish to.
+static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(CI_JOBS_NEVER_PUBLISHED);
+const CI_JOBS_NEVER_PUBLISHED: i64 = -1;
+const CI_JOBS_UNPUBLISHABLE: i64 = -2;
+
+fn record_advertised_ci_jobs(jobs: i32) {
+    ADVERTISED_CI_JOBS.store(i64::from(jobs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A publish returned without POSTing (no device identity, no coord base):
+/// mark "never published" as unpublishable, so [`ci_jobs_publish_owed`] does
+/// not re-run a publish that has nowhere to go on every sample tick. A value a
+/// successful publish recorded is left alone.
+fn note_ci_jobs_unpublishable() {
+    let _ = ADVERTISED_CI_JOBS.compare_exchange(
+        CI_JOBS_NEVER_PUBLISHED,
+        CI_JOBS_UNPUBLISHABLE,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Has the CI node's capacity moved off what the last successful budget
+/// publish advertised? With the capacity model (plan
+/// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci` Phase 7)
+/// an unset capacity changes with the box's load, and coord's `ci_dispatch`
+/// places against the advertised column, so a change is re-published on the
+/// next sample tick rather than at the next budget period. Takes `ci_state`'s
+/// lock through the model's read; the republisher holds no lock.
+fn advertised_ci_jobs_changed() -> bool {
+    let ci = crate::settings::get_ci_node_settings();
+    let now = if ci.enabled {
+        ci.configured_or_suggested_builds(crate::ci_node::host_sizing::probe())
+    } else {
+        0
+    };
+    let advertised = ADVERTISED_CI_JOBS.load(std::sync::atomic::Ordering::Relaxed);
+    ci_jobs_publish_owed(advertised, now, ci.enabled)
+}
+
+/// Is a CI-capacity publish owed, given what the last successful publish
+/// advertised ([`ADVERTISED_CI_JOBS`]), the capacity `now`, and whether the
+/// node is enabled? A changed capacity is owed. So is an enabled node's
+/// capacity that NO publish has carried yet: a failed boot publish leaves
+/// nothing recorded, and without this its CI capacity waited a full budget
+/// period for the re-assert (review round 5 on qontinui-runner#2921). A
+/// disabled node with nothing recorded owes nothing here, and neither does a
+/// box with nowhere to publish to: the periodic re-assert covers both. If the
+/// boot publish is still on its retry ladder, the tick's one attempt overlaps
+/// it, and should the older boot body land last, the recorded value differs
+/// from `now` and the next tick corrects it. PURE.
+fn ci_jobs_publish_owed(advertised: i64, now: u32, ci_enabled: bool) -> bool {
+    if advertised == CI_JOBS_NEVER_PUBLISHED {
+        return ci_enabled;
+    }
+    if advertised < 0 {
+        return false;
+    }
+    advertised != i64::from(now.min(i32::MAX as u32))
 }
 
 /// Periodically re-assert this device's budget, so a clobbered or stale
@@ -1111,6 +1442,16 @@ fn budget_republish_secs() -> u64 {
 /// therefore has up to one sample interval of granularity error (600s becomes
 /// 600–630s), which is immaterial for a self-heal loop and is the price of not
 /// running two timers.
+///
+/// One exception, and it is a CHANGE, not a re-assert: when the CI node's
+/// capacity moves off what the last successful publish advertised (the
+/// capacity model's answer follows the box's load —
+/// [`advertised_ci_jobs_changed`]), the budget is published on that tick with
+/// ONE attempt ([`BudgetDelivery::Once`]), so a failing budget route costs a
+/// tick at most one request timeout and never the retry ladder; a failure
+/// leaves the advertised value unrecorded, so the next tick tries again. An
+/// enabled CI node whose boot publish failed counts as changed too
+/// ([`ci_jobs_publish_owed`]), so its capacity reaches coord on the next tick.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -1141,26 +1482,59 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // payload fires immediately — the first sample lands one sample
             // interval in, the first re-assert one full budget period in.
             let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+            // The computer reporter (identity, services, events) rides this
+            // same gated loop — no timer or gate of its own. Rebuilt per
+            // supervised run; its durable state lives on disk.
+            let mut reporter = computer::Reporter::new();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                reporter.tick().await;
 
-                if tokio::time::Instant::now() < next_budget {
-                    continue;
+                // The CI node sizes its concurrency from coord's capacity
+                // model (plan 2026-11-05-one-free-resource-model-places-
+                // sessions-builds-and-ci Phase 7) and reads the cached row
+                // synchronously; this keeps it warm on the one periodic
+                // publisher rather than a timer of its own (coord is asked
+                // only when the kept read is stale — `fleet_capacity`).
+                if crate::settings::get_ci_node_settings().enabled {
+                    crate::ci_node::host_sizing::refresh_model().await;
+                    // A cap the model raised re-admits what it deferred.
+                    crate::ci_node::admission::drain_deferred_on_cap_rise();
                 }
+
+                let due = tokio::time::Instant::now() >= next_budget;
+                let delivery = if due {
+                    BudgetDelivery::Retry
+                } else if advertised_ci_jobs_changed() {
+                    BudgetDelivery::Once
+                } else {
+                    continue;
+                };
                 // Authoritative lane. Resources are re-detected each time: disk
                 // fills, and the ci_node settings this derives
                 // `max_concurrent_builds` from can change while the runner is up
                 // (the setting is designed to need no restart —
                 // `ci_node/subscription.rs` re-reads it every loop).
                 let resources = detect_resources();
-                if let Err(e) = publish_budget(role, resources, 0).await {
-                    warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
+                match publish_budget_with(role, resources, 0, delivery).await {
+                    Err(e) if due => {
+                        warn!("fleet::budget_republisher: re-publish failed (will retry): {e}")
+                    }
+                    // A change publish that failed is retried on the next
+                    // tick (its value stays unrecorded), so it logs quietly.
+                    Err(e) => tracing::debug!(
+                        "fleet::budget_republisher: CI capacity change publish failed \
+                         (next tick retries): {e}"
+                    ),
+                    Ok(()) => {}
                 }
-                next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                if due {
+                    next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                }
             }
         },
     );
@@ -1553,6 +1927,8 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 struct SlowHostProbes {
     powershell: bool,
     docker: bool,
+    /// `claude` resolves to a launchable executable ([`claude_launchable`]).
+    claude: bool,
 }
 
 static SLOW_HOST_PROBE_CACHE: Mutex<Option<(SlowHostProbes, std::time::Instant)>> =
@@ -1577,6 +1953,7 @@ fn slow_host_probes() -> SlowHostProbes {
     let probes = SlowHostProbes {
         powershell: powershell_on_path(),
         docker: docker_daemon_answers(),
+        claude: claude_launchable(),
     };
     if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
         *g = Some((probes, std::time::Instant::now()));
@@ -1596,11 +1973,9 @@ fn slow_host_probes() -> SlowHostProbes {
 /// BLOCKS: the heartbeat assembles its capability base
 /// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
-    let slow = slow_host_probes();
-    let mut caps = build_host_capabilities(
+    let mut caps = assemble_host_capabilities(
         current_os_label(),
-        slow.powershell,
-        slow.docker,
+        slow_host_probes(),
         webview_runtime_available(),
         host_mem_total_bytes(),
     );
@@ -1608,11 +1983,32 @@ fn host_capabilities() -> Vec<String> {
     caps
 }
 
+/// [`host_capabilities`] minus the image probe, from the probes' results:
+/// the [`build_host_capabilities`] set plus the condition-check token, which
+/// two of the probes decide together. Pure, so a test can hand it every
+/// combination a real host produces.
+fn assemble_host_capabilities(
+    os: &str,
+    slow: SlowHostProbes,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut caps =
+        build_host_capabilities(os, slow.powershell, slow.docker, webview, mem_total_bytes);
+    caps.extend(condition_secret_substitution_capability(
+        webview,
+        slow.claude,
+    ));
+    caps
+}
+
 /// The heartbeat's host capability set: [`host_capabilities`] plus the
-/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` —
-/// read from its own cache (see the section header above
-/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. The ONLY caller
-/// of [`cred_capabilities`], and called only by `heartbeat_to_coord`.
+/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` and
+/// the regional tokens coord's catalogue names — read from its own cache (see the section header above
+/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. Called only by
+/// `heartbeat_to_coord`, on the blocking pool. The other caller of
+/// [`cred_capabilities`] is [`heartbeat_join_failure_capabilities`], which runs
+/// on the async worker, so that read must stay non-blocking.
 fn heartbeat_capabilities() -> Vec<String> {
     let mut caps = host_capabilities();
     caps.extend(cred_capabilities());
@@ -1815,6 +2211,69 @@ fn build_host_capabilities(
     caps
 }
 
+/// The capability token asserting this runner substitutes a condition check's
+/// `{{secret:<ref>}}` placeholders inside its SDK `type` action
+/// ([`crate::condition_secrets`]), and can launch the session that types them.
+///
+/// Plan
+/// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+/// Phase 13, D-D7a: coord places a condition group whose `auth_setup` carries
+/// a credential only on a device advertising this token, and otherwise reads
+/// the run `unknown`, never a plaintext prompt. Coord's placement verdict reads
+/// the token and NOT `claude_code_available`, so the token itself carries the
+/// launch precondition ([`condition_secret_substitution_capability`]).
+///
+/// The spelling is frozen for the same reason as
+/// [`WEBVIEW_RUNTIME_CAPABILITY`]: a respelling silently un-targets every
+/// secret-bearing condition group, with nothing red on either side.
+pub const CONDITION_SECRET_SUBSTITUTION_CAPABILITY: &str = "condition:secret_substitution";
+
+/// `Some(token)` when this runner has what a condition-check session needs
+/// from its host: a webview runtime to host its visible terminal (the first
+/// thing `agent_runtime::run_condition_check_terminal` needs) AND a `claude`
+/// that resolves to a launchable executable. Necessary, not sufficient: a
+/// launch also needs spawn authorization, a signed-in account and a workspace
+/// root, which this host fact does not see. Fail-closed like
+/// [`webview_runtime_available`]: advertising falsely sends a run carrying
+/// secrets to a device that then cannot spawn its session; not advertising
+/// only moves the run elsewhere, or reads it `unknown`. Pure.
+fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Option<String> {
+    (webview && claude).then(|| CONDITION_SECRET_SUBSTITUTION_CAPABILITY.to_string())
+}
+
+/// True when what a condition-check spawn execs is the absolute path of an
+/// existing, executable file. The spawn execs `agent_runtime::resolve_claude_bin`
+/// as it is (`run_condition_check_terminal`), so a miss there, a bare name, is
+/// not a launch this runner can vouch for, and neither is an explicit
+/// `QONTINUI_CLAUDE_BIN` naming a file without its execute bit. Stats PATH, so
+/// it is cached behind `HOST_PROBE_TTL` with the other slow probes.
+fn claude_launchable() -> bool {
+    is_launchable_file(std::path::Path::new(
+        &crate::agent_runtime::resolve_claude_bin(),
+    ))
+}
+
+/// An absolute path to a regular file that, on unix, carries an execute bit.
+fn is_launchable_file(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && has_execute_bit(&metadata))
+}
+
+#[cfg(unix)]
+fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no execute bit: what launches is decided by the extension,
+/// which `agent_runtime::resolve_claude_bin`'s PATH walk restricts.
+#[cfg(not(unix))]
+fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
 /// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
 /// `ci_node.repo_allowlist` entry, so coord's device selection can filter on
 /// the same allowlist the runner's admission enforces instead of electing a
@@ -1855,6 +2314,21 @@ static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
 /// heartbeat runs it on the blocking pool, never inline on its async worker.
 fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
     build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
+}
+
+/// The capability base when the blocking assembly panicked: CI tokens, the OS
+/// fact (the one host token that needs no probe) and the credential family.
+///
+/// The vector is AUTHORITATIVE, so whatever is left out here is retracted from
+/// `coord.devices.capabilities` by this heartbeat. A panic in an unrelated host
+/// probe says nothing about this box's credentials, and leaving the family out
+/// would also drop `probes:cred`, turning the device from "probed" into
+/// "unprobed" for a tick. The read cannot block or probe: it is the same cache
+/// [`cred_capabilities`] always answers from.
+fn heartbeat_join_failure_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    let mut host = vec![format!("os:{}", current_os_label())];
+    host.extend(cred_capabilities());
+    build_device_capabilities(ci_node, repo_allowlist, &host)
 }
 
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
@@ -2121,7 +2595,9 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 // =============================================================================
 // Credential-presence capability family — `cred:gh`, `cred:aws-sts` and the
 // `probes:cred` marker (plan
-// `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 2).
+// `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 2), plus the
+// regional `cred:aws-ssm:<region>` / `cred:aws-ecs:<region>` tokens coord's
+// probe catalogue names (Phase 3, `fleet/cred_probe_specs.rs`).
 //
 // Coord places credential-gated continuations by matching
 // `required_capabilities` against `coord.devices.capabilities` (D1), so a
@@ -2165,6 +2641,15 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// the probes, and `no_capable_device` would assert an absence nobody
 /// measured. Present even when every probe answered `Unknown`.
 pub(crate) const CRED_PROBES_MARKER: &str = "probes:cred";
+
+/// The marker a runner advertises while its LAST regional cycle read an
+/// ANSWERED catalogue and measured every token in it: no spec left unrun, no
+/// unreadable or refused row, and no `Unknown` verdict. [`CRED_PROBES_MARKER`]
+/// says only that the built-in probes ran, so without this coord cannot tell a
+/// box that probed `cred:aws-ssm:<region>` and found nothing from one whose
+/// catalogue fetch never answered (plan
+/// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`).
+pub(crate) const CRED_REGIONAL_PROBES_MARKER: &str = "probes:cred-regional";
 
 /// A stored GitHub CLI login for `github.com` whose ACTIVE account answers
 /// `gh auth status --active`.
@@ -2729,11 +3214,32 @@ fn fold_cred_memo(
     }
 }
 
+/// Log one token's verdict — token and state only — at `info!` when its
+/// advertisement flips, `debug!` otherwise.
+fn log_cred_advertisement(token: &str, state: &str, was: bool, is: bool) {
+    if was != is {
+        info!("host_capabilities: {token} state={state} advertised={is}");
+    } else {
+        debug!("host_capabilities: {token} state={state} advertised={is}");
+    }
+}
+
 /// The `cred` family's cache: when it last ran, and each token's memo.
+///
+/// The built-in tokens and the catalogue's regional tokens sit in separate maps
+/// so that nothing a catalogue fetch does can reach `cred:gh` or `cred:aws-sts`:
+/// [`Self::apply_regional`] has no access path to `memos`, and the marker is
+/// derived from `ran_at` alone.
 #[derive(Debug)]
 struct CredFamilyState {
     ran_at: Option<std::time::Instant>,
     memos: std::collections::BTreeMap<&'static str, CredMemo>,
+    /// Keyed by the token [`cred_probe_specs::RegionalProbe::token`] rebuilt from
+    /// a validated spec, so every key is D1-grammar and safe to log.
+    regional: std::collections::BTreeMap<String, CredMemo>,
+    /// The last regional cycle read an answered catalogue and measured every
+    /// token in it; drives [`CRED_REGIONAL_PROBES_MARKER`].
+    regional_measured: bool,
 }
 
 impl CredFamilyState {
@@ -2741,6 +3247,8 @@ impl CredFamilyState {
         CredFamilyState {
             ran_at: None,
             memos: std::collections::BTreeMap::new(),
+            regional: std::collections::BTreeMap::new(),
+            regional_measured: false,
         }
     }
 
@@ -2763,17 +3271,7 @@ impl CredFamilyState {
             let after = fold_cred_memo(before, state, now, ttl);
             let was = before.is_some_and(|m| m.present);
             let is = after.is_some_and(|m| m.present);
-            if was != is {
-                info!(
-                    "host_capabilities: {token} state={} advertised={is}",
-                    state.as_str()
-                );
-            } else {
-                debug!(
-                    "host_capabilities: {token} state={} advertised={is}",
-                    state.as_str()
-                );
-            }
+            log_cred_advertisement(token, state.as_str(), was, is);
             match after {
                 Some(m) => {
                     self.memos.insert(token, m);
@@ -2786,19 +3284,131 @@ impl CredFamilyState {
         self.ran_at = Some(now);
     }
 
+    /// Fold one verdict into one regional token's memo.
+    fn fold_regional(
+        &mut self,
+        token: &str,
+        state: CredState,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        let before = self.regional.get(token).copied();
+        let after = fold_cred_memo(before, state, now, ttl);
+        // A token never earned and still not held says nothing; logging it
+        // would let a long list of unmeasured rows bypass the refusal-log cap.
+        if before.is_some() || after.is_some() {
+            log_cred_advertisement(
+                token,
+                state.as_str(),
+                before.is_some_and(|m| m.present),
+                after.is_some_and(|m| m.present),
+            );
+        }
+        match after {
+            Some(m) => {
+                self.regional.insert(token.to_string(), m);
+            }
+            None => {
+                self.regional.remove(token);
+            }
+        }
+    }
+
+    /// Fold one catalogue cycle in. D2's three outcomes:
+    ///
+    /// * No answer at all: nothing was measured, so every earned token folds as
+    ///   `Unknown` (its last answer holds for one TTL, then it drops).
+    /// * An answered catalogue: a token it no longer names was REMOVED and retracts
+    ///   here, with no hold, whatever its memo said. Every token it does name folds
+    ///   its own verdict, and a token past the run cap or named by a row of a kind
+    ///   this build does not know folds as `Unknown`: listed, but not measured.
+    /// * An answered catalogue holding an unreadable row: its silence about a token
+    ///   is not a removal, so a token no row names folds as `Unknown`. A token a
+    ///   readable row named and failed a check on still retracts at once.
+    ///
+    /// Never touches `memos` or `ran_at`. Sets `regional_measured`, which drives
+    /// [`CRED_REGIONAL_PROBES_MARKER`]: true only when the catalogue answered and
+    /// every token it lists reached a Present/Absent verdict this cycle.
+    fn apply_regional(
+        &mut self,
+        cycle: &cred_probe_specs::RegionalCycle,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        match cycle {
+            cred_probe_specs::RegionalCycle::NoAnswer => {
+                // Nothing was measured this cycle.
+                self.regional_measured = false;
+                let earned: Vec<String> = self.regional.keys().cloned().collect();
+                for token in &earned {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+            cred_probe_specs::RegionalCycle::Answered {
+                verdicts,
+                not_run,
+                unreadable_rows,
+                refused_tokens,
+                skipped_rows,
+            } => {
+                // Every catalogued token reached a verdict: nothing past the run
+                // cap, no unreadable, refused or unknown-kind row, no inconclusive
+                // answer.
+                self.regional_measured = not_run.is_empty()
+                    && !*unreadable_rows
+                    && !*skipped_rows
+                    && refused_tokens.is_empty()
+                    && verdicts.iter().all(|(_, s)| *s != CredState::Unknown);
+                let unnamed: Vec<String> = self
+                    .regional
+                    .keys()
+                    .filter(|token| {
+                        !verdicts.iter().any(|(t, _)| t == *token) && !not_run.contains(token)
+                    })
+                    .cloned()
+                    .collect();
+                for token in &unnamed {
+                    if *unreadable_rows && !refused_tokens.contains(token) {
+                        self.fold_regional(token, CredState::Unknown, now, ttl);
+                    } else {
+                        let was = self.regional.remove(token).is_some_and(|m| m.present);
+                        log_cred_advertisement(token, "removed", was, false);
+                    }
+                }
+                for (token, state) in verdicts {
+                    self.fold_regional(token, *state, now, ttl);
+                }
+                for token in not_run {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+        }
+    }
+
     /// The tokens this family contributes to the heartbeat: nothing before
     /// the first run (honestly unprobed), and afterwards [`CRED_PROBES_MARKER`]
+    /// (then [`CRED_REGIONAL_PROBES_MARKER`] while the last regional cycle measured
+    /// its whole catalogue)
     /// plus every token whose memo holds a positive answer.
     fn advertised(&self) -> Vec<String> {
         if self.ran_at.is_none() {
             return Vec::new();
         }
         let mut caps = vec![CRED_PROBES_MARKER.to_string()];
+        if self.regional_measured {
+            caps.push(CRED_REGIONAL_PROBES_MARKER.to_string());
+        }
         caps.extend(
             self.memos
                 .iter()
                 .filter(|(_, m)| m.present)
                 .map(|(token, _)| (*token).to_string()),
+        );
+        caps.extend(
+            self.regional
+                .iter()
+                .filter(|(_, m)| m.present)
+                .map(|(token, _)| token.clone()),
         );
         caps
     }
@@ -2830,6 +3440,83 @@ fn cred_capabilities() -> Vec<String> {
     caps
 }
 
+/// One whole family cycle, in the order that keeps the regional half from ever
+/// costing the built-ins anything: `cred:gh`, `cred:aws-sts` and the marker are
+/// settled in the cache BEFORE the catalogue is fetched, so a slow fetch or up to
+/// sixteen slow regional probes cannot delay them, and a failed fetch has nothing
+/// of theirs to disturb. The lock is held only to fold, never across a probe.
+///
+/// Both folds are stamped `started`, the cycle's START, not its end. The next
+/// cycle starts no sooner than `ran_at + ttl`, so consecutive regional folds are
+/// at least `ttl` apart however long the probes took, and D2's "hold for one TTL"
+/// is one cycle rather than two.
+#[cfg(test)]
+fn run_cred_refresh_cycle(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+) {
+    run_cred_refresh_cycle_scoped(cache, env, fetch_specs, started, ttl, true);
+}
+
+/// [`run_cred_refresh_cycle`] with the catalogue's tenancy. `single_tenant` is
+/// whether the device is bound to exactly ONE tenant. The catalogue is fetched
+/// under one binding's bearer, but the capability list is device-wide and coord
+/// reads it under every tenant the device is bound to, so on a multi-bound device
+/// [`CRED_REGIONAL_PROBES_MARKER`] would attest one tenant's catalogue to all of
+/// them. It is withheld there (coord then reads every regional zero as UNKNOWN);
+/// the regional tokens themselves fold exactly as before.
+fn run_cred_refresh_cycle_scoped(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+    single_tenant: bool,
+) {
+    let verdicts = probe_cred_family(env);
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .apply(&verdicts, started, ttl);
+    let regional = cred_probe_specs::run_regional_cycle(fetch_specs(), env);
+    let mut state = cache.lock().unwrap_or_else(|p| p.into_inner());
+    state.apply_regional(&regional, started, ttl);
+    // Under the same lock, so no heartbeat reads the marker in between.
+    state.regional_measured &= single_tenant;
+}
+
+/// Whether this device is bound to exactly ONE tenant, by BOTH reads: the local
+/// binding set (what the catalogue fetch's bearer comes from) and coord's own
+/// echoed set (`coord_bound_tenants.json`, what coord reads the capability list
+/// under). The local set alone can say one while coord binds two: the legacy-slot
+/// branch always reports one tenant, and `paired_user.json` heals only on a
+/// register response. Anything unresolved or UNKNOWN withholds the marker.
+fn heartbeat_binding_is_single_tenant() -> bool {
+    binding_is_single_tenant(
+        resolve_heartbeat_binding_set().as_ref(),
+        &qontinui_runner_lib::pair::coord_bound_tenants(),
+    )
+}
+
+/// The pure half of [`heartbeat_binding_is_single_tenant`].
+fn binding_is_single_tenant(
+    local: Option<&LocalBindingSet>,
+    coord: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+) -> bool {
+    use qontinui_runner_lib::pair::CoordBoundTenantsRead;
+    // ONE tenant, and the SAME one: a rebind with a stale local file would
+    // otherwise fetch tenant a's catalogue while coord reads the marker under b.
+    match (local, coord) {
+        (Some(set), CoordBoundTenantsRead::Known(v)) => {
+            v.len() == 1 && set.tenant_ids.as_slice() == v.as_slice()
+        }
+        _ => false,
+    }
+}
+
 /// Run the family once on a detached thread and fold it into
 /// [`CRED_FAMILY_CACHE`]. The latch is released by a drop guard, so a
 /// panicking probe cannot wedge every later refresh.
@@ -2838,7 +3525,8 @@ fn spawn_cred_refresh() {
     // Hermetic-test seam: a unit-test process must never run the operator's
     // real `gh` / `aws` (a live STS call with real credentials, on a detached
     // thread that outlives the test). Tests drive the family through
-    // `probe_cred_family` with a hermetic `CredProbeEnv` instead.
+    // `probe_cred_family` / `run_cred_refresh_cycle` with a hermetic
+    // `CredProbeEnv` instead.
     if cfg!(test) {
         debug!("host_capabilities: cred probe refresh suppressed under cfg(test)");
         return;
@@ -2856,10 +3544,17 @@ fn spawn_cred_refresh() {
         .name("cred-probe".into())
         .spawn(|| {
             let _release = Release;
+            let started = std::time::Instant::now();
             let env = CredProbeEnv::from_process();
-            let verdicts = probe_cred_family(&env);
-            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-            g.apply(&verdicts, std::time::Instant::now(), HOST_PROBE_TTL);
+            let single_tenant = heartbeat_binding_is_single_tenant();
+            run_cred_refresh_cycle_scoped(
+                &CRED_FAMILY_CACHE,
+                &env,
+                cred_probe_specs::fetch_probe_specs,
+                started,
+                HOST_PROBE_TTL,
+                single_tenant,
+            );
         });
     if let Err(e) = spawned {
         CRED_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
@@ -2982,6 +3677,19 @@ struct HeartbeatPayload {
     /// additive/backward-safe contract as `git_sha`.
     #[serde(skip_serializing_if = "Option::is_none")]
     commits_behind: Option<u64>,
+    /// The session-PR reconciler's credential's own `X-RateLimit-*` reading,
+    /// with its login, the per-consumer charged counts and the meter's start
+    /// (plan
+    /// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+    /// Phase 4). coord files it under `core:user:<login digest>/device:<id>`,
+    /// so a burn of the user bucket SHARED by every box on the identity is
+    /// visible from any box. OMITTED — never sent as a guess — before the
+    /// reconciler's first request, while its login is unresolved, or when the
+    /// reading is stale or unusable ([`crate::github_budget::build_user_budget_report`]).
+    /// Additive: a coord predating the block ignores the unknown key, and a
+    /// block coord refuses is dropped without failing the register.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_user_budget: Option<crate::github_budget::UserBudgetReport>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -2990,6 +3698,103 @@ struct HeartbeatPayload {
 /// the moment the probe starts passing.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Dedupe the "machine.json present but unloadable" heartbeat warning.
+static MACHINE_JSON_UNLOADABLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PURE: what the heartbeat reports when [`load_device_file`] produced no
+/// device, given the fallible read of the same file.
+///
+/// `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+/// cached dispatch role, so it is reported only when the file is positively
+/// ABSENT (or there is no home directory to hold one). A file that exists but
+/// could not be read or parsed, or that names no device_id / hostname, is
+/// `NotSent`, which `coord_drain_state::note_heartbeat` settles through its
+/// own `enrollment()` read. The same split `enrollment()` makes.
+pub(crate) fn unloadable_device_outcome(
+    read: &Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    >,
+) -> crate::coord_drain_state::HeartbeatOutcome {
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::MachineJsonError;
+    match read {
+        Err(MachineJsonError::NoHomeDir) => HeartbeatOutcome::NotEnrolled {
+            why: "no home directory, so there is no machine.json",
+        },
+        Err(e) if e.is_missing() => HeartbeatOutcome::NotEnrolled {
+            why: "~/.qontinui/machine.json is missing",
+        },
+        Err(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json is present but could not be read",
+        },
+        Ok(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json names no device_id or hostname",
+        },
+    }
+}
+
+#[cfg(test)]
+mod unloadable_device_outcome_tests {
+    use super::unloadable_device_outcome;
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::{try_parse_machine_json, MachineJsonError};
+    use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
+
+    fn read_err(kind: ErrorKind) -> MachineJsonError {
+        MachineJsonError::Read {
+            path: PathBuf::from("machine.json"),
+            source: Error::from(kind),
+        }
+    }
+
+    /// Only a positively absent file is "not enrolled"; anything merely
+    /// unreadable or incomplete must not be, or one transient read opens a
+    /// ci_node box's agent lane (the drain gate ignores the role while not
+    /// enrolled).
+    #[test]
+    fn only_an_absent_machine_json_is_not_enrolled() {
+        for read in [
+            Err(read_err(ErrorKind::NotFound)),
+            Err(MachineJsonError::NoHomeDir),
+        ] {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotEnrolled { .. }
+                ),
+                "{read:?}"
+            );
+        }
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let unreadable = [
+            Err(read_err(ErrorKind::PermissionDenied)),
+            Err(read_err(ErrorKind::Other)),
+            Err(MachineJsonError::Parse {
+                path: PathBuf::from("machine.json"),
+                source: parse,
+            }),
+            // Readable, but no hostname / no device_id.
+            Ok(
+                try_parse_machine_json(br#"{"device_id":"6c2f8a3e-1d1b-4c86-9d1e-2b9f6a2a0f10"}"#)
+                    .unwrap(),
+            ),
+            Ok(try_parse_machine_json(br#"{"hostname":"box"}"#).unwrap()),
+        ];
+        for read in unreadable {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotSent { .. }
+                ),
+                "{read:?}"
+            );
+        }
+    }
 }
 
 /// POST `{device_id, hostname, claude_code_available}` to
@@ -3020,16 +3825,37 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             why: "a secondary instance sends no register payload",
         });
     }
+    // `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+    // cached dispatch role, so it is reported only when the device file is
+    // positively ABSENT. Anything that merely could not be read — a locked or
+    // half-written machine.json, one with no hostname, a garbage device_id, a
+    // coord base that did not resolve — is `NotSent`, which
+    // `coord_drain_state::note_heartbeat` settles through its own `enrollment()`
+    // read (a miss, trending to Unknown, unless that read proves "not a coord
+    // device"). One transient read must not open a `ci_node` box's agent lane.
     let device = match load_device_file() {
         Some(d) => d,
         None => {
-            info!(
-                "fleet::heartbeat: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile device init` to enable fleet visibility. Skipping."
-            );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "~/.qontinui/machine.json is missing",
-            });
+            let outcome =
+                unloadable_device_outcome(&qontinui_runner_lib::ambient::try_read_machine_json());
+            match outcome {
+                HeartbeatOutcome::NotEnrolled { .. } => info!(
+                    "fleet::heartbeat: ~/.qontinui/machine.json missing — \
+                     run `qontinui_profile device init` to enable fleet visibility. Skipping."
+                ),
+                _ => {
+                    if !MACHINE_JSON_UNLOADABLE_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            "fleet::heartbeat: ~/.qontinui/machine.json is present but could \
+                             not be read, or names no device_id/hostname. Skipping the \
+                             register POST; the drain state reads it as a miss. (Logged once.)"
+                        );
+                    }
+                }
+            }
+            return Ok(outcome);
         }
     };
 
@@ -3037,7 +3863,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         Ok(id) => id,
         Err(e) => {
             warn!("fleet::heartbeat: machine.json device_id is not a valid UUID ({e}). Skipping.");
-            return Ok(HeartbeatOutcome::NotEnrolled {
+            return Ok(HeartbeatOutcome::NotSent {
                 why: "machine.json device_id is not a UUID",
             });
         }
@@ -3050,8 +3876,10 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
                 "fleet::heartbeat: ~/.qontinui/profiles.json missing or active profile \
                  has no coord_url — no coord to heartbeat to. Skipping."
             );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "the active profile has no coord_url",
+            // `enrollment()` tells a profile with no coord_url (not enrolled)
+            // from a settings.json it could not read (indeterminate).
+            return Ok(HeartbeatOutcome::NotSent {
+                why: "no coord base resolved for the register POST",
             });
         }
     };
@@ -3108,18 +3936,15 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // The host probes block (a `docker version` fork, and on a cache miss a
     // bounded `GET /v1/models` of the image upstream), so the capability base
     // is assembled on the blocking pool rather than on this async task's
-    // worker. A join failure (a panicking probe) still advertises the CI tokens
-    // and the OS fact, the one host token that needs no probe.
+    // worker. A join failure (a panicking probe) still advertises the CI tokens,
+    // the OS fact (the one host token that needs no probe) and the credential
+    // family from its non-blocking cache: `heartbeat_join_failure_capabilities`.
     let (ci_enabled, repo_allowlist) = (ci.enabled, ci.repo_allowlist.clone());
     let mut capabilities =
         spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
             .await
             .unwrap_or_else(|_| {
-                build_device_capabilities(
-                    ci.enabled,
-                    &ci.repo_allowlist,
-                    &[format!("os:{}", current_os_label())],
-                )
+                heartbeat_join_failure_capabilities(ci.enabled, &ci.repo_allowlist)
             });
     // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
     // Phase 3b): advertised only when the skill is served AND the bearer this
@@ -3169,6 +3994,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         git_sha,
         main_sha,
         commits_behind,
+        github_user_budget: crate::github_budget::user_budget_report(),
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -3222,18 +4048,10 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             .await
             .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
             match reconciled {
-                Ok(report) => {
-                    if report.changed() {
-                        info!(
-                            "fleet::heartbeat: reconciled bindings against coord \
-                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                            report.dropped, report.dropped_slots, report.default_repointed
-                        );
-                    }
-                    for (t, slot) in report.coord_only {
-                        warn_coord_only_binding_once(t, slot);
-                    }
-                }
+                Ok(report) => apply_binding_reconcile_report(
+                    report,
+                    crate::commands::web_integration::notify_tenant_bindings_changed,
+                ),
                 Err(e) => {
                     tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
@@ -3248,14 +4066,21 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             })
             .await
             .unwrap_or_else(|e| Err(format!("backfill task failed: {e}")));
-            if let Err(e) = backfilled {
-                tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+            match backfilled {
+                Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+                }
             }
         }
         // D2: the same body carries this device's drain state. An absent or
         // unparseable object folds to `Unknown`, never to clear.
+        // The device's dispatch role rides in the same `drain` object; an
+        // absent one keeps today's behaviour.
         Ok(HeartbeatOutcome::Registered {
             drain: crate::coord_drain_state::parse_register_response(&body),
+            dispatch_role: crate::coord_drain_state::parse_register_role(&body),
         })
     } else {
         let body = resp.text().await.unwrap_or_default();
@@ -3585,8 +4410,37 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
+    // which a crash between its write and its rename would leave behind.
+    ".coord-mcp-status.tmp-*",
     ".claude/worktrees/",
 ];
+
+/// The one in-process lock every `.git/info/exclude` writer holds across its
+/// read-modify-write: [`ensure_repo_info_exclude`], the shared-branch
+/// allocation block's add / remove / sweep
+/// (`agent_worktree::shared_branch_restore`), and the provisioners'
+/// per-path block (`provision_exclude::update_exclude`). In-process only —
+/// another runner process on the same box is not excluded by it, and a block
+/// such a race resurrects is reaped by the shared-branch module's stale-block
+/// sweep.
+pub(crate) fn info_exclude_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read a `.git/info/exclude` for a rewrite: an absent file is empty; any
+/// other read failure, and content that is not UTF-8, is an `Err`, so the
+/// caller never rewrites a file it could not read faithfully.
+pub(crate) fn read_info_exclude(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|e| format!("{} is not UTF-8 ({e})", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
 
 /// Header line bracketing the runner-managed block in a repo's
 /// `.git/info/exclude` — lets the operator see who added the entries.
@@ -3605,7 +4459,14 @@ const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts
 /// walks primary trees anyway). Best-effort: any IO error is swallowed — a
 /// missed exclude just means the tree reads dirty for one more cycle, never a
 /// panic.
-fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
+///
+/// Also applied to a canonical checkout right before the runner switches it
+/// onto a `shared_branch` agent branch
+/// ([`crate::agent_worktree::shared_branch_restore::prepare_canonical_excludes`]),
+/// because the session provisioned there writes these artifacts into the
+/// canonical checkout itself, and a refused spawn's restore requires that
+/// checkout to read fully clean.
+pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     // `.git` as a directory == primary checkout. Skip worktree `.git` files
     // and bare/odd layouts.
     if !repo_path.join(".git").is_dir() {
@@ -3613,7 +4474,24 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     }
     let info_dir = repo_path.join(".git").join("info");
     let exclude_path = info_dir.join("exclude");
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    // Every writer of a `.git/info/exclude` holds this lock across its
+    // read-modify-write, so this roster heal, the shared-branch allocation
+    // block (`agent_worktree::shared_branch_restore`) and the provisioners'
+    // per-path block (`provision_exclude`) never lose each other's edit.
+    let _excl = info_exclude_lock();
+    // A file that exists but cannot be read (or is not UTF-8) is never
+    // rewritten: rewriting it from an empty string would drop the operator's
+    // own lines.
+    let existing = match read_info_exclude(&exclude_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "fleet::ensure_repo_info_exclude: {e} — left as is, so the machine-local \
+                 artifacts are NOT excluded in this repo until the file is readable UTF-8"
+            );
+            return;
+        }
+    };
 
     // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
     // counts as already-covered.
@@ -4852,9 +5730,11 @@ fn spawn_skill_parity_pass_if_due() {
             }
             None => {
                 report_skill_parity_unreached(
-                    "the workspace root did not resolve, so neither tree could be \
-                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
-                        .to_string(),
+                    format!(
+                        "the workspace root did not resolve, so neither tree could be \
+                         located — set the \"{}\" setting to the folder that holds them",
+                        qontinui_types::paths::WORKSPACE_ROOT_SETTING
+                    ),
                     None,
                 );
                 None
@@ -4886,7 +5766,7 @@ fn spawn_skill_parity_pass_if_due() {
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
 ///
 /// Still `Option`: a miss means this publish pass finds no repos and says so
-/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
+/// (see the "no workspace root resolved" log below), which is honest
 /// degradation rather than an error.
 fn qontinui_root() -> Option<PathBuf> {
     crate::workspace_paths::workspace_root()
@@ -6108,16 +6988,22 @@ pub async fn publish_tree_state() -> Result<(), String> {
         }
     };
 
-    let root = match qontinui_root() {
-        Some(p) => p,
-        None => {
+    let root = match crate::workspace_paths::runner_workspace_root().require() {
+        Ok(p) => p,
+        Err(unresolved) => {
             info!(
-                "fleet::tree_publisher: no qontinui-root directory found (set \
-                 QONTINUI_ROOT to override). Skipping."
+                "fleet::tree_publisher: {unresolved} With no workspace root there are no \
+                 repos to publish. Skipping."
             );
             return Ok(());
         }
     };
+
+    // The checkouts this walk skips (no `qontinui-` prefix) still get the
+    // shared-branch stale exclude-block sweep each cycle; the walk below
+    // sweeps the `qontinui-*` ones itself.
+    crate::agent_worktree::shared_branch_restore::sweep_unpublished_checkouts(&root, base.clone())
+        .await;
 
     // Walk top-level entries; only `qontinui-*` dirs with a `.git/`
     // count. Skip `.wt/` sibling worktree dirs explicitly — those are
@@ -6192,6 +7078,15 @@ pub async fn publish_tree_state() -> Result<(), String> {
             let fetch_path = path.clone();
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
+
+        // Reap a shared-branch allocation's `.git/info/exclude` block that a
+        // runner exit, crash or restart left behind (only a provably dead
+        // allocation's; any unknown keeps it). Cheap when there is none.
+        crate::agent_worktree::shared_branch_restore::sweep_checkout(
+            path.clone(),
+            Some(base.clone()),
+        )
+        .await;
 
         let capture_path = path.clone();
         let mut payload = match spawn_blocking_tracked(move || {
@@ -6330,6 +7225,13 @@ pub fn spawn_tree_publisher() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.tree_publisher",
         move |hb| async move {
+            // Startup: reap shared-branch allocation blocks a previous runner
+            // left in the canonical checkouts' `.git/info/exclude`, whether or
+            // not this box can publish (no coord base still reaps a block
+            // whose branch is gone). Re-run on a supervised restart, which is
+            // harmless: the sweep is idempotent and keeps anything live.
+            crate::agent_worktree::shared_branch_restore::sweep_workspace(connected_coord_base())
+                .await;
             let mut tick = tokio::time::interval(Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Rebuilt with the loop on a supervised restart, so a restart
@@ -7023,6 +7925,64 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 mod tests {
     use super::*;
 
+    /// The reconcile runs on a heartbeat with no user action, so a changed
+    /// binding set has to reach the UI from here or it never does, and an
+    /// unchanged pass (every 30 s heartbeat) must not reach it at all.
+    #[test]
+    fn only_a_changed_binding_reconcile_tells_the_ui() {
+        use qontinui_runner_lib::pair::BindingReconcileReport;
+        let notified = |report: BindingReconcileReport| {
+            let mut count = 0;
+            apply_binding_reconcile_report(report, || count += 1);
+            count
+        };
+        let tenant = uuid::Uuid::from_u128(7);
+        assert_eq!(notified(BindingReconcileReport::default()), 0);
+        assert_eq!(
+            notified(BindingReconcileReport {
+                held: vec![(tenant, 1)],
+                ..Default::default()
+            }),
+            0,
+            "a held binding changed nothing"
+        );
+        for changed in [
+            BindingReconcileReport {
+                dropped: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                dropped_slots: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                default_repointed: Some(None),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(notified(changed.clone()), 1, "{changed:?}");
+        }
+    }
+
+    /// The heartbeat hands its report to the function the test above drives,
+    /// with the event that the tenant list listens for.
+    #[test]
+    fn the_heartbeat_reconcile_notifies_with_the_bindings_event() {
+        // Whitespace is collapsed on both sides, so a reformat cannot fail this.
+        // The needle cannot match its own spelling here: the `\` continuation
+        // stays in the squashed source between `report,` and `crate::`.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let needle = "Ok(report) => apply_binding_reconcile_report( report, \
+                      crate::commands::web_integration::notify_tenant_bindings_changed,";
+        let source = squash(include_str!("fleet.rs"));
+        assert!(source.contains(&squash(needle)));
+        // The legacy backfill announces only when it reports a rewrite.
+        assert!(source.contains(&squash(
+            "Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(), \
+             Ok(false) => {}"
+        )));
+    }
+
     /// Phase 3 (plan 2026-09-23-…-ungated): at a CRITICAL verdict the tree
     /// publisher's tick never calls `publish_tree_state` — so no `capture_tree`
     /// and no `fetch_due` `git fetch`, zero `git` spawns — across repeated
@@ -7361,6 +8321,8 @@ mod tests {",
             0,
             ci,
             test_host(),
+            crate::ci_node::host_sizing::suggested_concurrent_builds(test_host()),
+            CiReservation::Bounded(0),
         ))
         .expect("budget payload must serialize")
     }
@@ -7400,7 +8362,7 @@ mod tests {",
         // fix inverts into the mirror-image outage.
         assert_eq!(
             json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
-            Some(derive_max_agents(32) as i64),
+            Some(derive_max_agents(32, 8, 0) as i64),
             "the runner owns the agent cap and must keep publishing it"
         );
         // Machine-resource fields describe the BOX, not this process — both
@@ -7437,6 +8399,8 @@ mod tests {",
                     0,
                     &ci_settings(enabled, 2),
                     test_host(),
+                    12,
+                    CiReservation::Bounded(0),
                 ))
                 .expect("budget payload must serialize");
                 assert!(
@@ -7479,6 +8443,21 @@ mod tests {",
             "an enabled ci_node configured to 0 is an OPINION of zero and must \
              reach the wire — omission would make capacity un-withdrawable"
         );
+    }
+
+    /// Review round 5 on qontinui-runner#2921: a failed boot publish records
+    /// nothing (`-1`), and an ENABLED node then owes its capacity on the next
+    /// tick instead of waiting a budget period; a disabled one does not.
+    #[test]
+    fn a_failed_boot_publish_is_owed_on_the_next_tick_for_an_enabled_node() {
+        assert!(ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 4, true));
+        assert!(!ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 0, false));
+        // Nowhere to publish to: not re-run every tick.
+        assert!(!ci_jobs_publish_owed(CI_JOBS_UNPUBLISHABLE, 4, true));
+        assert!(!ci_jobs_publish_owed(4, 4, true));
+        assert!(ci_jobs_publish_owed(4, 5, true));
+        assert!(ci_jobs_publish_owed(4, 0, false), "disabling is a change");
+        assert!(!ci_jobs_publish_owed(i64::from(i32::MAX), u32::MAX, true));
     }
 
     /// Plan `2026-09-22-ci-capacity-is-hand-typed-...` Phase 2: an enabled
@@ -7664,8 +8643,11 @@ mod tests {",
         // file. A future entry spelled `/target-agent` or `target-agent/**`
         // would land in the exclude file and exclude nothing; only a fixture
         // derived from the roster catches that.
+        // A glob entry is materialized as one concrete name it matches (`*`
+        // is not a legal filename character on Windows).
+        let concrete = |pat: &str| pat.trim_end_matches('/').replace('*', "x");
         for pat in MANAGED_REPO_EXCLUDES {
-            let p = dir.join(pat.trim_end_matches('/'));
+            let p = dir.join(concrete(*pat));
             if pat.ends_with('/') {
                 std::fs::create_dir_all(&p).unwrap();
                 std::fs::write(p.join("x"), "x").unwrap();
@@ -7685,7 +8667,7 @@ mod tests {",
         // an entry that stopped being reported ride on a sibling's line and the
         // assert would silently stop asserting.
         for pat in MANAGED_REPO_EXCLUDES {
-            let want = pat.trim_end_matches('/');
+            let want = concrete(*pat);
             assert!(
                 before.lines().any(|l| {
                     l.split_whitespace()
@@ -7723,6 +8705,22 @@ mod tests {",
         assert_eq!(first, second, "second call must be a no-op");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.git/info/exclude` that is not UTF-8 is left byte-identical: the heal
+    /// used to read it with `read_to_string(..).unwrap_or_default()` and then
+    /// rewrite it from an EMPTY string, deleting every operator line.
+    #[test]
+    fn ensure_repo_info_exclude_leaves_a_non_utf8_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let before = b"operator-line\n\xff not utf-8\n".to_vec();
+        std::fs::write(info.join("exclude"), &before).unwrap();
+
+        ensure_repo_info_exclude(dir.path());
+
+        assert_eq!(std::fs::read(info.join("exclude")).unwrap(), before);
     }
 
     #[test]
@@ -7903,13 +8901,232 @@ mod tests {",
         UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The same worked-example table coord's `fleet.rs` pins
+    /// (`derive_agent_capacity_matches_plan_examples`).
     #[test]
     fn derive_max_agents_examples() {
-        assert_eq!(derive_max_agents(32), 7);
-        assert_eq!(derive_max_agents(16), 3);
-        assert_eq!(derive_max_agents(8), 1);
-        assert_eq!(derive_max_agents(4), 0);
-        assert_eq!(derive_max_agents(0), 0);
+        for (name, mem, cores, ci, want) in [
+            ("nawa", 503, 128, 327, 80),
+            ("nilan", 503, 128, 231, 272),
+            ("merytshost", 368, 48, 200, 215),
+            ("64 GB desktop, 16 threads, no CI", 64, 16, 0, 70),
+            ("monster", 31, 8, 0, 30),
+            ("MSI", 31, 16, 0, 14),
+            ("16 GB laptop, 8 threads", 16, 8, 0, 3),
+            ("nomad", 15, 8, 0, 3),
+            ("empty", 0, 0, 0, 3),
+        ] {
+            assert_eq!(derive_max_agents(mem, cores, ci), want, "{name}");
+        }
+    }
+
+    /// A cgroup v2 fixture. An empty `high` / `max` string leaves that file
+    /// ABSENT, so a slice missing one (or both) bound files can be built.
+    fn cgroup_fixture(slices: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.controllers"), "memory cpu\n").unwrap();
+        for (name, high, max) in slices {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            if !high.is_empty() {
+                std::fs::write(p.join("memory.high"), format!("{high}\n")).unwrap();
+            }
+            if !max.is_empty() {
+                std::fs::write(p.join("memory.max"), format!("{max}\n")).unwrap();
+            }
+        }
+        dir
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn ci_reservation_edge_cases() {
+        // memory.high file absent, memory.max numeric: max answers.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", "", &(10 * GIB).to_string()),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(10)
+        );
+        // A child slice with no memory files at all is unbounded: unknown.
+        let d = cgroup_fixture(&[("ci.slice", "max", "max"), ("ci.slice/ci-a.slice", "", "")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // A parent bound tighter than its children's sum caps it.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(50 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", &(40 * GIB).to_string(), "max"),
+            ("ci.slice/ci-b.slice", &(40 * GIB).to_string(), "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(50)
+        );
+        // A bounded parent covers an unbounded child.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(64 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", "max", "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(64)
+        );
+        // ci.slice with no children: its own bound, else UNKNOWN (never zero).
+        let d = cgroup_fixture(&[("ci.slice", "max", &(8 * GIB).to_string())]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(8)
+        );
+        let d = cgroup_fixture(&[("ci.slice", "max", "max")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // One byte over a GiB rounds up.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", &(GIB + 1).to_string(), "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(2)
+        );
+    }
+
+    #[test]
+    fn a_ci_node_with_no_cgroup_publishes_its_job_slots_times_16() {
+        let ci = ci_settings(true, 2);
+        let json = serde_json::to_value(build_budget_request(
+            "test-host",
+            MachineRole::Agent,
+            Resources {
+                cpu_cores: 16,
+                memory_gb: 64,
+                disk_total_gb: 1000,
+            },
+            0,
+            &ci,
+            test_host(),
+            12,
+            CiReservation::NoCgroup,
+        ))
+        .unwrap();
+        let jobs = json["max_concurrent_ci_jobs"].as_i64().expect("ci jobs");
+        assert_eq!(json["ci_reserved_gib"].as_i64(), Some(jobs * 16));
+    }
+
+    /// Plan 2026-11-05 Phase 7: an unset capacity ADVERTISES the suggestion it
+    /// is handed (the capacity model's answer), but the reservation published
+    /// for a host with no cgroup — which the plan makes a model input — is sized from
+    /// the static partition, so a loaded box's falling model total cannot
+    /// shrink its reservation and raise its agent cap.
+    #[test]
+    fn the_reservation_is_the_static_partition_not_the_models_answer() {
+        let mut ci = ci_settings(true, 0);
+        ci.max_concurrent_builds = None;
+        let mk = |suggested| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 16,
+                    memory_gb: 64,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                suggested,
+                CiReservation::NoCgroup,
+            ))
+            .unwrap()
+        };
+        let busy = mk(1);
+        let idle = mk(12);
+        assert_eq!(busy["max_concurrent_ci_jobs"].as_i64(), Some(1));
+        assert_eq!(idle["max_concurrent_ci_jobs"].as_i64(), Some(12));
+        // 48c/368 GiB's static partition is 12 slots: 12 × 16 GiB either way.
+        assert_eq!(busy["ci_reserved_gib"].as_i64(), Some(192));
+        assert_eq!(busy["ci_reserved_gib"], idle["ci_reserved_gib"]);
+        assert_eq!(
+            busy["max_concurrent_agents"], idle["max_concurrent_agents"],
+            "the agent cap must not move with the model's answer"
+        );
+    }
+
+    /// nawa's tree as read 2026-11-04: `ci-runners.slice` high 230.4 GiB,
+    /// `ci-winvm.slice` high `max` / max 96 GiB -> 327 GiB (rounded up).
+    #[test]
+    fn ci_reservation_sums_each_slice_high_else_max() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "274877906944"),
+            ("ci.slice/ci-winvm.slice", "max", "103079215104"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(327)
+        );
+    }
+
+    #[test]
+    fn an_unbounded_ci_slice_is_unknown_and_omitted() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "max"),
+            ("ci.slice/ci-other.slice", "max", "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        assert_eq!(published_ci_reserved_gib(CiReservation::Unbounded, 4), None);
+    }
+
+    #[test]
+    fn no_ci_slice_is_zero_and_no_cgroup_falls_back_to_ci_jobs() {
+        let d = cgroup_fixture(&[]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(0)
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ci_reservation_from_root(bare.path()),
+            CiReservation::NoCgroup
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 2),
+            Some(32)
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn budget_payload_omits_an_unknown_ci_reservation() {
+        let ci = ci_settings(false, 2);
+        let mk = |r| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 128,
+                    memory_gb: 503,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                12,
+                r,
+            ))
+            .unwrap()
+        };
+        let known = mk(CiReservation::Bounded(327));
+        assert_eq!(known["ci_reserved_gib"].as_i64(), Some(327));
+        assert_eq!(known["max_concurrent_agents"].as_i64(), Some(80));
+        assert!(mk(CiReservation::Unbounded)
+            .get("ci_reserved_gib")
+            .is_none());
     }
 
     #[test]
@@ -8006,11 +9223,67 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
             body.get("claude_code_available").is_none(),
             "false value should be omitted from heartbeat wire"
+        );
+    }
+
+    /// Plan 2026-10-30-…, Phase 4: the user-bucket block rides the register
+    /// body under coord's key, snake_case inside, and is ABSENT (not `null`)
+    /// when there is nothing honest to report.
+    #[test]
+    fn heartbeat_payload_carries_the_github_user_budget_block_only_when_present() {
+        let payload = |github_user_budget| HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
+            github_user_budget,
+        };
+        let absent = serde_json::to_value(payload(None)).unwrap();
+        assert!(
+            absent.get("github_user_budget").is_none(),
+            "no reading/login ⇒ the key is omitted, never null or a guess"
+        );
+
+        let report = crate::github_budget::UserBudgetReport {
+            login: "jspinak".into(),
+            limit: 5000,
+            remaining: 4100,
+            used: Some(900),
+            reset_at_unix: 1_763_560_000,
+            resource: "core".into(),
+            charged_by_consumer: [("session_pr_reconciler".to_string(), 4350_u64)]
+                .into_iter()
+                .collect(),
+            process_started_at_unix: Some(1_763_500_000),
+        };
+        let body = serde_json::to_value(payload(Some(report))).unwrap();
+        assert_eq!(
+            body["github_user_budget"],
+            serde_json::json!({
+                "login": "jspinak",
+                "limit": 5000,
+                "remaining": 4100,
+                "used": 900,
+                "reset_at_unix": 1_763_560_000_i64,
+                "resource": "core",
+                "charged_by_consumer": {"session_pr_reconciler": 4350},
+                "process_started_at_unix": 1_763_500_000_i64,
+            })
         );
     }
 
@@ -8030,6 +9303,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8060,6 +9334,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8088,6 +9363,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8122,6 +9398,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8157,6 +9434,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -8231,6 +9509,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8271,6 +9550,7 @@ mod tests {",
             git_sha: Some("dc7aa9c5aaaa"),
             main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
             commits_behind: Some(4),
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -8321,6 +9601,7 @@ mod tests {",
             git_sha,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -8491,6 +9772,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         }
     }
 
@@ -8891,6 +10173,81 @@ mod tests {",
         );
     }
 
+    /// Plan
+    /// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    /// Phase 13 (D-D7a): `condition:secret_substitution` is advertised only
+    /// when this runner can launch a condition-check session, a webview
+    /// runtime AND a launchable `claude`, because coord's placement verdict
+    /// reads the token and not `claude_code_available`.
+    #[test]
+    fn condition_secrets_capability_is_advertised_only_when_a_condition_check_can_launch() {
+        assert_eq!(
+            CONDITION_SECRET_SUBSTITUTION_CAPABILITY,
+            "condition:secret_substitution"
+        );
+        assert_eq!(
+            condition_secret_substitution_capability(true, true).as_deref(),
+            Some("condition:secret_substitution")
+        );
+        for (webview, claude) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                condition_secret_substitution_capability(webview, claude),
+                None,
+                "webview={webview} claude={claude}: no condition-check session can launch"
+            );
+        }
+        // The assembled set reads BOTH probes: every combination a host can
+        // produce, through the same assembly `host_capabilities` runs.
+        for (webview, claude) in [(true, true), (true, false), (false, true), (false, false)] {
+            let slow = SlowHostProbes {
+                powershell: false,
+                docker: false,
+                claude,
+            };
+            assert_eq!(
+                assemble_host_capabilities("linux", slow, webview, None)
+                    .iter()
+                    .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+                webview && claude,
+                "webview={webview} claude={claude}"
+            );
+        }
+        // A unit-test process holds no Tauri runtime, so the live set must not
+        // carry the token whatever PATH holds.
+        assert!(!webview_runtime_available());
+        assert!(
+            !host_capabilities()
+                .iter()
+                .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+            "the token was advertised by a runner that cannot launch a condition check"
+        );
+    }
+
+    /// `claude` counts as launchable only when it is an absolute, regular,
+    /// executable file: `resolve_claude_bin` hands an explicit
+    /// `QONTINUI_CLAUDE_BIN` back as it is, and a launch of a non-executable
+    /// one would fail.
+    #[cfg(unix)]
+    #[test]
+    fn condition_secrets_a_claude_without_its_execute_bit_is_not_launchable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("written");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(!is_launchable_file(&bin), "no execute bit");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(
+            is_launchable_file(&bin),
+            "anti-vacuity: an executable file is"
+        );
+        assert!(!is_launchable_file(dir.path()), "a directory is not");
+        assert!(
+            !is_launchable_file(std::path::Path::new("claude")),
+            "a bare name is not"
+        );
+    }
+
     /// Host facts ride the heartbeat WHETHER OR NOT CI-node mode is on —
     /// continuation dispatch is not a CI concern, and most of the fleet is
     /// not a CI node. `ci_node` alone is conditional, and stays a BARE token.
@@ -9086,6 +10443,83 @@ mod tests {",
         eprintln!("host_capabilities() on this host = {first:?}");
     }
 
+    /// The heartbeat's join-failure arm (`heartbeat_to_coord`'s `unwrap_or_else`
+    /// over the blocking assembly) keeps the credential family. The vector is
+    /// authoritative, so dropping it there would retract every `cred:*` token
+    /// and the `probes:cred` marker because an unrelated host probe panicked.
+    #[test]
+    fn a_join_failure_heartbeat_keeps_the_credential_family() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let mut seeded = CredFamilyState::new();
+        seeded.apply(
+            &[(CRED_GH_CAPABILITY, CredState::Present)],
+            std::time::Instant::now(),
+            HOST_PROBE_TTL,
+        );
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+        let allow = vec!["qontinui-runner".to_string()];
+        let caps = heartbeat_join_failure_capabilities(true, &allow);
+        for token in [
+            "ci_node",
+            "ci_repo:qontinui-runner",
+            CRED_PROBES_MARKER,
+            CRED_GH_CAPABILITY,
+        ] {
+            assert!(caps.iter().any(|c| c == token), "{token} missing: {caps:?}");
+        }
+        assert!(caps
+            .iter()
+            .any(|c| c == &format!("os:{}", current_os_label())));
+        // And the heartbeat really routes its join failure through it.
+        let src = include_str!("fleet.rs");
+        let prod = prod_part(src);
+        let (_, from_fn) = prod
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
+        assert!(
+            squeezed(body).contains(
+                ".unwrap_or_else(|_|{heartbeat_join_failure_capabilities(ci.enabled,&ci.repo_allowlist)})"
+            ),
+            "heartbeat_to_coord's join-failure arm must call heartbeat_join_failure_capabilities"
+        );
+        // That arm runs on the async worker, so the helper must reach no
+        // blocking probe — the same banned set the blocking-pool pin uses.
+        let (_, helper) = prod
+            .split_once("fn heartbeat_join_failure_capabilities(")
+            .expect("the helper is defined in fleet.rs");
+        let (helper, _) = helper.split_once("\n}\n").expect("the helper ends");
+        let helper = squeezed(helper);
+        for blocking in [
+            "heartbeat_device_capabilities",
+            "heartbeat_capabilities",
+            "host_capabilities",
+            "capability_tokens",
+            "slow_host_probes",
+            "claude_code_probe",
+        ] {
+            assert!(
+                !calls_fn(&helper, blocking),
+                "heartbeat_join_failure_capabilities runs on the async worker and must not call {blocking}(..)"
+            );
+        }
+    }
+
     /// ARMING test at the heartbeat seam (plan
     /// 2026-10-09-coord-knows-which-box-holds-which-credential, Phase 2).
     ///
@@ -9122,9 +10556,19 @@ mod tests {",
                 },
             );
         }
+        let regional_token = "cred:aws-ssm:eu-central-1";
         let seeded = CredFamilyState {
             ran_at: Some(now),
             memos,
+            regional: std::iter::once((
+                regional_token.to_string(),
+                CredMemo {
+                    present: true,
+                    unknown_since: None,
+                },
+            ))
+            .collect(),
+            regional_measured: false,
         };
         let _restore = {
             let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -9140,6 +10584,7 @@ mod tests {",
                 CRED_PROBES_MARKER,
                 CRED_GH_CAPABILITY,
                 CRED_AWS_STS_CAPABILITY,
+                regional_token,
             ] {
                 assert!(
                     payload_caps.iter().any(|c| c == token),
@@ -9162,13 +10607,192 @@ mod tests {",
     /// A fake secret the shims print on BOTH streams and plant in gh's
     /// `hosts.yml`. It must never surface in a log, the heartbeat payload, a
     /// verdict's Debug rendering or a panic message.
-    const CRED_FAKE_SECRET: &str = "FAKE-SECRET-ghp_credprobecanary0123456789";
+    pub(super) const CRED_FAKE_SECRET: &str = "FAKE-SECRET-ghp_credprobecanary0123456789";
 
-    const CRED_TEST_TTL: Duration = Duration::from_secs(300);
+    pub(super) const CRED_TEST_TTL: Duration = Duration::from_secs(300);
+
+    /// A listed token that was never earned and still is not held says nothing
+    /// in the logs, so a long list of unmeasured catalogue rows cannot bypass the
+    /// refusal-log cap. The token that IS newly advertised in the same fold is the
+    /// control that shows the capture sees this family's lines.
+    #[test]
+    fn an_unearned_listed_token_folds_without_a_log_line() {
+        const NEVER: &str = "cred:aws-ecs:ap-south-1";
+        const SEEN: &str = "cred:aws-ecs:eu-central-1";
+        let (held, logs) = capture_cred_logs(|| {
+            let mut state = CredFamilyState::new();
+            let cycle = super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: vec![(SEEN.to_string(), CredState::Present)],
+                not_run: vec![NEVER.to_string()],
+                unreadable_rows: false,
+                refused_tokens: Vec::new(),
+                skipped_rows: false,
+            };
+            state.apply_regional(&cycle, std::time::Instant::now(), CRED_TEST_TTL);
+            state.regional.contains_key(NEVER)
+        });
+        assert!(!held, "an unmeasured token is not memoized");
+        assert!(
+            logs.contains(SEEN),
+            "control: the capture saw the fold: {logs}"
+        );
+        assert!(!logs.contains(NEVER), "{logs}");
+    }
+
+    /// `probes:cred-regional` says THIS box measured every token of an answered
+    /// catalogue on its last regional cycle — the evidence coord needs before it
+    /// may read a regional token's absence as measured (plan
+    /// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`;
+    /// `probes:cred` attests only the built-in probes). Any cycle that left a
+    /// catalogued token unmeasured withdraws it.
+    #[test]
+    fn the_regional_marker_is_advertised_only_after_a_fully_measured_answered_cycle() {
+        const SSM: &str = "cred:aws-ssm:eu-central-1";
+        const ECS: &str = "cred:aws-ecs:eu-central-1";
+        let now = std::time::Instant::now();
+        let answered = |verdicts: Vec<(&str, CredState)>,
+                        not_run: Vec<&str>,
+                        unreadable_rows: bool,
+                        refused: Vec<&str>| {
+            super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: verdicts
+                    .into_iter()
+                    .map(|(t, s)| (t.to_string(), s))
+                    .collect(),
+                not_run: not_run.into_iter().map(str::to_string).collect(),
+                unreadable_rows,
+                refused_tokens: refused.into_iter().map(str::to_string).collect(),
+                skipped_rows: false,
+            }
+        };
+        let has_marker = |s: &CredFamilyState| {
+            s.advertised()
+                .iter()
+                .any(|c| c == CRED_REGIONAL_PROBES_MARKER)
+        };
+
+        let mut state = CredFamilyState::new();
+        // Before the family's first run nothing is advertised, marker included.
+        state.apply_regional(
+            &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+            now,
+            CRED_TEST_TTL,
+        );
+        assert!(state.advertised().is_empty());
+        state.apply(&[], now, CRED_TEST_TTL);
+        // Every listed token measured (an Absent verdict is a measurement): marker.
+        assert!(has_marker(&state), "{:?}", state.advertised());
+        assert_eq!(
+            state.advertised()[..2],
+            [
+                CRED_PROBES_MARKER.to_string(),
+                CRED_REGIONAL_PROBES_MARKER.to_string()
+            ]
+        );
+        // An answered EMPTY catalogue leaves nothing unmeasured.
+        state.apply_regional(&answered(vec![], vec![], false, vec![]), now, CRED_TEST_TTL);
+        assert!(has_marker(&state));
+
+        // Each way a cycle leaves a catalogued token unmeasured withdraws it.
+        let unmeasured = [
+            (
+                "no answer",
+                super::cred_probe_specs::RegionalCycle::NoAnswer,
+            ),
+            (
+                "an inconclusive verdict",
+                answered(
+                    vec![(SSM, CredState::Present), (ECS, CredState::Unknown)],
+                    vec![],
+                    false,
+                    vec![],
+                ),
+            ),
+            (
+                "a spec past the run cap",
+                answered(vec![(SSM, CredState::Absent)], vec![ECS], false, vec![]),
+            ),
+            (
+                "an unreadable row",
+                answered(vec![(SSM, CredState::Absent)], vec![], true, vec![]),
+            ),
+            (
+                "a refused spec",
+                answered(vec![(SSM, CredState::Absent)], vec![], false, vec![ECS]),
+            ),
+            (
+                // A skipped row whose token was not kept (off-grammar) leaves no
+                // trace in the lists above; the flag still withdraws the marker.
+                "a skipped row with no kept token",
+                super::cred_probe_specs::RegionalCycle::Answered {
+                    verdicts: vec![(SSM.to_string(), CredState::Absent)],
+                    not_run: Vec::new(),
+                    unreadable_rows: false,
+                    refused_tokens: Vec::new(),
+                    skipped_rows: true,
+                },
+            ),
+        ];
+        for (why, cycle) in unmeasured {
+            state.apply_regional(
+                &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+                now,
+                CRED_TEST_TTL,
+            );
+            assert!(has_marker(&state), "control before {why}");
+            state.apply_regional(&cycle, now, CRED_TEST_TTL);
+            assert!(!has_marker(&state), "{why}: {:?}", state.advertised());
+            // The built-in marker is never touched by a regional cycle.
+            assert!(
+                state.advertised().iter().any(|c| c == CRED_PROBES_MARKER),
+                "{why}"
+            );
+        }
+    }
+
+    /// Single-tenant needs BOTH reads to say exactly one tenant: a local set of one
+    /// beside a coord set of two (the legacy-slot / stale-file shape) withholds the
+    /// regional marker, and so does any unresolved or UNKNOWN read.
+    #[test]
+    fn the_regional_marker_needs_both_binding_reads_to_name_one_tenant() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as Coord;
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let local = |ids: Vec<uuid::Uuid>| LocalBindingSet {
+            default_tenant: ids[0],
+            tenant_ids: ids,
+            source: BindingSource::LegacySlotClaim,
+        };
+        let one = local(vec![a]);
+        let two = local(vec![a, b]);
+        assert!(binding_is_single_tenant(Some(&one), &Coord::Known(vec![a])));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![a, b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&two),
+            &Coord::Known(vec![a])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Unknown("unread")
+        ));
+        assert!(!binding_is_single_tenant(None, &Coord::Known(vec![a])));
+        // One tenant each, but not the same one (a rebind with a stale local file).
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(Vec::new())
+        ));
+    }
 
     /// What a shim does when run.
     #[derive(Clone, Copy)]
-    enum Shim {
+    pub(super) enum Shim {
         /// Print the fake secret on stdout and stderr, then exit with this code.
         Exit(i32),
         /// Print the fake secret, then hang far past any test budget.
@@ -9176,7 +10800,7 @@ mod tests {",
     }
 
     /// Write an executable shim named `name` into `dir` and return its path.
-    fn write_cred_shim(dir: &std::path::Path, name: &str, shim: Shim) -> PathBuf {
+    pub(super) fn write_cred_shim(dir: &std::path::Path, name: &str, shim: Shim) -> PathBuf {
         #[cfg(windows)]
         {
             let path = dir.join(format!("{name}.cmd"));
@@ -9222,7 +10846,7 @@ mod tests {",
     /// child's fd table, which no fork of this process copies, and it is gone
     /// once the child is reaped — before this returns.
     #[cfg(not(windows))]
-    fn write_executable_script(path: &std::path::Path, body: &str) {
+    pub(super) fn write_executable_script(path: &std::path::Path, body: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let mut writer = Command::new("/bin/sh")
@@ -9345,7 +10969,7 @@ mod tests {",
     ///   each. The null device is `FILE_TYPE_CHAR` (2) with no console mode;
     ///   an inherited console is 2 WITH a console mode, a pipe is 3, a file 1.
     #[cfg(any(windows, target_os = "linux"))]
-    fn write_stdio_report_shim(
+    pub(super) fn write_stdio_report_shim(
         dir: &std::path::Path,
         name: &str,
         report: &std::path::Path,
@@ -9373,7 +10997,7 @@ Add-Content -LiteralPath $Out -Value $lines
             let path = dir.join(format!("{name}.cmd"));
             let body = format!(
                 "@echo off\r\n\
-                 echo args=%*>>\"{report}\"\r\n\
+                 >>\"{report}\" echo args=%*\r\n\
                  \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{ps1}\" \"{report}\"\r\n\
                  echo {CRED_FAKE_SECRET}\r\n\
                  echo {CRED_FAKE_SECRET} 1>&2\r\n\
@@ -9405,7 +11029,7 @@ Add-Content -LiteralPath $Out -Value $lines
     /// A probe environment rooted in `home`, touching nothing of the real
     /// machine: no binary resolved (both tools "not on PATH"), gh's config dir
     /// pinned under `home`, no aws variables.
-    fn hermetic_cred_env(home: &std::path::Path) -> CredProbeEnv {
+    pub(super) fn hermetic_cred_env(home: &std::path::Path) -> CredProbeEnv {
         CredProbeEnv {
             gh: None,
             aws: None,
@@ -9451,7 +11075,7 @@ Add-Content -LiteralPath $Out -Value $lines
     /// family state — through the same assembly `heartbeat_to_coord` runs
     /// (`build_host_capabilities` + the family's tokens, then
     /// `build_device_capabilities`, then the payload's serialization).
-    fn cred_payload_capabilities(state: &CredFamilyState) -> (Vec<String>, String) {
+    pub(super) fn cred_payload_capabilities(state: &CredFamilyState) -> (Vec<String>, String) {
         let mut host = build_host_capabilities("linux", false, false, false, None);
         host.extend(state.advertised());
         let caps = build_device_capabilities(false, &[], &host);
@@ -9469,7 +11093,7 @@ Add-Content -LiteralPath $Out -Value $lines
 
     /// Run `f` with every `tracing` event on this thread captured (at TRACE,
     /// so `debug!` lines are included) and return the captured text.
-    fn capture_cred_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+    pub(super) fn capture_cred_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         #[derive(Clone, Default)]
         struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -9488,30 +11112,7 @@ Add-Content -LiteralPath $Out -Value $lines
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        // Tracing's callsite `Interest` cache is PROCESS-global. While ours is
-        // the ONLY registered dispatcher, tracing-core takes its `JustOne`
-        // path, which computes a newly registered callsite's interest from the
-        // REGISTERING thread's default alone. So when a parallel cred test
-        // reaches `CredFamilyState::apply`'s `info!`/`debug!` first, it caches
-        // them `never` (its default is `NoSubscriber`) and this capture comes
-        // back empty (observed 3 of 3 runs of `cargo test fleet::tests::cred_`).
-        // Two PROCESS-LIFETIME no-op dispatchers keep tracing-core off that
-        // path for good (`has_just_one` is `len <= 1` over the live set), so
-        // every registration consults every live dispatcher, ours included,
-        // under the dispatcher list's lock, and registering ours rebuilds every
-        // callsite. The explicit rebuild below is a guard for the first call,
-        // before both no-op dispatchers are live.
-        static MULTI_DISPATCH: std::sync::OnceLock<[tracing::Dispatch; 2]> =
-            std::sync::OnceLock::new();
-        MULTI_DISPATCH.get_or_init(|| {
-            std::array::from_fn(|_| {
-                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
-            })
-        });
-        let out = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
+        let out = crate::resource_guard::with_log_capture(subscriber, f);
         let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
         (out, text)
     }
@@ -10330,7 +11931,7 @@ Add-Content -LiteralPath $Out -Value $lines
             };
             let body = format!(
                 "@echo off\r\n\
-                 echo args=%*>>\"{log}\"\r\n\
+                 >>\"{log}\" echo args=%*\r\n\
                  echo {CRED_FAKE_SECRET}\r\n\
                  echo {CRED_FAKE_SECRET} 1>&2\r\n\
                  {refuse}\

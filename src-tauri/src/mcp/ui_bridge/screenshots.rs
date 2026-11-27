@@ -546,9 +546,39 @@ pub(crate) fn discover_all_elements_payload() -> serde_json::Value {
             // …and content/text elements, NOT only the interactive ones. The
             // SDK's default here is `true`; leaving it unstated is what made
             // `elementCount` under-report on every page.
-            "interactiveOnly": false
+            "interactiveOnly": false,
+            // …and the image rows, stated rather than left to the SDK's
+            // default: an image covering text is an occlusion. Page-health
+            // takes them back out (`page_health_elements`).
+            "includeMedia": true
         }
     })
+}
+
+/// The rows page-health judges: what `discover` returned under `elements`, less
+/// the `category: "media"` rows. The ratios describe a page's content and
+/// controls, and an image row in them would move every one of those ratios.
+fn page_health_elements(discover_data: &serde_json::Value) -> Vec<serde_json::Value> {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|el| el.get("category").and_then(|c| c.as_str()) != Some("media"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every row `discover` returned under `elements`, media rows included: the
+/// count page-health REPORTS as `element_count`, so it matches the
+/// `elementCount` `/control/visibility` reports for the same page.
+fn discovered_row_count(discover_data: &serde_json::Value) -> usize {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
 }
 
 /// Optional request body for page-health endpoint.
@@ -582,14 +612,14 @@ pub async fn ui_bridge_page_health_handler(
             }
         };
 
-    // Elements live under "elements" key returned by discover.
-    let elements = discover_data
-        .get("elements")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let elements = page_health_elements(&discover_data);
 
-    let element_count = elements.len();
+    // `element_count` (reported) counts every row discover returned, the same
+    // set `/control/visibility` counts as `elementCount`, so the two routes
+    // still agree. The checks below judge only `judged_count` rows, and
+    // `media_rows_excluded` states the difference rather than hiding it.
+    let element_count = discovered_row_count(&discover_data);
+    let judged_count = elements.len();
 
     // Visible elements: state.visible == true and state.normalizedRect present.
     let visible: Vec<&serde_json::Value> = elements
@@ -736,7 +766,7 @@ pub async fn ui_bridge_page_health_handler(
         *type_counts.entry(t.to_string()).or_insert(0) += 1;
     }
 
-    let all_nav = element_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
+    let all_nav = judged_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
 
     let diversity_severity = if all_nav { "WARNING" } else { "OK" };
 
@@ -746,7 +776,7 @@ pub async fn ui_bridge_page_health_handler(
         "detail": format!(
             "{} type(s) across {} elements{}",
             type_counts.len(),
-            element_count,
+            judged_count,
             if all_nav { " (navigation-only)" } else { "" }
         ),
         "data": {
@@ -979,6 +1009,7 @@ pub async fn ui_bridge_page_health_handler(
         "findings": findings,
         "heatmap": heatmap,
         "element_count": element_count,
+        "media_rows_excluded": element_count.saturating_sub(judged_count),
         "visible_count": visible_count
     });
 
@@ -1221,6 +1252,40 @@ fn occlusion_entry(
     entry
 }
 
+/// One `clipped[]` entry: an element whose own paint an ANCESTOR's `overflow`
+/// cuts off, as opposed to one another painted element covers.
+///
+/// The SDK's `VisibilityClippedEntry` shape (plan
+/// `2026-11-24-the-visibility-sweep-counts-an-ancestors-overflow-clipping-as-occlusion`
+/// Phase 1): `{element, label?, text?, ratio, scrollReachable}`. There is no
+/// `occludedBy` - nothing is on top, so nothing is blamed - and no
+/// `hidesText`, because a clipped entry never feeds the verdict.
+/// `scrollReachable` is `true` only when the registry said `clipScrollable:
+/// true` (every clipper is `auto`/`scroll`): scrolled-away nav a user reaches
+/// by scrolling, versus `truncate` text nobody can reveal. Absent reads as
+/// `false` - the reachability was not established.
+fn clipped_entry(
+    element_id: &str,
+    label: Option<&str>,
+    text: &str,
+    ratio: f64,
+    scroll_reachable: bool,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "element": element_id,
+        "ratio": ratio,
+        "scrollReachable": scroll_reachable,
+    });
+    let obj = entry.as_object_mut().expect("json! built an object");
+    if let Some(label) = label.filter(|l| !l.is_empty()) {
+        obj.insert("label".to_string(), serde_json::json!(label));
+    }
+    if !text.is_empty() {
+        obj.insert("text".to_string(), serde_json::json!(text));
+    }
+    entry
+}
+
 /// Extract the modal identity set from a `get_modal_context` IPC answer.
 ///
 /// The value is the SDK's `SnapshotModalContext` (`{ modals: [{ id, … }], … }`)
@@ -1296,6 +1361,10 @@ pub(crate) fn build_visibility_report(
     modal_ids: Option<&HashSet<String>>,
 ) -> serde_json::Value {
     let mut occlusions: Vec<(bool, f64, serde_json::Value)> = Vec::new();
+    // Ancestor-overflow clipping, reported BESIDE the occlusions and never in
+    // them: it does not feed `verdict` or `hidesText`, so a page whose only
+    // findings are clipped entries reads `clear` with this list served.
+    let mut clipped: Vec<(f64, serde_json::Value)> = Vec::new();
     let mut expected_overlays_filtered: u64 = 0;
     // Did ANY element carry occlusion data at all? See `occlusionDataObserved`
     // below - this is what separates "nothing is covered" from "this webview's
@@ -1314,8 +1383,32 @@ pub(crate) fn build_visibility_report(
         if state.get("occludedBy").is_some()
             || state.get("occludedPct").is_some()
             || state.get("visibilityReason").is_some()
+            || state.get("clippedPct").is_some()
         {
             any_occlusion_field = true;
+        }
+        let text = state
+            .get("textContent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let label = el.get("label").and_then(|v| v.as_str());
+        // Clipping is classified BEFORE the occluder check: an element can be
+        // partly clipped AND partly covered (the SDK computes `occludedPct`
+        // over the in-clip points and sets `clippedPct` beside it), and then
+        // it belongs in both lists. `clippedPct` is 0..100 and set only when
+        // above 0; `ratio` is 0..1 and takes the same `minRatio` floor as an
+        // occlusion. Absent => no entry, so an older bundle reads as today.
+        if let Some(clipped_pct) = state.get("clippedPct").and_then(|v| v.as_f64()) {
+            let clip_ratio = clipped_pct / 100.0;
+            if clip_ratio > 0.0 && clip_ratio >= min_ratio {
+                let scroll_reachable =
+                    state.get("clipScrollable").and_then(|v| v.as_bool()) == Some(true);
+                clipped.push((
+                    clip_ratio,
+                    clipped_entry(id, label, text, clip_ratio, scroll_reachable),
+                ));
+            }
         }
         let occluded_by = match state.get("occludedBy").and_then(|v| v.as_str()) {
             Some(o) if !o.is_empty() => o,
@@ -1336,12 +1429,6 @@ pub(crate) fn build_visibility_report(
             expected_overlays_filtered += 1;
             continue;
         }
-        let text = state
-            .get("textContent")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let label = el.get("label").and_then(|v| v.as_str());
         occlusions.push((
             !text.is_empty(),
             ratio,
@@ -1355,6 +1442,10 @@ pub(crate) fn build_visibility_report(
     // from a malformed payload must not panic the sort.
     occlusions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
     let entries: Vec<serde_json::Value> = occlusions.into_iter().map(|(_, _, e)| e).collect();
+    // The SDK's clipped order: worst ratio first, and nothing else. `sort_by`
+    // is stable, so equal ratios keep registry order, as the SDK's does.
+    clipped.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let clipped_entries: Vec<serde_json::Value> = clipped.into_iter().map(|(_, e)| e).collect();
 
     let verdict = if elements.is_empty() {
         // An empty list from a registry with no elements is UNKNOWN, not
@@ -1368,6 +1459,8 @@ pub(crate) fn build_visibility_report(
 
     serde_json::json!({
         "occlusions": entries,
+        // Never consulted by `verdict` above: clipping is not covering.
+        "clipped": clipped_entries,
         "elementCount": elements.len(),
         "minRatio": min_ratio,
         "includeExpected": include_expected,
@@ -1396,6 +1489,8 @@ pub(crate) fn build_visibility_report(
         // `/control/visibility` performs a real sweep for the first time.
         // That is a behavioural change of the bump, not of this function.
         //
+        // `clippedPct` counts too: a clip measurement is occlusion-sweep data.
+        //
         // `false` therefore means: no element in this snapshot carried any
         // occlusion field, so `clear` is "no occlusion OBSERVED", not proof
         // that nothing is covered. Reading it as proof is the
@@ -1405,6 +1500,71 @@ pub(crate) fn build_visibility_report(
         // old always-false.
         "occlusionDataObserved": any_occlusion_field,
     })
+}
+
+/// What `data.occlusionText` says about the fields of the occlusion and
+/// clipped entries that name or quote the webview (`element`, `occludedBy`,
+/// `label`, `text`):
+/// `"included"` for a local read, `"withheld"` for a relayed one.
+pub(crate) const OCCLUSION_TEXT_INCLUDED: &str = "included";
+/// See [`OCCLUSION_TEXT_INCLUDED`].
+pub(crate) const OCCLUSION_TEXT_WITHHELD: &str = "withheld";
+/// The occlusion-entry fields a relayed report drops
+/// ([`disclose_occlusion_text`]).
+const OCCLUSION_WEBVIEW_FIELDS: &[&str] = &["element", "occludedBy", "label", "text"];
+/// The clipped-entry fields a relayed report drops. A clipped entry has no
+/// `occludedBy`; its `element`, `label` and `text` name or quote the webview
+/// exactly as an occlusion entry's do.
+const CLIPPED_WEBVIEW_FIELDS: &[&str] = &["element", "label", "text"];
+
+/// Narrow a visibility report for a REMOTE caller: drop every field of each
+/// occlusion entry that names or quotes the webview, keep the rest, and say
+/// so in `occlusionText`.
+///
+/// Four fields go: `label` and `text` quote the covered element, and
+/// `element` and `occludedBy` are ids, which the webview SDK commonly builds
+/// by slugifying an element's accessible label or heading text (e.g.
+/// `heading-3-<slug of the heading>`), or a `tag#domid` descriptor. What
+/// remains per entry is `ratio`, `hidesText`, `isExpectedOverlay` and
+/// `source`; the report's verdict, `occlusionDataObserved` and counts stand.
+/// The relay's only client, the console's UI Bridge dashboard, reads exactly
+/// those (the verdict, the observed flag, the entry count and `hidesText`).
+///
+/// Every `clipped[]` entry loses `element`, `label` and `text` for the same
+/// reason (it has no `occludedBy`), keeping `ratio` and `scrollReachable`.
+///
+/// This is defence in depth, not the gate: the response still takes the
+/// snapshot's egress refusal (`backend_relay::http_request_egress_refusal`).
+/// A local read keeps every field and says `included`, so the disclosure is
+/// never absent from a reply.
+pub(crate) fn disclose_occlusion_text(report: &mut serde_json::Value, relayed: bool) {
+    let Some(obj) = report.as_object_mut() else {
+        return;
+    };
+    if relayed {
+        if let Some(entries) = obj.get_mut("occlusions").and_then(|v| v.as_array_mut()) {
+            for entry in entries.iter_mut().filter_map(|e| e.as_object_mut()) {
+                for field in OCCLUSION_WEBVIEW_FIELDS {
+                    entry.remove(*field);
+                }
+            }
+        }
+        if let Some(entries) = obj.get_mut("clipped").and_then(|v| v.as_array_mut()) {
+            for entry in entries.iter_mut().filter_map(|e| e.as_object_mut()) {
+                for field in CLIPPED_WEBVIEW_FIELDS {
+                    entry.remove(*field);
+                }
+            }
+        }
+    }
+    obj.insert(
+        "occlusionText".to_string(),
+        serde_json::json!(if relayed {
+            OCCLUSION_TEXT_WITHHELD
+        } else {
+            OCCLUSION_TEXT_INCLUDED
+        }),
+    );
 }
 
 /// `POST /control/visibility` - WHAT IS COVERING WHAT, page-wide.
@@ -1439,8 +1599,12 @@ pub(crate) fn build_visibility_report(
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
 pub async fn ui_bridge_visibility_handler(
     State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<VisibilityRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Read once, up front: a relayed sweep answers without the fields that
+    // name or quote the webview (`disclose_occlusion_text`).
+    let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);
     let req = body.map(|b| b.0).unwrap_or_default();
     let min_ratio = req.min_ratio.unwrap_or(0.02);
     // Gate BEFORE the sweep, not after: an out-of-range threshold must not be
@@ -1460,7 +1624,8 @@ pub async fn ui_bridge_visibility_handler(
         min_ratio, include_expected
     );
 
-    // BOTH filters stated. `includeHidden` alone is only half the ask: the SDK
+    // EVERY filter stated (`includeHidden`, `interactiveOnly`, `includeMedia`).
+    // `includeHidden` alone is only part of the ask: the SDK
     // defaults `interactiveOnly` to `true`, so a payload that leaves it unstated
     // silently drops every heading, paragraph and badge before the sweep ever
     // sees the page — i.e. exactly the elements a reader looks at, and exactly
@@ -1477,7 +1642,7 @@ pub async fn ui_bridge_visibility_handler(
     // `discover_all_elements_payload()` and its guard test accepts either form
     // for exactly this reason. Any sweep added here must ask the same question.
     let discover_payload = serde_json::json!({
-        "options": { "includeHidden": true, "interactiveOnly": false }
+        "options": { "includeHidden": true, "interactiveOnly": false, "includeMedia": true }
     });
     // Concurrent, as `state-summary` does: the wall time is the slower of the
     // two, not their sum.
@@ -1524,12 +1689,10 @@ pub async fn ui_bridge_visibility_handler(
         .cloned()
         .unwrap_or_default();
 
-    Ok(Json(ApiResponse::success(build_visibility_report(
-        &elements,
-        min_ratio,
-        include_expected,
-        modal_ids.as_ref(),
-    ))))
+    let mut report =
+        build_visibility_report(&elements, min_ratio, include_expected, modal_ids.as_ref());
+    disclose_occlusion_text(&mut report, relayed);
+    Ok(Json(ApiResponse::success(report)))
 }
 
 // ============================================================================
@@ -1631,15 +1794,16 @@ mod visibility_sweep_payload_tests {
     //! Scanned from source rather than exercised through the handler because
     //! the payload is built inline at the IPC call and never returned: there is
     //! no value to assert on without a live webview. The property being pinned
-    //! is nonetheless exact — BOTH filters stated, in the request this handler
-    //! actually issues.
+    //! is nonetheless exact — EVERY filter stated (`includeHidden`,
+    //! `interactiveOnly`, `includeMedia`; one test each below), in the request
+    //! this handler actually issues.
 
     /// The body of `ui_bridge_visibility_handler`, production source only.
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn visibility_handler_body() -> &'static str {
+    pub(super) fn visibility_handler_body() -> &'static str {
         let source = include_str!("screenshots.rs");
         let start = source
             .find("pub async fn ui_bridge_visibility_handler")
@@ -1665,6 +1829,16 @@ mod visibility_sweep_payload_tests {
         assert!(
             visibility_handler_body().contains("\"interactiveOnly\": false"),
             "MUST be stated explicitly: the SDK's default is `true`, so leaving              it unstated filtered every heading, paragraph and badge out of the              occlusion sweep and made `elementCount` report 281 where every              sibling route reported 296. `includeHidden` does not compensate -              hidden and non-interactive are INDEPENDENT filters."
+        );
+    }
+
+    #[test]
+    fn visibility_discover_asks_for_media_elements() {
+        assert!(
+            visibility_handler_body().contains("\"includeMedia\": true"),
+            "the occlusion sweep keeps media rows, because an image covering text \
+             is an occlusion; without includeMedia the SDK leaves them out and the \
+             sweep cannot see one (image plan Phase 8)"
         );
     }
 }
@@ -1932,6 +2106,308 @@ mod visibility_tests {
     fn the_route_is_declared_in_the_manifest() {
         assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
     }
+
+    // ── Ancestor clipping is its own list, never an occlusion ─────
+
+    /// A scrolled-away nav item (the production shape: clipped by its
+    /// `overflow-y:auto` scroller, no occluder) is a `clipped` entry, not an
+    /// occlusion, and on its own leaves the page `clear`. Fails if clipping
+    /// is dropped, folded into `occlusions`, or allowed to move the verdict.
+    #[test]
+    fn a_clipped_only_element_is_listed_in_clipped_and_reads_clear() {
+        let elements = vec![el(
+            "button-gates-12",
+            "Gates",
+            json!({
+                "visible": false,
+                "visibilityReason": "clipped",
+                "clippedPct": 100,
+                "clipScrollable": true,
+                "textContent": " Gates ",
+            }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        assert_eq!(report["verdict"], json!("clear"));
+        assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        let clipped = report["clipped"].as_array().unwrap();
+        assert_eq!(clipped.len(), 1);
+        let entry = &clipped[0];
+        assert_eq!(entry["element"], json!("button-gates-12"));
+        assert_eq!(entry["label"], json!("Gates"));
+        assert_eq!(entry["text"], json!("Gates"));
+        assert_eq!(entry["ratio"], json!(1.0));
+        assert_eq!(entry["scrollReachable"], json!(true));
+        for absent in ["occludedBy", "hidesText", "isExpectedOverlay", "source"] {
+            assert!(entry.get(absent).is_none(), "{absent} on a clipped entry");
+        }
+    }
+
+    /// `clippedPct` alone is occlusion data: a bridge that reports only a
+    /// clip must not read as "could not observe".
+    #[test]
+    fn clipped_pct_alone_turns_occlusion_data_observed_on() {
+        let elements = vec![el("s", "", json!({ "clippedPct": 33 }))];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        // A `truncate` clip with no `clipScrollable` is NOT scroll-reachable.
+        assert_eq!(report["clipped"][0]["scrollReachable"], json!(false));
+        assert!((report["clipped"][0]["ratio"].as_f64().unwrap() - 0.33).abs() < 1e-9);
+    }
+
+    /// Partly clipped AND partly covered: one entry in each list, and the
+    /// verdict is driven by the occlusion alone.
+    #[test]
+    fn a_clipped_and_covered_element_appears_in_both_lists() {
+        let elements = vec![el(
+            "nav",
+            "Nav",
+            json!({ "occludedBy": "div.footer", "occludedPct": 50, "clippedPct": 67 }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        assert_eq!(report["verdict"], json!("occlusions_found"));
+        assert_eq!(report["occlusions"][0]["element"], json!("nav"));
+        assert_eq!(report["clipped"][0]["element"], json!("nav"));
+    }
+
+    /// The clip is recorded before the occlusion is filtered: an element whose
+    /// occlusion falls under the `minRatio` floor is still listed as clipped,
+    /// as the SDK records it independently.
+    #[test]
+    fn a_clip_survives_its_occlusion_falling_under_min_ratio() {
+        let elements = vec![el(
+            "nav",
+            "Nav",
+            json!({ "occludedBy": "div.footer", "occludedPct": 1, "clippedPct": 50 }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(report["clipped"][0]["element"], json!("nav"));
+    }
+
+    /// ...and one whose occluder is an expected modal overlay is still listed
+    /// as clipped.
+    #[test]
+    fn a_clip_survives_its_occluder_being_an_expected_overlay() {
+        let elements = vec![el(
+            "nav",
+            "Nav",
+            json!({ "occludedBy": "modal-1", "occludedPct": 80, "clippedPct": 50 }),
+        )];
+        let modals: std::collections::HashSet<String> =
+            ["modal-1".to_string()].into_iter().collect();
+        let report = build_visibility_report(&elements, 0.02, false, Some(&modals));
+        assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(report["clipped"][0]["element"], json!("nav"));
+    }
+
+    /// `minRatio` filters the clipped list the way it filters occlusions, the
+    /// list is ordered worst ratio first with no text priority (the SDK's
+    /// order), and an element
+    /// with no `clippedPct` (an older bundle) contributes nothing.
+    #[test]
+    fn clipped_entries_take_min_ratio_and_the_sdk_ratio_order() {
+        let elements = vec![
+            el("hairline", "", json!({ "clippedPct": 1 })),
+            el("blank-90", "", json!({ "clippedPct": 90 })),
+            el(
+                "text-20",
+                "",
+                json!({ "clippedPct": 20, "textContent": "a" }),
+            ),
+            el(
+                "text-70",
+                "",
+                json!({ "clippedPct": 70, "textContent": "b" }),
+            ),
+            el("zero", "", json!({ "clippedPct": 0 })),
+            el("absent", "", json!({ "textContent": "c" })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        let ids: Vec<&str> = report["clipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["blank-90", "text-70", "text-20"]);
+        let strict = build_visibility_report(&elements, 0.8, false, None);
+        assert_eq!(strict["clipped"].as_array().unwrap().len(), 1);
+        // A zero clip is no clip, even at `minRatio: 0`.
+        let all = build_visibility_report(&elements, 0.0, false, None);
+        assert_eq!(all["clipped"].as_array().unwrap().len(), 4);
+    }
+
+    /// Equal ratios keep registry order (a stable sort), as the SDK's does;
+    /// text carries no priority in the clipped list.
+    #[test]
+    fn clipped_ties_keep_registry_order() {
+        let elements = vec![
+            el("first-blank", "", json!({ "clippedPct": 50 })),
+            el(
+                "second-text",
+                "",
+                json!({ "clippedPct": 50, "textContent": "t" }),
+            ),
+            el("third-blank", "", json!({ "clippedPct": 50 })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        let ids: Vec<&str> = report["clipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["first-blank", "second-text", "third-blank"]);
+    }
+
+    /// The stable order holds past the small-slice cutoff. Rust's unstable
+    /// sort is insertion sort (stable in practice) for slices of 20 or fewer,
+    /// so the three-entry test above cannot tell `sort_by` from
+    /// `sort_unstable_by`; 33 alternating 50/90 ties can.
+    #[test]
+    fn clipped_ties_keep_registry_order_beyond_the_small_sort_cutoff() {
+        let elements: Vec<serde_json::Value> = (0..33)
+            .map(|i| {
+                let pct = if i % 2 == 0 { 50 } else { 90 };
+                el(&format!("e{i:02}"), "", json!({ "clippedPct": pct }))
+            })
+            .collect();
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        let ids: Vec<String> = report["clipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = (1..33)
+            .step_by(2)
+            .chain((0..33).step_by(2))
+            .map(|i| format!("e{i:02}"))
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    /// Relayed: a clipped entry keeps only `ratio` and `scrollReachable`; its
+    /// id, label and text never reach the wire. Fails if the relay filter
+    /// stops walking `clipped[]`.
+    #[test]
+    fn a_relayed_sweep_strips_clipped_entries_too() {
+        let elements = vec![el(
+            "heading-3-fix-billing",
+            "Session label",
+            json!({ "clippedPct": 100, "clipScrollable": true, "textContent": "secret pane text" }),
+        )];
+        let mut report = build_visibility_report(&elements, 0.02, false, None);
+        super::disclose_occlusion_text(&mut report, true);
+        let entry = &report["clipped"][0];
+        for field in ["element", "label", "text"] {
+            assert!(entry.get(field).is_none(), "{field} survived: {entry}");
+        }
+        assert_eq!(entry["ratio"], json!(1.0));
+        assert_eq!(entry["scrollReachable"], json!(true));
+        let wire = report.to_string();
+        for quoted in ["secret pane text", "Session label", "heading-3-fix-billing"] {
+            assert!(!wire.contains(quoted), "{quoted} reached the wire: {wire}");
+        }
+        // Local keeps them.
+        let mut local = build_visibility_report(&elements, 0.02, false, None);
+        super::disclose_occlusion_text(&mut local, false);
+        assert_eq!(
+            local["clipped"][0]["element"],
+            json!("heading-3-fix-billing")
+        );
+        assert_eq!(local["clipped"][0]["text"], json!("secret pane text"));
+    }
+
+    // ── The relayed sweep withholds the covered elements' text ─────
+
+    /// One occluded element whose label and text are both webview text.
+    fn occluded_report() -> serde_json::Value {
+        let elements = vec![el(
+            "heading-3-fix-billing",
+            "Session label",
+            json!({ "occludedBy": "div.toast", "occludedPct": 60.0, "textContent": "secret pane text" }),
+        )];
+        build_visibility_report(&elements, 0.02, false, None)
+    }
+
+    /// Relayed: no entry keeps `element`, `occludedBy`, `label` or `text`
+    /// (ids are commonly slugs of the element's text), the rest of the entry
+    /// and of the report stand, and the reply says `withheld`. Fails if the
+    /// relayed arm stops stripping any of the four.
+    #[test]
+    fn a_relayed_sweep_carries_no_webview_text() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, true);
+        assert_eq!(report["occlusionText"], json!("withheld"));
+        let entry = &report["occlusions"][0];
+        for field in ["element", "occludedBy", "label", "text"] {
+            assert!(entry.get(field).is_none(), "{field} survived: {entry}");
+        }
+        assert_eq!(entry["hidesText"], json!(true));
+        assert_eq!(entry["ratio"], json!(0.6));
+        assert_eq!(report["verdict"], json!("occlusions_found"));
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        assert_eq!(report["elementCount"], json!(1));
+        let wire = report.to_string();
+        for quoted in [
+            "secret pane text",
+            "Session label",
+            "heading-3-fix-billing",
+            "div.toast",
+        ] {
+            assert!(!wire.contains(quoted), "{quoted} reached the wire: {wire}");
+        }
+    }
+
+    /// Local: the entry keeps both fields and the reply says `included`, so
+    /// the disclosure is present on every reply. Fails if the local arm
+    /// starts stripping too.
+    #[test]
+    fn a_local_sweep_keeps_the_text_and_says_so() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, false);
+        assert_eq!(report["occlusionText"], json!("included"));
+        assert_eq!(report["occlusions"][0]["text"], json!("secret pane text"));
+        assert_eq!(report["occlusions"][0]["label"], json!("Session label"));
+        assert_eq!(
+            report["occlusions"][0]["element"],
+            json!("heading-3-fix-billing")
+        );
+        assert_eq!(report["occlusions"][0]["occludedBy"], json!("div.toast"));
+    }
+
+    /// The handler reads the relay marker once and hands it, unchanged, to
+    /// the disclosure, so the pure tests above are the handler's behaviour.
+    /// Source-scanned: the handler cannot run without a webview.
+    #[test]
+    fn the_handler_discloses_by_the_relay_marker() {
+        let body = super::visibility_sweep_payload_tests::visibility_handler_body();
+        assert_eq!(
+            body.matches(
+                "let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);"
+            )
+            .count(),
+            1,
+            "the marker is read exactly once, from the request headers: {body}"
+        );
+        assert_eq!(
+            body.matches("relayed =").count(),
+            1,
+            "`relayed` is never reassigned after it is read: {body}"
+        );
+        assert_eq!(
+            body.matches("disclose_occlusion_text(&mut report, relayed);")
+                .count(),
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("Ok(Json(ApiResponse::success(report)))"),
+            "the disclosed report is the one returned: {body}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2104,11 +2580,13 @@ mod sweep_discover_tests {
 
     use super::*;
 
-    /// The payload itself. `interactiveOnly: false` is the half that was
-    /// missing: the SDK defaults it to `true`, so every heading, badge and
-    /// paragraph was filtered out before the sweep ever saw the page.
+    /// The payload itself states all three filters. `interactiveOnly: false`
+    /// was once missing: the SDK defaults it to `true`, so every heading,
+    /// badge and paragraph was filtered out before the sweep ever saw the
+    /// page. `includeMedia: true` brings the image rows the L0 image
+    /// assertions judge.
     #[test]
-    fn discover_payload_asks_for_hidden_and_non_interactive_elements() {
+    fn discover_payload_states_every_filter() {
         let payload = discover_all_elements_payload();
         let options = payload
             .get("options")
@@ -2124,6 +2602,68 @@ mod sweep_discover_tests {
             "MUST be stated explicitly: the SDK's default is `true`, and leaving \
              it unstated is what made elementCount under-report on every page"
         );
+        assert_eq!(
+            options.get("includeMedia").and_then(|v| v.as_bool()),
+            Some(true),
+            "the image assertions need the image rows, and an image covering text is \
+             an occlusion"
+        );
+    }
+
+    #[test]
+    fn page_health_leaves_out_the_media_rows_discover_returns() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "buy", "category": "interactive"},
+            {"id": "hero", "category": "media"},
+            {"id": "plain"},
+        ]});
+        let kept: Vec<_> = page_health_elements(&discover)
+            .iter()
+            .filter_map(|el| el.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect();
+        assert_eq!(kept, ["h1", "buy", "plain"]);
+    }
+
+    /// The reported `element_count` keeps the media rows, so page-health and
+    /// `/control/visibility` count the same set for the same page. Only the
+    /// ratios leave them out (`media_rows_excluded` is the difference).
+    #[test]
+    fn page_health_reports_every_discovered_row_as_its_element_count() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "hero", "category": "media"},
+            {"id": "logo", "category": "media"},
+        ]});
+        assert_eq!(discovered_row_count(&discover), 3);
+        assert_eq!(page_health_elements(&discover).len(), 1);
+        assert_eq!(discovered_row_count(&serde_json::json!({})), 0);
+    }
+
+    /// The handler reports the discovered count, not the judged one. Scanned
+    /// from source, because the report is built inline in the handler.
+    #[test]
+    fn page_health_report_states_the_media_rows_it_left_out() {
+        let source = include_str!("screenshots.rs");
+        // `split_once`, not byte slicing: the crate denies `string_slice`.
+        let (_, rest) = source
+            .split_once("pub async fn ui_bridge_page_health_handler")
+            .expect("the page-health handler is in this file");
+        // The handler ends at the first column-0 closing brace after it.
+        let (body, _) = rest.split_once("\n}\n").expect("the handler body closes");
+        assert!(
+            body.contains("\"media_rows_excluded\": element_count.saturating_sub(judged_count)"),
+            "the report must say how many media rows the ratios left out"
+        );
+        assert!(
+            body.contains("let element_count = discovered_row_count(&discover_data);"),
+            "element_count must count every discovered row, as visibility does"
+        );
+    }
+
+    #[test]
+    fn page_health_reads_no_rows_from_a_reply_without_elements() {
+        assert!(page_health_elements(&serde_json::json!({})).is_empty());
     }
 
     /// DIVERGENCE GUARD.
@@ -2137,10 +2677,11 @@ mod sweep_discover_tests {
     /// ## The rule this pins, and why it is SEMANTIC rather than syntactic
     ///
     /// Every `discover` request issued from this file must ask for the SAME
-    /// element set: `includeHidden: true` AND `interactiveOnly: false`. A site
+    /// element set: `includeHidden: true`, `interactiveOnly: false` AND
+    /// `includeMedia: true`. A site
     /// satisfies that either by calling `discover_all_elements_payload()` —
     /// still the preferred form, since a helper cannot drift — **or** by
-    /// stating both filters in its own literal. Both spellings ask the identical
+    /// stating every filter in its own literal. Both spellings ask the identical
     /// question, and the question is the property worth defending; requiring one
     /// SPELLING of it was an over-reach this guard has now been narrowed out of.
     ///
@@ -2185,9 +2726,10 @@ mod sweep_discover_tests {
                 site_asks_for_every_element(production, at),
                 "a `discover` request site in screenshots.rs does not ask for the \
                  full element set. Every page-wide sweep must ask the SAME \
-                 question — `includeHidden: true` AND `interactiveOnly: false` — \
-                 either by calling discover_all_elements_payload() or by stating \
-                 BOTH filters in its own literal. Stating only `includeHidden` \
+                 question — `includeHidden: true`, `interactiveOnly: false` AND \
+                 `includeMedia: true` — either by calling \
+                 discover_all_elements_payload() or by stating EVERY filter in its \
+                 own literal. Stating only `includeHidden` \
                  leaves the SDK's `interactiveOnly: true` default in force, which \
                  silently drops every heading, paragraph and badge; that is how \
                  the sweeps diverged. Offending site at byte {at}."
@@ -2200,8 +2742,8 @@ mod sweep_discover_tests {
         );
     }
 
-    /// Does the `discover` request at `at` ask for hidden AND non-interactive
-    /// elements?
+    /// Does the `discover` request at `at` ask for hidden, non-interactive AND
+    /// media elements?
     ///
     /// Resolves the payload ARGUMENT rather than eyeballing a fixed window,
     /// because the two accepted spellings sit on opposite sides of the call: a
@@ -2218,7 +2760,7 @@ mod sweep_discover_tests {
             return true;
         }
         // An inline literal — check the argument text itself…
-        if states_both_filters(arg) {
+        if states_every_filter(arg) {
             return true;
         }
         // …otherwise the argument is a binding; read the `let` that made it.
@@ -2227,7 +2769,7 @@ mod sweep_discover_tests {
             return false;
         }
         match production[..at].rfind(&format!("let {ident} ")) {
-            Some(binding) => states_both_filters(&production[binding..at]),
+            Some(binding) => states_every_filter(&production[binding..at]),
             None => false,
         }
     }
@@ -2252,11 +2794,13 @@ mod sweep_discover_tests {
         rest
     }
 
-    /// Both filters stated, whitespace-insensitively — a `json!` body is macro
+    /// Every filter stated, whitespace-insensitively — a `json!` body is macro
     /// input, which rustfmt does not normalize, so its spacing is whatever the
     /// author typed.
-    fn states_both_filters(text: &str) -> bool {
+    fn states_every_filter(text: &str) -> bool {
         let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
+        dense.contains("\"includeHidden\":true")
+            && dense.contains("\"interactiveOnly\":false")
+            && dense.contains("\"includeMedia\":true")
     }
 }

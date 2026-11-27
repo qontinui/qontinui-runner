@@ -31,7 +31,6 @@ class TestingCommands(ExecutorHost):
         "testing_clear_mocked_actions": "_handle_testing_clear_mocked_actions",
         "testing_start_run": "_handle_testing_start_run",
         "testing_run_assertion": "_handle_testing_run_assertion",
-        "testing_run_test_case": "_handle_testing_run_test_case",
         "testing_end_run": "_handle_testing_end_run",
         "testing_get_run": "_handle_testing_get_run",
         "testing_get_status": "_handle_testing_get_status",
@@ -153,12 +152,6 @@ class TestingCommands(ExecutorHost):
             return {"success": False, "error": "assertion_type and target are required"}
 
         return service.run_assertion(assertion_type, target, expected, timeout_seconds)
-
-    def _handle_testing_run_test_case(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle run test case command for integration testing."""
-        service = self._get_integration_testing_service()
-        test_case = params.get("test_case", {})
-        return service.run_test_case(test_case)
 
     def _handle_testing_end_run(self) -> dict[str, Any]:
         """Handle end test run command for integration testing."""

@@ -20,7 +20,7 @@ tool is read-only, fleet-wide, and needs **no device-scoped JWT** — it works o
 the standard session identity (it mirrors `coord_query_ci_state`'s auth-agnostic
 handler).
 
-Two shapes:
+Three shapes:
 
 - **`/pr-status`** (no args) → `coord_pr_status(mine=true)` — the PRs authored by
   *this* session (resolved via the PR↔session worktree mapping). Renders one card
@@ -29,6 +29,13 @@ Two shapes:
   specific PR's card, including **post-land** PRs (a merged PR still answers, with
   `merged_at` + `merge_commit`; if the row aged out after branch deletion the card
   is reconstructed from `pr_events` and flagged `reconstructed_from_events`).
+- **`/pr-status <owner/repo> <head-branch>`** → `coord_pr_status(repo, head_branch)`
+  — the coord equivalent of `gh pr list --head <branch>`. Answers
+  `{cards, unservable, note}`: one card per PR coord holds on that branch (open
+  first, then newest), `unservable` for a PR it lists but cannot build a card
+  for, and `cards: []` plus a `note` when it holds none. That empty answer is a
+  statement about coord's twin, not GitHub: a PR opened moments ago may not be
+  ingested yet.
 
 ## Instructions
 
@@ -36,12 +43,17 @@ Two shapes:
    - No args → call the MCP tool `coord_pr_status` with `{ "mine": true }`.
    - `<owner/repo> <number>` → call `coord_pr_status` with
      `{ "repo": "<owner/repo>", "number": <n> }`.
+   - `<owner/repo> <anything that is not a positive integer>` → call
+     `coord_pr_status` with `{ "repo": "<owner/repo>", "head_branch": "<it>" }`
+     and render each entry of `cards` as below; list `unservable` and `note`
+     verbatim after them.
 2. **Call the tool.** `coord_pr_status` is in the read-only tool allow-set, so a
    normal session can call it directly. If it comes back
    unknown/method-not-found (per-agent allow-set masking), fall back to the HTTP
    route via `pr-status.sh`, which sits next to this SKILL.md — run it as
    `bash <path-to-this-skill-dir>/pr-status.sh --mine` (or
-   `--repo <owner/repo> --number <n>`), never through a `qontinui-claude-config`
+   `--repo <owner/repo> --number <n>`, or
+   `--repo <owner/repo> --head-branch <branch>`), never through a `qontinui-claude-config`
    checkout, which a provisioned copy of this skill does not have.
    It mirrors the `/gate` transport
    cascade: first a sweep of the runner-written `.mcp.json` proxy doors
@@ -99,8 +111,7 @@ Two shapes:
    refused successor: <successor> (<arm>, <author_association>, refused <refused_at>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — verify content by hand
    ```
 
-   Inside either line, any field that is `null` or missing prints `?`, never a
-   guess. `successor land` is the successor's land, not proof this PR's code is
+   `successor land` is the successor's land, not proof this PR's code is
    on the base, and `content noop` alone is not equivalence: print the counts
    beside it.
 
@@ -117,6 +128,63 @@ Two shapes:
    `superseded_by_refused: []` prints nothing. `null` prints
    `refused successor: ? UNKNOWN (read failed)`, and a card with no such key
    prints `refused successor: ? UNKNOWN (older coord)`.
+
+   A `supersedes #N` declaration has three outcomes, and each has its own
+   field. `superseded_by` lists successors whose declaration coord RECORDED.
+   `superseded_by_refused` lists those it REFUSED, and names the reason in
+   `arm`. `superseded_by_pending` lists those it COULD NOT DECIDE: the
+   author-permission lookup erred, so the declaration waits for the backfill
+   to re-read it. `lookup_error` gives the cause (`budget_cooldown`,
+   `budget_paced`, `github_status_<code>` or `other`), and `backfill.state`
+   says how far that re-read has got. A `none_recorded` status beside a
+   non-empty pending list therefore means pending, not "not superseded". Print
+   one line per pending entry:
+
+   ```
+   pending successor: <successor> (lookup <lookup_error>, pending since <pending_since>, backfill <backfill>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — coord has not decided; <remedy>
+   ```
+
+   `<backfill>` is rendered from `backfill.state` as follows:
+   - `failed` or `deferred` prints as-is, followed by
+     `(<backfill.outcome>, at <backfill.at>)`.
+   - `not_attempted_or_unrecorded` prints as `? UNKNOWN (no backfill trace)`.
+   - `outside_backfill_window` prints as-is. The backfill will not re-read
+     that declaration again.
+
+   `<remedy>` depends on whether the successor has landed:
+   - When `successor_land_stamp` is `terminal` (so `successor_land` is set),
+     print `coord_declare_supersession records it if the successor is yours`.
+     That door re-checks the successor's author and its land on the server.
+   - When it is `current_head`, `superseded_head` or `terminal_uncorroborated`,
+     print the same text. Note that the door
+     decides land by its own `pr_merged` verdict, so it may still refuse. A
+     refusal naming its land check means "not landed yet".
+   - Otherwise, and when `backfill.state` is not `outside_backfill_window`,
+     print `it records on the next backfill re-read or webhook;
+     coord_declare_supersession applies only once the successor lands`.
+   - Otherwise, when it is `outside_backfill_window`, print `the backfill
+     will not re-read it; a new webhook records it, or
+     coord_declare_supersession once the successor lands`.
+
+   `superseded_by_pending: []` prints nothing. `null` prints
+   `pending successor: ? UNKNOWN (read failed)`, and a card with no such key
+   prints `pending successor: ? UNKNOWN (older coord)`.
+
+   The successor's own card answers the same question from the other side.
+   `declares_supersession` holds one entry per predecessor that its title
+   declares or the agent door recorded. Each entry has a `state` of
+   `recorded`, `refused`, `pending` or `not_recorded`. Print each entry as
+   `declares supersession of <predecessor>: <state>`, with `not_recorded`
+   printed as `not_recorded (UNKNOWN, not "nothing declared")`. `[]` means
+   neither the title nor an agent declaration names a predecessor. `null`,
+   or no such key, prints `declares supersession: ? UNKNOWN`.
+
+   On every supersession line (declared, refused, pending, declares
+   supersession), the same two rules apply:
+   - A `null` or missing field prints `?`, never a guess.
+   - A value of `backfill.state`, `lookup_error` or a `declares_supersession`
+     `state` outside the sets above prints
+     `? UNKNOWN (unrecognised <field> <value>)`.
 4. **Never cache the result in memory.** The whole point is that this read is
    always fresh and self-describing. If you want to record something durable
    about the PR, record the **narrative** (why it exists, its recurring failure

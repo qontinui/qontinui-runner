@@ -976,11 +976,20 @@ pub async fn ui_bridge_relay_dispatch_handler(
                     .join(", ")
             ));
             err.code = Some("AMBIGUOUS_TAB".to_string());
-            err.suggestions = Some(
-                ids.iter()
-                    .map(|c| format!("retry with {{\"tabId\": \"{}\"}}", c.id))
-                    .collect(),
-            );
+            // The remedy is the caller's to apply: pin the target with one of
+            // the candidates `hint.candidates` lists.
+            err.refusal = Some(crate::mcp::refusal_envelope::refusal_for_envelope(
+                "AMBIGUOUS_TAB",
+                StatusCode::CONFLICT,
+                err.error.as_deref(),
+                Some(
+                    qontinui_types::refusal::NextAction::new(
+                        qontinui_types::refusal::NextActionKind::FixRequest,
+                    )
+                    .with_target("tabId"),
+                ),
+                None,
+            ));
             err.hint = Some(serde_json::json!({
                 "candidates": ids
                     .iter()
@@ -1043,9 +1052,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_relay_heartbeat_handler),
         )
         .route("/ui-bridge/tabs", get(ui_bridge_relay_tabs_handler))
+        // A relay tab's answer is app content, so while a condition-check
+        // session holds a secret this ONE route's response is scrubbed
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). Never the router: `/ui-bridge/commands/stream` above carries
+        // commands TO the tabs, a `type` action's substituted value among them.
         .route(
             "/ui-bridge/relay/dispatch",
-            post(ui_bridge_relay_dispatch_handler),
+            post(ui_bridge_relay_dispatch_handler).layer(axum::middleware::from_fn(
+                crate::condition_secrets::scrub_sdk_responses,
+            )),
         )
 }
 

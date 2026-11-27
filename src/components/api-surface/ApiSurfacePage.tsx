@@ -82,7 +82,12 @@ export function ApiSurfacePage() {
           // Diff is optional
         }
       } else {
-        setError(json.error ?? "Scan failed");
+        // `error` is the typed refusal's rendered sentence (the structured
+        // envelope rides on `json.refusal`); the string `hint` says why this
+        // route needs a development checkout, which the sentence alone does
+        // not — without it the refusal reads as final there.
+        const hint = typeof json.hint === "string" ? ` ${json.hint}` : "";
+        setError(`${json.error ?? "Scan failed"}${hint}`);
       }
     } catch (err) {
       setError(String(err));

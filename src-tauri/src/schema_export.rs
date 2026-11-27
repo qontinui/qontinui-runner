@@ -40,9 +40,10 @@ pub fn export_all_schemas() -> Value {
         image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
         projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
-        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        spec_check as qsc, spec_model as qspm, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -149,6 +150,26 @@ pub fn export_all_schemas() -> Value {
     add!("NextTaskInfo", qs::NextTaskInfo);
     add!("CreateScheduledTaskRequest", qs::CreateScheduledTaskRequest);
     add!("UpdateScheduledTaskRequest", qs::UpdateScheduledTaskRequest);
+    // Recurring agents declared in coord and reconciled by the runner (plan
+    // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner,
+    // qontinui-schemas#276 / #283): the managed key a ScheduledTask carries,
+    // and the wire types of coord's device read and the status report.
+    add!("ManagedBy", qs::ManagedBy);
+    add!("RecurringAgentDispatchRole", qs::RecurringAgentDispatchRole);
+    add!("RecurringAgentOs", qs::RecurringAgentOs);
+    add!("RecurringAgentTarget", qs::RecurringAgentTarget);
+    add!(
+        "RecurringAgentExcludedValue",
+        qs::RecurringAgentExcludedValue
+    );
+    add!("RecurringAgentParamKind", qs::RecurringAgentParamKind);
+    add!("RecurringAgentParamDef", qs::RecurringAgentParamDef);
+    add!("RecurringAgentParamSchema", qs::RecurringAgentParamSchema);
+    add!("RecurringAgentSpec", qs::RecurringAgentSpec);
+    add!("RecurringAgentState", qs::RecurringAgentState);
+    add!("RecurringAgentOverride", qs::RecurringAgentOverride);
+    add!("RecurringAgentStatus", qs::RecurringAgentStatus);
+    add!("RecurringAgentStatusReport", qs::RecurringAgentStatusReport);
 
     // ── qontinui-types: workflow frame ──
     add!("RoutingRule", qw::RoutingRule);
@@ -501,6 +522,10 @@ pub fn export_all_schemas() -> Value {
     add!("TerminalInfo", qtm::TerminalInfo);
     add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
     add!("TerminalExitEvent", qtm::TerminalExitEvent);
+    add!("TerminalLayout", qtm::TerminalLayout);
+    add!("TerminalLayoutRunner", qtm::TerminalLayoutRunner);
+    add!("TerminalLayoutPage", qtm::TerminalLayoutPage);
+    add!("TerminalLayoutSession", qtm::TerminalLayoutSession);
 
     // ── runner-local: findings (Tauri `finding_detected` / `finding_resolved`
     // payloads). Distinct from `qontinui_types::verification::Finding`
@@ -654,20 +679,12 @@ pub fn export_all_schemas() -> Value {
     add!("WorkerStatus", qv::WorkerStatus);
     add!("WorkerInstance", qv::WorkerInstance);
     add!("WorkerCoordinationMessage", qv::WorkerCoordinationMessage);
-    add!("DomainVerificationResult", qv::DomainVerificationResult);
     add!("WorkerSignal", qv::WorkerSignal);
     add!("Finding", qv::Finding);
     add!("Confidence", qv::Confidence);
-    add!("VerificationResult", qv::VerificationResult);
-    add!(
-        "IterationVerificationResults",
-        qv::IterationVerificationResults
-    );
-    add!("VerificationAgentContext", qv::VerificationAgentContext);
     add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
     add!("CriterionOverride", qv::CriterionOverride);
     add!("OverrideCollection", qv::OverrideCollection);
-    add!("TaskCompletionResult", qv::TaskCompletionResult);
     add!("StageTransition", qv::StageTransition);
 
     // ── qontinui-types: spec_check (Plan 01 foundation) ──
@@ -736,6 +753,25 @@ pub fn export_all_schemas() -> Value {
     add!("CompletenessVerdict", qcv::CompletenessVerdict);
     add!("SectionVerdict", qcv::SectionVerdict);
     add!("SpecSection", qcv::SpecSection);
+    // spec_model — spec-artifact frontmatter (plan 2026-10-10 spec front end
+    // phase 6, Phase 2).
+    add!("EarsPattern", qspm::EarsPattern);
+    add!("CriterionVerification", qspm::CriterionVerification);
+    add!("SpecFrontmatter", qspm::SpecFrontmatter);
+    add!("RequestFrontmatter", qspm::RequestFrontmatter);
+    add!("RequirementFrontmatter", qspm::RequirementFrontmatter);
+    add!(
+        "InterfaceMappingFrontmatter",
+        qspm::InterfaceMappingFrontmatter
+    );
+    add!("StoryFrontmatter", qspm::StoryFrontmatter);
+    add!("SpecAcceptanceCriterion", qspm::SpecAcceptanceCriterion);
+    add!("SourceCitation", qspm::SourceCitation);
+    add!("SourceCitationKind", qspm::SourceCitationKind);
+    add!("ExternalRef", qspm::ExternalRef);
+    add!("TemplateRef", qspm::TemplateRef);
+    add!("MappingRow", qspm::MappingRow);
+    add!("SpecLanguage", qspm::SpecLanguage);
     add!("ProvenanceMix", qcv::ProvenanceMix);
     add!("CoverageGap", qcv::CoverageGap);
     add!("GapReason", qcv::GapReason);
@@ -1055,8 +1091,68 @@ mod tests {
         // types) so the TS pass declares each once = 596.
         // + JourneyArrivalDoubt (shared by JourneyGraph and
         // JourneyPriorKnowledge) = 597.
-        // The codegen's "Processing N top-level types" line should read 597 here.
-        assert_eq!(obj.len(), 597, "Expected 597 schema entries");
+        // + the 14 spec_model spec-artifact frontmatter types (EarsPattern,
+        // CriterionVerification, SpecFrontmatter, RequestFrontmatter,
+        // RequirementFrontmatter, InterfaceMappingFrontmatter, StoryFrontmatter,
+        // SpecAcceptanceCriterion, SourceCitation, SourceCitationKind,
+        // ExternalRef, TemplateRef, MappingRow, SpecLanguage) = 611.
+        // + the 13 recurring-agent types (ManagedBy, RecurringAgentDispatchRole,
+        // RecurringAgentOs, RecurringAgentTarget, RecurringAgentExcludedValue,
+        // RecurringAgentParamKind,
+        // RecurringAgentParamDef, RecurringAgentParamSchema, RecurringAgentSpec,
+        // RecurringAgentState, RecurringAgentOverride, RecurringAgentStatus,
+        // RecurringAgentStatusReport — plan
+        // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
+        // Phase 4a) = 624.
+        // - the 4 orchestrator verifier result types (DomainVerificationResult,
+        // VerificationResult, IterationVerificationResults,
+        // TaskCompletionResult — deleted with the unreachable orchestrator
+        // verifier that alone filled them, plan
+        // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
+        // Phase 6) = 620.
+        // - VerificationAgentContext (its only producer, the orchestrator
+        // verifier's context builder, went with the types above; coord
+        // finding 7c536351) = 619.
+        // + the 4 terminal-layout types (TerminalLayout, TerminalLayoutRunner,
+        // TerminalLayoutPage, TerminalLayoutSession — the GET /terminal-layout
+        // body, plan
+        // 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days
+        // Phase 1) = 623.
+        // The codegen's "Processing N top-level types" line should read 623 here.
+        assert_eq!(obj.len(), 623, "Expected 623 schema entries");
+        // Nothing in the product fills these any more, so registering one
+        // again would export a DTO that has no producer.
+        for removed in [
+            "DomainVerificationResult",
+            "VerificationResult",
+            "IterationVerificationResults",
+            "TaskCompletionResult",
+            "VerificationAgentContext",
+        ] {
+            assert!(
+                !obj.contains_key(removed),
+                "{removed} was deleted with the orchestrator verifier and must not be exported"
+            );
+        }
+        for layout in [
+            "TerminalLayout",
+            "TerminalLayoutRunner",
+            "TerminalLayoutPage",
+            "TerminalLayoutSession",
+        ] {
+            assert!(obj.contains_key(layout), "Missing {layout} schema");
+        }
+        for recurring in [
+            "ManagedBy",
+            "RecurringAgentTarget",
+            "RecurringAgentExcludedValue",
+            "RecurringAgentParamSchema",
+            "RecurringAgentSpec",
+            "RecurringAgentStatus",
+            "RecurringAgentStatusReport",
+        ] {
+            assert!(obj.contains_key(recurring), "Missing {recurring} schema");
+        }
         for journey in [
             "JourneyNode",
             "JourneyTrigger",

@@ -435,7 +435,6 @@ mod tests {
             outside.join("instance-x")
         );
     }
-    use crate::test_env::env_lock;
 
     #[test]
     fn sanitize_keeps_safe_chars() {
@@ -448,9 +447,15 @@ mod tests {
     /// secondaries so spawn-test runners never race the primary on a single
     /// shared `session-outbox.jsonl`. This asserts the exact `scope_path`
     /// contract relied on by the outbox + pane-store wiring in `main.rs`.
+    ///
+    /// The fixture captures `QONTINUI_INSTANCE_NAME` and restores it on drop,
+    /// unwinding included, so a failed assertion cannot leave every later test
+    /// in the binary reading a secondary. It also removes the hosting runner's
+    /// instance family first, so an inherited `QONTINUI_INSTANCE_ROOT` cannot
+    /// short-circuit `scope_path`.
     #[test]
     fn scope_path_isolates_outbox_dir_for_secondary() {
-        let _env = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let base = Path::new(".qontinui").join("runner");
 
         // Secondary: appends `instance-<sanitized-name>`.
@@ -463,8 +468,6 @@ mod tests {
         );
         let outbox = scoped.join("session-outbox.jsonl");
         assert!(outbox.to_string_lossy().contains("instance-test-runner_7_"));
-
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
     }
 
     const PRIMARY: u16 = crate::mcp::types::MCP_API_PORT;
@@ -765,15 +768,17 @@ mod tests {
     /// loop itself binds real sockets.
     #[test]
     fn the_mcp_api_bind_loop_takes_its_ports_from_api_ports_to_try() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_api.rs"))
-            .expect("mcp_api.rs is readable");
+        // The whole `mcp_api` module (root plus `mcp_api/**`): the bind loop
+        // lives in `mcp_api/serve.rs` since the split, and a scan of the root
+        // alone could no longer see a regression there.
+        let src = crate::mcp_api::mcp_api_sources();
         assert!(
             src.contains("let ports_to_try = crate::instance::api_ports_to_try(port);"),
             "the bind loop no longer asks instance::api_ports_to_try for its ports"
         );
         assert!(
             !src.contains("[port, port + 1, port + 2]"),
-            "an inline fallback port list is back in mcp_api.rs"
+            "an inline fallback port list is back in the mcp_api module"
         );
     }
 

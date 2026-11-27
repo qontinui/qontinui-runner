@@ -19,9 +19,18 @@ client = UIBridgeClient(
 
 # Common connection targets:
 # - Local runner:        http://127.0.0.1:9876
-# - Android emulator:    http://10.0.2.2:8087
+# - Android device or emulator: http://localhost:8087, after
+#   `adb forward tcp:8087 tcp:8087` on this host (on ui-bridge-native
+#   >= 0.11.0, only if the app's server adapter passes the socket's
+#   `remoteAddress`)
 # - iOS simulator:       http://localhost:8087
-# - Physical device:     http://<device-ip>:8087
+# - A phone's LAN IP (http://<device-ip>:8087): from @qontinui/ui-bridge-native
+#   0.11.0, an unsigned off-device caller reaches only GET /ui-bridge/health
+#   (and POST /ui-bridge/pair with an armed code); control routes answer
+#   401 PAIRING_REQUIRED or PAIRING_UNCONFIGURED. This client does not sign.
+#   Go through the runner instead: POST /ui-bridge/devices/{id}/pair (over a
+#   USB cable with {}, on Wi-Fi with {"code": "<6 digits from the app>"}), then
+#   POST /ui-bridge/devices/{id}/connect; the runner signs every request.
 # - Web app (dev):       http://localhost:3001 (check app's configured port)
 ```
 

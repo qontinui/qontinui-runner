@@ -786,6 +786,44 @@ impl ExecutionStepConfig {
         self.phase = Some(phase.as_str().to_string());
     }
 
+    /// Whether this step runs in a build whose `debug_assertions` setting is
+    /// the one given: a `dev_mode_only` step runs only in a build with debug
+    /// assertions, so the published runner never executes it. Callers pass
+    /// `cfg!(debug_assertions)`; tests pass either value. The verification
+    /// phase (which drops such steps before running) and the multi-agent
+    /// pipeline (which derives its acceptance criteria from the steps that will
+    /// actually run) share it; the setup, agentic and completion phases still
+    /// spell the same rule inline.
+    pub fn runs_in_build(&self, debug_assertions: bool) -> bool {
+        debug_assertions || !self.dev_mode_only.unwrap_or(false)
+    }
+
+    /// Whether running this step checks anything. A `gate` step is an
+    /// aggregation marker that always succeeds, and a `prompt` step with no
+    /// prompt content has nothing to evaluate (its verification handler
+    /// returns success without asking anything), so neither is evidence that
+    /// anything passed.
+    pub fn checks_something(&self) -> bool {
+        match self.step_type.as_str() {
+            "gate" => false,
+            "prompt" => self
+                .prompt_content
+                .as_deref()
+                .is_some_and(|content| !content.is_empty()),
+            _ => true,
+        }
+    }
+
+    /// Whether this step's outcome counts toward a verification verdict: it is
+    /// required (`required` absent counts as required) AND it checks something.
+    /// The ONE rule for "a required step": the verification phase stamps it on
+    /// every step result's `required` flag, so the shared fold, the loop's
+    /// decision and every stored result read the same answer, and the
+    /// multi-agent pipeline derives its acceptance criteria from it.
+    pub fn counts_toward_verdict(&self) -> bool {
+        self.required != Some(false) && self.checks_something()
+    }
+
     /// Create the default pre-flight environment check step.
     ///
     /// This creates a step that runs inline commands to verify:
@@ -915,7 +953,11 @@ pub struct StepExecutionResult {
     /// Additional output data from the step handler
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_data: Option<serde_json::Value>,
-    /// Whether this step is required for verification pass/fail (from step config)
+    /// Whether this step counts toward the verification verdict: the step
+    /// config's `required`. In the verification phase, a step that checks
+    /// nothing (a `gate`, a verification `prompt` with no prompt content) is
+    /// stamped `Some(false)` instead (`verification_execution::result_required`);
+    /// results from the other phases copy the config's value unstamped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
     /// Resolved input values (for debugging data flow)
@@ -1064,18 +1106,21 @@ pub struct ExecutionResult {
 
 /// Result of running all verification_steps in a unified workflow
 ///
-/// This is returned by execute_verification_steps and used to:
+/// This is returned by execute_verification_steps_with_events and used to:
 /// 1. Determine if the agentic phase should run (any failures)
 /// 2. Build context for the AI about what failed
 /// 3. Store results in the database for the Recap page
 ///
 /// Verification pass/fail is determined by `required` steps:
-/// all_passed = all steps with required=true (default) succeeded.
+/// all_passed = at least one step with required=true (the default) ran, and
+/// every such step succeeded. A set with no required step — an empty set
+/// included — checked nothing, so it is not a pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPhaseResult {
     /// Iteration number (1-indexed)
     pub iteration: u32,
-    /// Whether all required verification steps passed
+    /// Whether at least one required verification step ran and every
+    /// required step passed (false when no required step ran)
     pub all_passed: bool,
     /// Total number of verification steps
     pub total_steps: usize,

@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "host": "spaceship (Windows 11 Pro 10.0.26300)",
+    "measured_at": "2026-11-08T06:24:21Z",
+    "method": "Get-CimInstance Win32_Process, subtree of one real claude.exe (the path-identity shim excluded); start = CreationDate.ToFileTimeUtc(); coord-mcp-shim credential filenames redacted to 0123456789abcdef; tool-shell (bash.exe) command bodies redacted",
+    "shape": "bash.exe(bash.exe(conhost.exe())),bash.exe(bash.exe(conhost.exe())),cmd.exe(conhost.exe(),python3.exe(python.exe())),conhost.exe()",
+    "census": "100 real claude.exe on the box at capture: 93 held exactly cmd.exe(conhost.exe(),python3.exe(python.exe())), 7 held that chain plus tool shells or a direct conhost.exe"
+  },
+  "platform": "windows",
+  "claude_pid": 3248852,
+  "table": [
+    {
+      "pid": 3248852,
+      "ppid": 752896,
+      "image": "claude.exe",
+      "start": 134385924292162530,
+      "cmdline": "<claude argv not recorded>"
+    },
+    {
+      "pid": 7873760,
+      "ppid": 3248852,
+      "image": "conhost.exe",
+      "start": 134385924292240990,
+      "cmdline": "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4"
+    },
+    {
+      "pid": 7706508,
+      "ppid": 3248852,
+      "image": "cmd.exe",
+      "start": 134385924307353970,
+      "cmdline": "C:\\WINDOWS\\system32\\cmd.exe /d /s /c \"C:\\Users\\jspin\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe ^\"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py^\" ^\"--credential^\" ^\"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json^\"\""
+    },
+    {
+      "pid": 8455440,
+      "ppid": 3248852,
+      "image": "bash.exe",
+      "start": 134385925570806390,
+      "cmdline": "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"<tool command redacted>\""
+    },
+    {
+      "pid": 7955136,
+      "ppid": 3248852,
+      "image": "bash.exe",
+      "start": 134385925673763650,
+      "cmdline": "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"<tool command redacted>\""
+    },
+    {
+      "pid": 7922148,
+      "ppid": 7706508,
+      "image": "conhost.exe",
+      "start": 134385924307758310,
+      "cmdline": "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4"
+    },
+    {
+      "pid": 14461272,
+      "ppid": 7706508,
+      "image": "python3.exe",
+      "start": 134385924308636380,
+      "cmdline": "C:\\Users\\jspin\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe  \"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py\" \"--credential\" \"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json\""
+    },
+    {
+      "pid": 9380780,
+      "ppid": 8455440,
+      "image": "bash.exe",
+      "start": 134385925570924120,
+      "cmdline": "\"C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe\" -c \"<tool command redacted>\""
+    },
+    {
+      "pid": 8353376,
+      "ppid": 7955136,
+      "image": "bash.exe",
+      "start": 134385925673897910,
+      "cmdline": "\"C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe\" -c \"<tool command redacted>\""
+    },
+    {
+      "pid": 7633160,
+      "ppid": 14461272,
+      "image": "python.exe",
+      "start": 134385924310453570,
+      "cmdline": "\"C:\\Users\\jspin\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe\"  \"D:\\qontinui-root\\qontinui-claude-config\\scripts\\coord-mcp-shim.py\" \"--credential\" \"C:\\Users\\jspin\\.qontinui\\coord-mcp-shim\\0123456789abcdef.json\""
+    },
+    {
+      "pid": 4052408,
+      "ppid": 9380780,
+      "image": "conhost.exe",
+      "start": 134385925571015560,
+      "cmdline": "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4"
+    },
+    {
+      "pid": 8304704,
+      "ppid": 8353376,
+      "image": "conhost.exe",
+      "start": 134385925673992170,
+      "cmdline": "\\??\\C:\\WINDOWS\\system32\\conhost.exe 0x4"
+    }
+  ]
+}

@@ -14,10 +14,16 @@
 //!   reach it: [`copy_transcript`] (the account migration's destructive
 //!   [`MainTranscript::LiveSourceWins`] carry, visible only inside
 //!   `crate::terminal`, whose one caller holds the migration's in-flight
-//!   guard — [`super::account_migration::migrate_session`]) and
+//!   guard — `super::account_migration::prepare_migration`) and
 //!   [`carry_for_respawn`] (the cross-machine respawn receiver,
 //!   `crate::session::respawn`, which can name only the two non-destructive
 //!   modes, [`RespawnCarry`]).
+//! - [`copy_transcript`] first ranks every account root's copy of
+//!   `<sid>.jsonl` ([`newest`]) and carries from the root holding the NEWEST
+//!   one, which is not always the migration's source. When the destination
+//!   already holds it, nothing at all is carried over it (neither `<sid>.jsonl`
+//!   nor `<sid>/`). [`TranscriptCopy::carried_from`] names the root the carry
+//!   read from. Below, "the source" of a migration means that root.
 //! - [`delta_sync`] tops the destination's `<sid>/` up once the OLD writer has
 //!   exited, for files the old pane wrote between the carry and its close. It
 //!   never touches `<sid>.jsonl`, and backs out if the destination changed
@@ -26,12 +32,13 @@
 //!   (main or subagent) unless the destination's bytes are a prefix of the
 //!   source's: a destination that diverged is a fork with its own tail, and is
 //!   left alone. On an account migration ([`MainTranscript::LiveSourceWins`])
-//!   the live conversation must be what resumes, so every `.jsonl` — the main
-//!   `<sid>.jsonl` and each one under `<sid>/` alike — whose destination is
-//!   neither byte-identical to the source nor a prefix of it, whatever its
-//!   size, is renamed aside to `<file>.diverged-<unix_ms>` beside it (never
-//!   deleted, never over an earlier backup) and the source is copied in its
-//!   place. A subagent transcript moved aside keeps a copy of its fork's
+//!   the newest copy must be what resumes. When the destination is not
+//!   already that copy, every `.jsonl` — the main `<sid>.jsonl` and each one
+//!   under `<sid>/` alike — whose destination is neither byte-identical to
+//!   the source nor a prefix of it, whatever its size, is renamed aside to
+//!   `<file>.diverged-<unix_ms>` beside it (never deleted, never over an
+//!   earlier backup) and the source is copied in its place. A subagent
+//!   transcript moved aside keeps a copy of its fork's
 //!   `agent-<id>.meta.json` beside it, under the same suffix
 //!   (`agent-<id>.meta.json.diverged-<unix_ms>`), best-effort, and a main
 //!   transcript moved aside does the same for the fork's `custom-title.json`
@@ -71,8 +78,12 @@ use tracing::{info, warn};
 
 use crate::terminal::graceful_exit::ProcIdentity;
 
+mod newest;
 #[cfg(test)]
 mod tests;
+
+use newest::Newest;
+use qontinui_runner_lib::session_archive::discovery::AmbientDiscovery;
 
 /// What [`copy_transcript`] carried across accounts.
 #[derive(Debug, Clone)]
@@ -82,8 +93,8 @@ pub(crate) struct TranscriptCopy {
     /// What the carry did with the main `<sid>.jsonl`.
     pub main: MainCarry,
     /// The source's `<sid>/` side-car dir as the carry resolved it (beside the
-    /// source transcript), whether or not it exists. [`delta_sync`] reads it
-    /// from here rather than re-deriving it.
+    /// source transcript, under [`Self::carried_from`]), whether or not it
+    /// exists. [`delta_sync`] reads it from here rather than re-deriving it.
     pub src_session_dir: PathBuf,
     /// The destination's `<sid>/` side-car dir the carry wrote into (beside
     /// [`Self::path`] — for a long cwd, the source's `<prefix>-<hash>` name).
@@ -97,6 +108,11 @@ pub(crate) struct TranscriptCopy {
     /// Subagents whose transcripts the destination holds after the carry,
     /// sorted by id.
     pub subagents: Vec<CarriedSubagent>,
+    /// The account root the carry read the session from. That is the source
+    /// root the caller named, except on a migration ([`copy_transcript`])
+    /// whose ranking found the newest copy elsewhere: another root, or the
+    /// destination itself, which is then kept in place.
+    pub carried_from: PathBuf,
 }
 
 /// Tally of the best-effort `<sid>/` directory carry, counted per file (a
@@ -109,6 +125,9 @@ pub(crate) struct SessionDirCarry {
     /// depends on the mode and the file:
     /// - a `.jsonl` under [`MainTranscript::LiveSourceWins`] (a migration):
     ///   only when byte-identical to the source's;
+    /// - on a migration whose destination already held the newest copy
+    ///   ([`newest::keep_destination`]): every file of the destination's own
+    ///   `<sid>/`, whatever it is, since nothing was carried over any of them;
     /// - a `.jsonl` in every other mode: when it is at least as large as the
     ///   source's (append-only, so the newer copy);
     /// - any other file: when its bytes are identical, OR — whatever its bytes
@@ -218,7 +237,9 @@ pub(crate) enum MainCarry {
     ExtendedPrefix,
     /// The destination was already current; left untouched. Under
     /// [`MainTranscript::LiveSourceWins`] that means byte-identical to the
-    /// source; otherwise at least as large.
+    /// copy carried from ([`TranscriptCopy::carried_from`]), which is the
+    /// destination itself when it already held the newest copy
+    /// ([`copy_transcript`]). In every other mode it means at least as large.
     Present,
     /// [`MainTranscript::LiveSourceWins`] only: the destination was neither
     /// byte-identical to the source nor a strict byte-prefix of it (a fork —
@@ -384,24 +405,183 @@ enum MainTranscript {
 /// [`carry_session`] with [`MainTranscript::LiveSourceWins`] — the account
 /// migration's carry, which moves a diverged destination aside and copies the
 /// live source over it. Visible only inside `crate::terminal`: its one caller
-/// ([`super::account_migration::migrate_session`]) holds the session's
+/// (`super::account_migration::prepare_migration`) holds the session's
 /// in-flight guard across it, and nothing outside this module tree can name
 /// [`MainTranscript`] to reach the same carry another way
 /// ([`carry_for_respawn`] takes [`RespawnCarry`], which has no destructive
 /// mode).
+///
+/// The carry reads from the root holding the NEWEST copy of `<sid>.jsonl`
+/// among every account root on the machine, ranked by [`newest::rank`]. That
+/// copy is not always under `src_config_dir`; see [`copy_transcript_among`].
+/// The roots are discovered from this process ([`copy_transcript_discovering`]
+/// holds the rest).
+///
+/// In a unit test the discovery inputs are empty, so no roots are discovered.
+/// Reading the real ones would run the settings loader and sweep the
+/// operator's home for `.claude-*`. The carry still ranks the source against
+/// the destination, and tests that rank across discovered roots enter through
+/// [`copy_transcript_discovering`] over a temp home. `cfg!` rather than
+/// `#[cfg]`, so the test build compiles the production arm too.
 pub(super) fn copy_transcript(
     src_config_dir: &str,
     dst_config_dir: &str,
     working_dir: &str,
     claude_session_id: &str,
 ) -> Result<TranscriptCopy, String> {
-    carry_session(
+    let (ambient, configured) = if cfg!(test) {
+        (AmbientDiscovery::default(), Vec::new())
+    } else {
+        (
+            qontinui_runner_lib::session_archive::discovery::ambient_discovery(),
+            crate::settings::get_claude_config_dirs(),
+        )
+    };
+    copy_transcript_discovering(
+        &ambient,
+        &configured,
         src_config_dir,
         dst_config_dir,
         working_dir,
         claude_session_id,
-        MainTranscript::LiveSourceWins,
     )
+}
+
+/// [`copy_transcript`] over explicit discovery inputs: `ambient` and the
+/// settings roster `configured`. The account roots ranked are
+/// [`super::transcript::claude_config_dirs_from`] over them, the composition
+/// [`super::transcript::find_claude_config_dirs`] applies to this process's
+/// inputs (the enumeration `DiskTranscriptIndex::transcript_config_dirs`
+/// uses), in its order.
+fn copy_transcript_discovering(
+    ambient: &AmbientDiscovery,
+    configured: &[String],
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    working_dir: &str,
+    claude_session_id: &str,
+) -> Result<TranscriptCopy, String> {
+    copy_transcript_among(
+        &super::transcript::claude_config_dirs_from(ambient, configured),
+        src_config_dir,
+        dst_config_dir,
+        working_dir,
+        claude_session_id,
+    )
+}
+
+/// [`copy_transcript`] over an explicit list of account `roots`. The
+/// migration's source and destination are ranked whether or not `roots`
+/// lists them. By [`newest::rank`]'s verdict:
+///
+/// - [`Newest::Source`]: the source holds the newest copy (or one identical
+///   to it). The carry runs exactly as before.
+/// - [`Newest::Other`]: another root holds it. The main transcript and the
+///   `<sid>/` side-car are carried from THAT root, so [`delta_sync`] (which
+///   reads [`TranscriptCopy::src_session_dir`]) follows it too. Logged, and
+///   so is a carry from that root that fails.
+/// - [`Newest::Destination`]: the destination already holds it. It is kept in
+///   place and nothing is carried over it ([`newest::keep_destination`]).
+///   Logged. The migration then resumes the session on that same file, which
+///   the old pane may still be appending to. `carried_from` equal to the
+///   destination records that case; no caller reads it yet.
+/// - [`Newest::Unknown`]: the ranking could not be established, and no
+///   readable copy is proven by byte prefix to strictly extend the source.
+///   The carry reads the source, as it did before the ranking existed.
+///   Logged. (When the full ranking fails but such a copy exists, the verdict
+///   is [`Newest::Other`] or [`Newest::Destination`] with `unranked` set.)
+///
+/// A copy that is not the newest is never carried while the newest can be
+/// named, with one exception: when the root holding the newest copy
+/// ([`Newest::Other`]) is not valid UTF-8, the carry, which takes its roots as
+/// `&str`, reads the source instead, and logs it. The carry never refuses
+/// because a copy is not the newest. Refusing would leave
+/// the session on an exhausted account while its live context exists
+/// elsewhere. Plan
+/// `2026-11-16-boot-reconcile-reverts-a-migrated-sessions-config-dir-so-the-next-migration-carries-a-stale-transcript`,
+/// D3.
+fn copy_transcript_among(
+    roots: &[PathBuf],
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    working_dir: &str,
+    claude_session_id: &str,
+) -> Result<TranscriptCopy, String> {
+    // The id becomes a file name in every root's path below.
+    require_session_uuid(claude_session_id)?;
+    let carry_from = |root: &str| {
+        carry_session(
+            root,
+            dst_config_dir,
+            working_dir,
+            claude_session_id,
+            MainTranscript::LiveSourceWins,
+        )
+    };
+    match newest::rank(
+        Path::new(src_config_dir),
+        Path::new(dst_config_dir),
+        roots,
+        working_dir,
+        claude_session_id,
+    ) {
+        Newest::Source => carry_from(src_config_dir),
+        Newest::Unknown(reason) => {
+            warn!(
+                session = %claude_session_id,
+                src = %src_config_dir,
+                dst = %dst_config_dir,
+                reason = %reason,
+                "session transcript carry: the newest copy across config roots is UNKNOWN — carrying from the migration's source"
+            );
+            carry_from(src_config_dir)
+        }
+        Newest::Destination { unranked } => {
+            let kept = newest::keep_destination(dst_config_dir, working_dir, claude_session_id)?;
+            warn!(
+                session = %claude_session_id,
+                src = %src_config_dir,
+                dst = %kept.carried_from.display(),
+                transcript = %kept.path.display(),
+                unranked = unranked.as_deref().unwrap_or("-"),
+                "session transcript carry: the destination already holds the live copy of this session — kept in place and nothing carried over it; the old pane may still be appending to that same file while the migration resumes the session on it (carried_from = the destination)"
+            );
+            Ok(kept)
+        }
+        Newest::Other { root, unranked } => {
+            let Some(root) = root.to_str() else {
+                warn!(
+                    session = %claude_session_id,
+                    src = %src_config_dir,
+                    root = %root.display(),
+                    "session transcript carry: the root holding the newest copy is not valid UTF-8 — carrying from the migration's source"
+                );
+                return carry_from(src_config_dir);
+            };
+            let carried = carry_from(root).inspect_err(|error| {
+                warn!(
+                    session = %claude_session_id,
+                    root = %root,
+                    src = %src_config_dir,
+                    dst = %dst_config_dir,
+                    error = %error,
+                    "session transcript carry: the ranking redirected the carry away from the migration's source to the root holding the newest copy, and the carry from that root failed"
+                );
+            })?;
+            warn!(
+                session = %claude_session_id,
+                carried_from = %carried.carried_from.display(),
+                src = %src_config_dir,
+                dst = %dst_config_dir,
+                main = carried.main.event_name(),
+                unranked = unranked.as_deref().unwrap_or("-"),
+                "session transcript carry: carried the newest copy from {}, not the migration's source {}",
+                carried.carried_from.display(),
+                src_config_dir
+            );
+            Ok(carried)
+        }
+    }
 }
 
 /// The two carry modes the cross-machine respawn receiver may ask for — the
@@ -755,6 +935,7 @@ where
         session_dir,
         files,
         subagents,
+        carried_from: PathBuf::from(src_config_dir),
     })
 }
 
@@ -809,8 +990,8 @@ where
     if let Err(error) = copy_via_partial(src, dst) {
         // Check-then-rename, not atomic. The migration's per-session
         // in-flight guard (`account_migration::begin_migration`), held across
-        // the whole carry, excludes only a CONCURRENT MIGRATION of this
-        // session; the resumed pane that will own the destination is not
+        // the whole carry, excludes only a CONCURRENT MOVER of this session
+        // (a migration, the resume door, the respawn receiver); the resumed pane that will own the destination is not
         // spawned yet. It does NOT exclude an earlier hop's detached step-4b
         // delta sync, which runs outside the guard by design (the
         // `account_migration` module doc's exception): after a fast hop back
@@ -2156,8 +2337,9 @@ pub(crate) enum WriterProbe {
 /// ([`crate::terminal::graceful_exit::alive_in`]: pid plus start time, so a
 /// reused pid is not mistaken for it).
 async fn probe_writer(writer: ProcIdentity) -> WriterProbe {
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snapshot.parent_map.is_empty() {
+    // Never the memo: consecutive "gone" looks must be distinct observations.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
+    if snapshot.is_unknown() {
         return WriterProbe::Unreadable;
     }
     if crate::terminal::graceful_exit::alive_in(&snapshot, writer) {

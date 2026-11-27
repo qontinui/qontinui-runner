@@ -432,10 +432,7 @@ pub fn capture(
             // The account a resume runs under: the recorded dir, else the one
             // config dir holding the transcript. The transcript scan runs only
             // for a record that carries no dir of its own.
-            let has_recorded = rec
-                .config_dir
-                .as_deref()
-                .is_some_and(|d| !d.trim().is_empty());
+            let has_recorded = has_usable_recorded_config_dir(rec.config_dir.as_deref());
             let holders = if has_recorded {
                 None
             } else {
@@ -1016,7 +1013,36 @@ pub fn resolve_config_dir(
     recorded: Option<&str>,
     transcript_holders: Option<&[PathBuf]>,
 ) -> Option<String> {
-    if let Some(dir) = recorded.map(str::trim).filter(|d| !d.is_empty()) {
+    resolve_config_dir_with(recorded, transcript_holders, is_retired_default_home)
+}
+
+/// A default home (`~/.claude`) that no longer exists is a retired account:
+/// `resume_command_for` would type no `CLAUDE_CONFIG_DIR` for it and the resume
+/// would land on the shell's ambient account. Same existence test as the
+/// `claude_default_config_home` command.
+fn is_retired_default_home(dir: &str) -> bool {
+    qontinui_runner_lib::session_archive::discovery::is_default_config_home_from_env(dir)
+        && !std::path::Path::new(dir).is_dir()
+}
+
+/// Does the record carry a recorded dir that [`resolve_config_dir`] will use?
+/// When not (blank, or a retired default home), the caller must probe the
+/// transcript holders so the fallback has evidence to resolve from.
+pub fn has_usable_recorded_config_dir(recorded: Option<&str>) -> bool {
+    recorded
+        .map(str::trim)
+        .is_some_and(|d| !d.is_empty() && !is_retired_default_home(d))
+}
+
+fn resolve_config_dir_with(
+    recorded: Option<&str>,
+    transcript_holders: Option<&[PathBuf]>,
+    retired_default: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if let Some(dir) = recorded
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !retired_default(d))
+    {
         return Some(dir.to_string());
     }
     match transcript_holders? {
@@ -1161,13 +1187,116 @@ pub struct RegistryNow {
     /// on purpose after the capture, so a generation must not offer them back
     /// as missing.
     ///
-    /// LIMIT: the overlay lasts only as long as the closed row is RETAINED —
-    /// `SessionLifecycleStore::prune` drops a closed row 24 h after it closed
-    /// (while its terminal is gone). The ledger itself records no user-close,
-    /// so after that a retained generation (kept for five restarts, of any
-    /// age) shows the session as `missing` again: an older generation can
-    /// offer back a session the operator closed more than a day ago.
+    /// LIMIT: read straight off the registry, the overlay lasts only as long
+    /// as the closed row is RETAINED — `SessionLifecycleStore::prune` drops a
+    /// closed row 24 h after it closed (while its terminal is gone). Within
+    /// one process [`BootObservations`] keeps the last reading of a pruned
+    /// row, so the report does not lose it; across a restart nothing does,
+    /// and a retained OLDER generation (kept for five restarts, of any age)
+    /// can still offer back a session the operator closed more than a day
+    /// before this boot.
     pub closed_by_user: HashSet<String>,
+}
+
+/// What THIS process has observed about each session, kept after the registry
+/// forgets it.
+///
+/// [`observed_back`] and [`registry_now`] read the lifecycle registry as it
+/// stands NOW, and `SessionLifecycleStore::prune` deletes a closed row 24 h
+/// after it closed — taking its restore stamp, its finished flag and its
+/// close reason with it. Read raw, a session that came back after the restart
+/// and was closed a day later moved from `returned` to `missing`, so the
+/// strip's "didn't come back" count rose for as long as the runner stayed up
+/// (plan `2026-11-20-since-restart-back-sessions-turn-missing-when-registry-rows-prune`:
+/// 42 such sessions measured on a runner four days past its restart).
+///
+/// - `back` is MONOTONIC: having come back is a fact about this boot that a
+///   later close or prune cannot revoke.
+/// - The registry overlay is per id: while a row exists its fresh reading
+///   wins (so Finish/Unfinish still apply both ways); once it is pruned, the
+///   last reading this process took stands, rather than the capture-time flag.
+///
+/// A row can also leave the registry without being pruned — a session rekeyed
+/// to a new id (`rekey_session`), or a provisional row the reconcile pass
+/// removes (`remove_session`). Its last reading stands the same way: an id
+/// once observed back stays back for this boot, which for a rekey is the truth
+/// (it did come back, under its old id) and for a removed provisional row errs
+/// toward "came back" only when this boot had stamped it restored.
+///
+/// In memory only, and it holds one short entry per session id this process
+/// has seen — bounded by the sessions one runner life hosts. After the next
+/// restart this boot's generation is no longer
+/// "this boot", and nothing observed here is evidence about the next process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BootObservations {
+    back: HashSet<String>,
+    now: RegistryNow,
+}
+
+impl BootObservations {
+    /// Fold one fresh reading in and return the effective `(back, now)` the
+    /// report classifies against. `fresh.finished` carries a key for every
+    /// registry row, so it is also the set of ids whose row still exists.
+    pub fn absorb(&mut self, back: &[String], fresh: &RegistryNow) -> (Vec<String>, RegistryNow) {
+        self.record(back, fresh);
+        let mut back: Vec<String> = self.back.iter().cloned().collect();
+        back.sort();
+        (back, self.now.clone())
+    }
+
+    /// Fold one fresh reading in without building the effective view — the
+    /// poll tick's path, which has no reader for it.
+    pub fn record(&mut self, back: &[String], fresh: &RegistryNow) {
+        self.back
+            .extend(back.iter().map(|id| id.to_ascii_lowercase()));
+        for (id, finished) in &fresh.finished {
+            self.now.finished.insert(id.clone(), *finished);
+            if fresh.closed_by_user.contains(id) {
+                self.now.closed_by_user.insert(id.clone());
+            } else {
+                self.now.closed_by_user.remove(id);
+            }
+        }
+    }
+}
+
+fn boot_observations() -> &'static Mutex<BootObservations> {
+    static OBS: OnceLock<Mutex<BootObservations>> = OnceLock::new();
+    OBS.get_or_init(|| Mutex::new(BootObservations::default()))
+}
+
+/// Read the registry now, fold it into this process's [`BootObservations`],
+/// and return the effective `(back, now)`. Called by [`report`] and by the
+/// lifecycle poll every tick, so the memory accumulates whether or not any
+/// UI is reading the report — a row is pruned 24 h after it closes, far
+/// longer than one poll interval.
+pub fn observe_this_boot(
+    store: &SessionLifecycleStore,
+    live_terminal_ids: Option<&HashSet<String>>,
+) -> (Vec<String>, RegistryNow) {
+    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
+    let back = observed_back(store, boot_at, live_terminal_ids);
+    let fresh = registry_now(store);
+    boot_observations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .absorb(&back, &fresh)
+}
+
+/// The lifecycle poll's entry: [`observe_this_boot`]'s fold against the PTYs
+/// alive in `infos` (the `TerminalManager` list), without building the view.
+pub fn observe_tick(
+    store: &SessionLifecycleStore,
+    infos: impl IntoIterator<Item = crate::terminal::types::TerminalInfo>,
+) {
+    let live = alive_terminal_ids(infos, crate::process_capture::health::pid_alive);
+    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
+    let back = observed_back(store, boot_at, Some(&live));
+    let fresh = registry_now(store);
+    boot_observations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record(&back, &fresh);
 }
 
 /// [`RegistryNow`] from every registry row (open and closed).
@@ -1441,8 +1570,10 @@ pub fn generation_report(
 /// rows then cannot be confirmed back, and the verdict says `unknown` rather
 /// than pretending.
 ///
-/// Read-only apart from latching (and, on a process's first call, rotating)
-/// the prior ledger — see [`load_prior_once`].
+/// Read-only apart from two process-level writes: latching (and, on a
+/// process's first call, rotating) the prior ledger — see [`load_prior_once`]
+/// — and folding this read into the process's [`BootObservations`], so what
+/// an earlier call or poll tick observed stays in every later report.
 pub fn report(
     store: Option<&SessionLifecycleStore>,
     live_terminal_ids: Option<&HashSet<String>>,
@@ -1490,9 +1621,11 @@ pub fn report(
     // absent boot instant SKIPS the sticky-restore-stamp arm rather than
     // admitting it with a `0` floor, and that is reported (verdict `unknown`
     // on any miss), not laundered into a miss count.
+    //
+    // Read through this process's `BootObservations`, so a session observed
+    // back stays back after its closed row is pruned (see that type).
     let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
-    let back = observed_back(store, boot_at, live_terminal_ids);
-    let now_state = registry_now(store);
+    let (back, now_state) = observe_this_boot(store, live_terminal_ids);
     // Both inputs `back` rests on must be readable for a miss count to be a
     // claim rather than an upper bound.
     let observable = boot_at.is_some() && live_terminal_ids.is_some();
@@ -1943,6 +2076,28 @@ mod tests {
         assert_eq!(resolve_config_dir(None, Some(&[x, y])), None);
         assert_eq!(resolve_config_dir(None, Some(&[])), None);
         assert_eq!(resolve_config_dir(None, None), None);
+    }
+
+    /// A recorded default home that no longer exists is a retired account: the
+    /// unique transcript holder wins, and with no holder the account is unknown
+    /// rather than the ambient one.
+    #[test]
+    fn a_retired_default_home_yields_to_the_transcript_holder() {
+        let g = PathBuf::from("/a/.claude-gmail");
+        let retired = |d: &str| d == "/a/.claude";
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), Some(std::slice::from_ref(&g)), retired)
+                .as_deref(),
+            Some("/a/.claude-gmail")
+        );
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), Some(&[]), retired),
+            None
+        );
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), None, |_| false).as_deref(),
+            Some("/a/.claude")
+        );
     }
 
     /// An empty capture must never destroy a non-empty prior — that is how a
@@ -2516,6 +2671,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -2886,5 +3043,114 @@ mod tests {
             "another boot's file is not this process's save"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- BootObservations (plan
+    //    2026-11-20-since-restart-back-sessions-turn-missing-when-registry-rows-prune)
+
+    fn ids(c: &[LedgerOutcome]) -> Vec<String> {
+        let mut v: Vec<String> = c.iter().map(|o| o.claude_session_id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn reading(rows: &[(&str, bool, bool)]) -> RegistryNow {
+        let mut now = RegistryNow::default();
+        for (id, finished, closed_by_user) in rows {
+            now.finished.insert(id.to_string(), *finished);
+            if *closed_by_user {
+                now.closed_by_user.insert(id.to_string());
+            }
+        }
+        now
+    }
+
+    /// The measured defect: a session that came back, was closed, and had its
+    /// row pruned a day later must stay `back` — not turn into a miss.
+    #[test]
+    fn a_session_observed_back_stays_back_after_its_row_is_pruned() {
+        let prior = ledger(vec![
+            entry("a", Some(true), Some("C:/c")),
+            entry("b", Some(true), Some("C:/c")),
+        ]);
+        let mut obs = BootObservations::default();
+
+        // Tick 1: `a` is back (restored, row present); `b` never came back.
+        let (back, now) = obs.absorb(&["a".to_string()], &reading(&[("a", false, false)]));
+        let c = classify(&prior, &back, &now, true);
+        assert_eq!(ids(&c.returned), vec!["a"]);
+        assert_eq!(ids(&c.missing), vec!["b"]);
+
+        // Tick 2: `a`'s row is pruned — the raw registry no longer shows it at all.
+        let (back, now) = obs.absorb(&[], &RegistryNow::default());
+        let c = classify(&prior, &back, &now, true);
+        assert_eq!(
+            ids(&c.returned),
+            vec!["a"],
+            "a pruned row must not revoke `back`"
+        );
+        assert_eq!(ids(&c.missing), vec!["b"]);
+
+        // The raw reading (what the report used before) is the regression.
+        let raw = classify(&prior, &[], &RegistryNow::default(), true);
+        assert_eq!(ids(&raw.missing), vec!["a", "b"]);
+    }
+
+    /// Between the close and the prune the row still exists but no longer
+    /// reads back (closed for a reason other than the operator's); having come
+    /// back is not revoked by that either.
+    #[test]
+    fn a_closed_but_unpruned_row_stays_back() {
+        let prior = ledger(vec![entry("a", Some(true), Some("C:/c"))]);
+        let mut obs = BootObservations::default();
+        obs.record(&["a".to_string()], &reading(&[("a", false, false)]));
+        let (back, now) = obs.absorb(&[], &reading(&[("a", false, false)]));
+        assert_eq!(
+            ids(&classify(&prior, &back, &now, true).returned),
+            vec!["a"]
+        );
+    }
+
+    /// A finished or closed-by-user reading of a row that is later pruned
+    /// keeps classifying the session that way, instead of falling back to the
+    /// capture-time flag and reading `missing`.
+    #[test]
+    fn the_last_registry_reading_of_a_pruned_row_stands() {
+        let prior = ledger(vec![
+            entry("f", Some(true), Some("C:/c")),
+            entry("u", Some(true), Some("C:/c")),
+        ]);
+        let mut obs = BootObservations::default();
+        obs.absorb(&[], &reading(&[("f", true, false), ("u", false, true)]));
+        let (back, now) = obs.absorb(&[], &RegistryNow::default());
+        let c = classify(&prior, &back, &now, true);
+        assert_eq!(ids(&c.finished), vec!["f"]);
+        assert_eq!(ids(&c.closed_by_user), vec!["u"]);
+        assert!(c.missing.is_empty());
+    }
+
+    /// While a row exists its FRESH reading wins both ways: Unfinish clears a
+    /// remembered finish, and a reopened row stops reading closed-by-user.
+    #[test]
+    fn a_fresh_reading_overrides_the_remembered_one() {
+        let mut obs = BootObservations::default();
+        obs.absorb(&[], &reading(&[("x", true, true)]));
+        let (_, now) = obs.absorb(&[], &reading(&[("x", false, false)]));
+        assert_eq!(now.finished.get("x"), Some(&false));
+        assert!(!now.closed_by_user.contains("x"));
+    }
+
+    /// `back` ids are compared case-insensitively, like every other overlay.
+    #[test]
+    fn observed_back_ids_are_remembered_lowercased() {
+        let prior = ledger(vec![entry("abc", Some(true), Some("C:/c"))]);
+        let mut obs = BootObservations::default();
+        obs.absorb(&["ABC".to_string()], &RegistryNow::default());
+        let (back, now) = obs.absorb(&[], &RegistryNow::default());
+        assert_eq!(back, vec!["abc".to_string()]);
+        assert_eq!(
+            ids(&classify(&prior, &back, &now, true).returned),
+            vec!["abc"]
+        );
     }
 }

@@ -249,24 +249,71 @@ pub struct LaunchSpec {
 /// Maximum length (chars) of a `--name` value.
 pub const MAX_SESSION_NAME_CHARS: usize = 40;
 
+/// Bytes of SHA-256 an over-long name ends in, written as 8 lowercase hex chars.
+const SESSION_NAME_DIGEST_BYTES: usize = 4;
+
+/// Chars an over-long name keeps ahead of its `-<digest>`: 31 at a 40-char cap.
+const SESSION_NAME_HEAD_CHARS: usize = MAX_SESSION_NAME_CHARS - 1 - 2 * SESSION_NAME_DIGEST_BYTES;
+
 /// Make `raw` safe to hand to `claude --name`: control characters and newlines
-/// become spaces, whitespace runs collapse to one space, leading `-` is stripped
-/// (a value starting with `-` could be parsed as a flag), and the result is
-/// capped at [`MAX_SESSION_NAME_CHARS`] chars. `None` when nothing is left.
+/// become spaces, whitespace runs collapse to one space, and leading `-` is
+/// stripped (a value starting with `-` could be parsed as a flag). `None` when
+/// nothing is left.
+///
+/// A cleaned value of at most [`MAX_SESSION_NAME_CHARS`] chars is returned
+/// unchanged, so every name coord authors passes through byte-identical. A
+/// longer one is compacted, never cut silently: it becomes its longest run of
+/// leading whole tokens (split on `-` or ` `) that fits in 31 chars — a first
+/// token that alone overflows is cut by chars to 31 — followed by `-` and the
+/// first 8 lowercase hex of the SHA-256 of the whole cleaned value. The result
+/// fits the cap, stays distinct from a value that differs only past the cut,
+/// and never marks the cut with `…`. It is the session's name on every surface
+/// (`--name`, `~/.qontinui/session-names/<id>`, the tab), and
+/// `continuation-session.py` will not use a name ending in `…`, which reads as
+/// cut from a longer value that no surface holds. It also sanitises to itself,
+/// which `compose_flags` relies on when it re-sanitises a call site's name. Plan
+/// `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-visible-hand-off-refuses-them`
+/// D5.
 pub fn sanitize_session_name(raw: &str) -> Option<String> {
     let spaced: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
-    let capped: String = trimmed.chars().take(MAX_SESSION_NAME_CHARS).collect();
-    let capped = capped.trim_end().to_string();
-    if capped.is_empty() {
+    let cleaned = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
+    if cleaned.is_empty() {
         None
+    } else if cleaned.chars().count() <= MAX_SESSION_NAME_CHARS {
+        Some(cleaned.to_string())
     } else {
-        Some(capped)
+        Some(compact_session_name(cleaned))
     }
+}
+
+/// [`sanitize_session_name`]'s form for a cleaned value over the cap:
+/// `<whole leading tokens>-<digest>`.
+fn compact_session_name(cleaned: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let is_sep = |c: char| c == '-' || c == ' ';
+    // Counted in chars throughout, never sliced by byte (`clippy::string_slice`).
+    let window: String = cleaned.chars().take(SESSION_NAME_HEAD_CHARS).collect();
+    let window_ends_a_token = cleaned
+        .chars()
+        .nth(SESSION_NAME_HEAD_CHARS)
+        .is_some_and(is_sep);
+    // Whole tokens only: a token the window ends inside is dropped, and so are
+    // the separators ahead of it. `cleaned` never starts with a separator, so a
+    // window holding none is a first token that alone overflows, cut by chars.
+    let head = if window_ends_a_token {
+        window.trim_end_matches(is_sep)
+    } else {
+        window
+            .rsplit_once(is_sep)
+            .map_or(window.as_str(), |(kept, _)| kept.trim_end_matches(is_sep))
+    };
+    let digest = Sha256::digest(cleaned.as_bytes());
+    let digest = hex::encode(&digest[..SESSION_NAME_DIGEST_BYTES]);
+    format!("{head}-{digest}")
 }
 
 /// A parsed template flag and the value tokens that follow it (arity inferred:
@@ -435,10 +482,18 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut template_model: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
     let mut session_via_placeholder = false;
+    // Index in `other_units` of the placeholder-positioned session flag that
+    // carries the pin, so a second one can replace or be dropped (review A6).
+    let mut kept_session_unit: Option<usize> = None;
 
     if let Some(t) = &template {
+        // `had_placeholder` only says the template MENTIONS `{sessionId}`.
+        // Whether the spec's own session flag is suppressed is decided per
+        // unit below: only a KEPT session-naming flag that carries the pin
+        // positions it. A placeholder anywhere else (`--name {sessionId}`, or
+        // `-c {sessionId}`, whose unit is dropped) leaves argv without an id
+        // unless the spec's flag is still appended.
         let had_placeholder = t.contains(SESSION_ID_PLACEHOLDER);
-        session_via_placeholder = had_placeholder;
         let substituted = t.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or(""));
         let tokens = shell_tokenize(&substituted);
         // Drop the `claude` head token (guaranteed present — `claude_template`
@@ -459,19 +514,96 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                         "launch template flag dropped: the allow-list permission mode owns it"
                     );
                 }
-                // Model is decided below (spec beats template).
+                // Model is decided below (spec beats template), in either
+                // spelling: an attached `--model=<m>` left in `other_units`
+                // would ride along after the spec's `--model` and, the CLI
+                // taking the last value, silently override it.
                 "--model" => template_model = unit.values.first().cloned(),
+                n if n.starts_with("--model=") => {
+                    template_model = n
+                        .strip_prefix("--model=")
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string)
+                }
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
                 n if name.is_some() && n.starts_with("--name=") => {}
-                // Session flags: when the operator positioned the id via the
-                // `{sessionId}` placeholder, keep the flag in place; otherwise the
-                // spec owns session and we drop the template's.
-                "--session-id" | "--resume" => {
+                // Session flags that NAME an id — `--session-id`, `--resume`,
+                // `-r` and the `--session-id=` / `--resume=` inline forms: when
+                // the operator positioned the id via the `{sessionId}`
+                // placeholder, keep the flag that carries it in place;
+                // otherwise the spec owns session and we drop the template's.
+                // When the spec pins the session, a session flag that does NOT
+                // carry the pin is dropped even beside a placeholder: in
+                // `--session-id {sessionId} --resume <literal>` the literal
+                // would ship a second, different id (review A1 of
+                // qontinui-runner#3149). Only ONE flag that carries the pin is
+                // kept: `--session-id {sessionId} --resume {sessionId}` would
+                // otherwise ship two session flags, a pair Claude Code refuses
+                // without `--fork-session`. The kept one is the flag of the
+                // kind the spec pins with (`--resume`/`-r` for `resume_id`,
+                // `--session-id` for `session_id`), else the first.
+                n if names_session_id(n) => {
                     if had_placeholder {
-                        other_units.push(unit);
+                        let carries_pin = match pin {
+                            Some(p) => unit.name.contains(p) || unit.values.iter().any(|v| v == p),
+                            None => true,
+                        };
+                        if !carries_pin {
+                            tracing::warn!(
+                                flag = %flag_name_only(&unit.name),
+                                "launch template flag dropped: it names a session other than \
+                                 the one the spec pins"
+                            );
+                        } else if let (Some(_), Some(idx)) = (pin, kept_session_unit) {
+                            let wants_resume = spec.resume_id.is_some();
+                            let kept_matches = other_units
+                                .get(idx)
+                                .is_some_and(|u| is_resume_flag(&u.name) == wants_resume);
+                            let new_matches = is_resume_flag(&unit.name) == wants_resume;
+                            let dropped = if new_matches && !kept_matches {
+                                other_units
+                                    .get_mut(idx)
+                                    .map(|kept| std::mem::replace(kept, unit))
+                            } else {
+                                Some(unit)
+                            };
+                            if let Some(d) = dropped {
+                                tracing::warn!(
+                                    flag = %flag_name_only(&d.name),
+                                    "launch template flag dropped: another template flag \
+                                     already carries the pinned session"
+                                );
+                            }
+                        } else {
+                            session_via_placeholder = true;
+                            kept_session_unit = Some(other_units.len());
+                            other_units.push(unit);
+                        }
                     }
+                }
+                // Every other session choice — `--continue` / `-c` ("the most
+                // recent conversation in this cwd") and a bare `resume`
+                // token, i.e. the rest of the one token set
+                // `claude_env::claude_argv_chooses_session` — cannot stand
+                // beside the spec's `--session-id` / `--resume`: Claude Code
+                // refuses the pair ("--session-id with --continue or --resume
+                // also needs --fork-session", measured on 2.1.330), and were it
+                // accepted the session would no longer be the one the runner
+                // pinned (plan
+                // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+                // Phase 2). So whenever the spec names a session it is dropped,
+                // including when the template positions that id itself through
+                // `{sessionId}`.
+                n if pin.is_some()
+                    && qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[n]) =>
+                {
+                    tracing::warn!(
+                        flag = %flag_name_only(&unit.name),
+                        "launch template flag dropped: the spec pins the session, so the \
+                         template cannot choose a different one"
+                    );
                 }
                 // The append prompt flags are one mutually-exclusive group: when
                 // the caller supplies either (the runner's spawn-time carrier),
@@ -660,6 +792,24 @@ fn pty_verbatim_alias(cfg: &LaunchConfig) -> Option<String> {
         .as_ref()
         .filter(|a| !is_claude_command(a))
         .cloned()
+}
+
+/// Is this template unit a session flag that NAMES an id — `--session-id`,
+/// `--resume`, `-r`, or the `--session-id=…` / `--resume=…` inline form? A
+/// subset of `claude_env::claude_argv_chooses_session`: the members that can
+/// carry a `{sessionId}` placeholder. Case-insensitive, as that set is.
+fn names_session_id(name: &str) -> bool {
+    let t = name.to_ascii_lowercase();
+    matches!(t.as_str(), "--session-id" | "--resume" | "-r")
+        || t.starts_with("--session-id=")
+        || t.starts_with("--resume=")
+}
+
+/// Whether a session-naming flag (see [`names_session_id`]) RESUMES a session
+/// (`--resume`, `-r`, `--resume=…`) rather than starting one under an id.
+fn is_resume_flag(name: &str) -> bool {
+    let t = name.to_ascii_lowercase();
+    t == "--resume" || t == "-r" || t.starts_with("--resume=")
 }
 
 /// Whether `s` is a recognizable `claude …` invocation (vs. an opaque alias).
@@ -1245,6 +1395,257 @@ mod tests {
         assert_eq!(argv, vec!["claude", "--dangerously-skip-permissions"]);
     }
 
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2: when the spec pins the session (new or resumed), an operator
+    /// template's `--continue` / `-c` is dropped, so argv carries exactly one
+    /// session choice — the spec's id.
+    #[test]
+    fn spec_owned_session_drops_a_template_continue() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --continue --verbose", "claude -c --verbose"] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--session-id"), Some(ID));
+            // The template's other flags still layer in.
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+
+            let mut resumed = spec();
+            resumed.resume_id = Some(ID.to_string());
+            let argv = render_argv(&resumed, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--resume").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--resume"), Some(ID));
+        }
+
+        // With no spec session the operator's own choice is left alone.
+        let argv = render_argv(&spec(), &tmpl("claude --continue"), "claude");
+        assert!(argv.iter().any(|a| a == "--continue"), "{argv:?}");
+    }
+
+    /// The drop covers every spelling of a session choice in flag (or leading
+    /// subcommand) position, not only exact names: `-r <id>`, `--resume=<id>`,
+    /// `--session-id=<id>` and a leading `resume` subcommand in a template never
+    /// ride beside the spec's own id. (A bare `resume` that `parse_units` folds
+    /// in as the VALUE of a preceding flag is judged as that flag's value, not
+    /// as a session choice; that shape is not covered here.)
+    #[test]
+    fn spec_owned_session_drops_every_spelling_of_a_template_session_choice() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "52e88829-c137-421d-893a-b45feac50a00";
+        for template in [
+            "claude -r 52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --resume=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --session-id=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --SESSION-ID=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude resume --verbose",
+        ] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)
+                    || a == "-r"
+                    || a == "resume"
+                    || a.to_ascii_lowercase().starts_with("--session-id=")
+                    || a.starts_with("--resume")),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+
+        // A template that positions the id itself in the inline form keeps it
+        // there — and is then the only session flag.
+        let mut s = spec();
+        s.session_id = Some(ID.to_string());
+        let argv = render_argv(&s, &tmpl("claude --session-id={sessionId}"), "claude");
+        let inline = format!("--session-id={ID}");
+        assert_eq!(argv.iter().filter(|a| **a == inline).count(), 1, "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--session-id"), "{argv:?}");
+    }
+
+    /// A `{sessionId}` placeholder that does not sit in a kept session-naming
+    /// flag must not suppress the spec's own `--session-id`: argv still
+    /// carries exactly one id (review round 4, A1).
+    #[test]
+    fn a_placeholder_outside_a_kept_session_flag_still_gets_the_spec_session_id() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --name {sessionId}", "claude -c {sessionId}"] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(!argv.iter().any(|a| a == "-c"), "{template}: {argv:?}");
+        }
+    }
+
+    /// Beside a `{sessionId}` placeholder, a template session flag that names a
+    /// DIFFERENT, literal id is dropped when the spec pins the session: argv
+    /// carries exactly one session flag, and it is the pin (review round 5,
+    /// A1 of qontinui-runner#3149). Of two template flags that both carry the
+    /// pin, one is kept: the spec's kind, else the first (review of the A1
+    /// fix, A6).
+    #[test]
+    fn a_literal_session_flag_beside_a_placeholder_is_dropped() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+        for template in [
+            format!("claude --session-id {{sessionId}} --resume {OTHER}"),
+            format!("claude --resume {OTHER} --session-id {{sessionId}}"),
+            format!("claude --session-id={{sessionId}} -r {OTHER}"),
+            format!("claude --session-id {{sessionId}} --resume={OTHER}"),
+            // Two flags that BOTH carry the pin: one is kept, the one of the
+            // spec's kind (`--session-id` for the session_id spec here).
+            "claude --session-id {sessionId} --resume {sessionId}".to_string(),
+        ] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(&template), "claude");
+            let session_flags = argv
+                .iter()
+                .filter(|a| {
+                    let t = a.as_str();
+                    t == "--session-id"
+                        || t == "--resume"
+                        || t == "-r"
+                        || t.starts_with("--session-id=")
+                        || t.starts_with("--resume=")
+                })
+                .count();
+            assert_eq!(session_flags, 1, "{template}: {argv:?}");
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)),
+                "{template}: {argv:?}"
+            );
+            assert!(argv.iter().any(|a| a.contains(ID)), "{template}: {argv:?}");
+        }
+    }
+
+    /// Of two template flags that both carry the pin, the one kept is the
+    /// flag of the kind the spec pins with, in either template order: a
+    /// `resume_id` pin keeps `--resume`, a `session_id` pin keeps
+    /// `--session-id` (review round 2 of the A1 fix, A6).
+    #[test]
+    fn of_two_pinned_session_flags_the_specs_kind_is_kept() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // The other resume spellings: a resume_id pin keeps them over
+        // `--session-id`, whichever comes first.
+        for template in [
+            "claude --session-id {sessionId} -r {sessionId}",
+            "claude --session-id={sessionId} --resume={sessionId}",
+            "claude -r {sessionId} --session-id={sessionId}",
+        ] {
+            let mut s = spec();
+            s.resume_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "--session-id" || a.starts_with("--session-id=")),
+                "{template}: {argv:?}"
+            );
+            let inline = format!("--resume={ID}");
+            assert!(
+                value_after(&argv, "-r") == Some(ID) || argv.iter().any(|a| *a == inline),
+                "{template}: the pinned id must follow the kept resume flag: {argv:?}"
+            );
+        }
+        for template in [
+            "claude --session-id {sessionId} --resume {sessionId}",
+            "claude --resume {sessionId} --session-id {sessionId}",
+        ] {
+            let mut s = spec();
+            s.resume_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                value_after(&argv, "--resume"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--session-id"),
+                "{template}: {argv:?}"
+            );
+
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--resume"),
+                "{template}: {argv:?}"
+            );
+        }
+    }
+
+    /// `names_session_id` is a hand-spelled subset of the shared session-choice
+    /// set: every spelling it matches must also be a
+    /// `claude_env::claude_argv_chooses_session` match, so the two cannot drift
+    /// apart silently (review round 4, A3).
+    #[test]
+    fn names_session_id_is_a_subset_of_the_shared_session_choice_set() {
+        for name in [
+            "--session-id",
+            "--resume",
+            "-r",
+            "--session-id=x",
+            "--resume=x",
+            "--SESSION-ID",
+            "--Resume=x",
+        ] {
+            assert!(names_session_id(name), "{name}");
+            assert!(
+                qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[name]),
+                "{name} names a session id but the shared set does not choose a session"
+            );
+        }
+    }
+
     #[test]
     fn session_permission_setting_serde_and_normalization() {
         let v: SessionPermissionSetting =
@@ -1296,6 +1697,23 @@ mod tests {
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
         assert!(!argv.iter().any(|a| a == "sonnet"));
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+    }
+
+    /// The attached spelling is the template's model too: dropped under a spec
+    /// model (never a second, last-wins `--model=`), kept as the model when
+    /// the spec names none.
+    #[test]
+    fn spec_model_beats_an_attached_template_model() {
+        let mut s = spec();
+        s.model = Some("opus".to_string());
+        let argv = render_argv(&s, &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+
+        let argv = render_argv(&spec(), &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("sonnet"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
     }
 
     #[test]
@@ -1416,6 +1834,225 @@ mod tests {
             sanitize_session_name(&multi).unwrap().chars().count(),
             MAX_SESSION_NAME_CHARS
         );
+    }
+
+    // Plan `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-
+    // visible-hand-off-refuses-them`, D5 / Phase 3. Every expected string below
+    // was computed from an independent model of the rule, never from this
+    // function's output.
+
+    /// Every name coord authors fits the cap, so the runner hands it on byte for
+    /// byte: `--name`, the session-names file and the tab carry coord's string.
+    #[test]
+    fn sanitize_session_name_passes_every_coord_spawn_name_through_byte_identical() {
+        for name in [
+            "resume-terminal-titlebar-shows-f5782ab5",
+            "impl-terminal-titlebar-shows-694ae308",
+            "post-merge-a-very-long-8295759e#12345",
+            "fix-an-extraordinarily-ea25dfe5#123456",
+            "shepherd-an-ea25dfe5#123456",
+            "review-an-ea25dfe5#123456",
+            "red-main-an-extraordinarily-ea25dfe5",
+            "respond-red-main-an-ea25dfe5",
+            "respond-stall-an-ea25dfe5",
+            "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            "resume-finding-b31b377d",
+            "resume-terminal-titlebar-shows-44b98580",
+        ] {
+            assert_eq!(sanitize_session_name(name).as_deref(), Some(name));
+        }
+    }
+
+    /// Enters where every runner spawn does: a `LaunchSpec.name` turned into
+    /// argv by `compose_flags`, the seam `render_argv` and `render_pty_command`
+    /// share. A long runner-own name reaches `--name` compacted; a coord name
+    /// reaches it byte-identical.
+    #[test]
+    fn compose_flags_compacts_an_overlong_session_name() {
+        let mut s = spec();
+        for (name, want) in [
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate",
+                "loop-nightly-merge-train-2c0ac670",
+            ),
+            (
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            ),
+        ] {
+            s.name = Some(name.to_string());
+            let flags = compose_flags(&s, &LaunchConfig::default());
+            assert_eq!(value_after(&flags, "--name"), Some(want), "{flags:?}");
+            assert_eq!(flags.iter().filter(|a| *a == "--name").count(), 1);
+        }
+    }
+
+    #[test]
+    fn sanitize_session_name_compacts_an_overlong_value_with_a_digest() {
+        let cases = [
+            ("x".repeat(100), format!("{}-09ecb6eb", "x".repeat(31))),
+            ("é".repeat(100), format!("{}-f42ec48e", "é".repeat(31))),
+            // `loop-nightly-merge-train-steward` is 32 > 31 chars: `-steward` goes.
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate".to_string(),
+                "loop-nightly-merge-train-2c0ac670".to_string(),
+            ),
+            // The cap is inclusive: 40 is kept whole, 41 is compacted.
+            ("a".repeat(40), "a".repeat(40)),
+            ("a".repeat(41), format!("{}-c0f8bd4d", "a".repeat(31))),
+            // A first token that alone overflows is cut by chars to 31.
+            (
+                format!("{}-tail-tokens", "x".repeat(35)),
+                format!("{}-15d13ceb", "x".repeat(31)),
+            ),
+            // Separators after the last kept token are dropped, not doubled.
+            (
+                format!("fix this - {}", "y".repeat(40)),
+                "fix this-bd4a7d26".to_string(),
+            ),
+            // A space splits tokens too, and stays verbatim inside the head.
+            (
+                "check-login page renders the dashboard with all widgets".to_string(),
+                "check-login page renders the-d7458ca1".to_string(),
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(sanitize_session_name(&raw), Some(want), "{raw:?}");
+        }
+    }
+
+    /// The digest covers the CLEANED value: leading dashes, control chars and
+    /// whitespace runs are normalised first, exactly as for a short name.
+    #[test]
+    fn sanitize_session_name_digests_the_cleaned_value() {
+        assert_eq!(
+            sanitize_session_name("  --loop-nightly-merge-train-steward-watch-and-remediate"),
+            Some("loop-nightly-merge-train-2c0ac670".to_string())
+        );
+        assert_eq!(
+            sanitize_session_name("loop-nightly\tmerge   train\u{7}steward watch-and-remediate"),
+            Some("loop-nightly merge train-3a0b0f5d".to_string())
+        );
+    }
+
+    /// The silent cut this replaces gave both of these
+    /// `loop-nightly-merge-train-steward-watch-a`.
+    #[test]
+    fn sanitize_session_name_keeps_names_that_differ_past_the_cut_distinct() {
+        let remediate =
+            sanitize_session_name("loop-nightly-merge-train-steward-watch-and-remediate");
+        let report = sanitize_session_name("loop-nightly-merge-train-steward-watch-and-report");
+        assert_eq!(report.as_deref(), Some("loop-nightly-merge-train-51629b35"));
+        assert_ne!(remediate, report);
+    }
+
+    /// Fixed-seed xorshift64, so a failing sweep input replays exactly.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The first property the sweep's inputs violate, or `None`. A function of
+    /// the sanitiser so the sweep can be shown to REJECT a `…`-marked cut.
+    fn session_name_sweep_violation(
+        sanitize: fn(&str) -> Option<String>,
+        inputs: &[String],
+    ) -> Option<String> {
+        for raw in inputs {
+            let Some(out) = sanitize(raw) else { continue };
+            if out.contains('\u{2026}') {
+                return Some(format!("{raw:?} -> {out:?} carries U+2026"));
+            }
+            if out.chars().count() > MAX_SESSION_NAME_CHARS {
+                return Some(format!("{raw:?} -> {out:?} exceeds the cap"));
+            }
+            if out.starts_with('-') || out.starts_with(char::is_whitespace) {
+                return Some(format!("{raw:?} -> {out:?} starts with a dash or blank"));
+            }
+            // `compose_flags` sanitises a call site's already-sanitised name
+            // again, so `--name` matches the tab and the file only at a fixed point.
+            if sanitize(&out).as_deref() != Some(out.as_str()) {
+                return Some(format!("{raw:?} -> {out:?} is not a fixed point"));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn sanitize_session_name_never_emits_an_ellipsis() {
+        // No piece carries `…`, so any in an output was introduced by the
+        // function; the dirty pieces exercise the cleanup ahead of the cap.
+        let long: &str = &"x".repeat(33);
+        let mut pieces: Vec<&str> = "a bb unit 9e9b1b7b é 日本語 🦀 #12345".split(' ').collect();
+        pieces.extend(["-", "--", " ", "   ", "\t", "\r\n", "\u{7}", long]);
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let inputs: Vec<String> = (0..500)
+            .map(|_| {
+                let len = 41 + (xorshift(&mut seed) % 160) as usize;
+                let mut raw = String::new();
+                while raw.chars().count() < len {
+                    raw.push_str(pieces[(xorshift(&mut seed) % pieces.len() as u64) as usize]);
+                }
+                raw
+            })
+            .collect();
+        assert_eq!(
+            session_name_sweep_violation(sanitize_session_name, &inputs),
+            None
+        );
+        // Negative control: the sweep catches the `…` cut coord used to author.
+        fn cut_with_ellipsis(raw: &str) -> Option<String> {
+            let kept: String = raw.chars().take(MAX_SESSION_NAME_CHARS - 1).collect();
+            Some(format!("{kept}\u{2026}"))
+        }
+        let caught = session_name_sweep_violation(cut_with_ellipsis, &inputs).unwrap_or_default();
+        assert!(caught.ends_with("carries U+2026"), "{caught:?}");
+    }
+
+    /// Clean long inputs (tokens joined by single `-`/` `), so the cleaned value
+    /// IS the input and the compacted form can be checked exactly.
+    #[test]
+    fn sanitize_session_name_compacts_to_whole_leading_tokens_and_the_digest() {
+        use sha2::{Digest, Sha256};
+        let is_sep = |c: char| c == '-' || c == ' ';
+        let long: &str = &"y".repeat(34);
+        let mut tokens: Vec<&str> = "a bb loop nightly 9e9b1b7b é 日本語 🦀 #12345"
+            .split(' ')
+            .collect();
+        tokens.push(long);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..500 {
+            let mut raw = String::new();
+            loop {
+                raw.push_str(tokens[(xorshift(&mut seed) % tokens.len() as u64) as usize]);
+                if raw.chars().count() > MAX_SESSION_NAME_CHARS {
+                    break;
+                }
+                raw.push(['-', ' '][(xorshift(&mut seed) % 2) as usize]);
+            }
+            let out = sanitize_session_name(&raw).unwrap();
+            let (head, digest) = out.rsplit_once('-').unwrap();
+            let want_digest = hex::encode(&Sha256::digest(raw.as_bytes())[..4]);
+            assert_eq!(digest, want_digest, "{raw:?} -> {out:?}");
+            let Some(rest) = raw.strip_prefix(head) else {
+                panic!("{raw:?} -> {out:?}: the head is not a prefix of the input");
+            };
+            let kept = head.chars().count();
+            if rest.starts_with(is_sep) {
+                // Whole tokens up to a token end; the next whole token does not fit.
+                let seps = rest.chars().take_while(|&c| is_sep(c)).count();
+                let next = rest.chars().skip(seps).take_while(|&c| !is_sep(c)).count();
+                assert!(
+                    !head.ends_with(is_sep) && kept <= 31 && kept + seps + next > 31,
+                    "{raw:?} -> {out:?}"
+                );
+            } else {
+                // The first token alone overflows: cut by chars to 31.
+                assert!(!head.contains(is_sep) && kept == 31, "{raw:?} -> {out:?}");
+            }
+        }
     }
 
     #[test]
@@ -1775,7 +2412,9 @@ mod tests {
 
     #[test]
     fn pty_ai_launch_session_placeholder_substituted() {
-        // `{sessionId}` placeholder: id substituted in place, not appended.
+        // `{sessionId}` placeholder: id substituted in place, not appended. The
+        // template's `--continue` is dropped: Claude Code refuses
+        // `--session-id X --continue` without `--fork-session`.
         let mut s = spec();
         s.config_dir = Some("/h/.claude-x".to_string());
         s.session_id = Some("abc".to_string());
@@ -1787,7 +2426,7 @@ mod tests {
         assert_eq!(
             cmd,
             "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" \
-             claude --permission-mode bypassPermissions --session-id abc --continue"
+             claude --permission-mode bypassPermissions --session-id abc"
         );
     }
 

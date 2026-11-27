@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process signalling WORK is attached right now (a shell, a nested `claude`, an unreadable image, or any child spawned after the session's first 60 s — a stdio MCP server the session started at boot is infrastructure and does not count), never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but the wind-down executor acts on the same verdict in two arms: its drain arm closes any `eligible` session WHILE COORD HOLDS THIS DEVICE DRAINED, and its `finished_close` arm closes a finished TERMINAL session after grace with NO drain at all, once every worktree that session touched is clean and pushed (looping agents and stewards are closed only under a drain); they are computed whether or not the runner is drained, the executor's own extra gates (the drain, the `finished_close` switch and its custody gate, a wall-clock-jump quarantine, the arm's census cadence, and a per-tick close budget) are NOT reflected in `eligibility`, so `eligible` is a candidacy and never a prediction; `windDown.custody` appears only when the `finished_close` arm judged that session on its latest pass and is that pass's verdict (`clean` / `dirty` / `unknown`, with the worktree it is about), never a probe made by this request — absent means \"not judged\", never \"clean\"; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process signalling WORK is attached right now (a shell, a nested `claude`, an unreadable image, or any child spawned after the session's first 60 s — a stdio MCP server the session started at boot is infrastructure and does not count), never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but the wind-down executor acts on the same verdict in two arms: its drain arm closes any `eligible` session WHILE COORD HOLDS THIS DEVICE DRAINED, and its `finished_close` arm closes a finished TERMINAL session after grace with NO drain at all, once every worktree that session touched is clean and pushed AND every item coord's session obligations attributes to it is watched, an unreadable answer being UNKNOWN and never closing (looping agents and stewards are closed only under a drain); they are computed whether or not the runner is drained, the executor's own extra gates (the drain, the `finished_close` switch and its custody gate, a wall-clock-jump quarantine, the arm's census cadence, and a per-tick close budget) are NOT reflected in `eligibility`, so `eligible` is a candidacy and never a prediction; `windDown.custody` appears only when the `finished_close` arm judged that session on its latest pass and is that pass's verdict (`clean` / `dirty` / `unknown`, with the worktree it is about), never a probe made by this request — absent means \"not judged\", never \"clean\"; `windDown.custody.worktrees` (present only when the pass resolved a coord ledger path) names, per ledger path, the worktree roots tried, the paths that exist under them and the outcome (`found` / `ambiguous` / `absent_from_every_root` / `root_unreadable` / `reaped_retired` / `probe_error` / `absolute`) — `absent_from_every_root` is custody reason `worktree_absent_from_every_root`, an UNKNOWN and never \"reaped\", and a closeGuard `undelivered_messages_page_full` means coord did not apply the per-session `session` filter (an older coord); `windDown.obligations` is the same for the remote half (`watched` / `unwatched` / `unknown`, with the item it is about), read from coord by the arm and only for a session whose custody was clean — absent means \"not read\", never \"watched\"; `windDown.closeGuard` is the arm's close guard for that session from its latest close batch (`would_mint` / `held` / `unknown`, the input that decided it, and every input's own verdict: eligibility, custody, obligations, first_verdict, revival, undelivered_messages) — in this build it is SHADOW, so `would_mint` mints nothing and the close is still refused `no_close_authority`, and absent means \"not judged\", never \"would mint\"; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart; a `claude` is a process whose image is `claude` OR one Claude Code's session registry (`sessions/<pid>.json`) names, whatever its image, so an npm-installed `claude` (`node … cli.js`) counts — and a process whose image could be one (`node`, `nodejs`, `bun`, or unreadable) that the registry could not settle is `live_claude.undecided`: counted in `total` and `blocking`, in no plane, and never read as absent; an npm-installed `claude` NESTED under a native `claude` is not looked up in the registry (that skip spares an environment read for every `npx` server under every native `claude`), so it is not counted as a process of its own — its native ancestor is, and still blocks a restart unless its session is `finished`";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -400,6 +400,13 @@ pub struct LiveClaudeTotals {
     /// Claimed by nothing. Blocks a restart like any other live process —
     /// fail-closed: what the runner cannot explain, it does not wave through.
     pub unclassified: usize,
+    /// Processes that may be a live `claude` and may not: an image that could
+    /// be a JS-runtime Claude Code (an npm install runs as `node … cli.js`)
+    /// which Claude Code's session registry could not settle (plan
+    /// `2026-11-05-npm-installed-claude-is-invisible-to-the-image-only-liveness-checks-outside-the-pane-probe`).
+    /// In `total` and in `blocking`, in no class, and **any non-zero value is
+    /// unsafe on its own** — an undecided process is never read as absent.
+    pub undecided: usize,
     /// Live processes counted as WORK IN FLIGHT: `total - finished_discounted`.
     /// **This is what `safe_to_restart` reads**, in place of `total`.
     pub blocking: usize,
@@ -690,15 +697,18 @@ pub fn live_claude_totals_observed(
         headless_exempt: report.headless_exempt.len(),
         holder_unresolved_panes: report.holder_unresolved_count(),
         unclassified: report.live_untracked.len(),
+        undecided: report.undecided.len(),
         // Only the terminal-hosted plane can carry a work axis (it is the only
         // class with a `claude_session_id` coord can be asked about), but the
-        // sum is taken over EVERY class so the arithmetic
+        // sum is taken over EVERY class — and every undecided process, which
+        // has no work axis and blocks — so the arithmetic
         // `blocking + finished_discounted == total` holds unconditionally.
         blocking: report
             .classes()
             .iter()
             .map(|l| TrackingHealthReport::blocking_count(l))
-            .sum(),
+            .sum::<usize>()
+            + report.undecided.len(),
         finished_discounted: report
             .classes()
             .iter()
@@ -708,8 +718,9 @@ pub fn live_claude_totals_observed(
     }
 }
 
-/// Classify every live process in all five census classes — the same
-/// population `total` counts, so the four cells always sum to it.
+/// Classify every live process in all five census classes, and every
+/// undecided one as `unknown` — the same population `total` counts, so the
+/// four cells always sum to it.
 pub fn activity_counts(
     report: &TrackingHealthReport,
     evidence: &ActivityEvidence,
@@ -727,6 +738,9 @@ pub fn activity_counts(
                 evidence.now_ms,
             ));
         }
+    }
+    for _ in &report.undecided {
+        counts.add(claude_activity::Activity::Unknown);
     }
     counts
 }
@@ -761,6 +775,13 @@ pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Set while a Claude Code record read is running. See
 /// [`gather_activity_evidence`].
 pub static RECORD_READ_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// The unlistable-`sessions/`-dir condition as this reader last logged it.
+static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog =
+    claude_activity::UnlistableLog::new(
+        "restart-readiness",
+        "every undecided process without a record elsewhere reads activity `unknown`",
+    );
 
 /// Clears the in-flight flag when dropped — i.e. when the blocking read
 /// finishes or unwinds.
@@ -843,10 +864,23 @@ pub async fn gather_activity_evidence(
             // Released when the read ENDS (or unwinds), not when the caller
             // stops waiting for it.
             let _guard = guard;
-            claude_activity::read_records(&config_dirs, &pids, &proc_start)
+            let readings = claude_activity::read_records(
+                &config_dirs,
+                &pids,
+                &proc_start,
+                claude_activity::RecordDepth::Activity,
+            );
+            // An unlistable `sessions/` dir has already turned every would-be
+            // `Missing` or `PidReused` into `Unlisted`, which classifies
+            // `unknown` as both of those already did — so the counts stay
+            // honest by construction. The dir is named in the log, once per
+            // transition, because nothing else says WHY those processes read
+            // unknown.
+            UNLISTABLE_SESSIONS_LOG.observe(&config_dirs, &readings.unlistable);
+            readings
         });
         match tokio::time::timeout(read_timeout, read).await {
-            Ok(Ok(records)) => records,
+            Ok(Ok(readings)) => readings.by_pid,
             Ok(Err(e)) => {
                 tracing::warn!(
                     "restart-readiness: Claude Code session-record read failed ({e}) — \
@@ -1113,6 +1147,14 @@ pub fn build_verdict(
             if t.live_untracked_count == 1 { "es" } else { "" },
         ));
     }
+    if totals.undecided > 0 {
+        parts.push(format!(
+            "{} process{} {} be a live npm-installed `claude` (a `node`/`bun` image, or an unreadable one) that Claude Code's session registry could not settle — UNDECIDED, so counted as live work, never as absent",
+            totals.undecided,
+            if totals.undecided == 1 { "" } else { "es" },
+            if totals.undecided == 1 { "may" } else { "may each" },
+        ));
+    }
     if a.count > 0 {
         parts.push(format!(
             "{} AI/task-run session{} {} live ({} hold an isolated worktree)",
@@ -1162,7 +1204,12 @@ pub fn build_verdict(
     // An unresolved holder pane (unknown / incompatible) is a PANE whose
     // processes this runner cannot vouch for: it blocks on its own, beside
     // `blocking`, and is never folded into a process count that could read 0.
-    let safe = totals.blocking == 0 && totals.holder_unresolved_panes == 0 && a.count == 0;
+    // An undecided process is already in `blocking`; it is named here too so
+    // the verdict cannot lose it to a future change in how `blocking` is summed.
+    let safe = totals.blocking == 0
+        && totals.undecided == 0
+        && totals.holder_unresolved_panes == 0
+        && a.count == 0;
     let reason = if safe && totals.total == 0 {
         "no live agent sessions in any plane".to_string()
     } else if safe && parts.is_empty() {
@@ -1363,6 +1410,9 @@ pub async fn restart_readiness_handler(
     // Phase 4 the wind-down executor reads the same one and does act on it,
     // while drained. Do not restore the old "DRY RUN" wording: it described the
     // verdict, and stopped being true of it.
+    // Stamp for the systemd watchdog gate's snapshot: when this census pass
+    // was observed, not when its verdict is published (plan 2026-10-19 Phase 2b).
+    let observed_at = std::time::Instant::now();
     let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
     let wind_down_observer::FreshPass {
         mut pass,
@@ -1375,6 +1425,8 @@ pub async fn restart_readiness_handler(
     // here, because this endpoint answers under a 2 s client timeout.
     if let Some(p) = pass.as_mut() {
         crate::session::finished_close::attach_last_custody(&mut p.report.terminal_hosted);
+        crate::session::finished_close::attach_last_obligations(&mut p.report.terminal_hosted);
+        crate::session::finished_close::attach_last_close_guard(&mut p.report.terminal_hosted);
     }
     unknowns.extend(pass_unknowns);
     let status_source = SessionStatusSource::from(&status_fetch);
@@ -1445,7 +1497,7 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
+    let verdict = build_verdict(
         terminal,
         headless,
         holder,
@@ -1455,7 +1507,11 @@ pub async fn restart_readiness_handler(
         drain,
         census,
         status_source,
-    ))
+    );
+    // Fresher than the 600 s background census: the systemd watchdog gate
+    // reads the newest published verdict (plan 2026-10-19 Phase 2b).
+    crate::sd_notify::publish_readiness_verdict(&verdict, observed_at);
+    Json(verdict)
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1582,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -1587,6 +1645,7 @@ mod tests {
             holder_hosted: vec![],
             holder_panes: vec![],
             holder_census_error: None,
+            undecided: Vec::new(),
         }
     }
 
@@ -1681,7 +1740,7 @@ mod tests {
                 .collect();
 
         let report = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &records,
             &terminal_pids,
@@ -1747,6 +1806,76 @@ mod tests {
         assert!(json.contains("\"boundary\""));
     }
 
+    /// Restart readiness over an npm-installed `claude` (`node … cli.js`,
+    /// runner 1 → shell 5 → `node` 50): named by the registry it blocks the
+    /// restart as a live process; unsettled it blocks as UNDECIDED; with the
+    /// witness dropped — the regression — the box reads safe.
+    #[test]
+    fn an_npm_claude_blocks_the_restart_and_an_undecided_one_does_too() {
+        use crate::terminal::graceful_exit::{PaneLook, RegistryWitness};
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let mut snap = snap_with(
+            &[(1, &[5]), (5, &[50])],
+            &[(5, now_s), (50, now_s)],
+            &[(5, "bash"), (50, "node")],
+        );
+        snap.stale = false;
+        let verdict = |w: RegistryWitness| {
+            let report = evaluate(
+                &PaneLook::over_whole_table(snap.clone(), w),
+                1,
+                &[],
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                now_ms,
+                now_ms,
+                &crate::session::tracking_health::HolderCensus::default(),
+            );
+            let totals = live_claude_totals_from(&report);
+            assert_eq!(totals.by_activity.sum(), totals.total);
+            assert_eq!(totals.blocking + totals.finished_discounted, totals.total);
+            let v = verdict_from(
+                &report,
+                &[],
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            );
+            (v, totals)
+        };
+
+        let (named, totals) = verdict(RegistryWitness::naming(&[50]));
+        assert!(!named.safe_to_restart, "{}", named.reason);
+        assert_eq!(
+            (totals.total, totals.unclassified, totals.undecided),
+            (1, 1, 0)
+        );
+
+        let (undecided, totals) = verdict(RegistryWitness::unreadable("test"));
+        assert!(!undecided.safe_to_restart, "{}", undecided.reason);
+        assert_eq!((totals.total, totals.undecided, totals.blocking), (1, 1, 1));
+        assert!(
+            undecided.reason.contains("UNDECIDED"),
+            "{}",
+            undecided.reason
+        );
+        let json = serde_json::to_value(&undecided).unwrap();
+        assert_eq!(json["live_claude"]["undecided"], 1, "{json}");
+
+        let (dropped, _) = verdict(RegistryWitness::naming(&[]));
+        assert!(
+            dropped.safe_to_restart,
+            "the regression this pins: {}",
+            dropped.reason
+        );
+    }
+
     /// A genuinely idle runner: both planes empty → `safe_to_restart: true`.
     #[test]
     fn idle_runner_is_safe() {
@@ -1756,7 +1885,7 @@ mod tests {
         let snap = snap_with(&[(1, &[5])], &[(5, now_s)], &[(5, "powershell.exe")]);
 
         let report = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -1797,11 +1926,10 @@ mod tests {
     fn empty_process_snapshot_is_unsafe_with_the_cause_named() {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        // `compute` returns None on an empty parent_map; the handler turns that
-        // into this unknown. Assert the composition end of that contract.
-        let cause = "the terminal-session plane could not be determined: the process table is \
-                     unreadable (snapshot_process_table_public returned an empty parent_map), so \
-                     live `claude` processes cannot be enumerated";
+        // `compute` returns None on an UNKNOWN table (empty, or the stale
+        // last-good one); the handler turns that into this unknown. Assert the
+        // composition end of that contract.
+        let cause = crate::session::wind_down_observer::TERMINAL_PLANE_TABLE_UNKNOWN;
         let v = build_verdict(
             None,
             None,
@@ -1884,6 +2012,7 @@ mod tests {
                 session_status_since: None,
                 blocks_restart: true,
                 wind_down: None,
+                stray_wait_shells: 0,
             }],
             tracked_dead: vec![TrackedDeadRecord {
                 claude_session_id: "ghost".to_string(),
@@ -1893,6 +2022,7 @@ mod tests {
             holder_hosted: vec![],
             holder_panes: vec![],
             holder_census_error: None,
+            undecided: Vec::new(),
         };
         let census = census_info(Some(&stale), now_ms);
         assert_eq!(census.periodic_task_healthy, Some(false));
@@ -2015,7 +2145,7 @@ mod tests {
         let terminal_pids: HashMap<String, u32> = [("t-5".to_string(), 5u32)].into_iter().collect();
 
         let report = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &records,
             &terminal_pids,
@@ -2148,7 +2278,7 @@ mod tests {
         let agent_runtime: HashSet<u32> = [10u32, 11, 12, 13].into_iter().collect();
 
         evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -2340,7 +2470,7 @@ mod tests {
 
         // (a) all headless-exempt, (b) all unclassified.
         let a = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -2353,7 +2483,7 @@ mod tests {
             &crate::session::tracking_health::HolderCensus::default(),
         );
         let b = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),
@@ -2615,7 +2745,7 @@ mod tests {
         now_ms: i64,
     ) -> TrackingHealthReport {
         evaluate(
-            snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(snap),
             1,
             records,
             terminal_pids,
@@ -2938,7 +3068,7 @@ mod tests {
             ("sess-headless", "finished"),
         ]);
         let report = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &records,
             &tpids,
@@ -3132,6 +3262,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
@@ -3316,6 +3447,10 @@ mod tests {
         // the boundary must say so rather than imply a drain is required.
         assert!(BOUNDARY.contains("with NO drain at all"));
         assert!(BOUNDARY.contains("`windDown.custody`"));
+        assert!(BOUNDARY.contains("`windDown.obligations`"));
+        assert!(BOUNDARY.contains("never \"watched\""));
+        assert!(BOUNDARY.contains("`windDown.closeGuard`"));
+        assert!(BOUNDARY.contains("never \"would mint\""));
         assert!(BOUNDARY.contains("never \"clean\""));
         assert!(BOUNDARY.contains("a candidacy and never a prediction"));
         assert!(BOUNDARY.contains("windDownCandidates"));
@@ -3368,6 +3503,7 @@ mod tests {
             holder_hosted: vec![],
             holder_panes: vec![],
             holder_census_error: None,
+            undecided: Vec::new(),
         }
     }
 
@@ -3630,6 +3766,55 @@ mod tests {
                 idle: 6,
                 stale: 0,
                 unknown: 2,
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+    }
+
+    /// A `sessions/` dir that exists and cannot be listed: every undecided
+    /// process whose record sits there reads `unknown` (its reading is
+    /// `Unlisted`, never `Missing`), while the records of a dir that WAS
+    /// listed still decide, and the sum holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_sessions_dir_leaves_its_processes_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let listed = root.path().join(".claude-x");
+        for pid in [3, 4, 5] {
+            write_record(&listed, pid, "idle");
+        }
+        let hidden = root.path().join(".claude-y");
+        for pid in 6..=9 {
+            write_record(&hidden, pid, "idle");
+        }
+        let Some(_restore) =
+            crate::session::claude_activity::unlistable_fixture::unreadable_sessions_dir(&hidden)
+        else {
+            return;
+        };
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let report = activity_report();
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            vec![listed, hidden],
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
+        )
+        .await;
+        for pid in 6..=9 {
+            assert_eq!(evidence.records[&pid], RecordReading::Unlisted, "pid {pid}");
+        }
+        let totals = live_claude_totals_observed(&report, &evidence);
+        // 3-5 idle from the listed dir; 1, 2 have no record anywhere and the
+        // hidden dir could hold theirs too; 6-9 sit in the hidden dir.
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                idle: 3,
+                unknown: 6,
+                ..ActivityCounts::default()
             }
         );
         assert_eq!(totals.by_activity.sum(), totals.total);
@@ -3937,7 +4122,7 @@ mod tests {
             verified_terminal_pids: Default::default(),
         };
         let report = evaluate(
-            &snap,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
             1,
             &[],
             &HashMap::new(),

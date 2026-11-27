@@ -15,8 +15,7 @@
 // - `@playwright/test` is a RUNTIME dependency: executor.rs:153-173 resolves
 //   it out of node_modules and hard-errors without it;
 //   scripts/headless-launcher.js:42 requires it for the MCP headless-browser
-//   path; orchestrator/verification.rs:232 generates `npx playwright test`
-//   commands. Do not remove it when pruning devDependencies. (Keep it in
+//   path. Do not remove it when pruning devDependencies. (Keep it in
 //   devDependencies — moving it to dependencies is a packaging change with
 //   its own blast radius, not a cleanup.)
 // - This config is NOT used by this repo's CI. The UI-Bridge-not-Playwright

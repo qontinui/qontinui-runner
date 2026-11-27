@@ -39,6 +39,12 @@ vte = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Plan 2026-11-04 (socket-overflow) Phase 4: the socket's name is a sha256 of
+# (pane dir, pane id), so its path fits `sun_path` whatever the pane dir. The
+# same major version src-tauri already links (`src-tauri/Cargo.toml`), so it
+# adds no new crate to the build. Unix only: the
+# Windows endpoint is a named pipe, named by `pane::pipe_name`.
+sha2 = "0.10"
 
 # Target-gated with an EXPLICIT feature list, as crates/runner-win32 does: a
 # plain `windows-sys` dependency takes default features and resolves none of

@@ -46,7 +46,8 @@ for %%X in (cmd exe bat) do (
     for %%D in ("%PATH:;=" "%") do (
       if not defined REAL (
         set "DENTRY=%%~D"
-        if /I not "!DENTRY!"=="%SHIM_DIR%" (
+        call :is_qontinui_shim_dir
+        if "!DSKIP!"=="0" (
           if exist "!DENTRY!\%TOOL%.%%X" set "REAL=!DENTRY!\%TOOL%.%%X"
         )
       )
@@ -71,6 +72,8 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
   exit /b 127
 )
 :resolved
+rem The PATH-walk scratch variables must not reach the real tool's env.
+for %%V in (DENTRY DTRIM DNAME DSKIP) do set "%%V="
 
 rem ---- recursion guard: a nested invocation never re-pins -------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
@@ -101,20 +104,62 @@ set "USER_CHOSE=0"
 set "KEEP_POLICY_SHA=0"
 set "PREV_APF=0"
 set "REPLACEMENT_PROMPT=0"
-for %%A in (%*) do (
-  set "TOK=%%~A"
+rem The VALUE of a Claude Code option is not a session choice (--name resume,
+rem --model -c), so it is skipped: a single-value option consumes its next
+rem token even when that is --, a variadic one consumes up to the next token
+rem that is an option (longer than "-" and starting with -), as commander
+rem does. Nothing after a bare -- is a choice.
+rem These two lists are the Rust CLAUDE_VALUE_FLAGS / CLAUDE_VARIADIC_FLAGS in
+rem src/claude_env.rs, and a test there pins them together: keep each on its
+rem one `set` line, space-separated, with a space after = and before the quote.
+rem The scan walks %1 with SHIFT rather than `for %%A in (%*)`, which treats a
+rem token holding * or ? as a file pattern and DROPS it when nothing matches
+rem (`--name "Why?" -c` would then read -c as the name). SHIFT leaves %* intact
+rem for the exec lines below. Residual: cmd splits arguments on = , ; so an
+rem inline `--add-dir=a` reads as `--add-dir a` here, unlike the Rust and bash
+rem scans, and a variadic run then swallows what follows. Only a bare `resume`
+rem can be swallowed that way (-c, -r and every other choice start with - and
+rem end the run), so `--add-dir=a resume` is pinned here and not by the Rust
+rem and bash scans. Claude Code has no `resume` subcommand, so pinning it is
+rem the correct outcome. The same split runs the other way inside an unquoted
+rem single value: `--name a,resume`, `--name a=-c` or `--model o;-r` leave a
+rem session-looking piece behind, so the pane is NOT pinned here where the Rust
+rem and bash scans pin it. Quote such a value. (Follow-up edge 23d2295f.) `--append-system-prompt-file=x` relies on that split (below).
+set "VALUE_FLAGS= --name -n --model --fallback-model --permission-mode --permission-prompt-tool --append-system-prompt --append-system-prompt-file --system-prompt --system-prompt-file --output-format --input-format --settings --setting-sources --agent --agents --effort --max-turns --max-budget-usd --json-schema --plugin-dir --autocompact --debug-file --environment --permission-prompts --plugin-url --remote-control-session-name-prefix --system-prompt-snapshot "
+set "VARIADIC_FLAGS= --add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --mcp-config --tools --betas --file "
+set "SKIP_VALUES=0"
+set "OPTS_ENDED=0"
+:scan_args
+if [%1]==[] goto :scan_args_done
+set "TOK=%~1"
+set "IS_VALUE=0"
+set "IS_OPTION=0"
+if "!TOK:~0,1!"=="-" if not "!TOK!"=="-" set "IS_OPTION=1"
+if "!SKIP_VALUES!"=="2" if "!IS_OPTION!"=="1" set "SKIP_VALUES=0"
+if "!SKIP_VALUES!"=="2" set "IS_VALUE=1"
+if "!SKIP_VALUES!"=="1" (
+  set "SKIP_VALUES=0"
+  set "IS_VALUE=1"
+)
+if "!IS_VALUE!"=="0" if "!OPTS_ENDED!"=="0" (
+  if "!TOK!"=="--" set "OPTS_ENDED=1"
   if /I "!TOK!"=="--session-id" set "USER_CHOSE=1"
   if /I "!TOK!"=="--resume" set "USER_CHOSE=1"
   if /I "!TOK!"=="-r" set "USER_CHOSE=1"
   if /I "!TOK!"=="resume" set "USER_CHOSE=1"
   if /I "!TOK!"=="--continue" set "USER_CHOSE=1"
   if /I "!TOK!"=="-c" set "USER_CHOSE=1"
-  if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
-  set "PREV_APF=0"
-  if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
-  if /I "!TOK!"=="--system-prompt" set "REPLACEMENT_PROMPT=1"
-  if /I "!TOK!"=="--system-prompt-file" set "REPLACEMENT_PROMPT=1"
+  for %%F in (!VALUE_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=1"
+  for %%F in (!VARIADIC_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=2"
 )
+if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
+set "PREV_APF=0"
+if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
+if /I "!TOK!"=="--system-prompt" set "REPLACEMENT_PROMPT=1"
+if /I "!TOK!"=="--system-prompt-file" set "REPLACEMENT_PROMPT=1"
+shift
+goto :scan_args
+:scan_args_done
 
 rem ---- spawn-time policy delivery marker -------------------------------------
 rem QONTINUI_POLICY_DELIVERED_SHA says THIS claude received the policy body in
@@ -122,7 +167,7 @@ rem its system prompt, and QONTINUI_POLICY_DELIVERED_FILE names the composed
 rem file it rode in. Only a claude whose argv passes THAT file to
 rem --append-system-prompt-file did; an inherited marker on a nested claude
 rem (bare, or with its own --append-system-prompt-file) would make the policy
-rem hook skip a body that session never got. (The `for` above splits
+rem hook skip a body that session never got. (cmd's argument parsing splits
 rem `--append-system-prompt-file=x` on `=`, so the file is the token after the
 rem flag in both spellings.) A REPLACEMENT prompt (--system-prompt[-file])
 rem withholds it as well: whether Claude Code still applies the append file
@@ -185,3 +230,43 @@ if defined REAL (
   call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 )
 endlocal & exit /b %ERRORLEVEL%
+
+rem ---- is_qontinui_shim_dir: DSKIP=1 when DENTRY is ANY qontinui shim dir ---
+rem Not only our own SHIM_DIR: a PATH inherited from another runner session
+rem carries THAT session's qontinui-identity-*/qontinui-shim-* dir too, and
+rem resolving its shim as the "real" tool made two shims dispatch to each other
+rem for ever (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-and-
+rem secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+rem intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+rem with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+rem marker. Trailing separators are ignored. An EMPTY entry (a doubled or
+rem trailing `;`) is skipped, as the bash templates and the native stub skip
+rem it: probing it would test `\<tool>.cmd` at the root of the current drive.
+:is_qontinui_shim_dir
+set "DSKIP=0"
+if not defined DENTRY (
+  set "DSKIP=1"
+  exit /b 0
+)
+if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
+set "DTRIM=!DENTRY!"
+:is_qontinui_shim_dir_trim
+if not defined DTRIM exit /b 0
+if "!DTRIM:~-1!"=="\" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+if "!DTRIM:~-1!"=="/" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+rem A drive root (C:\ trimmed to C:) has no final name; %%~nx of C: would
+rem name the CURRENT directory on that drive instead.
+if "!DTRIM:~1!"==":" goto :is_qontinui_shim_dir_marker
+set "DNAME="
+for %%N in ("!DTRIM!") do set "DNAME=%%~nxN"
+if /I "!DNAME:~0,18!"=="qontinui-identity-" set "DSKIP=1"
+if /I "!DNAME:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+:is_qontinui_shim_dir_marker
+if exist "!DTRIM!\.qontinui-identity-build" set "DSKIP=1"
+exit /b 0

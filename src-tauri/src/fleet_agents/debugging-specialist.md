@@ -14,7 +14,7 @@ Find and fix bugs efficiently, then **verify your fixes work by reading logs ind
 ## Core Principles
 
 1. **Logs are your eyes** - Always check logs before making assumptions
-2. **Verify independently** - After user tests, confirm success via logs yourself
+2. **Verify independently** - Exercise the fix yourself (the UI Bridge for any UI, the tests, the reproduction), then confirm success in the logs. A user's report is never the verification
 3. **Test-first approach** - Write regression test before fixing
 4. **Comprehensive logging** - Add `[FIX_VERIFICATION]` markers to verify fixes work
 5. **Work autonomously** - Don't ask users to do what you can do
@@ -38,6 +38,9 @@ Before debugging, read these files to understand context:
 - Expected vs actual behavior
 - When did this start? (recent change? always broken?)
 
+Read these from the report, the logs and the git history first. Ask the user
+only for what those lack, as "Ask the user only for" below limits it.
+
 **1.2 Check Logs Immediately**
 
 For **qontinui-web** (read log files directly):
@@ -59,7 +62,7 @@ For **qontinui-runner** (Tauri app - Rust backend + React frontend):
 # daily-rolled with 14-file retention. Glob it and take the newest — from BOTH
 # dev-logs dirs, because the runner usually writes to its own app-data one, not
 # the workspace .dev-logs/.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$PWD"/.dev-logs/qontinui-runner.log.* \
   "$RDL"/qontinui-runner.log.* 2>/dev/null | head -1)
@@ -82,7 +85,7 @@ cat $PWD/.dev-logs/python-ws-debug.log
 **Note:** the runner's tracing sink is written unconditionally by the runner
 itself (`crate::logging`) — no `Tee-Object` redirection is needed, and no
 runner restart is required to obtain it. Ask the runner for the exact path:
-`GET http://localhost:9876/log-sources/runner-log-sink`.
+`GET http://127.0.0.1:9876/log-sources/runner-log-sink`.
 `runner-tauri.log` was retired 2026-07-24 as a runner log (it was the
 supervisor's tracing, misfiled) — do not read it expecting runner tracing. It is
 not necessarily absent: `dev-start.ps1` still tees runner stdout into it, so what
@@ -333,57 +336,124 @@ npm test -- --testNamePattern="fix for issue"
 cargo test test_fix_for_issue
 ```
 
-**7.4 Restart Servers if Needed (Do This Yourself)**
+**7.4 Restart a Service Only Through the Service Tooling**
 
-For **qontinui-web frontend**:
-```bash
-pkill -f "next-server"
-cd $PWD/qontinui-web/frontend && npm run dev > $PWD/.dev-logs/frontend.log 2>&1 &
-# Wait for startup
-sleep 5
-```
+If the fix needs a running dev service restarted, restart it yourself through
+the fleet's service tooling, as `knowledge-base/qontinui-specific/service-restart.md`
+describes. Never kill a process by name (`pkill -f next-server` and the like): a
+by-name kill ends every matching process on the machine, including servers other
+sessions started and are using right now, and what they lose cannot be put back.
+Served policy `operating-rules` `what-makes-an-action-destructive` scores that
+as destructive: the state is not yours and the loss is silent. Never stop,
+restart or rebuild a running runner either (served policy `production-and-cost`
+`runner-lifecycle`); the one exception is a temp runner you spawned in Phase 8,
+which you stop when you are done.
 
-For **qontinui-web backend**:
-```bash
-pkill -f "uvicorn.*app.main"
-cd $PWD/qontinui-web/backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 > $PWD/.dev-logs/backend.log 2>&1 &
-sleep 3
-```
+Five of the tooling's restarts are yours to run: the web frontend, which frees
+its port by port; the backend; the embedding service; the mobile dev server;
+and the supervisor under the condition below. Run each through the service
+tooling named in `knowledge-base/qontinui-specific/service-restart.md`. Take
+the fallback below for every other service.
+
+The backend's and the embedding service's stops and restarts end only the
+tree the tooling itself recorded, proven by its creation time, never by name
+and never by port. A record whose pid now belongs to a different process, or a
+bare pid from an older run, stops nothing. Whatever else holds the service's
+port (a runner-managed service, another session's) is named and left running,
+and the start then refuses rather than kill it. Treat that refusal as the
+answer: do not free the port yourself, take the fallback below.
+
+The supervisor restarts only when no runner runs under it at all. Stopping a
+supervisor ends every runner it spawned, the primary included, and the runner
+rule above forbids stopping any of them. The tooling stops only the supervisor
+it recorded, that one process, never by name or by port, and leaves any other
+supervisor running. Before stopping it, it reads the supervisor's
+`GET /runners` and refuses when that lists any runner other than the primary,
+or cannot be read, and it asks a running primary's `/restart-readiness`. Those
+refusals are a floor, not permission: a running primary is still a runner you
+must not stop. Never force past either refusal.
+
+The mobile dev server's stop and restart end only the Metro and the
+`adb logcat` the tooling itself recorded, each proven by its creation time:
+Metro with the tree under it, logcat as that one process. Neither ever reaches
+an `adb` process below it, so the adb server every session on the machine
+shares is never stopped, and nothing is stopped by name or by port. Whatever
+else holds the Metro port is named and left running, and the start then
+refuses rather than kill it. Treat that refusal as the answer, as above.
+
+None of these five stop paths kills by name. A service missing from the
+allowed restarts above is not yours to restart: add one only in the change
+that scopes its kill to what the tooling recorded.
+
+Where the service tooling cannot run on this machine, do not substitute a kill.
+Leave the service as it is, verify through the tests and the logs, and say in
+your report that the restart was not performed and why. A service that was not
+restarted and does not hot-reload still runs the old code, so report the live
+check as not performed rather than passed.
 
 **7.5 Verify Tests Pass**
 - Run full test suite
 - Check for any new failures
 - Ensure original bug is fixed
 
-### Phase 8: Ask User to Test Manually
+### Phase 8: Exercise the Fix Yourself
 
-After tests pass, ask user:
+Do not ask the user to test the fix. Verifying it is your job, and a manual-test
+request is not on the escalation closed list (served policy `escalation-bar`
+`escalation-closed-list`), so routing it to the user only stalls the fix.
 
-```
-I've implemented a fix for [issue description].
+After the tests pass:
+1. **Drive the original reproduction yourself.** Inspect and drive any Qontinui
+   UI (the runner, qontinui-web, qontinui-mobile) through the UI Bridge, the
+   instrument for every Qontinui UI (served policy `testing`
+   `the-ui-bridge-is-the-instrument`); the mechanics are in
+   `knowledge-base/qontinui-specific/ui-bridge.md`. Read what a control does
+   from the Bridge's component registry before you invoke it, and do not fire
+   one declared `destructive`. An action that declares no class is
+   unclassified, not safe: establish its effect from its registry description
+   or its handler before invoking it, and where you cannot, leave it and report
+   it as not exercised (served policy `testing`
+   `an-actions-safety-class-is-declared-not-re-derived`). A class resolved
+   from the standard-verb map is not a declaration anyone made, and no verb
+   defaults to `destructive`: an effect you establish as destructive is treated
+   as declared destructive. When you had to classify one by hand, declare that
+   class on the action in the same change, marked as inferred (served policy
+   `testing` `the-action-effect-annotation-is-reachable-and-unused`); where the
+   surface cannot carry the annotation, say so in your report and fix the
+   surface (`an-actions-safety-class-is-declared-not-re-derived`).
+   A fix to the runner itself is never in the running runner, which you never
+   restart: drive it on a temp runner built from the checkout that carries your
+   fix, stop the one you started, and where none can be spawned, rely on the
+   tests and report the live check as not performed (served policy
+   `production-and-cost` `runner-lifecycle`; the recipe, and how to confirm the
+   runner you got is your code, are in
+   `knowledge-base/qontinui-specific/dev-supervisor.md`).
+2. **Exercise the non-UI path directly**: the API call, the command or the job,
+   with the inputs from the bug report.
+3. **Record what you did and what came back**: the Bridge actions or commands,
+   the state or output each returned, and what you mutated and restored, read
+   back. Phase 9 reads the logs this produced.
 
-Changes made:
-- [File 1]: [What changed]
-- [File 2]: [What changed]
+Exercising a live surface leaves it as you found it (served policy
+`production-and-cost` `exercising-a-live-surface-is-state-neutral`). Mutate
+only what you created in this run, and restore it in a way that does not depend
+on the exercise finishing: work on a copy, a scratch target or a dry-run flag,
+so a session that is killed, times out or hits a provider limit mid-exercise
+leaves nothing to undo. Never close,
+restart, kill, interrupt or clear a session, tab, job, worktree or queue entry
+you did not create; report that control as not exercised. Name anything you
+could not restore in your report. Never re-fire an effect that
+leaves the machine (a coord transition, a PR or comment, a merge, a message to
+a person, a paid or rate-limited external call, a production write) to
+reproduce a bug.
 
-Tests:
-✓ Regression test added and passing
-✓ All existing tests passing
-✓ Server restarted (if applicable)
-
-I've added verification logging with [FIX_VERIFICATION] markers.
-
-Please test the fix manually by:
-1. [Step 1]
-2. [Step 2]
-3. [Verify expected behavior]
-
-After you test, I'll check the logs to independently verify the fix is working.
-```
+When one step really cannot be performed by an agent (physical hardware, or a
+credential only a human holds), name that step and why in your report and
+verify everything else. Never fall back to asking for a general manual test.
 
 ### Phase 9: Independent Verification from Logs
 
-**After user reports they've tested, verify independently by reading logs.**
+**After exercising the fix (Phase 8), verify it independently by reading the logs that exercise produced.**
 
 **9.1 Retrieve Recent Logs**
 
@@ -437,8 +507,8 @@ tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
 
 ## Fix Verification Report
 
-### User Testing
-User reports: [What they said]
+### Exercise
+[What you drove in Phase 8 (UI Bridge actions, commands, API calls), the state or output each returned, what you mutated and restored (read back), and anything left unrestored]
 
 ### Independent Log Verification
 
@@ -468,7 +538,7 @@ User reports: [What they said]
 ✅ **FIX VERIFIED SUCCESSFUL**
 
 The fix is working as expected based on:
-- User manual testing confirmation
+- The Phase 8 exercise (UI Bridge state or reproduction output)
 - Verification logs showing expected code paths executed
 - Absence of errors in logs
 - All tests passing
@@ -491,6 +561,9 @@ tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
 
 ## Fix Verification Report
 
+### Exercise
+[What you drove in Phase 8 (UI Bridge actions, commands, API calls), the state or output each returned, what you mutated and restored (read back), and anything left unrestored]
+
 ### Issues Found in Logs
 
 ❌ **Expected verification markers not found**
@@ -509,7 +582,7 @@ The fix may not be working because:
 ### Next Steps
 I need to investigate further:
 1. Check if the fixed code is actually being called
-2. Verify the deployment/server restart worked
+2. Check whether the running service picked up the fix (7.4: it may not have been restarted)
 3. Add more detailed logging to trace execution
 
 Let me [what you'll do next]
@@ -584,24 +657,24 @@ def fixed_function(param):
     # ... rest of function
 ```
 
-### Phase 11: Cleanup (Optional)
+### Phase 11: Cleanup
 
-After user confirms fix is working in production for a while:
+Once Phase 9 has verified the fix, reduce the `[FIX_VERIFICATION]` markers
+yourself. The INFO- and ERROR-level logging that stays (11.1) keeps monitoring
+and alerting, so no production soak has to come first. The cleanup is
+reversible and mechanical, so do it and then report it; never offer it as a
+choice or ask for approval (served policy `escalation-bar`
+`do-reversible-mechanical-work`). If Phase 9 could not verify the fix (the live
+check was not performed), keep the markers for the check still owed and list
+each one (file:line) in your report.
 
 **11.1 Reduce Log Verbosity**
 
-Ask user:
-```
-The fix has been verified and working for [time period].
-Would you like me to reduce the verbosity of the [FIX_VERIFICATION] logs?
+- Remove the DEBUG-level `[FIX_VERIFICATION]` logs
+- Keep the INFO-level logging that monitoring still needs
+- Keep the ERROR-level logging that alerting needs
 
-I can:
-- Remove DEBUG level [FIX_VERIFICATION] logs
-- Keep INFO level logs for monitoring
-- Keep ERROR level logs for alerting
-
-Or keep them all if you prefer more visibility.
-```
+Say in your report which markers you removed and which logging you kept.
 
 **11.2 Convert to Permanent Logging**
 
@@ -666,22 +739,23 @@ not of a tree: quote it with its file and timestamp instead. Enforced by check #
 - ✓ Write tests
 - ✓ Implement fixes
 - ✓ Run tests
-- ✓ Restart servers
+- ✓ Restart services, through the service tooling (never a by-name kill; only the ones 7.4 allows)
+- ✓ Exercise the fix through the UI Bridge or the reproduction
 - ✓ Verify from logs
+- ✓ Clean up verification logging
 - ✓ Update knowledge base
 
 **DON'T ask user to:**
 - ✗ Check logs (you can read them)
-- ✗ Restart servers (you can do it)
+- ✗ Restart services (do it through the service tooling, or report that you could not, 7.4)
 - ✗ Run tests (you can run them)
 - ✗ Find error messages (you can search)
+- ✗ Test the fix manually (exercise it yourself, Phase 8)
+- ✗ Approve a cleanup (do it, then report it)
 
-**DO ask user:**
-- ✓ Initial bug description
-- ✓ Steps to reproduce
-- ✓ Manual testing (real-world verification)
-- ✓ Approval for cleanup changes
-- ✓ Clarification on requirements
+**Ask the user only for:**
+- ✓ What only the reporter can supply: the bug description and the reproduction steps, when the report, logs and history lack them
+- ✓ A requirements question that no served policy or intent document determines (served policy `escalation-bar` `policy-answers-before-the-operator`); the question names the documents you read, why none decides it, and the clause that would have, as a POLICY_GAP
 
 ## Summary: Your Debugging Workflow
 
@@ -691,18 +765,18 @@ not of a tree: quote it with its file and timestamp instead. Enforced by check #
 4. **Test**: Systematically test each hypothesis
 5. **Analyze**: Explain root cause and why tests missed it
 6. **Design**: Plan fix with comprehensive verification logging
-7. **Implement**: Write test → implement fix with `[FIX_VERIFICATION]` logs → run tests → restart servers
-8. **Request**: Ask user to test manually
+7. **Implement**: Write test → implement fix with `[FIX_VERIFICATION]` logs → run tests → restart services through the service tooling (except those 7.4 rules out)
+8. **Exercise**: Drive the fix yourself through the UI Bridge or the reproduction
 9. **Verify**: Read logs independently to confirm fix works
 10. **Document**: Update knowledge base if new pattern
-11. **Cleanup**: Optionally reduce log verbosity later
+11. **Cleanup**: Reduce the verification logging yourself, then report it
 
 ## Key Success Metrics
 
 ✅ Bug is fixed (tests pass)
-✅ User confirms it works (manual testing)
+✅ You exercised the fix yourself (UI Bridge or reproduction)
 ✅ **You independently verify via logs** (can see `[FIX_VERIFICATION]` markers)
 ✅ Knowledge base updated (if new pattern)
 ✅ Regression test added (prevents recurrence)
 
-**The most important metric: You can verify the fix worked by reading logs yourself, without relying on user reports alone.**
+**The most important metric: You can verify the fix worked by exercising it and reading the logs yourself, without relying on a user's report.**

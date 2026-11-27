@@ -17,6 +17,19 @@
 //! any other parameter is a 400, so a misspelt filter can never be silently
 //! dropped. Every applied filter is echoed (`filterEcho`).
 //!
+//! `since` also narrows the read: only rows at or after it are read in full,
+//! and older ones as one row per distinct transition with its count
+//! ([`super::read`]). They are still all excluded. When any were summarized,
+//! `provenance.coverage.edgesSummarized {rows, groups}` says so:
+//! `edgesFilteredOut`, `edgesInvalidated`, `unplacedRejectedRows` and the
+//! unparseable-row count count rows, and so do the `unmeasured[].count`s built
+//! from them; every other count of excluded rows (per node,
+//! `unknownDestinationArrivals`, `offGraphDepartures`, `coverage.rowsRejected`)
+//! counts each group once, so read it only as zero or non-zero. A rejected
+//! group is one `rejected[]` entry whose `rows` is the group's row count and
+//! whose `row` is the smallest id among them: it names one of those rows, not
+//! all.
+//!
 //! ## The answer is the shared `Observation<T>` envelope (plan D6)
 //!
 //! - a POSITIVE answer (a path found, a node listed) is `measured`, its value
@@ -75,8 +88,8 @@ use crate::mcp::types::ApiState;
 
 use super::health;
 use super::read::{
-    read_ledger, read_timed_edges, LedgerRead, LedgerUnavailable, TimedEdge, EDGE_READ_LIMIT,
-    FRONTIER_READ_LIMIT,
+    read_ledger, read_ledger_since, read_timed_edges, LedgerRead, LedgerUnavailable, TimedEdge,
+    EDGE_READ_LIMIT, FRONTIER_READ_LIMIT,
 };
 
 // The route-local answer value lives in the LIB crate
@@ -181,21 +194,34 @@ impl JourneyParams {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReadGaps {
     pub edges_truncated: bool,
+    /// More older groups than the bound: some rows before `since` are unread.
+    pub older_groups_truncated: bool,
     pub frontier_truncated: bool,
     pub rows_unparseable: u64,
+    /// Ledger rows read only as older groups, and how many groups. NOT a gap,
+    /// so [`ReadGaps::any`] ignores them: every such row is excluded and counted.
+    /// They set the resolution of the other counts ([`disclose_summarized`]).
+    pub summarized_rows: u64,
+    pub summarized_groups: u64,
 }
 
 impl ReadGaps {
     /// Whether the read has any gap at all.
     pub(crate) fn any(&self) -> bool {
-        self.edges_truncated || self.frontier_truncated || self.rows_unparseable > 0
+        self.edges_truncated
+            || self.older_groups_truncated
+            || self.frontier_truncated
+            || self.rows_unparseable > 0
     }
 
     fn of(read: &LedgerRead) -> Self {
         Self {
             edges_truncated: read.edges_truncated,
+            older_groups_truncated: read.older_groups_truncated,
             frontier_truncated: read.frontier_truncated,
             rows_unparseable: read.rows_unparseable,
+            summarized_rows: read.older_rows(),
+            summarized_groups: read.older_groups.len() as u64,
         }
     }
 
@@ -207,6 +233,13 @@ impl ReadGaps {
         if self.edges_truncated {
             out.push(UnmeasuredDimension::new(
                 format!("edges_beyond_read_bound_{EDGE_READ_LIMIT}"),
+                1,
+                UnknownCode::InputMissing,
+            ));
+        }
+        if self.older_groups_truncated {
+            out.push(UnmeasuredDimension::new(
+                format!("older_groups_beyond_read_bound_{EDGE_READ_LIMIT}"),
                 1,
                 UnknownCode::InputMissing,
             ));
@@ -226,6 +259,25 @@ impl ReadGaps {
             ));
         }
         out
+    }
+}
+
+/// Say in the answer that older rows were summarized, when any were.
+pub(crate) fn disclose_summarized(body: &mut Value, gaps: &ReadGaps) {
+    if gaps.summarized_rows == 0 {
+        return;
+    }
+    if let Some(coverage) = body
+        .pointer_mut("/provenance/coverage")
+        .and_then(Value::as_object_mut)
+    {
+        coverage.insert(
+            "edgesSummarized".into(),
+            serde_json::json!({
+                "rows": gaps.summarized_rows,
+                "groups": gaps.summarized_groups,
+            }),
+        );
     }
 }
 
@@ -326,7 +378,13 @@ fn detail_for(query: &str, code: UnknownCode, dim: Option<&UnmeasuredDimension>)
         }
         _ if name.starts_with("edges_beyond_read_bound") => format!(
             "{query}: the read bound was reached ({EDGE_READ_LIMIT} edges, newest first); \
-             older edges were not read, so what they record is unknown"
+             older edges were not read, so what they record is unknown. A later `since` \
+             narrows the read"
+        ),
+        _ if name.starts_with("older_groups_beyond_read_bound") => format!(
+            "{query}: the rows before `since` hold more than {EDGE_READ_LIMIT} distinct \
+             transitions, so what the unread ones record is unknown. An earlier `since` \
+             leaves fewer of them"
         ),
         _ if name.starts_with("frontier_beyond_read_bound") => format!(
             "{query}: the frontier read bound was reached ({FRONTIER_READ_LIMIT} rows); \
@@ -670,7 +728,7 @@ pub(crate) fn answer_edge_timing(
     for r in rows {
         let e = &r.edge;
         let Ok(observed_at) = trusted_edge_row(e) else {
-            rejected += 1;
+            rejected += r.rows;
             continue;
         };
         let same_edge =
@@ -679,11 +737,11 @@ pub(crate) fn answer_edge_timing(
             continue;
         }
         if e.invalidated_at.is_some() {
-            invalidated += 1;
+            invalidated += r.rows;
             continue;
         }
         if !filter.keeps(e, observed_at) {
-            filtered_out += 1;
+            filtered_out += r.rows;
             continue;
         }
         if r.timeline_unparseable {
@@ -836,17 +894,24 @@ async fn graph_route(
         Err(e) => return e.into_response(),
     };
     let ledger = live_ledger(&state, &app_id).await;
-    let body = match read_ledger(&state.app_state.pg_db, &app_id).await {
+    let pg = &state.app_state.pg_db;
+    let read = match filter.since {
+        Some(since) => read_ledger_since(pg, &app_id, since).await,
+        None => read_ledger(pg, &app_id).await,
+    };
+    let body = match read {
         Err(why) => answer_unavailable(query, &app_id, &filter, &ledger, &why, now()),
         Ok(read) => {
-            let graph = build_graph(&read.edges, &read.frontier, &ledger, &filter);
+            let graph = read.build_graph(&ledger, &filter);
             let ctx = AnswerCtx {
                 query,
                 app_id: &app_id,
                 gaps: ReadGaps::of(&read),
                 evaluated_at: now(),
             };
-            f(&ctx, &graph, &params)
+            let mut body = f(&ctx, &graph, &params);
+            disclose_summarized(&mut body, &ctx.gaps);
+            body
         }
     };
     Json(body).into_response()
@@ -991,20 +1056,23 @@ pub async fn get_journey_edge_timing(
         Err(e) => return e.into_response(),
     };
     let ledger = live_ledger(&state, &app_id).await;
-    let body = match read_timed_edges(&state.app_state.pg_db, &app_id).await {
+    let body = match read_timed_edges(&state.app_state.pg_db, &app_id, filter.since).await {
         Err(why) => answer_unavailable("edge-timing", &app_id, &filter, &ledger, &why, now()),
-        Ok((rows, truncated, bad)) => {
+        Ok(read) => {
             let ctx = AnswerCtx {
                 query: "edge-timing",
                 app_id: &app_id,
+                // No `summarized_*`: edge-timing weighs each row by its count,
+                // so every number in its answer counts rows.
                 gaps: ReadGaps {
-                    edges_truncated: truncated,
-                    frontier_truncated: false,
-                    rows_unparseable: bad,
+                    edges_truncated: read.edges_truncated,
+                    older_groups_truncated: read.older_groups_truncated,
+                    rows_unparseable: read.rows_unparseable,
+                    ..ReadGaps::default()
                 },
                 evaluated_at: now(),
             };
-            answer_edge_timing(&ctx, &rows, &from, &to, &filter, &ledger)
+            answer_edge_timing(&ctx, &read.rows, &from, &to, &filter, &ledger)
         }
     };
     Json(body).into_response()

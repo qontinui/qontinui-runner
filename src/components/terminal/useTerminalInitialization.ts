@@ -3,7 +3,7 @@ import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useC
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import { LAYOUT_PRESETS, FLOW_GRID_ID, resolveLayout } from "./useZoneLayout";
 import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
@@ -42,8 +42,10 @@ import { displayNameOf } from "@/lib/session-ledger";
  * creation-order mapping the localStorage snapshot used to drive.
  *
  * `terminal_session_list_open` returns the restorable superset: `open` records
- * (hard-crash case) PLUS in-grace `closed`/`pty-exit` records (graceful-restart
- * case, where `handleExit` flipped every live PTY to `closed`). The backend
+ * (hard-crash and runner-shutdown case: the backend refuses a `pty-exit` close
+ * once `close_all` begins, so a shutdown leaves its rows `open`) PLUS in-grace
+ * `closed`/`pty-exit` records (a PTY that died while the runner ran, and rows
+ * a pre-latch runner's `handleExit` closed at shutdown). The backend
  * owns the state/reason/grace gating, so we deliberately do NOT re-filter on
  * `state === "open"` here — that would drop the pty-exit records the backend
  * just decided are restorable.
@@ -876,9 +878,14 @@ export function mayClaimRecordedZone(
   zoneIndex: number,
   tabId: string,
   assignments: Record<number, string>,
+  zoneCount: number,
 ): boolean {
   if (zoneIndex < 0) return false;
   if (!isDrainRerun) return true;
+  // The grid may have shrunk since the record was written. A tab assigned past
+  // the last zone renders nowhere, and it is not "unassigned" either, so nothing
+  // reports it. Auto-fill gives it a zone that exists.
+  if (zoneIndex >= zoneCount) return false;
   const holder = assignments[zoneIndex];
   return holder === undefined || holder === tabId;
 }
@@ -1236,9 +1243,16 @@ export function resolveRestoreAccount(
   const recorded = rec.configDir?.trim();
   if (recorded) {
     const dir = resolveAccountDir(recorded, home);
-    return dir.kind === "resolved"
-      ? { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir }
-      : { kind: "unknown", reason: dir.reason };
+    if (dir.kind === "resolved") {
+      return { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir };
+    }
+    // A recorded default home that does not exist on this machine (the backend
+    // answers `home = null` for it) is a RETIRED account, not an unreadable
+    // one: fall through to the transcript evidence instead of asking, so a
+    // resume never lands on whatever account the shell happens to carry.
+    if (dir.reason !== "default-home-unknown") {
+      return { kind: "unknown", reason: dir.reason };
+    }
   }
   const holders = rec.transcriptConfigDirCount;
   if (holders === undefined) return { kind: "unknown", reason: "transcript-unprobed" };
@@ -1465,8 +1479,17 @@ interface UseTerminalInitializationParams {
      */
     placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
-    gridView: { assignments: Record<number, string> };
+    /**
+     * The grid, read live from however long ago this object was captured — the
+     * snapshot's in tmux mode (`useZoneLayout().readGridView`).
+     */
+    readGridView: () => { layoutId: string; assignments: Record<number, string> };
+    /**
+     * Hold (false) or release (true) the page's auto-trim around a restore
+     * run (`useZoneLayout().setRestoreSettled`): while a run drains, a falling
+     * tab count is the drain, not a close. Mirrors the auto-save gate.
+     */
+    setRestoreSettled: (settled: boolean) => void;
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -1619,6 +1642,16 @@ export function useTerminalInitialization({
   // Pages whose restore the drain deferred, so their re-run merges into the
   // tabs that exist by then instead of re-laying the page out.
   const drainDeferredPages = useRef<Set<string>>(new Set());
+  // Pages whose last run was deferred by the drain, so their next run does not
+  // close the trim hold until it knows it is not deferred again. A deferred run
+  // opens the hold, and that state change re-renders the page's scope, which
+  // re-runs the restore effect. Closing the hold at the start of every retry
+  // turned that into a loop that lasted as long as the drain.
+  const deferredRetryPages = useRef<Set<string>>(new Set());
+  // Each page's newest restore run. A re-run can start before an earlier run's
+  // drain timer fires, and that timer must not release the hold the newer run
+  // still needs.
+  const newestRestoreRun = useRef<Map<string, number>>(new Map());
 
   // The two page sets above, PUBLISHED as state for the "Since restart" strip
   // (plan `2026-10-04-runner-session-roster-restore-picker`, Phase 4): it
@@ -1726,6 +1759,32 @@ export function useTerminalInitialization({
     // same finally / drain timer.
     const isDrainRerun = drainDeferredPages.current.delete(initPageId);
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
+    // The page's auto-trim waits for this run exactly as auto-save does: both
+    // are released together by `openRestoreGate`. The setter is the page's
+    // own (captured with this run), so a drain timer firing after a page
+    // switch still releases the right page.
+    const setRestoreSettled = zoneLayout.setRestoreSettled;
+    const retryingDeferral = deferredRetryPages.current.delete(initPageId);
+    if (!retryingDeferral) setRestoreSettled(false);
+    const thisRun = (newestRestoreRun.current.get(initPageId) ?? 0) + 1;
+    newestRestoreRun.current.set(initPageId, thisRun);
+    const openRestoreGate = () => {
+      restoreCompletePages.current.add(initPageId);
+      if (newestRestoreRun.current.get(initPageId) === thisRun) setRestoreSettled(true);
+    };
+    // What a merging run may place into: its own page's grid as it is now. The
+    // captured `zoneLayout` is the page's own, so this holds through a page
+    // switch, and it reads live because a deferred retry starts with the hold
+    // still open, so a trim can land mid-run. A flow-grid sizes itself to its
+    // highest occupied zone, so it has no limit, and every other layout's zone
+    // count ignores the tab count.
+    const runGridView = zoneLayout.readGridView;
+    const gridZoneCount = () => {
+      const { layoutId } = runGridView();
+      return layoutId === FLOW_GRID_ID
+        ? Number.POSITIVE_INFINITY
+        : resolveLayout(layoutId, 0).zones.length;
+    };
     // A re-run for the holder sweep's late settle restores only these. Ids
     // scheduled while this run is in flight wait for its end.
     const recheckOnly = beginRestoreRun(rerun, initPageId);
@@ -1794,6 +1853,8 @@ export function useTerminalInitialization({
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
+          // A deferral retry reaches here with the hold still open.
+          setRestoreSettled(false);
           // Release the guard so the retry can run — this abort must not
           // consume the pageId.
           didInitPages.current.delete(initPageId);
@@ -1831,15 +1892,19 @@ export function useTerminalInitialization({
           // the restore re-runs — merging, not re-laying out — when
           // `drainResumeEpoch` moves.
           restoreDeferred = true;
+          deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(
             `[TerminalPage] restore for page "${initPageId}" deferred by the coord device ` +
-              `drain: ${restoreSet.deferredByDrain} — it re-runs when the drain lifts.`,
+              `drain or dispatch role: ${restoreSet.deferredByDrain} — it re-runs when ` +
+              `autonomous spawns are allowed again.`,
           );
           return;
         }
+        // Not deferred after all, so this retry is a real restore: hold the trim.
+        setRestoreSettled(false);
         const openRecords = restoreSet.records;
         // The default Claude home, for the account rule (`resolveAccountDir`):
         // `null` = unreadable, which makes a dir that may be it needs-account.
@@ -1955,7 +2020,8 @@ export function useTerminalInitialization({
                 isDrainRerun,
                 rec.zoneIndex,
                 tabId,
-                zoneLayout.gridView.assignments,
+                runGridView().assignments,
+                gridZoneCount(),
               )
             ) {
               zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
@@ -2062,7 +2128,8 @@ export function useTerminalInitialization({
               isDrainRerun,
               rec.zoneIndex,
               tabId,
-              zoneLayout.gridView.assignments,
+              runGridView().assignments,
+              gridZoneCount(),
             )
           ) {
             zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
@@ -2322,7 +2389,7 @@ export function useTerminalInitialization({
             } finally {
               // Restored tabs now carry their claudeSessionId / scrollback —
               // safe to let the debounced auto-save persist this page's layout.
-              restoreCompletePages.current.add(initPageId);
+              openRestoreGate();
               publishRestorePages();
             }
           }, 1500);
@@ -2351,7 +2418,7 @@ export function useTerminalInitialization({
         // auto-save suppressed. Not permanent: the retry flips it via this
         // same finally / its drain timer.
         if (!drainScheduled && !restoreAborted) {
-          restoreCompletePages.current.add(initPageId);
+          openRestoreGate();
         }
         // Publishes the deferral too (set before the early return above).
         publishRestorePages();

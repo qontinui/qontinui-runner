@@ -26,9 +26,18 @@
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
 #   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
-#     npm's placeholder stub (mid-reinstall), is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
-#     (default 10) before the fail-open fall-through; a resolved tool never
-#     waits, and the only output added is on STDERR, on the miss path alone.
+#     npm's placeholder stub (mid-reinstall), or resolved but changed under
+#     ~3 s ago (whole seconds; see the SETTLE check -- an install still
+#     writing it), is re-scanned for at most
+#     QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables both waits)
+#     before the fail-open fall-through. One deadline covers both waits; a
+#     candidate still changing at it is launched anyway. A SETTLED tool never
+#     waits, and the only output added is on STDERR, on the miss and
+#     still-changing paths alone.
+#   * LAUNCH FAILURE IS REPORTED: a top-level invocation that gives up on the
+#     real tool (`resolve-failed`) or cannot exec it (`exec-failed`) tells the
+#     runner so before it falls through, so the pane's session row can close
+#     `launch-failed` instead of reading as a session that died.
 #
 # Placeholders:
 #   @@TOOL@@      the wrapped provider program name (claude/gemini)
@@ -64,7 +73,41 @@ is_npm_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# Scan PATH, skipping SHIM_DIR, for the first candidate of one kind:
+# is_qontinui_shim_dir <dir>: true for ANY qontinui shim dir, not only ours.
+# A PATH inherited from another runner session (a supervisor started inside a
+# session, then a temp runner spawned from it) carries THAT session's shim dir
+# too; resolving its shim as the "real" tool made two shims exec each other for
+# ever, keeping the pid (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-
+# and-secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+# intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+# with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+# marker. Trailing separators are ignored, and the name splits on `/` and `\`
+# alike, so the MSYS and Windows spellings of one dir (our own included) read
+# the same. The name match is ASCII-case-insensitive like the Rust and .cmd
+# copies (a case-changed Windows `Path` entry under Git Bash), spelled as
+# bracket classes because `${x,,}` needs bash 4 and macOS ships 3.2.
+# Builtins only (no fork per PATH entry).
+# ---------------------------------------------------------------------------
+is_qontinui_shim_dir() {
+  local d="$1" name
+  while :; do
+    case "$d" in
+      */|*\\) d="${d%?}" ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$d" ] || return 1
+  name="${d##*/}"
+  name="${name##*\\}"
+  case "$name" in
+    [qQ][oO][nN][tT][iI][nN][uU][iI]-[iI][dD][eE][nN][tT][iI][tT][yY]-*) return 0 ;;
+    [qQ][oO][nN][tT][iI][nN][uU][iI]-[sS][hH][iI][mM]-*) return 0 ;;
+  esac
+  [ -e "$d/.qontinui-identity-build" ]
+}
+
+# ---------------------------------------------------------------------------
+# Scan PATH, skipping SHIM_DIR and every other qontinui shim dir, for the first candidate of one kind:
 # `scan_path real` wants a tool that is NOT npm's placeholder stub,
 # `scan_path placeholder` wants the stub itself (only for the give-up message).
 # ---------------------------------------------------------------------------
@@ -77,6 +120,7 @@ scan_path() {
     case "${dir%/}" in
       "${SHIM_DIR%/}") continue ;;
     esac
+    is_qontinui_shim_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         if is_npm_placeholder "$cand"; then
@@ -95,7 +139,7 @@ scan_path() {
 }
 
 # Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
-# and is not npm's placeholder stub.
+# (or any other qontinui shim dir) and is not npm's placeholder stub.
 resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
@@ -107,10 +151,14 @@ resolve_real() { scan_path real; }
 # which failed `not found` 73 ms after spawn and silently lost a runner-spawned
 # gate continuation (2026-10-01, merytshost). So a miss re-scans with short
 # sleeps for up to QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables)
-# before giving up. A HIT costs nothing extra — the wait is only ever paid by
-# an invocation that would otherwise have failed. One stderr line announces the
-# wait so a genuinely absent tool is not a silent 10 s stall.
+# before giving up. A SETTLED hit costs one `stat` and no wait (see the settle
+# check below) — the wait is only ever paid by an invocation that would
+# otherwise have failed, or launched a tool still being written. One stderr
+# line announces the wait so a genuinely absent tool is not a silent 10 s stall.
 # ---------------------------------------------------------------------------
+# The bound is counted in whole-second SECONDS, so it can end up to ~1 s
+# early, and a bound of 3 s or less may not see a fresh write settle (settled
+# needs `now - ctime >= 3`): such a launch goes out with the launch-anyway line.
 resolve_wait_secs() {
   local w="${QONTINUI_SHIM_RESOLVE_WAIT_SECS:-10}"
   case "$w" in ''|*[!0-9]*) w=10 ;; esac
@@ -119,35 +167,181 @@ resolve_wait_secs() {
   printf '%s' "$((10#$w))"
 }
 
-resolve_real_waiting() {
-  local found
-  if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
-  local wait_secs; wait_secs="$(resolve_wait_secs)"
-  [ "$wait_secs" -gt 0 ] || return 1
-  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
-    "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
-  local deadline=$((SECONDS + wait_secs))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    sleep 0.25 2>/dev/null || sleep 1
-    if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
-  done
+# ---------------------------------------------------------------------------
+# SETTLE check (plan 2026-11-10-shim-settle-wait-and-in-memory-launch-liveness,
+# Phase 3, D3). npm re-links `bin/claude` and THEN writes the 340 MB native
+# image behind it, so a resolved, executable, non-stub `claude` can still be
+# mid-write: a sampler saw one as small as 11.8 MB of 341.9 MB, in partial-ELF
+# windows of up to 1.7 s, settling at p95 3.1 s (coord finding 18ee5471). A candidate is SETTLED when its target's change time is
+# old enough -- the runner's intercept_core::settled predicate, carried here as
+# a copy the way is_npm_placeholder is. Both clocks are whole seconds here, so
+# settled means `now - ctime >= 3`, which guarantees more than 2 s.
+#
+# file_changed_at <path>: the TARGET's change time (`-L` follows a symlink,
+# so a long-standing bin/claude link to a freshly rewritten image reads the
+# image), in epoch seconds. GNU/MSYS `stat -c %Z`, else BSD/macOS
+# `stat -f %c`. Both run with 2>/dev/null: BSD stat rejects `-c` with a usage
+# error that would otherwise reach the pane on EVERY launch (TRANSPARENT), and
+# a missing `stat` stays silent too. Fails when neither prints an integer.
+file_changed_at() {
+  local t
+  t="$(stat -L -c %Z "$1" 2>/dev/null)" || t=''
+  case "$t" in ''|*[!0-9]*) t="$(stat -L -f %c "$1" 2>/dev/null)" || t='' ;; esac
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$t"
+}
+
+# now_epoch: the current time in epoch seconds. $EPOCHSECONDS is a builtin
+# from bash 5; a bash before 5 (e.g. 3.2) falls back to `date +%s`.
+now_epoch() {
+  local n="${EPOCHSECONDS:-}"
+  [ -n "$n" ] || n="$(date +%s 2>/dev/null)" || n=''
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
+# is_settled <path>: 0 settled, 1 changing, 2 unknown (no readable change time
+# or clock). The caller treats unknown as settled: waiting on it would delay
+# every launch by the full bound on such a box, and launching at once is the
+# behaviour that predates this check. Sets SETTLE_AGE to the age in whole
+# seconds (0 for a change time in the future, which reads as changing).
+SETTLE_AGE=0
+is_settled() {
+  local changed now
+  changed="$(file_changed_at "$1")" || return 2
+  now="$(now_epoch)" || return 2
+  SETTLE_AGE=$((10#$now - 10#$changed))
+  if [ "$SETTLE_AGE" -ge 3 ]; then return 0; fi
+  [ "$SETTLE_AGE" -ge 0 ] || SETTLE_AGE=0
   return 1
+}
+
+# One deadline over both waits: a MISS (absent, or only npm's stub) and a
+# candidate still CHANGING. Prints a settled (or unknown) candidate at once;
+# announces each kind of wait once on stderr; at the deadline prints the last
+# probe's still-changing candidate with a `launching it anyway` line (something
+# launchable DID resolve, so this is no resolve-failed -- FAIL-OPEN, and an
+# exec that then fails still reports exec-failed), or returns 1 so that
+# report_unresolved runs as before. A zero wait disables both: the first hit is
+# printed as found, with no stat. A candidate whose change time could not be
+# read AND that no longer exists is a MISS, not an unknown: npm's reify renames
+# bin/claude aside between the scan and the stat, which is the very window this
+# wait is for, and launching the vanished path would fail.
+resolve_real_waiting() {
+  local found='' last='' rc=0 said_missing=0 said_changing=0
+  local wait_secs; wait_secs="$(resolve_wait_secs)"
+  if [ "$wait_secs" -le 0 ]; then
+    if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
+    return 1
+  fi
+  local deadline=$((SECONDS + wait_secs))
+  while :; do
+    rc=0
+    if found="$(resolve_real)"; then
+      is_settled "$found" || rc=$?
+      if [ "$rc" -eq 2 ] && [ ! -e "$found" ]; then found=''; fi
+    else
+      found=''
+    fi
+    if [ -n "$found" ]; then
+      if [ "$rc" -ne 1 ]; then printf '%s' "$found"; return 0; fi
+      last="$found"
+      if [ "$said_changing" -eq 0 ]; then
+        said_changing=1
+        printf 'qontinui shim: %s changed %ss ago (an install may still be writing it); waiting up to %ss for it to settle\n' \
+          "$found" "$SETTLE_AGE" "$wait_secs" >&2
+      fi
+    else
+      last=''
+      if [ "$said_missing" -eq 0 ]; then
+        said_missing=1
+        printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
+          "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
+      fi
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep 0.25 2>/dev/null || sleep 1
+  done
+  if [ -n "$last" ]; then
+    printf 'qontinui shim: %s has not settled after %ss; launching it anyway\n' \
+      "$last" "$wait_secs" >&2
+    printf '%s' "$last"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Launch-failure beacon (plan 2026-11-10-migration-holds-for-missing-claude-cli,
+# Phase 2). When this shim gives up on the real tool (`resolve-failed`) or
+# cannot exec the one it resolved (`exec-failed`), it POSTs that to the runner
+# BEFORE its fall-through, so the pane's session row closes `launch-failed`
+# rather than reading as a session that died. `curl -fsS` waits for the reply,
+# so the runner holds the record before the exec that exits 127. Same fail-open
+# curl options as notify_shim_beacon below: no port, no curl or no runner means
+# no record, and the row keeps its old close reason (UNKNOWN, never a guess).
+# Defined up here because the guard passthrough reaches report_unresolved long
+# before notify_shim_beacon is defined.
+#
+# Only a TOP-LEVEL invocation posts. A nested `claude` (a subagent's, under an
+# INHERITED guard) must never mark its parent's pane, which may be running
+# fine. SHIM_NESTED is captured once, below, before anything here can run.
+# ---------------------------------------------------------------------------
+notify_launch_failure() {
+  [ "${SHIM_NESTED:-}" = "1" ] && return 0
+  local port="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
+  [ -z "$port" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local body
+  body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"tool\":\"$TOOL\",\"event\":\"$1\",\"detail\":\"$2\"}"
+  curl -fsS --connect-timeout 3 --max-time 10 \
+      -X POST "http://127.0.0.1:$port/control/shim-beacon" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null 2>&1 || true
+}
+
+# The flags every launch-failure event carries, both read by the runner's
+# `launch-failed` decider: whether this shim delivers the SessionStart hook
+# (`settings=`, the same flag notify_shim_beacon reports) and whether the argv
+# chose its own session (`user_session_id=`: `--resume` / `--session-id`).
+# `set -u` safe on purpose: the guard passthrough reaches report_unresolved
+# before SETTINGS_ARGS and user_chose_session are assigned, and a plain
+# expansion of either there would abort the shim before its fall-through exec.
+# `[*]`, never `[@]`: a quoted "${a[@]+set}" expands to ZERO words when the
+# array is unset or empty, which leaves `[ -n ]` -- one argument, always true.
+launch_failure_flags() {
+  local settings=false user_chose=false
+  [ -n "${SETTINGS_ARGS[*]+set}" ] && settings=true
+  [ "${user_chose_session:-0}" = "1" ] && user_chose=true
+  printf 'settings=%s user_session_id=%s' "$settings" "$user_chose"
 }
 
 # The last-resort fall-through is about to dispatch by NAME — say plainly what
 # was searched, so a `not found` that follows is diagnosable from the pane.
 # When what IS on PATH is npm's placeholder stub, say so: "not found" alone
-# would hide that the reinstall's postinstall never replaced it.
+# would hide that the reinstall's postinstall never replaced it. Then tell the
+# runner the launch failed (`resolve-failed`), before the fall-through runs.
 report_unresolved() {
-  local stub
+  local stub stub_found=false
   if stub="$(scan_path placeholder)"; then
+    stub_found=true
     printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding %s): %s\n' \
       "$TOOL" "$(resolve_wait_secs)" "$stub" "$SHIM_DIR" "$PATH" >&2
-    return 0
+  else
+    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
+      "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
   fi
-  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
-    "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
+  notify_launch_failure resolve-failed \
+    "waited=$(resolve_wait_secs) stub=$stub_found $(launch_failure_flags)"
 }
+
+# Is THIS invocation nested inside another `claude` (a subagent)? Read once,
+# here, from the INHERITED environment, because the live variable cannot answer
+# it later: exec_real below runs `QONTINUI_INSTALL_INTERCEPT_GUARD=1
+# exec_with_retry …`, and bash keeps a prefix assignment in force inside the
+# function it calls, so inside exec_with_retry the guard reads 1 even for a
+# top-level invocation. Both launch-failure call sites gate on this instead.
+SHIM_NESTED="${QONTINUI_INSTALL_INTERCEPT_GUARD:-}"
 
 REAL="$(resolve_real_waiting || true)"
 
@@ -161,7 +355,8 @@ REAL="$(resolve_real_waiting || true)"
 # fires. `execfail` makes a failed exec return instead of exiting; we retry for
 # at most QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables -> the old
 # exit-on-failure behaviour), then exit with exec's own status. A SUCCESSFUL
-# exec replaces this process, so a healthy launch pays nothing.
+# exec replaces this process, so a healthy launch pays nothing. Giving up is a
+# launch failure, reported once (`exec-failed`) after the last attempt.
 # ---------------------------------------------------------------------------
 exec_with_retry() {
   shopt -s execfail 2>/dev/null || true
@@ -179,12 +374,14 @@ exec_with_retry() {
     fi
     sleep 0.5 2>/dev/null || sleep 1
   done
+  notify_launch_failure exec-failed \
+    "status=$rc waited=$wait_secs $(launch_failure_flags)"
   exit "$rc"
 }
 
 # Run the real provider, replacing this process (we don't need an exit code
-# beyond what exec propagates). Strips our dir from PATH as a last resort when
-# the real tool couldn't be resolved.
+# beyond what exec propagates). Strips our dir, and every other qontinui shim
+# dir, from PATH as a last resort when the real tool couldn't be resolved.
 exec_real() {
   if [ -n "${REAL:-}" ]; then
     QONTINUI_INSTALL_INTERCEPT_GUARD=1 exec_with_retry exec "$REAL" "$@"
@@ -194,6 +391,7 @@ exec_real() {
   local IFS=':'
   for d in $PATH; do
     case "${d%/}" in "${SHIM_DIR%/}") continue ;; esac
+    is_qontinui_shim_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is
@@ -242,12 +440,29 @@ if [ "$TOOL" = "claude" ] && [ -n "${QONTINUI_MCP_CONFIG:-}" ] \
 fi
 
 # Does the user's argv already choose a session? Then don't double-pin.
+# The VALUE of a Claude Code option is not a session choice (`--name resume`,
+# `--model -c`), so it is skipped. A single-value option consumes its next
+# token even when that is `--`; a variadic one consumes up to the next token
+# that is an option, i.e. longer than `-` and starting with it (commander's
+# rules; a lone `-` is a value). The two lists below are the Rust
+# CLAUDE_VALUE_FLAGS / CLAUDE_VARIADIC_FLAGS in src/claude_env.rs, and a test
+# there pins them together: keep each list on ONE line, starting with --name|
+# and --add-dir| respectively.
 user_chose_session=0
+skip_values=0   # 1 = consume exactly one value; 2 = consume a variadic run
 for a in "$@"; do
+  if [ "$skip_values" = 1 ]; then skip_values=0; continue; fi
+  if [ "$skip_values" = 2 ]; then
+    case "$a" in -?*) skip_values=0 ;; *) continue ;; esac
+  fi
   case "$a" in
     --) break ;;
     --session-id|--session-id=*|--resume|--resume=*|-r|resume|--continue|-c)
       user_chose_session=1; break ;;
+    --name|-n|--model|--fallback-model|--permission-mode|--permission-prompt-tool|--append-system-prompt|--append-system-prompt-file|--system-prompt|--system-prompt-file|--output-format|--input-format|--settings|--setting-sources|--agent|--agents|--effort|--max-turns|--max-budget-usd|--json-schema|--plugin-dir|--autocompact|--debug-file|--environment|--permission-prompts|--plugin-url|--remote-control-session-name-prefix|--system-prompt-snapshot)
+      skip_values=1 ;;
+    --add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--mcp-config|--tools|--betas|--file)
+      skip_values=2 ;;
   esac
 done
 
