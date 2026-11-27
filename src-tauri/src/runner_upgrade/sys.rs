@@ -274,22 +274,38 @@ pub fn pid_runs_with(pid: u32, flag: &str, value: &str) -> bool {
     }
 }
 
-/// `true` when `/proc/<pid>/stat` names a zombie (`Z`) or a dying (`X`)
-/// process. The state is the first field after the LAST `)`, since `comm`
-/// may itself contain `)`. An unreadable or unparsable stat is `false`
-/// (not proven dead), as is every pid off Linux.
+/// `true` when EVERY task of `pid` is a zombie (`Z`) or dying (`X`). The
+/// leader's own `/proc/<pid>/stat` is not enough: a multithreaded process's
+/// leader reads `Z` while sibling threads are still exiting, and those still
+/// hold the shared fd table (its listeners) until the last one is gone. So
+/// each `/proc/<pid>/task/<tid>/stat` is read; the state is the first field
+/// after the LAST `)`, since `comm` may itself contain `)`. Any unreadable or
+/// unparsable task, an empty task list, and every pid off Linux is `false`
+/// (not proven dead).
 pub fn is_zombie(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                let rest = stat.get(stat.rfind(')')? + 1..)?;
-                rest.split_whitespace()
-                    .next()
-                    .map(|st| st == "Z" || st == "X")
-            })
-            .unwrap_or(false)
+        fn task_dead(stat: &str) -> Option<bool> {
+            let rest = stat.get(stat.rfind(')')? + 1..)?;
+            rest.split_whitespace()
+                .next()
+                .map(|st| st == "Z" || st == "X")
+        }
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return false;
+        };
+        let mut seen = 0usize;
+        for task in tasks {
+            let Ok(task) = task else { return false };
+            let dead = std::fs::read_to_string(task.path().join("stat"))
+                .ok()
+                .and_then(|stat| task_dead(&stat));
+            if dead != Some(true) {
+                return false;
+            }
+            seen += 1;
+        }
+        seen > 0
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -307,9 +323,10 @@ pub fn cmdline_has_pair(cmdline: &[u8], flag: &str, value: &str) -> bool {
 }
 
 /// Is `pid` a live process? `kill(pid, 0)`: success, or `EPERM` (alive, not
-/// ours). On Linux a zombie (`Z`, or `X` while it is torn down) is NOT alive:
-/// `kill(pid, 0)` succeeds on one until its parent reaps it, but it holds no
-/// socket and runs no code, so a process that has died waiting on a slow
+/// ours). On Linux a process every task of which is a zombie (`Z`, or `X`
+/// while it is torn down; see [`is_zombie`]) is NOT alive: `kill(pid, 0)`
+/// succeeds on one until its parent reaps it, but it holds no socket and runs
+/// no code, so a process that has died waiting on a slow
 /// (or absent) reaper is dead to every caller here. Off Unix: `false` is
 /// never claimed — the caller gets `true` so it waits rather than racing a
 /// live process.
