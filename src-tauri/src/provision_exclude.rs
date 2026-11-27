@@ -1,22 +1,27 @@
 //! Keep what the fleet provisioners WROTE out of `git status`.
 //!
-//! [`crate::fleet_commands`] and [`crate::fleet_skills`] write
-//! `.claude/commands/<name>.md` and `.claude/skills/<name>/…` into a spawned
-//! session's cwd. When that cwd is a git checkout, every path they create reads
+//! [`crate::fleet_commands`], [`crate::fleet_skills`] and the subagent
+//! definitions pass (`agent_runtime::provision_agent_definitions_layers`, over
+//! [`crate::fleet_agents`] and the checkout overlay) write
+//! `.claude/commands/<name>.md`, `.claude/skills/<name>/…` and
+//! `.claude/agents/<name>.md` into a spawned session's cwd. When that cwd is a
+//! git checkout, every path they create reads
 //! as untracked, so the checkout looks dirty: a "fast-forward only if the tree
 //! is clean" step skips it, and the runner's own pull executor parks it as
 //! `wip_on_default`. Measured 2026-11-14 on a primary `qontinui-studio`: 12
 //! untracked entries, all provisioned, and a scheduled fast-forward that had
 //! skipped for weeks.
 //!
-//! The fix is NOT a blanket `.claude/commands/` / `.claude/skills/` entry in
-//! `fleet::MANAGED_REPO_EXCLUDES`: in `qontinui-claude-config` (and any repo
-//! with repo-local skills) those directories are AUTHORED, and a blanket
-//! exclude would hide a human's new untracked skill from `git status`. Instead
-//! each provisioning pass appends exactly the paths it wrote to the repository's
-//! `info/exclude`:
+//! The fix is NOT a blanket `.claude/commands/` / `.claude/skills/` /
+//! `.claude/agents/` entry in `fleet::MANAGED_REPO_EXCLUDES`: in
+//! `qontinui-claude-config` (and any repo with repo-local skills or agents, such
+//! as qontinui-forge's `clone-implementer.md`) those directories are AUTHORED,
+//! and a blanket exclude would hide a human's new untracked skill or agent from
+//! `git status`. Instead each provisioning pass appends exactly the paths it
+//! wrote to the repository's `info/exclude`:
 //!
-//! - one anchored line per written command file (`/<prefix>.claude/commands/<name>.md`);
+//! - one anchored line per written command file (`/<prefix>.claude/commands/<name>.md`)
+//!   and per written subagent definition (`/<prefix>.claude/agents/<name>.md`);
 //! - one anchored line per written skill DIRECTORY (`/<prefix>.claude/skills/<name>/`),
 //!   unless git tracks anything under that directory — then each written,
 //!   untracked file of it is excluded individually instead, so a tracked skill
@@ -42,9 +47,20 @@
 //! on disk and untracked is KEPT even when this pass did not write it (another
 //! account's override-only command, a skill this pass refused, a failed write),
 //! so that file never reads dirty again and alternating passes do not
-//! flip-flop the file. Accepted cost: linked worktrees share one
+//! flip-flop the file — unless the pass DISOWNS that path: a file at a
+//! provisioned name that the pass held back as somebody else's (the agents
+//! pass's operator-authored, edited or symlinked keep). A line for a disowned
+//! path is pruned although the file is present and untracked, because the file
+//! is no longer the runner's and a person's edit must show in `git status`.
+//! Accepted cost: linked worktrees share one
 //! `info/exclude`, so a path absent in one worktree and present in another can
-//! lose its line until the next pass in the other worktree re-adds it. "The
+//! lose its line until the next pass in the other worktree re-adds it. The
+//! same sharing bounds the disowned guarantee: it holds per PASS, not across
+//! worktrees. A path one worktree disowns (a person's edit there) and a
+//! sibling worktree wrote as the runner's is ONE anchored line, so the
+//! sibling's next pass re-adds it and hides the edit again until the first
+//! worktree's next pass prunes it — the two alternate. One shared file cannot
+//! hold a per-worktree answer; a per-worktree exclude is a separate change. "The
 //! block" is every line from this module's marker up to the next comment line,
 //! so a person's own lines are never touched provided they sit outside it —
 //! before the marker, or under a comment header of their own. (An uncommented
@@ -71,12 +87,18 @@ use crate::provision_guard::TrackedPaths;
 /// Header line written once above the provisioned-path entries in a repo's
 /// `info/exclude`, so an operator can see who added them. Distinct from
 /// `fleet::MANAGED_EXCLUDE_MARKER`, which brackets the fixed machine-local roster.
+///
+/// One block serves every provisioner — commands, skills AND subagent
+/// definitions (`.claude/agents`) — although the text names only the first two.
+/// The text is NOT updated to match: a block is found by exact string match on
+/// this marker ([`block_lines`], [`update_exclude`]), so a renamed marker would
+/// strand every block already written on every box, its lines never pruned.
 pub(crate) const PROVISIONED_EXCLUDE_MARKER: &str =
     "# qontinui-runner: provisioned .claude commands/skills (auto-excluded, per path)";
 
 /// Compute the exclude entries for one provisioning pass, relative to the
-/// provisioned root (`.claude/commands` or `.claude/skills`). A trailing `/`
-/// marks a directory entry.
+/// provisioned root (`.claude/commands`, `.claude/skills` or `.claude/agents`).
+/// A trailing `/` marks a directory entry.
 ///
 /// `written` are the paths the pass wrote, relative to that root (as the
 /// provisioners compute them). A single-component path is a file entry; a
@@ -160,14 +182,17 @@ fn unescape(pattern: &str) -> String {
 /// escaped, anchored provisioned root, ending in `/`) that this pass did NOT
 /// produce and that is provably stale: the path it names, relative to `base`,
 /// is tracked (a tracked file, or a directory with anything tracked beneath
-/// it) or absent from disk — which is also every path held back as
-/// `RootVersioned`. Only ever asked about lines inside this module's own
-/// marker block (see [`update_exclude`]).
+/// it), absent from disk — which is also every path held back as
+/// `RootVersioned` — or one of `disowned`: a path, relative to `base`, that
+/// this pass held back as somebody else's file, so its line must not keep
+/// hiding it although the file is present and untracked. Only ever asked about
+/// lines inside this module's own marker block (see [`update_exclude`]).
 fn is_stale(
     line: &str,
     root_pattern: &str,
     current: &std::collections::HashSet<&str>,
     base: &Path,
+    disowned: &[PathBuf],
     tracked: &TrackedPaths,
 ) -> bool {
     let Some(rest) = line.strip_prefix(root_pattern) else {
@@ -193,7 +218,7 @@ fn is_stale(
         Some(dir) => (Path::new(dir), tracked.tracks_any_under(Path::new(dir))),
         None => (Path::new(rel.as_str()), tracked.contains(Path::new(&rel))),
     };
-    is_tracked || !base.join(rel_path).exists()
+    is_tracked || disowned.iter().any(|d| d == rel_path) || !base.join(rel_path).exists()
 }
 
 /// Where `base`'s repository keeps its `info/exclude`, and `base`'s path
@@ -415,15 +440,20 @@ fn update_exclude(
 /// Exclude what one provisioning pass wrote under `base` (the provisioned root,
 /// e.g. `<cwd>/.claude/skills`) from `git status` of the enclosing repository,
 /// and prune lines under that root that this pass did not produce and that
-/// name a now-tracked or absent path.
+/// name a now-tracked, absent or disowned path.
 ///
-/// `written` are paths relative to `base`; `tracked` is the probe the pass
-/// already ran over `base` BEFORE writing. Best-effort: never panics, never
-/// propagates — see the module doc.
+/// `written` are paths relative to `base`; `disowned` are paths relative to
+/// `base` the pass held back because a person owns the file there (it kept an
+/// operator-authored, edited or symlinked destination rather than overwrite
+/// it), so a line an earlier pass wrote for one is pruned; a provisioner that
+/// overwrites edits passes `&[]`. A path in both is treated as written.
+/// `tracked` is the probe the pass already ran over `base` BEFORE writing.
+/// Best-effort: never panics, never propagates — see the module doc.
 pub(crate) fn exclude_written_paths(
     provisioner: &str,
     base: &Path,
     written: &[PathBuf],
+    disowned: &[PathBuf],
     tracked: &TrackedPaths,
 ) {
     // Not answered: outside a work tree (nothing to exclude in), or an
@@ -452,7 +482,7 @@ pub(crate) fn exclude_written_paths(
     // ending in an escaped space would otherwise never match itself.
     let current: std::collections::HashSet<&str> = patterns.iter().map(|p| p.trim()).collect();
     match update_exclude(&exclude_path, &patterns, |line| {
-        is_stale(line, &root_pattern, &current, base, tracked)
+        is_stale(line, &root_pattern, &current, base, disowned, tracked)
     }) {
         Ok((0, 0)) => {}
         Ok((added, pruned)) => info!(
@@ -514,7 +544,7 @@ mod tests {
             write(&base.join(f), "x\n");
             written.push(PathBuf::from(f));
         }
-        exclude_written_paths("test", base, &written, &tracked);
+        exclude_written_paths("test", base, &written, &[], &tracked);
     }
 
     #[test]
@@ -711,6 +741,69 @@ mod tests {
             "a person's glob line is kept: {lines:?}"
         );
         assert_eq!(untracked(tmp.path()), "");
+    }
+
+    /// A DISOWNED path loses its line although the file is still present and
+    /// untracked: the pass kept a person's file at a provisioned name rather
+    /// than overwrite it, so the line an earlier pass wrote must stop hiding
+    /// it. Only under the pass's own root: the same name under another root
+    /// keeps its line. A present, untracked file this pass did not write and
+    /// did not disown keeps its line as before, and a path both written and
+    /// disowned keeps its line (written wins).
+    #[test]
+    fn a_disowned_path_loses_its_line_while_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let agents = tmp.path().join(".claude").join("agents");
+        let commands = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(&commands).unwrap();
+        provision(&agents, &["edited.md", "untouched.md", "rewritten.md"]);
+        provision(&commands, &["edited.md"]);
+        let first = exclude_lines(tmp.path());
+        for line in [
+            "/.claude/agents/edited.md",
+            "/.claude/agents/untouched.md",
+            "/.claude/agents/rewritten.md",
+            "/.claude/commands/edited.md",
+        ] {
+            assert!(first.contains(&line.to_string()), "{line}: {first:?}");
+        }
+
+        // A person edits edited.md; the next pass keeps and disowns it,
+        // rewrites rewritten.md, and leaves untouched.md alone.
+        std::fs::write(agents.join("edited.md"), "mine\n").unwrap();
+        let tracked = TrackedPaths::probe(&agents);
+        exclude_written_paths(
+            "test",
+            &agents,
+            &[PathBuf::from("rewritten.md")],
+            &[PathBuf::from("edited.md"), PathBuf::from("rewritten.md")],
+            &tracked,
+        );
+
+        let lines = exclude_lines(tmp.path());
+        assert!(
+            !lines.contains(&"/.claude/agents/edited.md".to_string()),
+            "a disowned path loses its line: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/agents/untouched.md".to_string()),
+            "an undisowned runner file still on disk keeps its line: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/agents/rewritten.md".to_string()),
+            "a path this pass wrote keeps its line even if also disowned: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/.claude/commands/edited.md".to_string()),
+            "disowning is confined to the pass's own root: {lines:?}"
+        );
+        assert_eq!(
+            untracked(tmp.path()),
+            "?? .claude/agents/edited.md\n",
+            "the person's edit is visible again"
+        );
     }
 
     #[test]
@@ -951,7 +1044,7 @@ mod tests {
         // b.md goes away, so the next pass prunes its line: a whole-file rewrite.
         std::fs::remove_file(commands.join("b.md")).unwrap();
         let tracked = TrackedPaths::probe(&commands);
-        exclude_written_paths("test", &commands, &[PathBuf::from("a.md")], &tracked);
+        exclude_written_paths("test", &commands, &[PathBuf::from("a.md")], &[], &tracked);
         let pruned = std::fs::read_to_string(&exclude).unwrap();
         assert!(!pruned.contains("/.claude/commands/b.md"), "{pruned:?}");
         assert!(pruned.contains("/.claude/commands/a.md"), "{pruned:?}");

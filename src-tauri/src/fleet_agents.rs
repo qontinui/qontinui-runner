@@ -75,7 +75,7 @@
 //! operator's absolute paths — see
 //! [`tests::bundled_agent_defs_have_no_operator_local_paths`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use include_dir::{include_dir, Dir};
 
@@ -121,9 +121,24 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// remove — `claude` cannot resolve the named subagent, the review never runs,
 /// and coord ages the PR out as `specialist_timeout` with no error at the point
 /// of cause — so "how many" was never the interesting half.
+///
+/// **Names, for the caller's `info/exclude` pass.** Every file name it writes
+/// is pushed onto `written`, and every name it holds back because a person
+/// owns the file there (an [`SkipReason::OperatorAuthored`] keep: a foreign,
+/// edited or uninspectable file, or a symlink) onto `disowned`, both as
+/// one-component paths relative to `dst_dir`. The caller excludes the first and
+/// un-excludes the second ([`crate::provision_exclude::exclude_written_paths`]).
+/// A name kept because the repository tracks it, or may (`GitTracked`,
+/// `ProbeUnknownInRepo`), or held back absent (`RootVersioned`), or whose write
+/// failed, is in neither: the exclude pass already reads tracked and absent
+/// paths itself, and a failed write changes nothing about who owns the file.
+/// On `Err` (the directory could not be created) nothing was written and
+/// neither list is touched.
 pub(crate) fn provision_fleet_agents_into(
     dst_dir: &Path,
     keep: &KeepDecisions,
+    written: &mut Vec<PathBuf>,
+    disowned: &mut Vec<PathBuf>,
 ) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(dst_dir)?;
     let mut out = ProvisionReport::new(
@@ -146,6 +161,14 @@ pub(crate) fn provision_fleet_agents_into(
                 dst_dir.join(name).display(),
                 reason.describe()
             );
+            // `OperatorAuthored` also covers an owner the pass could not
+            // establish (a history probe that did not answer, a destination
+            // it could not inspect). Disowning that too is deliberate: an
+            // unproven owner is never hidden from `git status`, at the cost of
+            // one dirty pass when a slow probe misses a runner-written copy.
+            if matches!(reason, SkipReason::OperatorAuthored(_)) {
+                disowned.push(PathBuf::from(name));
+            }
             out.skip(unit, reason.clone());
             continue;
         }
@@ -159,6 +182,7 @@ pub(crate) fn provision_fleet_agents_into(
                 dst.display(),
                 reason.describe()
             );
+            disowned.push(PathBuf::from(name));
             out.skip(unit, reason);
             continue;
         }
@@ -168,7 +192,10 @@ pub(crate) fn provision_fleet_agents_into(
         // hard link that appeared since the check above is REPLACED as a
         // directory entry, never written through.
         match write_atomically(&dst, file.contents(), None) {
-            Ok(()) => out.record_written(),
+            Ok(()) => {
+                out.record_written();
+                written.push(PathBuf::from(name));
+            }
             Err(e) => out.skip(unit, SkipReason::WriteFailed(e.to_string())),
         }
     }
@@ -769,13 +796,31 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let report =
-            provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("provision");
+        let (mut written, mut disowned) = (Vec::new(), Vec::new());
+        let report = provision_fleet_agents_into(
+            &dst,
+            &KeepDecisions::default(),
+            &mut written,
+            &mut disowned,
+        )
+        .expect("provision");
         assert_eq!(
             report.written,
             embedded_agent_count(),
             "should write every embedded definition"
         );
+        let mut named: Vec<String> = written
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        named.sort();
+        let mut embedded = embedded_agent_names();
+        embedded.sort();
+        assert_eq!(
+            named, embedded,
+            "every written definition is named, as a bare file name"
+        );
+        assert!(disowned.is_empty(), "nothing is disowned: {disowned:?}");
         assert_eq!(report.expected, embedded_agent_count());
         assert!(report.skipped.is_empty(), "nothing should be skipped here");
         assert!(
@@ -804,11 +849,23 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let first = provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("first");
+        let first = provision_fleet_agents_into(
+            &dst,
+            &KeepDecisions::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect("first");
         let victim = dst.join("code-reviewer.md");
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
-        let second = provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("second");
+        let second = provision_fleet_agents_into(
+            &dst,
+            &KeepDecisions::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect("second");
         assert_eq!(
             (first.written, first.skipped.len()),
             (second.written, second.skipped.len()),
@@ -928,9 +985,23 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         std::os::unix::fs::symlink(&target, dst.join("code-reviewer.md")).unwrap();
 
-        let report = provision_fleet_agents_into(&dst, &KeepDecisions::default()).unwrap();
+        let (mut written, mut disowned) = (Vec::new(), Vec::new());
+        let report = provision_fleet_agents_into(
+            &dst,
+            &KeepDecisions::default(),
+            &mut written,
+            &mut disowned,
+        )
+        .unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"OPERATOR SOURCE");
+        assert_eq!(
+            disowned,
+            vec![PathBuf::from("code-reviewer.md")],
+            "the symlink is disowned, so no exclude line may hide it"
+        );
+        assert!(!written.contains(&PathBuf::from("code-reviewer.md")));
+        assert_eq!(written.len(), embedded_agent_count() - 1);
         assert!(std::fs::symlink_metadata(dst.join("code-reviewer.md"))
             .unwrap()
             .file_type()

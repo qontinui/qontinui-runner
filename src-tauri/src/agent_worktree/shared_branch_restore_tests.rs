@@ -384,6 +384,8 @@ fn provision_like_a_session(dir: &Path) {
     let agents = crate::fleet_agents::provision_fleet_agents_into(
         &claude.join("agents"),
         &crate::provision_guard::KeepDecisions::default(),
+        &mut Vec::new(),
+        &mut Vec::new(),
     )
     .expect("agents");
     assert!(agents.written > 0, "the agent definitions were written");

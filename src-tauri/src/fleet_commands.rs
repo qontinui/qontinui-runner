@@ -668,6 +668,7 @@ pub(crate) fn provision_fleet_commands_into(
         "fleet_commands",
         commands_dir,
         &written,
+        &[],
         &tracked,
     );
     // Built after the loop rather than at construction so it can carry the

@@ -11819,7 +11819,17 @@ fn provision_agent_definitions_layers(
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
+    //
+    // Both layers name what they WROTE and what they DISOWNED (kept as a
+    // person's file), relative to `dst_dir`, for the exclude pass at the end.
+    let mut written: Vec<PathBuf> = Vec::new();
+    let mut disowned: Vec<PathBuf> = Vec::new();
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(
+        &dst_dir,
+        &keep,
+        &mut written,
+        &mut disowned,
+    ) {
         Ok(report) => report,
         Err(e) => {
             warn!(
@@ -11880,6 +11890,8 @@ fn provision_agent_definitions_layers(
             &candidates,
             floor,
             retired,
+            &mut written,
+            &mut disowned,
         ),
         // No root: no overlay to read. The row states why (the typed error) and
         // which copy the floor left serving.
@@ -11928,6 +11940,41 @@ fn provision_agent_definitions_layers(
         retired,
         &mut report,
     );
+    // A retired copy the pass KEPT because somebody edited it, or because it
+    // could not be read (so nothing shows it is the runner's), is disowned like
+    // a layer's operator-authored keep: a line an earlier pass wrote for it,
+    // before the definition was retired, must not keep hiding it. A shipped
+    // copy kept for any other reason (tracked, behind a symlink, a failed
+    // removal) is still the runner's own or the repository's.
+    disowned.extend(
+        report
+            .retained_retired
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.reason,
+                    capability_manifest::RetainedReason::LocallyModified(_)
+                        | capability_manifest::RetainedReason::ReadFailed(_)
+                )
+            })
+            .map(|r| PathBuf::from(&r.unit)),
+    );
+
+    // EXCLUDED LAST: what either layer wrote is kept out of the checkout's
+    // `git status`, one anchored line per definition (never a blanket
+    // `.claude/agents/` line: a repository may author agents of its own), and
+    // the block's stale lines are pruned. It runs after the retirement pass, so
+    // a definition removed above loses its line in this same pass (its path is
+    // now absent). `tracked` is the probe both layers' keep decisions were
+    // taken from, before either wrote. Best-effort, as for commands and skills:
+    // it never fails the spawn.
+    crate::provision_exclude::exclude_written_paths(
+        "fleet_agents",
+        &dst_dir,
+        &written,
+        &disowned,
+        &tracked,
+    );
     report
 }
 
@@ -11958,6 +12005,14 @@ struct FloorOutcome<'a> {
 /// `src_dir` again, so a definition that appeared there since has no decision;
 /// such a name gets the same [`crate::fleet_agents::foreign_destination_reason`]
 /// check here, before its copy, so no name reaches the write unchecked.
+///
+/// Every file name it copies is pushed onto `written`, and every name it keeps
+/// because a person owns the file there (an `OperatorAuthored` keep: foreign,
+/// edited or uninspectable, or a symlink) onto `disowned`, as one-component
+/// paths relative to `dst_dir`, exactly as
+/// [`crate::fleet_agents::provision_fleet_agents_into`] does. A retired name, a
+/// tracked or root-versioned keep, a destination served in place and a failed
+/// copy are in neither. An early return or `Err` leaves what was pushed so far.
 fn overlay_checkout_agent_definitions(
     src_dir: &Path,
     dst_dir: &Path,
@@ -11965,6 +12020,8 @@ fn overlay_checkout_agent_definitions(
     decided: &[String],
     floor: FloorOutcome<'_>,
     retired: &[&str],
+    written: &mut Vec<PathBuf>,
+    disowned: &mut Vec<PathBuf>,
 ) -> anyhow::Result<ProvisionReport> {
     let embedded = floor.written;
     let retired_names = crate::fleet_agents::retired_agent_names(retired);
@@ -12072,6 +12129,9 @@ fn overlay_checkout_agent_definitions(
                 dst.display(),
                 reason.describe()
             );
+            if matches!(reason, capability_manifest::SkipReason::OperatorAuthored(_)) {
+                disowned.push(PathBuf::from(name));
+            }
             report.skip(unit, reason.clone());
             continue;
         }
@@ -12086,6 +12146,7 @@ fn overlay_checkout_agent_definitions(
                     dst.display(),
                     reason.describe()
                 );
+                disowned.push(PathBuf::from(name));
                 report.skip(unit, reason);
                 continue;
             }
@@ -12100,6 +12161,7 @@ fn overlay_checkout_agent_definitions(
                 dst.display(),
                 reason.describe()
             );
+            disowned.push(PathBuf::from(name));
             report.skip(unit, reason);
             continue;
         }
@@ -12136,6 +12198,7 @@ fn overlay_checkout_agent_definitions(
             continue;
         }
         report.record_written();
+        written.push(PathBuf::from(name));
         copied += 1;
     }
     info!(
@@ -17081,6 +17144,7 @@ mod tests {
             write_failure: None,
         };
 
+        let (mut written, mut disowned) = (Vec::new(), Vec::new());
         let report = overlay_checkout_agent_definitions(
             &src,
             &dst,
@@ -17088,6 +17152,8 @@ mod tests {
             &[],
             floor,
             &[],
+            &mut written,
+            &mut disowned,
         )
         .unwrap();
 
@@ -17096,6 +17162,12 @@ mod tests {
             b"# the operator's own\n"
         );
         assert_eq!(std::fs::read(dst.join("fresh.md")).unwrap(), b"# fresh\n");
+        assert_eq!(written, vec![PathBuf::from("fresh.md")]);
+        assert_eq!(
+            disowned,
+            vec![PathBuf::from("late.md")],
+            "the operator's late.md is disowned, so no exclude line may hide it"
+        );
         assert!(
             report.skipped.iter().any(|u| u.unit == "late.md"
                 && matches!(
@@ -17126,6 +17198,7 @@ mod tests {
             write_failure: None,
         };
 
+        let (mut written, mut disowned) = (Vec::new(), Vec::new());
         let report = overlay_checkout_agent_definitions(
             &src,
             &dst,
@@ -17133,8 +17206,14 @@ mod tests {
             &["linked.md".to_string()],
             floor,
             &[],
+            &mut written,
+            &mut disowned,
         )
         .unwrap();
+        assert!(
+            written.is_empty() && disowned.is_empty(),
+            "served in place is neither written nor disowned: {written:?} {disowned:?}"
+        );
 
         assert_eq!(std::fs::read(src.join("linked.md")).unwrap(), b"# linked\n");
         assert!(
@@ -25081,6 +25160,12 @@ mod gateway_spawn_refusal_tests {
 /// continuation's gateway refusal, driven end to end through the remover.
 #[cfg(test)]
 mod headless_refusal_tests;
+
+/// Plan `2026-11-26-runner-provisioned-subagent-definitions-dirty-every-tree-they-are-written-into`
+/// Phase 1: the subagent-definitions pass excludes what it writes from
+/// `git status`, in a file of its own so an arming proof can isolate it.
+#[cfg(test)]
+mod agent_defs_exclude_tests;
 
 /// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
 /// Phase 3: what the gate-continuation and coord-launch doors hand the remover.
