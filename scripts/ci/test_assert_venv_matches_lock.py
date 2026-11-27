@@ -52,3 +52,23 @@ def test_marker_excluded_package_is_not_required():
 
 def test_optional_group_is_not_required():
     assert "torch-extra" not in " ".join(run(OK))
+
+
+def _write_lock(tmp_path):
+    lock = tmp_path / "poetry.lock"
+    lock.write_text(
+        '[[package]]\nname = "pillow"\nversion = "13.0.0"\ngroups = ["main"]\n'
+    )
+    return lock
+
+
+def test_main_exits_1_on_drift_and_0_on_conformance(tmp_path, monkeypatch):
+    lock = _write_lock(tmp_path)
+    monkeypatch.setattr(avml, "installed_distributions", lambda: {"pillow": "12.3.0"})
+    assert avml.main([str(lock)]) == 1
+    monkeypatch.setattr(avml, "installed_distributions", lambda: {"pillow": "13.0.0"})
+    assert avml.main([str(lock)]) == 0
+
+
+def test_main_exits_2_on_unreadable_lock(tmp_path):
+    assert avml.main([str(tmp_path / "missing.lock")]) == 2
