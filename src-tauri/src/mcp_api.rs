@@ -6520,13 +6520,16 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 3: the topic read/list and the three agent-writable topic writes
     // (upsert, member attach/confirm/reject/remove, merge). coord serves them
     // from a concurrent qontinui-coord PR; until it lands a call gets coord's
-    // unknown-tool refusal. `coord_topic_vectors_submit` (Phase 4) is HELD and
-    // deliberately absent.
+    // unknown-tool refusal. Phase 4 adds the `semantic` family's vector pair:
+    // the steward reads pending subproject documents and submits their
+    // vectors (coord serves both from qontinui-coord's Phase 4 PR).
     "coord_topic_get",
     "coord_topic_list",
     "coord_topic_member",
     "coord_topic_merge",
     "coord_topic_upsert",
+    "coord_topic_vectors_pending",
+    "coord_topic_vectors_submit",
     "coord_twin_catalog",
     "coord_typecheck_file",
     // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
@@ -18121,9 +18124,8 @@ mod coord_mcp_body_gate_tests {
 
     /// The topic tools (plan
     /// `2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator`
-    /// Phase 3) must forward, and the held Phase 4 vectors submit must not.
-    /// The source-text parser the drift verdict runs must read each back
-    /// exactly once.
+    /// Phases 3 and 4) must forward. The source-text parser the drift verdict
+    /// runs must read each back exactly once.
     #[test]
     fn topic_tools_are_allowed_and_parse_from_source() {
         let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
@@ -18134,6 +18136,8 @@ mod coord_mcp_body_gate_tests {
             "coord_topic_member",
             "coord_topic_merge",
             "coord_topic_upsert",
+            "coord_topic_vectors_pending",
+            "coord_topic_vectors_submit",
         ] {
             assert!(
                 COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
@@ -18156,10 +18160,6 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
-        assert!(
-            !coord_mcp_tool_is_allowed("coord_topic_vectors_submit"),
-            "the Phase 4 vectors submit is held and must not forward yet"
-        );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
