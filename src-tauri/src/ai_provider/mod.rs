@@ -37,8 +37,8 @@ pub(crate) mod pi_cli;
 pub(crate) mod process;
 pub mod retry;
 pub(crate) mod routing;
-pub mod usage_probe;
 mod types;
+pub mod usage_probe;
 
 // Re-export public API
 pub use account_usage::{
