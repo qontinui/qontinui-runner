@@ -104,18 +104,31 @@ pub(crate) struct SliceObs {
     /// Each tracked direct child's `oom_kill` baseline, by name.
     #[serde(default)]
     pub(crate) children: BTreeMap<String, u64>,
-    /// The journal entries and kernel records (`<unit>@<realtime µs>`) that
-    /// named a kill this baseline counted although they were stamped at or
-    /// after its read ([`JOURNAL_LOOKAHEAD_SECS`]): the next window starts at the
-    /// read, so they would otherwise name a second kill.
+    /// The units Layer C or a kernel record named on the tick that took this
+    /// baseline, with the time of the entry that named each (µs). A kill is
+    /// seen by BOTH sources — the kernel's line, then systemd's a moment
+    /// later — and the next window starts at this read, so without this the
+    /// other source's line for the same kill could name a second one.
     #[serde(default)]
-    pub(crate) named_ahead: BTreeSet<String>,
+    pub(crate) named: BTreeMap<String, u64>,
+    /// What the vmstat clamp kept back in this baseline (`oom_kill` below
+    /// the read). Carried ONE tick only: still uncovered by vmstat the next
+    /// tick, it is dropped rather than carried again (an excess no vmstat
+    /// lag explains, such as a watched unit with no known cgroup, would
+    /// otherwise stay forever and be counted against a later kill).
+    #[serde(default)]
+    pub(crate) carried: u64,
 }
 
 /// How far past the counter read a journal entry or kernel record may be
 /// stamped and still name a kill that read counted: systemd logs a kill a
-/// moment after the kernel counts it.
+/// moment after the kernel counts it. The reporter WAITS until then before
+/// it forks (`collect_from`), so the window's end is real.
 pub(crate) const JOURNAL_LOOKAHEAD_SECS: i64 = 3;
+
+/// Two lines naming one unit this close together are the same kill, seen by
+/// the kernel and by systemd.
+const SAME_KILL_SECS: u64 = 5;
 
 /// The upper bound of a tick's journal window: its counter read plus
 /// [`JOURNAL_LOOKAHEAD_SECS`]. PURE.
@@ -123,9 +136,12 @@ fn window_end(read_at: DateTime<Utc>) -> DateTime<Utc> {
     read_at + chrono::Duration::seconds(JOURNAL_LOOKAHEAD_SECS)
 }
 
-/// The `named_ahead` key of one entry. PURE.
-fn named_key(unit: &str, realtime_usec: u64) -> String {
-    format!("{unit}@{realtime_usec}")
+/// Whether last tick already named `unit` for the kill a line at `at` (µs)
+/// reports, from either source. PURE.
+fn named_before(plan: &SlicePlan<'_>, unit: &str, at: u64) -> bool {
+    plan.named_before
+        .and_then(|n| n.get(unit))
+        .is_some_and(|was| was.abs_diff(at) <= SAME_KILL_SECS * 1_000_000)
 }
 
 /// Whether this tick read the watched slices — the `slices` detail field.
@@ -364,6 +380,9 @@ pub(crate) struct Sources {
     pub(crate) journalctl: Journalctl,
     /// One deadline for every journal read of the tick, together.
     pub(crate) deadline: Duration,
+    /// How long after the counter read to wait before forking, so the
+    /// window's end ([`JOURNAL_LOOKAHEAD_SECS`]) has happened.
+    pub(crate) lookahead: Duration,
 }
 
 impl Sources {
@@ -378,6 +397,7 @@ impl Sources {
             euid: Some(euid),
             journalctl: Journalctl::live(),
             deadline: journal_oom::READ_TIMEOUT,
+            lookahead: Duration::from_secs(JOURNAL_LOOKAHEAD_SECS.unsigned_abs()),
         }
     }
 }
@@ -399,8 +419,11 @@ pub(crate) async fn collect(prev: Option<&ComputerObs>, input: &ObsInput<'_>) ->
 }
 
 /// [`collect`] against explicit [`Sources`]: the slice read in one tracked
-/// blocking body, then — only when [`journal_window`] asks — the journal
-/// reads, concurrently, under the sources' one deadline.
+/// blocking body, then — only when [`journal_window`] asks, i.e. on a tick
+/// with a slice kill to place — a wait until the read plus the lookahead (an
+/// async sleep: it holds no thread and delays only this tick's report, by at
+/// most [`JOURNAL_LOOKAHEAD_SECS`]), then the journal reads, concurrently,
+/// under the sources' one deadline.
 pub(crate) async fn collect_from(
     prev: Option<&ComputerObs>,
     input: &ObsInput<'_>,
@@ -433,6 +456,11 @@ pub(crate) async fn collect_from(
             });
     let (journal, kernel) = match journal_window(prev, input, &slices) {
         Some(w) => {
+            let wait = (slices.read_at - Utc::now())
+                .to_std()
+                .unwrap_or_default()
+                .saturating_add(src.lookahead);
+            tokio::time::sleep(wait).await;
             journal_oom::read_all(
                 &src.journalctl,
                 w.since,
@@ -493,7 +521,9 @@ struct SlicePlan<'a> {
     /// `None` after a reboot (no proof within this boot) or a rebaseline.
     listing: Option<&'a BTreeMap<String, u64>>,
     /// What last tick's entries stamped past its read already named.
-    named_before: Option<&'a BTreeSet<String>>,
+    named_before: Option<&'a BTreeMap<String, u64>>,
+    /// What the vmstat clamp kept back in the previous baseline.
+    carried_before: u64,
     /// The next tick's baseline.
     next: SliceObs,
 }
@@ -560,7 +590,8 @@ fn plan_slice<'a>(
         oom_kill: s.oom_kill,
         observed_at: read_at,
         children: next_children,
-        named_ahead: BTreeSet::new(),
+        named: BTreeMap::new(),
+        carried: 0,
     };
     let Some((base, children_base)) = consume else {
         return SlicePlan {
@@ -572,6 +603,7 @@ fn plan_slice<'a>(
             since: None,
             listing: None,
             named_before: None,
+            carried_before: 0,
             next,
         };
     };
@@ -629,7 +661,8 @@ fn plan_slice<'a>(
         clamped,
         since: prev.map(|p| p.observed_at),
         listing: children_base,
-        named_before: prev.map(|p| &p.named_ahead),
+        named_before: prev.map(|p| &p.named),
+        carried_before: prev.map_or(0, |p| p.carried),
         next,
     }
 }
@@ -753,9 +786,7 @@ fn place_kernel(
             (!watched.contains(&unit)
                 && !plan.children.iter().any(|c| c.child == unit)
                 && !journal.iter().any(|e| e.unit == unit)
-                && !plan
-                    .named_before
-                    .is_some_and(|n| n.contains(&named_key(unit, r.realtime_usec))))
+                && !named_before(plan, unit, r.realtime_usec))
             .then(|| (unit.to_string(), (*r).clone()))
         })
         .take(usize::try_from(need).unwrap_or(usize::MAX))
@@ -822,9 +853,7 @@ fn accept_journal(
                         && c.oom_kill.is_some()
                         && c.oom_kill == listing.get(&e.unit).copied()
                 })
-                && !plan
-                    .named_before
-                    .is_some_and(|n| n.contains(&named_key(&e.unit, e.realtime_usec)))
+                && !named_before(plan, &e.unit, e.realtime_usec)
         })
         .take(usize::try_from(need).unwrap_or(usize::MAX))
         .cloned()
@@ -934,7 +963,7 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
     let tick_clamped = clamp_to_budget(&mut drafts, budget);
     let events = emit_slice_events(a, status, &plans, &drafts, tick_clamped);
     let attributed = drafts.iter().map(Draft::total).sum();
-    carry_into_next(&mut plans, &drafts, read.read_at);
+    carry_into_next(&mut plans, &drafts);
     // A slice not read this tick (gone, or its counter unreadable) loses its
     // baseline: its kills meanwhile were the residual's, and it rebaselines
     // when it is back.
@@ -1048,25 +1077,27 @@ fn clamp_to_budget(drafts: &mut [Draft<'_>], budget: u64) -> bool {
     true
 }
 
-/// Carry what the clamp cut, and what was named past the read, into the
-/// next baselines. PURE.
-fn carry_into_next(plans: &mut [SlicePlan<'_>], drafts: &[Draft<'_>], read_at: DateTime<Utc>) {
-    let read_us = micros(read_at);
+/// Carry into the next baselines what the clamp cut — for one tick only:
+/// a baseline that already carried a cut takes none again, so an excess
+/// vmstat never covers is dropped instead of carried forever — and the units
+/// C and the kernel records named this tick. PURE.
+fn carry_into_next(plans: &mut [SlicePlan<'_>], drafts: &[Draft<'_>]) {
     for (p, d) in plans.iter_mut().zip(drafts) {
-        p.next.oom_kill = p.next.oom_kill.saturating_sub(d.cut_slice);
-        for (child, cut) in &d.cut_children {
-            if let Some(v) = p.next.children.get_mut(child) {
-                *v = v.saturating_sub(*cut);
+        if p.carried_before == 0 && d.cut_slice > 0 {
+            p.next.oom_kill = p.next.oom_kill.saturating_sub(d.cut_slice);
+            p.next.carried = d.cut_slice;
+            for (child, cut) in &d.cut_children {
+                if let Some(v) = p.next.children.get_mut(child) {
+                    *v = v.saturating_sub(*cut);
+                }
             }
         }
-        let ahead = d
+        let named = d
             .journal
             .iter()
-            .map(|e| (e.unit.as_str(), e.realtime_usec))
-            .chain(d.kernel.iter().map(|(u, r)| (u.as_str(), r.realtime_usec)))
-            .filter(|(_, at)| *at >= read_us)
-            .map(|(u, at)| named_key(u, at));
-        p.next.named_ahead.extend(ahead);
+            .map(|e| (e.unit.clone(), e.realtime_usec))
+            .chain(d.kernel.iter().map(|(u, r)| (u.clone(), r.realtime_usec)));
+        p.next.named.extend(named);
     }
 }
 
@@ -1174,11 +1205,14 @@ fn emit_slice_events(
             events.push(ComputerEvent {
                 client_event_id: event_id(
                     "oom_kill",
+                    // The counter RANGE, as a B child's: a remainder carried
+                    // to the next tick at an unchanged counter is a distinct
+                    // event there, not a duplicate coord drops.
                     &[
                         a.boot,
                         &s.cgroup,
                         "slice_memory_events",
-                        &s.oom_kill.to_string(),
+                        &format!("{}..{}", p.base.unwrap_or(0), s.oom_kill),
                     ],
                 ),
                 kind: "oom_kill".into(),
@@ -1204,9 +1238,11 @@ struct Draft<'k> {
     remainder: u64,
     clamped: bool,
     /// What the vmstat clamp cut from this slice's kills, kept back in its
-    /// next baseline so they are counted (and placed) when vmstat catches up.
+    /// next baseline (for one tick) so they are counted when vmstat catches
+    /// up. Only a B cut keeps its placement (its child's baseline is kept
+    /// back too); the others come back as an unplaced slice remainder.
     cut_slice: u64,
-    /// The same, per B child.
+    /// The B part of it, per child.
     cut_children: Vec<(String, u64)>,
 }
 
@@ -1536,7 +1572,7 @@ ControlGroup=
             o[0].client_event_id,
             event_id(
                 "oom_kill",
-                &[BOOT, "/ci.slice/ci-runners.slice", "slice_memory_events", "5"]
+                &[BOOT, "/ci.slice/ci-runners.slice", "slice_memory_events", "3..5"]
             )
         );
         assert_eq!(o[1].detail["victim_unit"], "agent-build-a.scope");
@@ -1658,7 +1694,7 @@ ControlGroup=
                     new_boot,
                     "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice",
                     "slice_memory_events",
-                    "2"
+                    "0..2"
                 ]
             )
         );
@@ -2820,8 +2856,12 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
                 leading: vec![fake.path().join("journalctl.sh").to_string_lossy().into_owned()],
             },
             deadline: Duration::from_secs(5),
+            lookahead: Duration::from_millis(1200),
         };
+        // No previous state: no window, so no wait.
+        let started = std::time::Instant::now();
         let r0 = collect_from(None, &input(&[], Some(34078), None), &src).await;
+        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
         assert_eq!(r0.journal, None, "no previous state, no window");
         let (_, o0) = derive(None, &input(&[], Some(34078), r0.slices.as_ref()), t("2026-11-27T00:14:40Z"));
 
@@ -2843,7 +2883,11 @@ esac
         std::fs::write(fake.path().join("journalctl.sh"), script).unwrap();
 
         let base = input(&[], Some(34079), None);
+        // Round-3 A4: a tick with a kill to place waits out the lookahead
+        // after its counter read before it forks.
+        let started = std::time::Instant::now();
         let r1 = collect_from(Some(&o0), &base, &src).await;
+        assert!(started.elapsed() >= Duration::from_millis(1200), "{:?}", started.elapsed());
         assert!(matches!(r1.journal, Some(JournalRead::Read(ref e)) if e.len() == 1), "{r1:?}");
         assert_eq!(r1.kernel, Some(KernelRead::Unreadable));
         let inp = ObsInput {
@@ -2955,7 +2999,7 @@ esac
         );
         assert_eq!(ev1.len(), 1, "{ev1:?}");
         assert_eq!(ev1[0].detail["victim_unit"], SCOPE);
-        assert!(o1.slices["agent-builds.slice"].named_ahead.contains(&format!("{SCOPE}@1795738510500000")));
+        assert_eq!(o1.slices["agent-builds.slice"].named.get(SCOPE), Some(&1795738510500000));
         // Next tick: another kill, and the same entry is still in its window
         // (it starts at the previous read). It must not name this one.
         let o1 = ComputerObs {
@@ -2978,6 +3022,7 @@ esac
         );
         assert_eq!(ev2.len(), 1, "{ev2:?}");
         assert_eq!(ev2[0].detail["attribution"], "slice_memory_events");
+        assert_ne!(ev1[0].client_event_id, ev2[0].client_event_id);
     }
 
     /// Round-2 A7: `journal_window` subtracts the watched units' kills (its
@@ -2996,5 +3041,116 @@ esac
         // unexplained, and both reads are asked for.
         let w = journal_window(Some(&o0), &input(&units, Some(12), Some(&r1)), &r1).unwrap();
         assert!(w.user && w.kernel, "{w:?}");
+    }
+
+    // ---- round-3 review fixes -------------------------------------------
+
+    /// Round-3 A1: a slice remainder the vmstat clamp carried is re-emitted
+    /// next tick at an UNCHANGED counter; its id is keyed on the counter range,
+    /// so it is not deduped away while already counted as attributed.
+    #[test]
+    fn a_carried_remainder_is_a_distinct_event_next_tick() {
+        let o0 = baseline(&[]);
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 291, &[])]);
+        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34080), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let (ev2, _) = derive(Some(&o1), &input(&[], Some(34081), Some(&r1)), t("2026-11-27T00:15:40Z"));
+        let rem = |ev: &[ComputerEvent]| {
+            ev.iter()
+                .find(|e| e.detail["attribution"] == "slice_memory_events")
+                .map(|e| e.client_event_id.clone())
+                .unwrap()
+        };
+        assert_ne!(rem(&ev1), rem(&ev2));
+        assert_eq!(
+            rem(&ev2),
+            event_id(
+                "oom_kill",
+                &[
+                    BOOT,
+                    "/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice",
+                    "slice_memory_events",
+                    "290..291"
+                ]
+            )
+        );
+    }
+
+    /// Round-3 A2: a clamp cut is carried ONE tick. A watched unit with no
+    /// known cgroup inside a slice is counted by U but never subtracted from
+    /// the slice, so vmstat never covers that excess; carried forever it
+    /// would be counted against a later kill elsewhere.
+    #[test]
+    fn a_clamp_cut_vmstat_never_covers_is_dropped_after_one_tick() {
+        let no_cg = RUNNER_SERVICE.replace(
+            "ControlGroup=/user.slice/user-1000.slice/user@1000.service/qontinui.slice/qontinui-runner.slice/qontinui-runner.service",
+            "ControlGroup=",
+        );
+        let before = watched(&no_cg, Some(0));
+        let after = watched(&no_cg, Some(1));
+        let r0 = read("2026-11-27T00:14:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])]);
+        let (_, o0) = derive(None, &input(&before, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
+        let (_, o1) = derive(Some(&o0), &input(&after, Some(11), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        assert_eq!(o1.slices["qontinui-runner.slice"].oom_kill, 4, "carried once");
+        assert_eq!(o1.slices["qontinui-runner.slice"].carried, 1);
+        let (_, o2) = derive(Some(&o1), &input(&after, Some(11), Some(&r1)), t("2026-11-27T00:15:40Z"));
+        assert_eq!(o2.slices["qontinui-runner.slice"].oom_kill, 5, "not carried again");
+        assert_eq!(o2.slices["qontinui-runner.slice"].carried, 0);
+        // A later tick: one kill in the slice, one elsewhere.
+        let r3 = read("2026-11-27T00:16:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])]);
+        let (ev, _) = derive(Some(&o2), &input(&after, Some(13), Some(&r3)), t("2026-11-27T00:16:10Z"));
+        let got: Vec<(String, u64)> = ooms(&ev)
+            .iter()
+            .map(|e| (e.detail["attribution"].as_str().unwrap().to_string(), e.detail["count"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("slice_memory_events".to_string(), 1), ("vmstat_delta".to_string(), 1)],
+            "{ev:?}"
+        );
+    }
+
+    /// Round-3 A5: a kill a kernel record named is not named again next tick
+    /// by systemd's later line for the same unit, as if it were another kill.
+    #[test]
+    fn a_unit_named_by_one_source_is_not_renamed_by_the_other() {
+        let o0 = baseline(&[(SCOPE, Some(0))]);
+        // The scope is still listed at the read, but its counter could not
+        // be read (it was going away): B cannot name it; the kernel can.
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[(SCOPE, None)])]);
+        let k = KernelRead::Read(vec![krec(
+            &format!("{AGENT}/{SCOPE}"),
+            "rustc",
+            1795738509500000, // 00:15:09.5Z
+            "27cd98773ff347f083889880a31d5902",
+        )]);
+        let (ev1, o1) = derive(Some(&o0), &with_kernel(input(&[], Some(34079), Some(&r1)), &k), t("2026-11-27T00:15:10Z"));
+        assert_eq!(ev1.len(), 1, "{ev1:?}");
+        assert_eq!(ev1[0].detail["attribution"], "kernel_oom_record");
+        assert_eq!(o1.slices["agent-builds.slice"].named.get(SCOPE), Some(&1795738509500000));
+        // Next tick another, unplaced kill; systemd's line for the FIRST kill
+        // lands in this window (00:15:13.5Z, past the last lookahead).
+        let r2 = read("2026-11-27T00:15:40Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let j = journal(&[jline(SCOPE, 1795738513500000, BOOT)]);
+        let (ev2, _) = derive(Some(&o1), &with_journal(input(&[], Some(34080), Some(&r2)), &j), t("2026-11-27T00:15:40Z"));
+        assert_eq!(ev2.len(), 1, "{ev2:?}");
+        assert_eq!(ev2[0].detail["attribution"], "slice_memory_events");
+        assert_eq!(ev2[0].detail["victim_unit"], serde_json::Value::Null);
+    }
+
+    /// Round-3 A6: a slice baseline saved before `named` and `carried`
+    /// existed loads with neither.
+    #[test]
+    fn an_old_slice_baseline_loads_without_the_new_fields() {
+        let old: SliceObs = serde_json::from_str(
+            r#"{"cgroup":"/user.slice/user-1000.slice/user@1000.service/agent.slice/agent-builds.slice","oom_kill":289,"observed_at":"2026-11-27T00:14:40Z","children":{"agent-build-a.scope":0},"named_ahead":["x@1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.oom_kill, 289);
+        assert!(old.named.is_empty());
+        assert_eq!(old.carried, 0);
+        let bare: SliceObs =
+            serde_json::from_str(r#"{"cgroup":"/a.slice","oom_kill":1,"observed_at":"2026-11-27T00:14:40Z"}"#).unwrap();
+        assert!(bare.children.is_empty() && bare.named.is_empty());
     }
 }

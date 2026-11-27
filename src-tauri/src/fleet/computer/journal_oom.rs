@@ -234,39 +234,52 @@ pub(crate) fn user_read_from(probe: Option<&str>, window: Option<&str>) -> Journ
 
 /// Fork `bin args`, bounded by `timeout`: its stdout when it exited 0,
 /// `None` when it is missing, exited non-zero or timed out. Forked as
-/// `access.rs` forks `tailscale` — no window, killed on drop, stdin and
-/// stderr closed.
+/// `access.rs` forks `tailscale` — no window, killed on drop, stdin closed.
 pub(crate) async fn run_journalctl(
     bin: &str,
     args: &[String],
     timeout: Duration,
 ) -> Option<String> {
     match run_journalctl_status(bin, args, timeout).await {
-        Some((Some(0), stdout)) => Some(stdout),
+        Some(Ran {
+            code: Some(0),
+            stdout,
+            ..
+        }) => Some(stdout),
         _ => None,
     }
 }
 
-/// Fork `bin args` as [`run_journalctl`] does, but keep the exit code:
-/// `(code, stdout)`, or `None` when it could not run or timed out. The code
-/// is what tells `journalctl --grep`'s "no match" (1, nothing printed) from
-/// a read.
+/// One finished fork: its exit code, its stdout, and whether it printed
+/// anything on stderr. The stderr TEXT is dropped on the spot — only its
+/// emptiness is kept, which is what tells `--grep`'s silent "no match" from a
+/// failure that explains itself.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Ran {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr_empty: bool,
+}
+
+/// Fork `bin args` as [`run_journalctl`] does, but keep the exit code and
+/// whether stderr was empty, or `None` when it could not run or timed out.
 pub(crate) async fn run_journalctl_status(
     bin: &str,
     args: &[String],
     timeout: Duration,
-) -> Option<(Option<i32>, String)> {
+) -> Option<Ran> {
     let mut cmd = crate::process_helpers::tokio_no_window(bin);
     cmd.args(args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) => Some((
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )),
+        Ok(Ok(out)) => Some(Ran {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr_empty: out.stderr.iter().all(u8::is_ascii_whitespace),
+        }),
         _ => None,
     }
 }
@@ -298,7 +311,7 @@ impl Journalctl {
         run_journalctl(&self.program, &self.argv(args), timeout).await
     }
 
-    async fn run_status(&self, args: Vec<String>, timeout: Duration) -> Option<(Option<i32>, String)> {
+    async fn run_status(&self, args: Vec<String>, timeout: Duration) -> Option<Ran> {
         run_journalctl_status(&self.program, &self.argv(args), timeout).await
     }
 }
@@ -506,12 +519,15 @@ pub(crate) fn grep_supported(version: Option<&str>) -> bool {
 }
 
 /// The window stdout of a `--grep` read from its exit: 0 is the output; 1
-/// with nothing printed is journalctl's "no entry matched" (systemd 257) — an
-/// empty window, not a failure; anything else is no window. PURE.
-pub(crate) fn grep_window_from(run: Option<(Option<i32>, String)>) -> Option<String> {
-    match run? {
-        (Some(0), out) => Some(out),
-        (Some(1), out) if out.trim().is_empty() => Some(String::new()),
+/// with NOTHING printed on either stream is journalctl's "no entry matched"
+/// (systemd 257) — an empty window. Exit 1 is also most of journalctl's
+/// failures (a PCRE2 that fails to load, a bad argument), and those say why
+/// on stderr: no window. Anything else is no window too. PURE.
+pub(crate) fn grep_window_from(run: Option<Ran>) -> Option<String> {
+    let r = run?;
+    match r.code {
+        Some(0) => Some(r.stdout),
+        Some(1) if r.stdout.trim().is_empty() && r.stderr_empty => Some(String::new()),
         _ => None,
     }
 }
@@ -765,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn every_read_is_bounded_by_one_deadline() {
         let d = tempfile::tempdir().unwrap();
-        let jc = fake_journalctl(d.path(), "sleep 10\n");
+        let jc = fake_journalctl(d.path(), "exec sleep 10\n");
         let started = std::time::Instant::now();
         let (u, k) = read_all(
             &jc,
@@ -845,11 +861,19 @@ esac
 
     #[test]
     fn grep_exits_and_versions_read_as_journalctl_means_them() {
-        assert_eq!(grep_window_from(Some((Some(0), "x".into()))), Some("x".into()));
-        assert_eq!(grep_window_from(Some((Some(1), "\n".into()))), Some(String::new()));
-        assert_eq!(grep_window_from(Some((Some(1), "partial".into()))), None);
-        assert_eq!(grep_window_from(Some((Some(2), String::new()))), None);
-        assert_eq!(grep_window_from(Some((None, String::new()))), None, "killed by a signal");
+        let ran = |code: Option<i32>, out: &str, err_empty: bool| {
+            Some(Ran {
+                code,
+                stdout: out.into(),
+                stderr_empty: err_empty,
+            })
+        };
+        assert_eq!(grep_window_from(ran(Some(0), "x", true)), Some("x".into()));
+        assert_eq!(grep_window_from(ran(Some(1), "\n", true)), Some(String::new()));
+        assert_eq!(grep_window_from(ran(Some(1), "", false)), None, "exit 1 that says why");
+        assert_eq!(grep_window_from(ran(Some(1), "partial", true)), None);
+        assert_eq!(grep_window_from(ran(Some(2), "", true)), None);
+        assert_eq!(grep_window_from(ran(None, "", true)), None, "killed by a signal");
         assert_eq!(grep_window_from(None), None);
         assert!(grep_supported(Some("systemd 257 (257.13)\n+PAM +AUDIT +PCRE2 +ZSTD\n")));
         assert!(!grep_supported(Some("systemd 247\n+PAM -PCRE2\n")));
@@ -868,7 +892,7 @@ esac
       -n) echo '{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}' ;;
       *) echo '{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"ab","USER_UNIT":"x.scope"}' ;;
     esac ;;
-  *) sleep 10 ;;
+  *) exec sleep 10 ;;
 esac
 "#;
         let jc = fake_journalctl(d.path(), body);
@@ -892,5 +916,24 @@ esac
             }]))
         );
         assert_eq!(k, Some(KernelRead::Unreadable));
+    }
+
+    /// Round-3 A3: a `--grep` that exits 1 and SAYS why on stderr (here a
+    /// PCRE2 that fails to load) is a failed read — `Unreadable` — never an
+    /// empty window that would read as `not_found`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grep_failure_that_explains_itself_is_unreadable() {
+        let d = tempfile::tempdir().unwrap();
+        let body = r#"case "$*" in
+  --version) echo 'systemd 257 (257.13-1~deb13u1)'; echo '+PAM +PCRE2 +ZSTD' ;;
+  *"-b -n 1"*) echo '{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}' ;;
+  *--grep*) echo 'Failed to load libpcre2-8.so.0' >&2; exit 1 ;;
+  *) echo '{"__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab","MESSAGE":"oom-kill:constraint=CONSTRAINT_MEMCG,task_memcg=/a.slice/b.scope,task=rustc,pid=9,uid=1000"}' ;;
+esac
+"#;
+        let jc = fake_journalctl(d.path(), body);
+        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        assert_eq!(k, KernelRead::Unreadable);
     }
 }
