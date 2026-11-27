@@ -190,12 +190,20 @@ pub fn cgroup_is_in_systemd_unit(cgroup_file: &str) -> bool {
 /// (a unit's stop kills its whole subtree, a leaf the runner moved itself
 /// into included). A runner outside any unit has no unit to share. The
 /// comparison is on the unified (`0::`) line's path, falling back to the
-/// whole file when there is none.
+/// cgroup-v1 `name=systemd` line's path when there is none (the hierarchy
+/// systemd places units in); a file with neither has no unit path.
 pub fn shares_runner_unit_cgroup(runner_cgroup: &str, holder_cgroup: &str) -> bool {
     fn path(c: &str) -> &str {
         c.lines()
             .find_map(|l| l.strip_prefix("0::"))
-            .unwrap_or(c)
+            .or_else(|| {
+                c.lines().find_map(|l| {
+                    let mut f = l.splitn(3, ':');
+                    let (_, ctl, p) = (f.next()?, f.next()?, f.next()?);
+                    (ctl == "name=systemd").then_some(p)
+                })
+            })
+            .unwrap_or("")
             .trim()
     }
     if !cgroup_is_in_systemd_unit(runner_cgroup) {
@@ -216,13 +224,23 @@ pub fn shares_runner_unit_cgroup(runner_cgroup: &str, holder_cgroup: &str) -> bo
 }
 
 /// Read [`shares_runner_unit_cgroup`] for a live holder `holder_pid` against
-/// this process. `None` when either cgroup file cannot be read (not Linux, or
-/// the holder is gone): UNKNOWN, which the caller must not report as safe
-/// on its own authority.
+/// this process. Off Linux there are no systemd units to share, so the answer
+/// is `Some(false)` by construction — the same verdict a fresh spawn there
+/// gets. On Linux `None` when either cgroup file cannot be read (the holder
+/// is gone, `/proc` is hidden): UNKNOWN, which the caller must not report as
+/// safe on its own authority.
 pub fn holder_shares_runner_unit_cgroup(holder_pid: u32) -> Option<bool> {
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let holder = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup")).ok()?;
-    Some(shares_runner_unit_cgroup(&own, &holder))
+    #[cfg(target_os = "linux")]
+    {
+        let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let holder = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup")).ok()?;
+        Some(shares_runner_unit_cgroup(&own, &holder))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = holder_pid;
+        Some(false)
+    }
 }
 
 /// `systemd-run` on `$PATH`, if any.
@@ -1436,6 +1454,39 @@ mod tests {
         // A runner outside any unit (a login shell) has no unit to share.
         let shell = "0::/user.slice/user-1000.slice/session-3.scope\n";
         assert!(!shares_runner_unit_cgroup(shell, shell));
+        // cgroup v1 only: the `name=systemd` line decides, not the other
+        // controllers' lines.
+        let v1 = |unit_path: &str| {
+            format!("12:cpu,cpuacct:/\n4:memory:/user.slice\n1:name=systemd:{unit_path}\n")
+        };
+        let v1_runner =
+            v1("/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service");
+        assert!(shares_runner_unit_cgroup(&v1_runner, &v1_runner));
+        assert!(shares_runner_unit_cgroup(
+            &v1_runner,
+            &v1(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service/x"
+            )
+        ));
+        assert!(!shares_runner_unit_cgroup(
+            &v1_runner,
+            &v1("/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-pty-holder-p1.scope")
+        ));
+    }
+
+    /// Off Linux there is no unit to share: an adopted holder reads the same
+    /// `Some(false)` a fresh spawn does, never UNKNOWN. On Linux this test
+    /// process's own pid answers from `/proc`.
+    #[test]
+    fn pty_holder_spawn_the_live_cgroup_read_answers_for_this_process() {
+        let own = holder_shares_runner_unit_cgroup(std::process::id());
+        if cfg!(target_os = "linux") {
+            // Itself: under a unit it shares it, outside one it does not —
+            // either way the read succeeds.
+            assert!(own.is_some());
+        } else {
+            assert_eq!(own, Some(false));
+        }
     }
 
     #[test]
