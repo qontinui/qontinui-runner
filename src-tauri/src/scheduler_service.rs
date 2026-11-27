@@ -29,6 +29,7 @@ use crate::scheduler::{
     ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
     TaskExecutionRecordExt,
 };
+use crate::scheduler_start_recheck::SlotRecheck;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -149,8 +150,11 @@ fn due_task_order(a: &ScheduledTask, b: &ScheduledTask) -> std::cmp::Ordering {
 /// `max_concurrent` is 1 by default: slots taken before the conditions were
 /// checked let `return-to-main`, parked on its quiet probe from 2026-10-28, hold
 /// the other due tasks overdue for days.
-async fn start_due_tasks<T, Fut>(due: Vec<T>, mut slots: usize, mut try_start: impl FnMut(T) -> Fut)
-where
+pub(crate) async fn start_due_tasks<T, Fut>(
+    due: Vec<T>,
+    mut slots: usize,
+    mut try_start: impl FnMut(T) -> Fut,
+) where
     Fut: std::future::Future<Output = bool>,
 {
     for candidate in due {
@@ -681,8 +685,18 @@ impl SchedulerService {
             }
         }
 
+        // The walk awaits between this tick's snapshot and here, so the row
+        // may have stopped being true: a run that finalized mid-walk, an
+        // edit, a disable. Mark first, then re-read under the mark (see
+        // `scheduler_start_recheck`).
+        let verdict = self
+            .mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))
+            .await;
+        if verdict != Some(SlotRecheck::Start) {
+            return false;
+        }
         info!("Scheduler: Executing task '{}'", task.name);
-        self.clone().execute_task(task).await;
+        self.clone().run_marked_task(task, None).await;
         true
     }
 
@@ -747,22 +761,32 @@ impl SchedulerService {
         task: ScheduledTask,
         catch_up: Option<CatchUpContext>,
     ) {
-        let task_id = task.id.clone();
-        let task_name = task.name.clone();
-        let auto_fix_on_failure = task.auto_fix_on_failure;
-
         // Mark as running (stays marked until the spawned poller completes
         // for async workflows; until the sync execute_* returns otherwise).
         // Check-and-insert is one step under one write lock: the tick, a
         // catch-up and "Run now" can all reach here, and a separate
         // read-then-push lets two of them both start the task.
-        if !self.try_mark_running(&task_id).await {
+        if !self.try_mark_running(&task.id).await {
             warn!(
                 "Scheduler: task '{}' is already running; not starting a second run",
-                task_name
+                task.name
             );
             return;
         }
+        self.run_marked_task(task, catch_up).await
+    }
+
+    /// Run a task whose `running_tasks` mark the caller already holds; the
+    /// run releases it. Reached from [`Self::execute_task_with_context`] and
+    /// from the tick's slot re-check, which marks before it re-reads the row.
+    async fn run_marked_task(
+        self: Arc<Self>,
+        task: ScheduledTask,
+        catch_up: Option<CatchUpContext>,
+    ) {
+        let task_id = task.id.clone();
+        let task_name = task.name.clone();
+        let auto_fix_on_failure = task.auto_fix_on_failure;
 
         // === Async launch-and-poll paths ===
         match &task.task {
@@ -2164,10 +2188,9 @@ After making fixes, run tests if applicable to verify the fixes work."#
             .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
     }
 
-    /// Check if a specific task is currently running
     /// Atomically mark `task_id` running: `false` (and no change) when it
     /// already is.
-    async fn try_mark_running(&self, task_id: &str) -> bool {
+    pub(crate) async fn try_mark_running(&self, task_id: &str) -> bool {
         let mut running = self.running_tasks.write().await;
         if running.iter().any(|id| id == task_id) {
             return false;
@@ -2176,6 +2199,14 @@ After making fixes, run tests if applicable to verify the fixes work."#
         true
     }
 
+    /// Release a mark taken by [`Self::try_mark_running`] for a task that
+    /// was NOT started, so there is no `next_run` to write first.
+    pub(crate) async fn release_unstarted_mark(&self, task_id: &str) {
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+    }
+
+    /// Check if a specific task is currently running
     pub async fn is_task_running(&self, task_id: &str) -> bool {
         let running = self.running_tasks.read().await;
         running.contains(&task_id.to_string())
@@ -4807,9 +4838,50 @@ mod tests {
             "a skip or a condition wait must not spend a slot"
         );
         let (before_true, _) = body.split_once("\n        true\n").expect("started arm");
+        assert!(before_true.trim_end().ends_with(
+            "if verdict != Some(SlotRecheck::Start) {\n            return false;\n        }\n        \
+             info!(\"Scheduler: Executing task '{}'\", task.name);\n        \
+             self.clone().run_marked_task(task, None).await;"
+        ));
         assert!(before_true
-            .trim_end()
-            .ends_with("self.clone().execute_task(task).await;"));
+            .contains(".mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))"));
+    }
+
+    /// Every site that releases a run's mark writes `next_run` BEFORE it
+    /// releases: the tick's slot re-check (`scheduler_start_recheck`) relies
+    /// on a free mark meaning the previous run's `next_run` has landed.
+    #[test]
+    fn every_release_writes_next_run_before_the_mark() {
+        let src = include_str!("scheduler_service.rs");
+        let (src, _) = src.split_once("#[cfg(test)]").expect("tests follow");
+        let release = "running.retain(|id| id != ";
+        let releases: Vec<usize> = src.match_indices(release).map(|(at, _)| at).collect();
+        assert_eq!(
+            releases.len(),
+            5,
+            "four run releases plus release_unstarted_mark"
+        );
+        let writes = [
+            "self.apply_launch_failure_backoff(",
+            "self.update_task_next_run_db(",
+            "self.write_next_run_after_limit(",
+        ];
+        let mut checked = 0;
+        for at in releases {
+            let (head, _) = src.split_at(at);
+            let fn_start = head.rfind("async fn ").expect("enclosing fn");
+            let fn_head = &head[fn_start..];
+            if fn_head.starts_with("async fn release_unstarted_mark(") {
+                continue;
+            }
+            assert!(
+                writes.iter().any(|w| fn_head.contains(w)),
+                "a release with no next_run write before it: {}",
+                &fn_head[..fn_head.find('(').unwrap()]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
     }
 
     /// The drain gate is read again for each task, before its condition
@@ -4878,18 +4950,49 @@ mod tests {
         assert!(hold_fn.contains("!t.enabled"));
     }
 
-    /// `execute_task_with_context` starts only through the atomic mark.
+    /// A task runs only through the atomic mark: `execute_task_with_context`
+    /// marks then runs, and `run_marked_task` is otherwise reached only from
+    /// the tick's started arm, after `mark_and_recheck_slot` kept the mark.
     #[test]
     fn execute_task_starts_only_through_the_atomic_mark() {
         let src = include_str!("scheduler_service.rs");
         let (_, body) = src
             .split_once("async fn execute_task_with_context(")
             .expect("execute_task_with_context");
-        let (head, _) = body
-            .split_once("// === Async launch-and-poll paths ===")
-            .expect("launch section");
-        assert!(head.contains("if !self.try_mark_running(&task_id).await {"));
-        assert!(!head.contains("running.push("));
+        let (wrapper, _) = body
+            .split_once("async fn run_marked_task(")
+            .expect("run_marked_task follows the wrapper");
+        let mark = wrapper
+            .find("if !self.try_mark_running(&task.id).await {")
+            .expect("the wrapper marks");
+        let run = wrapper
+            .find("self.run_marked_task(task, catch_up).await")
+            .expect("the wrapper runs");
+        assert!(mark < run);
+        assert!(!wrapper.contains("running.push("));
+
+        let (code, _) = src.split_once("#[cfg(test)]").expect("tests follow");
+        assert_eq!(
+            code.matches("run_marked_task(").count(),
+            3,
+            "def + two calls"
+        );
+        let (_, arm) = code
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task");
+        let (arm, _) = arm
+            .split_once("/// Record a skipped execution")
+            .expect("fn ends");
+        assert_eq!(
+            arm.matches("self.clone().run_marked_task(task, None).await;")
+                .count(),
+            1
+        );
+        let check = arm
+            .find(".mark_and_recheck_slot(")
+            .expect("the slot re-check");
+        let start = arm.find("run_marked_task(").unwrap();
+        assert!(check < start);
     }
 
     /// A condition timeout records its Skipped row and last_run ONLY after the

@@ -277,6 +277,7 @@ mod scheduler_probe;
 mod scheduler_remote_agent;
 mod scheduler_script;
 mod scheduler_service;
+mod scheduler_start_recheck;
 mod schema_registry;
 mod screen;
 mod sd_notify; // Plan 2026-10-19 ci-node Phase 2b — systemd READY/WATCHDOG, readiness-gated
