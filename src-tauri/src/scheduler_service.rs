@@ -620,6 +620,22 @@ impl SchedulerService {
 
         // Check conditions if task has any
         if task.has_conditions() {
+            // A met probe verdict is spent by `gate_conditions`, so do not
+            // spend one on a copy whose slot is already gone: an unmarked
+            // look at the row first. The marked re-check below stays the
+            // authority; this only spares the probe.
+            let early = crate::scheduler_start_recheck::recheck_slot(
+                &task,
+                pg.get_scheduled_task(&task.id).await,
+            );
+            if early != SlotRecheck::Start {
+                info!(
+                    "Scheduler: not checking conditions for task '{}' — {} since this tick read it",
+                    task.name,
+                    early.reason()
+                );
+                return false;
+            }
             match self.gate_conditions(&task, std::time::Instant::now()).await {
                 ConditionGate::TimedOut => {
                     info!(
@@ -688,7 +704,10 @@ impl SchedulerService {
         // The walk awaits between this tick's snapshot and here, so the row
         // may have stopped being true: a run that finalized mid-walk, an
         // edit, a disable. Mark first, then re-read under the mark (see
-        // `scheduler_start_recheck`).
+        // `scheduler_start_recheck`). A refusal here after a Fire discards
+        // that met verdict (the edit or unreadable row that refused it is
+        // re-evaluated next tick); the unmarked look above keeps the common
+        // case, a consumed slot, from spending one.
         let verdict = self
             .mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))
             .await;
@@ -5556,5 +5575,105 @@ mod tests {
             let fin = fin.split_once("\n    }\n").expect("finalize body").0;
             assert!(fin.contains("self.write_next_run_after_limit(task_id, decision).await;"));
         }
+    }
+}
+
+/// The tick's real start path against a real row: the stale-snapshot defect
+/// (plan `2026-11-27-devops-runner-scheduler-relaunches-a-cron-task-from-a-stale-tick-snapshot`)
+/// entered through `try_start_due_task`, the call `tick_pass` makes.
+#[cfg(test)]
+mod stale_snapshot_tests {
+    use super::*;
+    use crate::scheduler::ScheduledTaskExt;
+
+    /// The tick read the row while the slot was 05:27; before the walk reached
+    /// it, that slot's run finalized and moved `next_run` to 06:27. Starting
+    /// from the stale copy would run the 05:27 slot a second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tick_does_not_start_a_task_from_a_stale_snapshot() {
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "stale-snapshot-probe".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T06:27:00+00:00".to_string());
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+
+        let mut snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+        snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = svc.clone().try_start_due_task(&pg, snapshot).await;
+
+        assert!(
+            !started,
+            "a slot consumed since the tick's read must not be started again"
+        );
+        assert!(
+            svc.get_running_tasks().await.is_empty(),
+            "no mark is left behind"
+        );
+    }
+
+    /// A probe-gated copy whose slot is already gone is refused BEFORE its
+    /// probe runs: a met probe verdict is spent by the condition gate, so
+    /// running the probe for a slot that will be refused wastes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_probe_gated_copy_does_not_run_its_probe() {
+        let marker =
+            std::env::temp_dir().join(format!("stale-snapshot-probe-{}", uuid::Uuid::new_v4()));
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "stale-snapshot-probe-gated".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T06:27:00+00:00".to_string());
+        stored.conditions = Some(crate::scheduler::ScheduleConditions {
+            require_probe: Some(crate::scheduler::ProbeCondition {
+                enabled: true,
+                command: vec!["touch".to_string(), marker.to_string_lossy().into_owned()],
+                poll_seconds: 60,
+                timeout_seconds: 10,
+            }),
+            ..Default::default()
+        });
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+
+        let mut snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+        snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = svc.clone().try_start_due_task(&pg, snapshot).await;
+
+        let probed = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!started);
+        assert!(!probed, "the probe must not run for a consumed slot");
     }
 }

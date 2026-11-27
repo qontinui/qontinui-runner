@@ -12,12 +12,14 @@
 //!
 //! # Why the re-read happens under the mark
 //!
-//! Every site that releases a `running_tasks` mark after a run writes
-//! `next_run` first. So once [`SchedulerService::try_mark_running`] succeeds,
-//! any earlier run's `next_run` write has already landed, and no other starter
+//! Every site that releases a `running_tasks` mark after a run ATTEMPTS the
+//! `next_run` write first. So once [`SchedulerService::try_mark_running`]
+//! succeeds, any earlier run's `next_run` write has already been attempted
+//! (and, unless it failed, has landed), and no other starter
 //! can begin the task while the mark is held. A re-read taken after the mark
 //! therefore sees every change the snapshot missed; one taken before it does
-//! not.
+//! not. The residue: a finalize whose `next_run` write FAILED (PG down)
+//! leaves the served slot in the row, which this check reads as unchanged.
 //!
 //! # What is compared
 //!
@@ -56,7 +58,7 @@ pub(crate) enum SlotRecheck {
 impl SlotRecheck {
     /// The clause for `not starting task '<name>' — <reason> since this tick
     /// read it`. `Disabled` / `Gone` share `relaunch_hold`'s wording.
-    fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         match self {
             SlotRecheck::Start => "nothing changed".to_string(),
             SlotRecheck::Consumed { read, now } => format!(
