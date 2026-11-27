@@ -54,7 +54,13 @@
 //! is no longer the runner's and a person's edit must show in `git status`.
 //! Accepted cost: linked worktrees share one
 //! `info/exclude`, so a path absent in one worktree and present in another can
-//! lose its line until the next pass in the other worktree re-adds it. "The
+//! lose its line until the next pass in the other worktree re-adds it. The
+//! same sharing bounds the disowned guarantee: it holds per PASS, not across
+//! worktrees. A path one worktree disowns (a person's edit there) and a
+//! sibling worktree wrote as the runner's is ONE anchored line, so the
+//! sibling's next pass re-adds it and hides the edit again until the first
+//! worktree's next pass prunes it — the two alternate. One shared file cannot
+//! hold a per-worktree answer; a per-worktree exclude is a separate change. "The
 //! block" is every line from this module's marker up to the next comment line,
 //! so a person's own lines are never touched provided they sit outside it —
 //! before the marker, or under a comment header of their own. (An uncommented

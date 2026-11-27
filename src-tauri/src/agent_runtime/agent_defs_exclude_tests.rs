@@ -378,3 +378,62 @@ fn provision_agent_defs_unexclude_an_edited_copy() {
         "the edit is visible"
     );
 }
+
+/// Plan `2026-11-26-runner-provisioned-subagent-definitions-dirty-every-tree-they-are-written-into`
+/// Phase 1: a retired name the pass cannot READ (here a directory, so the read
+/// fails with something other than not-found) is retained as `ReadFailed` —
+/// nothing shows it is the runner's — and DISOWNED, so the line an earlier
+/// pass wrote for it is pruned and what sits there reads untracked.
+#[test]
+fn provision_agent_defs_unexclude_an_unreadable_retired_copy() {
+    let (_, line) = retired_fixture();
+    let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+    let wt = tempfile::tempdir().unwrap();
+    git_init(wt.path());
+    let dst = wt.path().join(".claude").join("agents");
+    let unreadable = dst.join("retired-agent.md");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    std::fs::write(unreadable.join("notes.txt"), "a person's file\n").unwrap();
+    let exclude_path = wt.path().join(".git").join("info").join("exclude");
+    let mut seeded = agent_defs_exclude(wt.path());
+    seeded.push_str(&format!(
+        "{}\n{}\n",
+        crate::provision_exclude::PROVISIONED_EXCLUDE_MARKER,
+        agent_def_line("retired-agent.md"),
+    ));
+    std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+    std::fs::write(&exclude_path, seeded).unwrap();
+    assert_eq!(
+        agent_defs_git_status(wt.path()),
+        "",
+        "fixture: the unreadable path starts hidden by its line"
+    );
+
+    let wt_cwd = wt.path().to_string_lossy().into_owned();
+    let report = provision_agent_definitions_retiring(root.path(), &wt_cwd, &[line.as_str()]);
+
+    assert!(
+        report
+            .retained_retired
+            .iter()
+            .any(|r| r.unit == "retired-agent.md"
+                && matches!(
+                    r.reason,
+                    crate::capability_manifest::RetainedReason::ReadFailed(_)
+                )),
+        "the unreadable retired copy is retained as ReadFailed: {:?}",
+        report.retained_retired
+    );
+    let exclude = agent_defs_exclude(wt.path());
+    assert!(
+        !exclude
+            .lines()
+            .any(|l| l == agent_def_line("retired-agent.md")),
+        "the unreadable copy's line is pruned: {exclude}"
+    );
+    assert_eq!(
+        agent_defs_untracked(wt.path()),
+        vec!["?? .claude/agents/retired-agent.md/notes.txt".to_string()],
+        "what sits at the retired name reads untracked again"
+    );
+}

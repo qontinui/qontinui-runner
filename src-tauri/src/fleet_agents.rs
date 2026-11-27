@@ -161,6 +161,11 @@ pub(crate) fn provision_fleet_agents_into(
                 dst_dir.join(name).display(),
                 reason.describe()
             );
+            // `OperatorAuthored` also covers an owner the pass could not
+            // establish (a history probe that did not answer, a destination
+            // it could not inspect). Disowning that too is deliberate: an
+            // unproven owner is never hidden from `git status`, at the cost of
+            // one dirty pass when a slow probe misses a runner-written copy.
             if matches!(reason, SkipReason::OperatorAuthored(_)) {
                 disowned.push(PathBuf::from(name));
             }
