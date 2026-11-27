@@ -17,6 +17,9 @@
  *   4. SDK click → mocked `invoke("send_user_message", ...)` called.
  *   5. Disabled-state click is a no-op for clean / empty / merging /
  *      unknown.
+ *   6. Staleness (plan 2026-10-01-…-poll-gate Phase 4): a cached answer the
+ *      runner served under memory pressure is labelled in the tooltip and
+ *      marked `data-commit-stale` (rendered via `renderToStaticMarkup`).
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -28,15 +31,16 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   COMMIT_PROMPT_TEMPLATE,
+  CommitTrafficLight,
+  buildTooltip,
   isCommitButtonEnabled,
   type CommitState,
 } from "./CommitTrafficLight";
 
-const baseState = (
-  overrides: Partial<CommitState> & Pick<CommitState, "status">,
-): CommitState => ({
+const baseState = (overrides: Partial<CommitState> & Pick<CommitState, "status">): CommitState => ({
   touched_count: 3,
   dirty_count: 1,
   repo_roots: ["D:/repo"],
@@ -134,26 +138,80 @@ describe("commit-button click dispatch", () => {
     ]);
   });
 
-  it.each([
-    ["clean" as const],
-    ["empty" as const],
-    ["merging" as const],
-    ["unknown" as const],
-  ])("disabled status %s → no IPC, no terminal write", async (status) => {
-    const writeSpy = vi.fn();
-    await simulateClick({
-      state: baseState({ status }),
-      isPtyTab: true,
-      onWriteToTerminal: writeSpy,
-    });
-    expect(writeSpy).not.toHaveBeenCalled();
-    expect(mockInvoke).not.toHaveBeenCalled();
-  });
+  it.each([["clean" as const], ["empty" as const], ["merging" as const], ["unknown" as const]])(
+    "disabled status %s → no IPC, no terminal write",
+    async (status) => {
+      const writeSpy = vi.fn();
+      await simulateClick({
+        state: baseState({ status }),
+        isPtyTab: true,
+        onWriteToTerminal: writeSpy,
+      });
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(mockInvoke).not.toHaveBeenCalled();
+    },
+  );
 
   it("undefined state → no IPC, no terminal write", async () => {
     const writeSpy = vi.fn();
     await simulateClick({ state: undefined, isPtyTab: true, onWriteToTerminal: writeSpy });
     expect(writeSpy).not.toHaveBeenCalled();
     expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("stale commit state", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("tooltip names staleness and the answer's age", () => {
+    const tip = buildTooltip(
+      baseState({ status: "dirty", stale: true, generated_at_ms: NOW - 42_000 }),
+      NOW,
+    );
+    expect(tip).toContain("1/3 dirty in 1 repo");
+    expect(tip).toContain("last known answer from 42s ago");
+    expect(tip).toContain("probe paused under memory pressure");
+  });
+
+  it("tooltip without a clock still names staleness", () => {
+    const tip = buildTooltip(baseState({ status: "clean", stale: true }));
+    expect(tip).toContain("last known answer observed at");
+    expect(tip).toContain("probe paused under memory pressure");
+  });
+
+  it("a stale unknown names no answer, not memory pressure", () => {
+    const tip = buildTooltip(baseState({ status: "unknown", stale: true }), NOW);
+    expect(tip).toContain("runner gave no current answer");
+    expect(tip).not.toContain("memory pressure");
+  });
+
+  it("fresh tooltip carries no staleness note", () => {
+    expect(buildTooltip(baseState({ status: "dirty" }), NOW)).not.toContain("last known answer");
+    expect(buildTooltip(baseState({ status: "dirty", stale: false }), NOW)).not.toContain(
+      "last known answer",
+    );
+  });
+
+  it("marks the root data-commit-stale and dims the dot when stale", () => {
+    const html = renderToStaticMarkup(
+      <CommitTrafficLight
+        state={baseState({ status: "dirty", stale: true, generated_at_ms: NOW - 5_000 })}
+        isPtyTab
+        nowMs={NOW}
+      />,
+    );
+    expect(html).toContain('data-commit-stale="true"');
+    expect(html).toContain("opacity-50");
+    expect(html).toContain("last known answer from 5s ago");
+    // A stale dirty is still a commit button — the AI re-checks the tree.
+    expect(html).not.toMatch(/<button[^>]*disabled/);
+  });
+
+  it("does not set data-commit-stale when stale is absent", () => {
+    const html = renderToStaticMarkup(
+      <CommitTrafficLight state={baseState({ status: "dirty" })} isPtyTab nowMs={NOW} />,
+    );
+    expect(html).not.toContain("data-commit-stale");
+    expect(html).not.toContain("opacity-50");
   });
 });
