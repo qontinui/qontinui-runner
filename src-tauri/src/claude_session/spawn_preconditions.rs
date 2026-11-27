@@ -1182,8 +1182,12 @@ pub enum StallCloseOutcome {
     FailedPaneHeld,
     /// The close erred and the pane is gone (the operator closed it).
     FailedPaneGone,
-    /// The close task did not return (it panicked): the outcome is UNKNOWN.
-    Unknown,
+    /// The close task did not return (it panicked) and the child may still be
+    /// running — its pid is alive, or unknown: held, no outcome posted.
+    UnknownHeld,
+    /// The close task did not return, and the child's pid is proven dead:
+    /// released and reported `spawn_failed`.
+    UnknownGone,
 }
 
 impl StallCloseOutcome {
@@ -1630,7 +1634,8 @@ mod tests {
             (StallCloseOutcome::ClosedStartedAcross, "closed_started_across", true),
             (StallCloseOutcome::FailedPaneHeld, "failed_pane_held", false),
             (StallCloseOutcome::FailedPaneGone, "failed_pane_gone", false),
-            (StallCloseOutcome::Unknown, "unknown", false),
+            (StallCloseOutcome::UnknownHeld, "unknown_held", false),
+            (StallCloseOutcome::UnknownGone, "unknown_gone", false),
         ];
         for (outcome, token, closed) in all {
             assert_eq!(serde_json::to_value(outcome).unwrap(), token);
