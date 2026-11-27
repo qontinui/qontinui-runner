@@ -38,9 +38,17 @@ vi.mock("@/lib/instance-storage", () => ({
 }));
 // One Map for every render, as the real hook returns its state between polls —
 // a fresh Map per render would recompute the row memos on every render.
-vi.mock("./useLiveClaudeSessionNames", () => {
-  const names = new Map<string, string>();
-  return { useLiveClaudeSessionNames: () => names };
+vi.mock("./useLiveClaudeSessions", async (importOriginal) => {
+  const snapshot = {
+    read: "ok" as const,
+    bySessionId: new Map(),
+    names: new Map<string, string>(),
+    pids: new Set<number>(),
+  };
+  return {
+    ...(await importOriginal<typeof import("./useLiveClaudeSessions")>()),
+    useLiveClaudeSessions: () => snapshot,
+  };
 });
 vi.mock("./StewardControl", () => ({ StewardControl: () => null }));
 vi.mock("../worktrees/WorktreesPanel", () => ({ WorktreesPanel: () => null }));
@@ -133,6 +141,7 @@ function params(
     tabs: [claudeTab(titles.claude), shellTab(titles.shell)],
     sessionStates,
     staleTabs,
+    visibleTabIds: new Set<string>(),
     transcriptSessions,
     sessionsLoading: false,
     desktopNotify: false,
@@ -174,7 +183,6 @@ describe("useSessionManager — a title tick keeps the cards' props stable", () 
 
     expect(second.openSession).toBe(first.openSession);
     expect(second.viewTranscript).toBe(first.viewTranscript);
-    expect(second.closeSession).toBe(first.closeSession);
     expect(second.resumeSession).toBe(first.resumeSession);
     expect(second.refresh).toBe(first.refresh);
   });
@@ -198,7 +206,6 @@ describe("useSessionManager — a title tick keeps the cards' props stable", () 
   it("runs the LATEST provider callbacks, not the ones from the first render", () => {
     const firstFocus = vi.fn();
     const firstSelect = vi.fn();
-    const firstClose = vi.fn();
     const hook = mountHook();
     hook.render(
       params(
@@ -206,20 +213,17 @@ describe("useSessionManager — a title tick keeps the cards' props stable", () 
         {
           onFocusSessionTab: firstFocus,
           onSelectSession: firstSelect,
-          onCloseSessionTab: firstClose,
         },
       ),
     );
     const latestFocus = vi.fn();
     const latestSelect = vi.fn();
-    const latestClose = vi.fn();
     hook.render(
       params(
         { claude: "b", shell: "bash" },
         {
           onFocusSessionTab: latestFocus,
           onSelectSession: latestSelect,
-          onCloseSessionTab: latestClose,
         },
       ),
     );
@@ -228,14 +232,11 @@ describe("useSessionManager — a title tick keeps the cards' props stable", () 
     const claudeRow = m.sessions.find((s) => s.sessionId === "sess-1")!;
     act(() => m.openSession(claudeRow));
     act(() => m.viewTranscript(claudeRow));
-    act(() => m.closeSession(claudeRow));
 
     expect(latestFocus).toHaveBeenCalledWith("sess-1", "tab-claude", "transcript");
     expect(latestSelect).toHaveBeenCalledWith("sess-1");
-    expect(latestClose).toHaveBeenCalledWith("tab-claude");
     expect(firstFocus).not.toHaveBeenCalled();
     expect(firstSelect).not.toHaveBeenCalled();
-    expect(firstClose).not.toHaveBeenCalled();
   });
 });
 

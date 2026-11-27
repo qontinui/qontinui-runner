@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import type { TerminalTab } from "./useTerminalManager";
-import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
+import { useLiveClaudeSessions } from "./useLiveClaudeSessions";
 
 /**
  * Zone-title resolver (plan 2026-10-02-terminal-titlebar-shows-session-name,
@@ -74,7 +74,7 @@ export function resolveDisplayTitle({
 export function useDisplayTitle(
   tab: Pick<TerminalTab, "title" | "spawnName" | "claudeSessionId" | "workingDir">,
 ): string {
-  const registryNames = useLiveClaudeSessionNames();
+  const registryNames = useLiveClaudeSessions().names;
   return resolveDisplayTitle({ tab, registryNames });
 }
 
@@ -85,7 +85,7 @@ export function useDisplayTitle(
 export function useDisplayTitleResolver(): (
   tab: Pick<TerminalTab, "title" | "spawnName" | "claudeSessionId" | "workingDir">,
 ) => string {
-  const registryNames = useLiveClaudeSessionNames();
+  const registryNames = useLiveClaudeSessions().names;
   return useCallback((tab) => resolveDisplayTitle({ tab, registryNames }), [registryNames]);
 }
 

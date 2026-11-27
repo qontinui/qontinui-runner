@@ -123,6 +123,16 @@ export const GLOBAL_CHORDS = {
    * unicode-entry chord, and Ctrl+Shift+Z is redo inside the CommandBar input.
    */
   terminalWorkMode: { key: "y", shift: true, meta: false },
+  /**
+   * Session search palette — Chrome's tab search over live, previous and
+   * recently-closed sessions (`terminal/sessionSearchPaletteStore` →
+   * `useSessionSearchHotkey`). Chrome spells it Ctrl+Shift+A, which the
+   * terminal already claims (`isCtrlShiftChord(e, "a")`). Every Ctrl+Shift
+   * letter is spoken for or unusable (C/V copy-paste, U unicode entry, Z
+   * redo, Q quits a GNOME terminal), so the chord is Ctrl+Shift+Space: free in
+   * both registries, and the same `e.key` on every keyboard layout.
+   */
+  sessionSearch: { key: " ", shift: true, meta: false },
 } as const satisfies Record<string, GlobalChord>;
 
 /**

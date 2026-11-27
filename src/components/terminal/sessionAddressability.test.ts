@@ -31,12 +31,9 @@ import servedActions from "@/lib/ui-bridge/servedActions.0.46.json";
 
 import { CommandBar, COMMAND_BAR_INPUT_ID, COMMAND_BAR_INPUT_ELEMENT } from "./CommandBar";
 import { sessionCardElementId } from "./SessionCard";
-import {
-  SEARCH_INPUT_ELEMENT,
-  SESSION_MANAGER_HEADER_IDS,
-  SessionManagerHeader,
-  sessionManagerAccountFilterId,
-} from "./SessionManagerHeader";
+import { SESSION_MANAGER_HEADER_IDS } from "./SessionManagerHeader";
+import { QUERY_INPUT_ACTIONS } from "./SessionQueryBar";
+import { SESSION_QUERY_CONTROLS, sessionQueryControlId } from "./sessionQueryChips";
 import { SESSION_MANAGER_TOGGLE_ID } from "./SessionManagerToggle";
 
 // The command bar's IO-bound siblings and its terminal-session context are not
@@ -91,8 +88,6 @@ afterEach(() => {
   registry = null;
 });
 
-const noop = () => {};
-
 /**
  * The verbs the last override listed (main's 6e43e5f20: the SDK 0.38.0 inferred
  * input set): every one must still be served. Pinned here independently of the
@@ -120,10 +115,14 @@ describe("text inputs advertise sendKeys", () => {
     // silently un-advertises a working action. And `TerminalInstance.tsx`
     // registers a CUSTOM `sendKeys` on the terminal PANE taking a plain
     // string, which would shadow the built-in (`keys: [{key, modifiers?}]`).
-    for (const descriptor of [COMMAND_BAR_INPUT_ELEMENT, SEARCH_INPUT_ELEMENT]) {
+    for (const descriptor of [COMMAND_BAR_INPUT_ELEMENT]) {
       expect("actions" in descriptor).toBe(false);
       expect("customActions" in descriptor).toBe(false);
     }
+  });
+
+  it("the session query box still advertises sendKeys", () => {
+    expect(QUERY_INPUT_ACTIONS).toContain("sendKeys");
   });
 
   it("the rendered command bar input serves the 0.46 list, sendKeys and the old override's verbs included", () => {
@@ -133,34 +132,6 @@ describe("text inputs advertise sendKeys", () => {
     // `autocomplete`), `role="combobox"` (`select`), `aria-expanded` (`toggle`).
     // The same list the Rust vocabulary tests read (`action_vocabulary.rs`).
     expect(actions).toEqual(servedActions.commandBarInput);
-  });
-
-  it("the rendered session search box serves sendKeys and every verb the old override listed", () => {
-    const actions = servedFor(
-      createElement(SessionManagerHeader, {
-        loading: false,
-        searchQuery: "",
-        onSearchChange: noop,
-        statusFilter: "all",
-        onStatusFilterChange: noop,
-        accountFilter: "all",
-        onAccountFilterChange: noop,
-        groupBy: "status",
-        onGroupByChange: noop,
-        sortBy: "recent",
-        onSortByChange: noop,
-        accountUsage: [],
-        accounts: [],
-        onRefresh: noop,
-        frozenCount: 0,
-        needsInputCount: 0,
-        activeCount: 0,
-        totalCount: 0,
-      }),
-      SESSION_MANAGER_HEADER_IDS.search,
-    );
-    for (const verb of FORMER_OVERRIDE) expect(actions).toContain(verb);
-    expect(actions).toEqual(servedActions.autoRegisteredTextInput);
   });
 });
 
@@ -182,7 +153,8 @@ describe("author-stamped control ids", () => {
     for (const id of [
       COMMAND_BAR_INPUT_ID,
       sessionCardElementId("x"),
-      sessionManagerAccountFilterId("gmail"),
+      sessionQueryControlId("chip", "needs-you"),
+      ...Object.values(SESSION_QUERY_CONTROLS).map((c) => c.id),
       ...Object.values(SESSION_MANAGER_HEADER_IDS),
     ]) {
       expect(id.startsWith("terminal.")).toBe(true);

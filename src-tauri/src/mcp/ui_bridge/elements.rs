@@ -6613,6 +6613,31 @@ mod is_builtin_action_tests {
         }
     }
 
+    /// The spellings an element ADVERTISES must pass the name gate, or the
+    /// advertised-action gate after it can never be satisfied: an element
+    /// advertising `rightClick` was unreachable when only `right` validated.
+    #[test]
+    fn sdk_advertised_button_variants_are_accepted_and_advertised() {
+        let advertised = Some(
+            [
+                "focus",
+                "blur",
+                "hover",
+                "click",
+                "hoverClick",
+                "doubleClick",
+                "rightClick",
+                "middleClick",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        );
+        for name in ["rightClick", "middleClick", "doubleClick"] {
+            assert!(super::is_action_advertised(name, &advertised), "{name}");
+        }
+    }
+
     #[test]
     fn surrounding_whitespace_is_trimmed() {
         assert!(is_builtin_action("  click "));

@@ -76,6 +76,8 @@ terminal.save-workflow	empty	[]	error:no-workflow	-	false	-	error
 terminal.select-by-state	alternate	[["state","needs-input"]]	ok	ui.dispatch	false	selected 1 zone	ok
 terminal.select-by-state	canonical	[["state","idle"]]	ok	ui.dispatch	false	selected 1 zone	ok
 terminal.select-by-state	empty	[]	error:invalid-args	-	false	-	error
+terminal.sessions-find	canonical	[]	error:no-palette	-	false	-	error
+terminal.sessions-find	empty	[]	error:no-palette	-	false	-	error
 terminal.show-shortcuts	canonical	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]	ok
 terminal.show-shortcuts	empty	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]	ok
 terminal.sort-zones	canonical	[]	ok	ctx.sortZones	true	moved 0 zone	noop

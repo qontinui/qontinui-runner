@@ -181,24 +181,25 @@ export function StatusStrip() {
   // set — NOT raw PTY tabs and NOT every historical on-disk transcript.
   // Counting raw tabs inflated the total (18 tabs → "18 sessions"); counting
   // ALL `allSessions` inflated it the other way (hundreds of dormant
-  // historical transcripts → "438 sessions / 436 idle"). statusCounts keeps
-  // only sessions tied to a live PTY tab in this window (or active-external),
-  // so working = active-in-zone + active-external, idle = stale-tab `frozen`
-  // still open here, and dormant/orphaned historical transcripts are dropped.
+  // historical transcripts → "438 sessions / 436 idle"). `computeStatusCounts`
+  // keeps only sessions whose location is not `Not running` — a tab here, a
+  // live registry process, or an UNKNOWN placement — so a historical
+  // transcript whose process is gone is dropped by its location.
   const {
     claudeSessionCount,
     needsInputCount: claudeNeedsInputCount,
     errorCount: sessionErrorCount,
     workingCount: totalWorkingCount,
-    externalWorkingCount,
+    outsideWorkingCount,
     completedCount,
     idleCount,
+    unknownCount,
   } = sessionManager;
 
-  // See {@link splitWorking} — the strip is the Terminal PAGE's status, so the
-  // headline working count is page-scoped and running `active-external`
-  // sessions (other `claude` processes, no tab here) read as `+M external`.
-  const workingText = formatWorking(splitWorking(totalWorkingCount, externalWorkingCount));
+  // See {@link splitWorking} — the strip is the Terminal PAGE's status, so
+  // running `Outside runner` sessions (a live process this runner does not
+  // own, matched per session) read as `+M outside runner`, not as page work.
+  const workingText = formatWorking(splitWorking(totalWorkingCount, outsideWorkingCount));
 
   // See {@link unionErrorCount} — the pill must not read 0 while the page is
   // painting a dead PTY tab red and `focusNextError` can cycle to it.
@@ -268,7 +269,8 @@ export function StatusStrip() {
   // context ZSB used to. The attention-pills above keep their bright
   // colors; these new pills render in muted shades so they don't
   // compete visually with "needs attention" signals.
-  const hasBreakdown = workingText !== null || completedCount > 0 || idleCount > 0;
+  const hasBreakdown =
+    workingText !== null || completedCount > 0 || idleCount > 0 || unknownCount > 0;
 
   // "Keep AI" button gate. Deliberately NOT a reason to show the strip (like
   // `wrapperCount`): an oversized grid is not a condition needing attention,
@@ -473,11 +475,11 @@ export function StatusStrip() {
           // very page the union exists to keep visible (two live PTYs, no
           // Claude session), so both inputs are disclosed in the tooltip
           // instead. The tooltip does NOT say "on this page": the Claude count
-          // includes active-external sessions, which by definition have no
+          // includes `Outside runner` sessions, which by definition have no
           // tab in this window.
           title={
             `${sessionOrPaneCount} sessions — ` +
-            `${claudeSessionCount} Claude (incl. external), ` +
+            `${claudeSessionCount} Claude (incl. outside runner), ` +
             `${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"} on this page`
           }
         />
@@ -533,6 +535,17 @@ export function StatusStrip() {
                 aria-hidden
               />
               {idleCount} idle
+            </span>
+          )}
+          {/* A session that may be running but whose activity no source could
+              classify — reported, never folded into idle or done. */}
+          {unknownCount > 0 && (
+            <span
+              className="flex items-center gap-1 text-[#565f89]"
+              title="Sessions that may be running but whose activity could not be read"
+            >
+              <span className="w-1.5 h-1.5 rounded-full border border-[#565f89]" aria-hidden />
+              {unknownCount} unknown
             </span>
           )}
         </span>

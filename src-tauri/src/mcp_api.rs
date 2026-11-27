@@ -14150,6 +14150,7 @@ pub fn create_router(
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::tenant::routes())
         .merge(crate::mcp::terminals::routes())
+        .merge(crate::mcp::session_org::routes())
         // `GET /terminal-layout` — kept out of `terminals::routes()` because
         // it is relayed (as a read only) and every route there is refused
         // over the relay by construction; see the module docs.

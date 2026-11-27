@@ -2244,6 +2244,14 @@ pub fn terminal_report_bridge_registration_failure(
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
 ///
+/// Each row also carries `runnerManaged`: whether this runner owns the process
+/// (see [`runner_managed_pids`]). The Session Manager reads a live row with
+/// `runnerManaged: false` and no tab in the window as `Outside runner` — a
+/// per-session match that replaced a guess from the COUNT of unmanaged
+/// `claude` processes (plan
+/// `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+/// Phase 1). It is computed from the SAME process-table snapshot the liveness
+/// re-check already takes, so it adds no third snapshot per poll.
 /// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
 /// lists name what the read could NOT see: `sessions/` dirs that exist and
 /// cannot be listed, and unreadable or unparseable records named for live pids
@@ -2256,7 +2264,14 @@ pub fn terminal_report_bridge_registration_failure(
 /// live, and the window-name hook keeps updating. Failing the whole read would
 /// hand the click paths `null`, which they read as "go ahead".
 #[tauri::command]
-pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
+pub async fn terminal_claude_session_list_live(
+    execution: tauri::State<'_, crate::commands::compartments::ExecutionCompartment>,
+) -> Result<CommandResponse, String> {
+    let ai_pids = execution
+        .ai_pid_tracker()
+        .lock()
+        .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
+        .clone();
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     // Re-check liveness: a crashed process cannot remove its own registry file,
     // so PID presence is the guard against reporting a dead session as open.
@@ -2275,10 +2290,11 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
         &live_pids,
         &crate::session::claude_session_registry::may_host_claude(&snapshot),
     );
+    let managed = runner_managed_pids(&snapshot, std::process::id(), &ai_pids);
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(live_sessions_payload(read)),
+        data: Some(live_sessions_payload(read, &managed)),
     })
 }
 
@@ -2286,7 +2302,16 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// the read could not see (see that command's docs for why both travel).
 fn live_sessions_payload(
     read: crate::session::claude_session_registry::LiveSessions,
+    managed: &std::collections::HashSet<u32>,
 ) -> serde_json::Value {
+    let rows: Vec<LiveClaudeSessionRow> = read
+        .sessions
+        .into_iter()
+        .map(|session| LiveClaudeSessionRow {
+            runner_managed: managed.contains(&session.pid),
+            session,
+        })
+        .collect();
     let unlistable: Vec<String> = read.unlistable.iter().map(ToString::to_string).collect();
     let unreadable_records: Vec<String> = read
         .unreadable_records
@@ -2294,10 +2319,44 @@ fn live_sessions_payload(
         .map(ToString::to_string)
         .collect();
     serde_json::json!({
-        "sessions": read.sessions,
+        "sessions": rows,
         "unlistable": unlistable,
         "unreadableRecords": unreadable_records,
     })
+}
+
+/// One `terminal_claude_session_list_live` row: the registry entry, flattened,
+/// plus whether this runner owns its process.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveClaudeSessionRow {
+    #[serde(flatten)]
+    session: crate::session::claude_session_registry::LiveClaudeSession,
+    runner_managed: bool,
+}
+
+/// The pids this runner owns: everything in its own process subtree (every PTY
+/// tab's shell and the `claude` it runs) plus the pids `ai_pid_tracker`
+/// records for headless AI sessions — the same set
+/// `transcript_find_external_processes` excludes as "managed".
+///
+/// The subtree comes from `snapshot`, so a process that outlived a crashed
+/// parent and was re-parented away from the runner reads as NOT managed, which
+/// is what it is.
+fn runner_managed_pids(
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    runner_pid: u32,
+    ai_pids: &[u32],
+) -> std::collections::HashSet<u32> {
+    let mut managed: std::collections::HashSet<u32> =
+        crate::process_capture::process_tree::collect_descendants_from_snapshot(
+            runner_pid, snapshot,
+        )
+        .into_iter()
+        .map(|p| p.pid)
+        .collect();
+    managed.extend(ai_pids.iter().copied());
+    managed
 }
 
 /// Manually migrate a Claude terminal session to a different configured
@@ -3455,23 +3514,26 @@ mod tests {
         use crate::session::claude_activity::UnlistableSessionsDir;
         use crate::session::claude_session_registry::{LiveSessions, UnreadableRecord};
 
-        let complete = live_sessions_payload(LiveSessions::default());
+        let complete = live_sessions_payload(LiveSessions::default(), &Default::default());
         assert_eq!(
             complete,
             serde_json::json!({ "sessions": [], "unlistable": [], "unreadableRecords": [] })
         );
 
-        let partial = live_sessions_payload(LiveSessions {
-            sessions: Vec::new(),
-            unlistable: vec![UnlistableSessionsDir {
-                sessions_dir: std::path::PathBuf::from("/h/.claude-a/sessions"),
-                error: "Permission denied".to_string(),
-            }],
-            unreadable_records: vec![UnreadableRecord {
-                path: std::path::PathBuf::from("/h/.claude/sessions/7.json"),
-                error: "does not parse".to_string(),
-            }],
-        });
+        let partial = live_sessions_payload(
+            LiveSessions {
+                sessions: Vec::new(),
+                unlistable: vec![UnlistableSessionsDir {
+                    sessions_dir: std::path::PathBuf::from("/h/.claude-a/sessions"),
+                    error: "Permission denied".to_string(),
+                }],
+                unreadable_records: vec![UnreadableRecord {
+                    path: std::path::PathBuf::from("/h/.claude/sessions/7.json"),
+                    error: "does not parse".to_string(),
+                }],
+            },
+            &Default::default(),
+        );
         assert_eq!(
             partial["unlistable"],
             serde_json::json!(["/h/.claude-a/sessions (Permission denied)"])
@@ -4596,6 +4658,73 @@ mod tests {
             None,
             "a whitespace config_dir must normalize to None, not persist as a blank"
         );
+    }
+
+    /// `runnerManaged` is the per-session discriminant the Session Manager's
+    /// `Outside runner` location reads, so both halves of the managed set must
+    /// count: the runner's own process subtree (a PTY tab's shell → `claude`)
+    /// and the headless pids `ai_pid_tracker` records. A process outside both
+    /// — an operator's `claude` in another terminal — is NOT managed.
+    #[test]
+    fn runner_managed_pids_covers_subtree_and_ai_tracker_only() {
+        let mut snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
+        // runner 100 → shell 200 → claude 300; unrelated shell 900 → claude 901.
+        snapshot.parent_map.insert(100, vec![200]);
+        snapshot.parent_map.insert(200, vec![300]);
+        snapshot.parent_map.insert(900, vec![901]);
+        let managed = super::runner_managed_pids(&snapshot, 100, &[555]);
+        assert!(managed.contains(&200));
+        assert!(
+            managed.contains(&300),
+            "a claude in a PTY tab is runner-managed"
+        );
+        assert!(
+            managed.contains(&555),
+            "an ai_pid_tracker pid is runner-managed"
+        );
+        assert!(
+            !managed.contains(&901),
+            "a claude outside the runner is not managed"
+        );
+        assert!(
+            !managed.contains(&100),
+            "the runner itself is not a session"
+        );
+    }
+
+    /// The row is the registry entry FLATTENED plus `runnerManaged`, so every
+    /// existing consumer of the listing (`sessionId`, `pid`, `status`, …)
+    /// reads the same keys it did before the field was added.
+    #[test]
+    fn live_session_row_serializes_flat_with_runner_managed() {
+        let row = super::LiveClaudeSessionRow {
+            session: crate::session::claude_session_registry::LiveClaudeSession {
+                session_id: "s-1".to_string(),
+                name: "n".to_string(),
+                name_source: None,
+                pid: 42,
+                account: crate::session::past_sessions::PastSessionAccount {
+                    label: "gmail".to_string(),
+                    wrapper: "clg".to_string(),
+                },
+                working_dir: "/w".to_string(),
+                status: "busy".to_string(),
+                kind: "interactive".to_string(),
+                started_at: 1,
+                updated_at: 2,
+                resume_command: Some("cd '/w' && clg --resume s-1".to_string()),
+                status_updated_at: None,
+                proc_start: None,
+                entrypoint: None,
+                tmux: None,
+            },
+            runner_managed: false,
+        };
+        let v = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(v["sessionId"], "s-1");
+        assert_eq!(v["pid"], 42);
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["runnerManaged"], false);
     }
 
     // ---------------------------------------------------------------------
