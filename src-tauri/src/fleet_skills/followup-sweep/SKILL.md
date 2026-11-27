@@ -16,7 +16,7 @@ bounded PR per repo. It is a skill, not a command, so it ships in the runner's
 `fleet_skills/` bundle and a coord-dispatched `run_skill followup-sweep` finds
 it on every device. `--dry-run` runs steps 1-2 (it skips step 0's reconcile, which
 writes) and prints each repo's batch; it allocates and writes nothing. Selection and bounding are pure code:
-`followup-sweep-select.py` (test: `followup-sweep-select-test.py`). Never
+`followup-sweep-select.py` (its test stays in the source repo beside it and is not part of the bundle). Never
 merge: coord's merge train lands the PR.
 
 Credentials: the runner proxy at `http://127.0.0.1:9876/plan-library/...` needs
@@ -33,13 +33,17 @@ coord device JWT.
    `GET /plan-library/followups?state=open&anchored=true`, following
    `next_cursor` until it is null and checking the count against the first page's
    `total` (a first-page read silently truncates), grouped by `anchors[].repo`; a follow-up anchored in several repos is skipped. Feed
-   these to `followup-sweep-select.py`.
+   these to `followup-sweep-select.py`, which also skips any follow-up whose
+   `size_class` is `plan_sized` (whoever set it) or is `small` with
+   `size_class_source: sweep` (an earlier sweep already tried and reverted it).
+   Unclassified follow-ups stay candidates: the sweep classifies on attempt.
 2. **Collisions.** For each repo gather the paths in open PRs' diffs
    (`gh pr list` + `gh pr diff --name-only`) and the paths under live file
    claims (`coord_conflict_check`) and pass them as `open_pr_paths` /
    `claimed_paths`. A follow-up touching one is skipped.
 3. **Fix.** `allocate-worktree.sh --repo <repo> --intent "followup sweep"`. For
-   each selected follow-up, oldest first:
+   each selected follow-up, in the selector's order (declared `trivial` first,
+   then the rest, oldest first within each):
    - if the issue is no longer present, record `already_fixed` with the commit
      `git log -L` names as the fix (`POST .../edges/<id>/resolution`);
    - otherwise make the fix, then run `exec-equivalence.py` on that follow-up's
@@ -48,7 +52,8 @@ coord device JWT.
      `size_class_source: sweep` through `PUT .../edges/<id>/anchors`. That PUT
      REPLACES the anchors, so read the follow-up first and send its existing
      `anchors` back with the class; an empty set would blank them.
-4. **Bounds.** At most 20 follow-ups and 400 changed lines per PR (feed the verified hunks, in order, to
+4. **Bounds.** At most 20 follow-ups (filled `trivial`-first, so the bound
+   never spends a slot on an excluded row) and 400 changed lines per PR (feed the verified hunks, in order, to
    `followup-sweep-select.py --bound-lines`); one PR per repo per run; the PR's files
    are a subset of the included follow-ups' anchored paths plus the derived
    artifacts step 5 regenerates. A migration revision is admissible only when its hunk is itself
