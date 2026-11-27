@@ -2894,6 +2894,8 @@ mod tests {
         // device. The Started row must name the tenant (create body + JWT
         // slot) and every thin row after it must carry the same one.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
         let trid = Uuid::new_v4().to_string();
@@ -2946,6 +2948,8 @@ mod tests {
         // a different tenant (the re-pinned device).
         const REPINNED: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_000000000001);
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
         let trid = Uuid::new_v4().to_string();
@@ -2992,6 +2996,8 @@ mod tests {
         // paired here) must stay none, not be papered over with the default.
         const REPO_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_0000000000d1);
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
 
@@ -3127,6 +3133,8 @@ mod tests {
         // under, so it must not be reported as the row's observed tenant.
         const CALLER_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_000000000002);
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
 
@@ -3173,6 +3181,8 @@ mod tests {
     #[test]
     fn a_poisoned_row_state_lock_reads_as_poisoned_never_as_adopted_or_minted() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
         let minted_key = Uuid::new_v4().to_string();
@@ -3227,6 +3237,8 @@ mod tests {
     #[test]
     fn recorded_row_for_record_follows_the_adoption_chain_to_the_pinned_terminal() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -3278,6 +3290,8 @@ mod tests {
     #[test]
     fn the_pinned_flag_covers_every_link_of_the_adoption_chain() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -3343,6 +3357,8 @@ mod tests {
         // An unresolvable or unpaired machine keeps the pre-existing shape:
         // no `tenant_id`, so the drain falls back exactly as it did before.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -3357,6 +3373,8 @@ mod tests {
     #[test]
     fn register_writes_started_row_and_indexes_both_directions() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -3382,6 +3400,8 @@ mod tests {
     #[test]
     fn finish_session_queues_a_finished_row_carrying_the_claude_session_id() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -3448,6 +3468,8 @@ mod tests {
     #[test]
     fn finish_for_a_terminal_plane_session_enqueues_a_finished_row() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let pinned = Uuid::new_v4().to_string();
@@ -3494,6 +3516,8 @@ mod tests {
     #[test]
     fn an_owed_terminal_mark_is_delivered_when_the_coord_row_is_bound() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let store_dir = tempfile::tempdir().unwrap();
@@ -3554,6 +3578,8 @@ mod tests {
     #[test]
     fn late_delivery_resolves_with_the_forward_serializer_held() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _store_dir) = attach_store(&reg);
@@ -3666,6 +3692,8 @@ mod tests {
     #[test]
     fn an_adopted_harness_id_resolves_through_its_predecessor() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -3732,6 +3760,8 @@ mod tests {
     #[test]
     fn a_clear_in_a_typed_resume_queues_to_the_resumed_sessions_row_not_the_panes() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -3811,6 +3841,8 @@ mod tests {
     #[test]
     fn a_chain_of_clears_resolves_through_every_predecessor() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -3944,6 +3976,8 @@ mod tests {
     #[test]
     fn a_typed_resume_record_on_a_terminal_never_borrows_the_terminals_row() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let (store, _sdir) = attach_store(&reg);
@@ -5311,6 +5345,8 @@ mod tests {
         // sniffed plane left pinned/agentic sessions unaddressable and their
         // handle register refused 403.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5330,6 +5366,8 @@ mod tests {
         // anchor would fail deserialization of the WHOLE create body and
         // break session registration itself. Omit instead.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
 
@@ -5347,6 +5385,8 @@ mod tests {
     #[test]
     fn reregister_is_idempotent_no_duplicate_started_row() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5370,6 +5410,8 @@ mod tests {
     #[test]
     fn sniffed_register_writes_terminal_claude_row_without_task_run_id() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -5404,6 +5446,8 @@ mod tests {
         // operator re-types the resume line, or a restore storm re-observes
         // it) must not re-register — one Started row per session per process.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -5433,6 +5477,8 @@ mod tests {
         // session that registered as pinned must no-op when the sniff later
         // observes the same id (and vice versa) — no duplicate coord row.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let id = Uuid::new_v4().to_string();
@@ -5448,6 +5494,8 @@ mod tests {
     #[test]
     fn sniffed_disabled_gate_registers_nothing() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -5456,7 +5504,6 @@ mod tests {
             .is_none());
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         assert!(reg.session_id_for(&csid).is_none());
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
     }
 
     #[test]
@@ -5467,6 +5514,8 @@ mod tests {
         // them: whatever the interleaving, exactly one Started row is
         // written and every racer returns the same coord id.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -5513,6 +5562,8 @@ mod tests {
         // hit must NOT (unchanged pinned semantics). Counter increments
         // pre-store-gate, so this stays network-silent (no store attached).
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let id = Uuid::new_v4().to_string();
@@ -5550,6 +5601,8 @@ mod tests {
         // queued after `Started`. A non-uuid anchor keeps the attached store's
         // handle hook network-silent (it returns before spawning).
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let store_dir = tempfile::tempdir().unwrap();
@@ -5748,6 +5801,8 @@ mod tests {
         // close_session is keyed on the same claude_session_id keyspace, so
         // a sniffed registration can be closed by the same path.
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
@@ -5766,6 +5821,8 @@ mod tests {
     #[test]
     fn heartbeat_only_after_register_and_keyed_by_session() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5798,6 +5855,8 @@ mod tests {
     #[test]
     fn progress_only_after_register_and_keyed_by_session() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5833,6 +5892,8 @@ mod tests {
     #[test]
     fn progress_disabled_gate_is_noop() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5840,12 +5901,13 @@ mod tests {
         assert!(reg.register_session(&trid, "purpose", None).is_none());
         reg.progress_on_interaction(&trid);
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
     }
 
     #[test]
     fn close_emits_closed_row_and_evicts_index() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -5868,6 +5930,7 @@ mod tests {
     #[test]
     fn report_commits_enqueues_commit_report_row() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_COMMIT_LINEAGE_REPORT"]);
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
         let (reg, _dir) = registrar();
 
@@ -5891,6 +5954,7 @@ mod tests {
     #[test]
     fn report_commits_per_branch_seq_lane_is_deterministic() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_COMMIT_LINEAGE_REPORT"]);
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
         let (reg, _dir) = registrar();
 
@@ -5908,6 +5972,7 @@ mod tests {
     #[test]
     fn report_commits_skips_empty_shas() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_COMMIT_LINEAGE_REPORT"]);
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
         let (reg, _dir) = registrar();
         reg.report_commits("o/r", "main", vec![]);
@@ -5918,11 +5983,11 @@ mod tests {
     #[test]
     fn report_commits_disabled_gate_is_noop() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_COMMIT_LINEAGE_REPORT"]);
         std::env::set_var("QONTINUI_COMMIT_LINEAGE_REPORT", "0");
         let (reg, _dir) = registrar();
         reg.report_commits("o/r", "main", vec!["a".into()]);
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
-        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
     }
 
     /// Phase 9 of plan
@@ -5932,6 +5997,7 @@ mod tests {
     #[test]
     fn report_agent_notification_enqueues_the_body_verbatim() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_AGENT_ACTION_NOTIFY"]);
         std::env::remove_var("QONTINUI_AGENT_ACTION_NOTIFY");
         let (reg, _dir) = registrar();
         let lane = Uuid::new_v4();
@@ -5958,16 +6024,18 @@ mod tests {
     #[test]
     fn report_agent_notification_disabled_gate_is_noop() {
         let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_AGENT_ACTION_NOTIFY"]);
         std::env::set_var("QONTINUI_AGENT_ACTION_NOTIFY", "off");
         let (reg, _dir) = registrar();
         reg.report_agent_notification(Uuid::new_v4(), json!({"action": "publish"}));
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
-        std::env::remove_var("QONTINUI_AGENT_ACTION_NOTIFY");
     }
 
     #[test]
     fn agent_logs_gate_defaults_on_and_only_falsy_disables() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_AGENT_LOGS_FROM_SESSIONS"]);
         std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
         // Default (unset) is ON — the feature is standard after the rollout
         // burn-in; deployed runners need no per-environment config.
@@ -5989,15 +6057,15 @@ mod tests {
                 "value {on:?} must leave the gate ON (only explicit falsy disables)"
             );
         }
-        std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
     }
 
     #[test]
     fn emitter_off_gate_yields_no_emitter() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_AGENT_LOGS_FROM_SESSIONS"]);
         std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", "0");
         assert!(AgentLogEmitter::start(Uuid::new_v4()).is_none());
-        std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
     }
 
     /// A private emitter service whose coord base never resolves, so a flush
@@ -6518,6 +6586,8 @@ mod tests {
     #[test]
     fn disabled_gate_registers_nothing() {
         let _env = env_lock();
+        let _restore =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_AUTOMATION_REGISTER"]);
         std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -6525,8 +6595,6 @@ mod tests {
         assert!(reg.register_session(&trid, "purpose", None).is_none());
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         assert!(reg.session_id_for(&trid).is_none());
-
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
     }
 
     // ------------------------------------------------------------------
