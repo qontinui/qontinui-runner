@@ -14,6 +14,7 @@ pub mod account_migration;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
+pub mod child_path; // The base PATH every hosted-session child is composed from (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path)
 pub mod claude_resume_sniff;
 pub mod close_authority;
 pub mod commit_report;
@@ -28,6 +29,7 @@ pub mod holder_boot_sweep;
 pub mod holder_census;
 #[cfg(test)]
 mod idle_chrome_replay;
+pub mod input_funnel; // The pane's input funnel exposed: draft state + writer-tagged input history (plan 2026-10-28-one-session-lifecycle-authority, Phase 80)
 pub mod interceptor;
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
 pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout

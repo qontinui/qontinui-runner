@@ -334,6 +334,15 @@ struct Entry {
     fetched: Fetched,
 }
 
+/// Whether `next` is a change worth one log line against the last kept entry:
+/// its outcome (state and reason) or the coord it asked differs. The coord is
+/// part of the key because the same outcome from another coord is a different
+/// fact about this device.
+fn read_changed(last: Option<&Entry>, next: &Entry) -> bool {
+    last.map(|e| (e.fetched.outcome(), e.coord_base.as_deref()))
+        != Some((next.fetched.outcome(), next.coord_base.as_deref()))
+}
+
 impl Entry {
     fn fresh_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.done) < self.fetched.ttl()
@@ -496,11 +505,7 @@ impl CapacityCache {
         };
         let read = entry.read_at(done);
         let mut last = self.last_guard();
-        let changed = last
-            .as_ref()
-            .map(|e| (e.fetched.outcome(), e.coord_base.as_deref()))
-            != Some((entry.fetched.outcome(), entry.coord_base.as_deref()));
-        if changed {
+        if read_changed(last.as_ref(), &entry) {
             // The bearer never reaches a reason, so a reason is safe to log.
             tracing::info!(
                 state = read.state,
@@ -802,6 +807,31 @@ mod tests {
             coord_base: Some(COORD_BASE.to_string()),
             fetched,
         }
+    }
+
+    /// The change-log key is (outcome, coord_base): the same outcome from a
+    /// different coord logs again, and the same pair does not.
+    #[test]
+    fn a_coord_base_change_with_the_same_outcome_is_logged_again() {
+        let t = Instant::now();
+        let first = entry_at(t, known());
+        assert!(read_changed(None, &first), "the first read is a change");
+        assert!(
+            !read_changed(Some(&first), &entry_at(t, known())),
+            "same outcome, same coord: not logged again"
+        );
+        let mut elsewhere = entry_at(t, known());
+        elsewhere.coord_base = Some("https://other.example".to_string());
+        assert!(
+            read_changed(Some(&first), &elsewhere),
+            "same outcome, another coord: logged again"
+        );
+        let mut unresolved = entry_at(t, known());
+        unresolved.coord_base = None;
+        assert!(
+            read_changed(Some(&first), &unresolved),
+            "same outcome, no coord resolved: logged again"
+        );
     }
 
     /// A clock that stands at `t` (and at this moment's wall time).

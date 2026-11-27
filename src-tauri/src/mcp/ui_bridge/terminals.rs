@@ -169,7 +169,7 @@ pub(crate) fn classify_terminal_session_get_response(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             };
             Err((StatusCode::NOT_FOUND, Json(body)))
         }
@@ -187,7 +187,7 @@ pub(crate) fn classify_terminal_session_get_response(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             };
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(body)))
         }
@@ -219,7 +219,7 @@ pub async fn ui_bridge_terminal_session_get_handler(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             };
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(body)))
         }

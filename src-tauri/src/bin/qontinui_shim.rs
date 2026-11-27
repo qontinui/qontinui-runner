@@ -289,14 +289,15 @@ pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
 }
 
 /// Did the user's argv already choose a session? Then the shim must NOT
-/// double-pin. Exact token match, case-insensitive, mirroring
-/// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
-/// bash identity shim also honors. A merely-prefixed token
-/// (`--session-id-ish`) does NOT match, and neither does anything after a `--`,
-/// which is positional. The token set itself is the Rust spelling
+/// double-pin. The scan is
 /// `qontinui_runner_lib::claude_env::claude_argv_chooses_session`, shared with
-/// the runner's terminal seam; the `.bash` / `.cmd` script shims still carry
-/// copies (plan-library follow-up edge `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
+/// the runner's terminal seam: a session token (case-insensitive, plus the
+/// `--session-id=…`/`--resume=…` inline forms) that is not the VALUE of a
+/// Claude Code option, before a `--` that is not one either. A merely-prefixed
+/// token (`--session-id-ish`) does NOT match. The `.bash` / `.cmd` script shims
+/// carry their own copies of the scan, whose option lists a `claude_env` test
+/// pins to the Rust ones (unifying them: plan-library follow-up edge
+/// `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
 pub fn user_chose_session(args: &[String]) -> bool {
     qontinui_runner_lib::claude_env::claude_argv_chooses_session(args)
 }
@@ -2445,6 +2446,35 @@ mod tests {
             "--append-system-prompt",
             "use --resume-like flows"
         ])));
+    }
+
+    /// The VALUE of a Claude Code option is not a session choice, so the pin
+    /// is still appended: `claude --name resume` must not launch id-less
+    /// (review round 5, A2 of qontinui-runner#3149).
+    #[test]
+    fn an_option_value_named_like_a_session_choice_still_gets_the_pin() {
+        for argv in [
+            &["--name", "resume"][..],
+            &["-n", "-c"],
+            &["--model", "-r"],
+            &["--add-dir", "a", "resume"],
+        ] {
+            let orig = strs(argv);
+            let user_chose = user_chose_session(&orig);
+            assert!(!user_chose, "{argv:?} chooses no session");
+            let out = identity_argv(&orig, &[], &[], Some("pin-123"), user_chose);
+            assert_eq!(
+                out.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{argv:?}: {out:?}"
+            );
+            let i = out.iter().position(|a| a == "--session-id").unwrap();
+            assert_eq!(
+                out.get(i + 1).map(String::as_str),
+                Some("pin-123"),
+                "{out:?}"
+            );
+        }
     }
 
     #[test]

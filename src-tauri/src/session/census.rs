@@ -106,6 +106,13 @@ pub struct CensusRow {
     /// ancestor? `None` = not read (non-Linux) or unreadable mid-walk.
     #[serde(skip)]
     pub runner_ancestor: Option<bool>,
+    /// Where THIS runner shows the session — `terminal_id`, `page_id`,
+    /// `page_name`, `page_window`, flattened into the row — for a
+    /// `runner_hosted` row whose terminal is here; absent otherwise
+    /// ([`crate::session_placement`], plan
+    /// `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::session_placement::Placement>,
 }
 
 /// The whole-device snapshot body.
@@ -450,6 +457,9 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
             .or_else(|| s.status_updated_at.and_then(ms_to_rfc3339)),
         runner_hosted: (probes.is_runner_hosted)(&s.session_id) || runner_ancestor == Some(true),
         runner_ancestor,
+        // Filled after the build, from the terminal layout
+        // (`session_placement::apply_placements`).
+        placement: None,
     }
 }
 
@@ -652,8 +662,17 @@ async fn publisher_loop(app: tauri::AppHandle) {
     let mut last: Option<PostState> = None;
     let mut ticker = tokio::time::interval(CENSUS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let early = crate::session_placement::early_post();
     loop {
-        ticker.tick().await;
+        // The interval, or an early post a rename / move / pop-out / bind /
+        // close asked for (debounced; `session_placement`). Posts run one at a
+        // time here, which is what makes early posts single-flight.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = early.wait() => {}
+        }
+        // Whichever arm won, this post answers every request made so far.
+        early.clear();
         let state = tick(&app, client.as_ref()).await;
         if last.as_ref() != Some(&state) {
             log_transition(&state);
@@ -708,6 +727,7 @@ struct HostedSubstrate {
     sessions: Option<Arc<crate::claude_session::SessionManager>>,
     registrar: Option<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
     lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    terminals: Option<Arc<crate::terminal::TerminalManager>>,
 }
 
 impl HostedSubstrate {
@@ -723,7 +743,28 @@ impl HostedSubstrate {
             lifecycle: app
                 .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
                 .map(|s| s.inner().clone()),
+            terminals: app
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone()),
         }
+    }
+
+    /// Every confirmed session's placement on THIS runner, through the layout
+    /// join (`session_placement::placements_by_session`). Empty before the
+    /// terminal manager is up.
+    fn placements(&self) -> std::collections::HashMap<String, crate::session_placement::Placement> {
+        let Some(terminals) = &self.terminals else {
+            return std::collections::HashMap::new();
+        };
+        let joined = crate::terminal::layout::join_terminals(
+            terminals.list(),
+            self.lifecycle.as_deref(),
+            |_| None,
+        );
+        crate::session_placement::placements_by_session(
+            joined,
+            &crate::terminal::layout::page_labels().snapshot(),
+        )
     }
 
     fn hosts(&self, id: &str) -> bool {
@@ -759,7 +800,7 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
     let built = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let hosted = |id: &str| substrate.hosts(id);
         let may_host = super::claude_session_registry::may_host_claude(&snap);
-        build_snapshot(
+        let mut built = build_snapshot(
             &crate::terminal::transcript::find_claude_config_dirs(),
             &live_pids,
             Utc::now(),
@@ -770,7 +811,14 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
                 is_runner_hosted: &hosted,
                 may_host_claude: &may_host,
             },
-        )
+        );
+        if let Ok(snapshot) = built.as_mut() {
+            crate::session_placement::apply_placements(
+                &mut snapshot.sessions,
+                &substrate.placements(),
+            );
+        }
+        built
     })
     .await;
     let snapshot = match built {
@@ -1539,6 +1587,7 @@ mod tests {
                 last_acted_at: None,
                 runner_hosted: false,
                 runner_ancestor: Some(true),
+                placement: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();

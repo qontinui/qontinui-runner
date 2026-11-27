@@ -63,7 +63,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use super::relay::tabs_response_body;
-use super::screenshots::{build_visibility_report, VisibilityRequest};
+use super::screenshots::{build_visibility_report, disclose_occlusion_text, VisibilityRequest};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -306,6 +306,12 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         "`occlusions` is the SDK's entry list"
     );
     assert_eq!(
+        report["clipped"].as_array().map(Vec::len),
+        Some(0),
+        "`clipped` is a required key of the SDK's VisibilityReport, present \
+         (empty) even when nothing is clipped"
+    );
+    assert_eq!(
         report["elementCount"], 1,
         "`elementCount` is the size of the swept population, not of the result \
          — it is what separates 'clear' from 'nothing was looked at'"
@@ -417,6 +423,66 @@ fn visibility_verdict_union_is_exactly_the_sdk_three() {
     assert_eq!(found["verdict"], "occlusions_found");
 }
 
+/// Ancestor-overflow clipping is NOT a fourth verdict and NOT an occlusion.
+///
+/// Plan `2026-11-24-the-visibility-sweep-counts-an-ancestors-overflow-clipping-as-occlusion`
+/// Phase 2: the SDK's `VisibilityReport` gains `clipped:
+/// VisibilityClippedEntry[]` (`{element, label?, text?, ratio,
+/// scrollReachable}`), which never moves `verdict` or `hidesText`. A clipped-
+/// only page therefore reads `clear`, with the list beside it. And on a
+/// relayed read the entry carries no `element` / `label` / `text`, because an
+/// id is commonly a slug of the element's text.
+#[test]
+fn a_clipped_only_element_reads_clear_with_one_clipped_entry_and_relays_no_element() {
+    let elements = [serde_json::json!({
+        "id": "button-gates-12",
+        "label": "Gates",
+        "state": {
+            "visible": false,
+            "visibilityReason": "clipped",
+            "clippedPct": 100,
+            "clipScrollable": true,
+            "textContent": "Gates",
+        }
+    })];
+    let mut report = build_visibility_report(&elements, 0.02, false, None);
+
+    assert_eq!(
+        report["verdict"], "clear",
+        "clipping is not covering: a clipped-only page is `clear`, never a fourth verdict and never `occlusions_found`"
+    );
+    assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
+    let clipped = report["clipped"]
+        .as_array()
+        .expect("`clipped` is the SDK's clipped-entry list");
+    assert_eq!(clipped.len(), 1, "exactly one clipped entry");
+    let entry = &clipped[0];
+    assert_eq!(entry["element"], "button-gates-12");
+    assert_eq!(entry["ratio"], 1.0, "`ratio` is clippedPct / 100");
+    assert_eq!(
+        entry["scrollReachable"], true,
+        "`scrollReachable` is camelCase and carries `clipScrollable`"
+    );
+    for absent in ["occludedBy", "scroll_reachable", "clippedPct", "hidesText"] {
+        assert!(
+            entry.get(absent).is_none(),
+            "`{absent}` is not a clipped-entry key"
+        );
+    }
+
+    disclose_occlusion_text(&mut report, true);
+    let relayed = &report["clipped"][0];
+    for stripped in ["element", "label", "text"] {
+        assert!(
+            relayed.get(stripped).is_none(),
+            "a relayed clipped entry must carry no `{stripped}`: {relayed}"
+        );
+    }
+    assert_eq!(relayed["ratio"], 1.0);
+    assert_eq!(relayed["scrollReachable"], true);
+    assert_eq!(report["verdict"], "clear");
+}
+
 /// `minRatio` is a `<` filter, and its boundary is shared with the SDK
 /// (`if (ratio < minRatio) continue`). Off-by-one here means the two
 /// implementations disagree about the same page at exactly the threshold a
@@ -448,6 +514,31 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
         below_threshold["verdict"], "clear",
         "a fully-filtered list is `clear`, not `unknown_empty_registry` — the \
          registry was not empty"
+    );
+
+    // The clipped list shares the boundary: the SDK keeps a clip when
+    // `clipRatio >= minRatio`, so a clip exactly AT the threshold is listed and
+    // one just below it is not.
+    let clipped = [serde_json::json!({
+        "id": "tab-2",
+        "state": {
+            "visible": false,
+            "visibilityReason": "clipped",
+            "clippedPct": 2,
+            "clipScrollable": false,
+        }
+    })];
+    let at = build_visibility_report(&clipped, 0.02, false, None);
+    assert_eq!(
+        at["clipped"].as_array().map(Vec::len),
+        Some(1),
+        "a clip exactly AT minRatio is listed, matching the SDK's `>=`"
+    );
+    let below = build_visibility_report(&clipped, 0.020_001, false, None);
+    assert_eq!(
+        below["clipped"].as_array().map(Vec::len),
+        Some(0),
+        "a clip just below minRatio is dropped"
     );
 }
 

@@ -4000,17 +4000,24 @@ mod tests {
         fn pty_holder_attach_synthetic_frames_leave_the_offset_alone() {
             let script = past_the_ring("\\033[?2004h\\033[?1049h", "DONE");
             let (dir, id) = spawn_then_detach("off", &script, b"DONE");
-            let (_, end) = bare_tail(&dir, &id);
+            let (tail, end) = bare_tail(&dir, &id);
 
             let pane = Arc::new(
                 DaemonPaneIo::attach_existing(&dir, &id, None, Some((80, 24)))
                     .expect("fresh reattach"),
             );
             let start = end - TAIL as u64;
-            assert_eq!(
-                pane.stream_offset(),
-                start,
-                "the tail starts where the holder said"
+            // Only a BOUND before the drain: `attach_existing` starts the pump
+            // at once, and `PaneOutput::push_output` (pane_output.rs) advances
+            // the offset when a chunk is QUEUED, not when it is drained — so
+            // under load the pump may already have queued a holder frame
+            // here. The exact checks below run after the drain, when the race
+            // window has closed.
+            let at_attach = pane.stream_offset();
+            assert!(
+                start <= at_attach && at_attach <= end,
+                "the offset at attach ({at_attach}) lies in the tail [{start}, {end}] \
+                 (the pump may already have queued a frame)"
             );
             let (c, t) = drain(&pane);
             let synthetic = b"\x1b[?1049h".len() + b"\x1b[?2004h".len();
@@ -4028,6 +4035,22 @@ mod tests {
                 "the tail plus exactly the envelope"
             );
             assert!(got.starts_with(b"\x1b[?1049h") && got.ends_with(b"DONE\x1b[?2004h"));
+            // Byte-exact: the stream part of what the pane delivered, between
+            // the 8-byte `?1049h` preamble and the 8-byte `?2004h` postamble,
+            // is exactly the tail the holder serves. The tail is uniform `x`
+            // ending in `DONE`, so this pins the envelope boundaries; where the
+            // tail STARTS is pinned only jointly with the exact length, the
+            // `ends_with` and the `offset == end` checks above — keep all four.
+            let stream = &got[b"\x1b[?1049h".len()..got.len() - b"\x1b[?2004h".len()];
+            assert_eq!(tail.len(), TAIL, "the bare tail is one full tail");
+            let first_diff = stream.iter().zip(tail.iter()).position(|(a, b)| a != b);
+            assert!(
+                stream == &tail[..],
+                "the delivered stream bytes are exactly the holder's tail \
+                 (stream {} bytes, tail {} bytes, first difference at {first_diff:?})",
+                stream.len(),
+                tail.len()
+            );
             assert!(
                 !contains(&got, b"were lost here"),
                 "no loss marker: nothing was lost"

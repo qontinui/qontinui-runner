@@ -73,10 +73,17 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 
 /// Did a `claude` argv (everything after the program) already choose a
 /// session? Then nothing may add a second one. Exact token match,
-/// case-insensitive: `--session-id`, `--resume`, `-r`, the `resume`
-/// subcommand, `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
+/// case-insensitive: `--session-id`, `--resume`, `-r`, a bare `resume` (kept
+/// though Claude Code 2.1.332 has no `resume` subcommand, so it is really a
+/// prompt; plan-library follow-up edge
+/// `23d2295f-98d4-4eaa-a999-ab2927ae0e4f`),
+/// `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
 /// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
-/// and neither does anything after a `--`, which is positional.
+/// and neither does anything after a `--`, which is positional. Nor does the
+/// VALUE of a Claude Code option that takes one ([`CLAUDE_VALUE_FLAGS`],
+/// [`CLAUDE_VARIADIC_FLAGS`]): in `--name resume` or `--model -c` the token
+/// names a session title or a model, not a session choice, and reading it as
+/// one would leave the pane unpinned.
 ///
 /// The Rust spelling of that set, shared by every Rust reader: the native
 /// identity shim (`bin/qontinui_shim.rs`) decides from it whether to append
@@ -90,18 +97,101 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// copies of the list — a recorded follow-up, plan-library edge
 /// `2ce2a5a6-da43-4585-a372-d533fb50b7e7`.
 pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
-    args.iter()
-        .map(AsRef::as_ref)
-        .take_while(|a| *a != "--")
-        .any(|a| {
-            let t = a.to_ascii_lowercase();
-            matches!(
-                t.as_str(),
-                "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-            ) || t.starts_with("--session-id=")
-                || t.starts_with("--resume=")
-        })
+    let mut tokens = args.iter().map(AsRef::as_ref).peekable();
+    while let Some(a) = tokens.next() {
+        // `--` ends the options, so nothing after it is a session choice. A
+        // `--` that is an option's VALUE (`--name -- -c`) never reaches here:
+        // it is consumed below, as commander consumes it, and the scan goes on.
+        if a == "--" {
+            return false;
+        }
+        let t = a.to_ascii_lowercase();
+        if matches!(
+            t.as_str(),
+            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
+        ) || t.starts_with("--session-id=")
+            || t.starts_with("--resume=")
+        {
+            return true;
+        }
+        // An option's value is never a session choice. Inline `--flag=value`
+        // carries its value in the same token, so only the bare spelling
+        // consumes what follows.
+        if CLAUDE_VALUE_FLAGS.contains(&a) {
+            tokens.next();
+        } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
+            // Variadic options take every following token up to the next
+            // option, i.e. one longer than `-` that starts with it
+            // (commander's option test `arg.length > 1 && arg[0] === '-'`,
+            // which the Claude Code 2.1.332 binary carries), so a
+            // `resume` or a lone `-` in that run is a value. A `--` is an
+            // option by that test, so it ends the run and is then read as the
+            // terminator.
+            while tokens
+                .next_if(|v| !(v.len() > 1 && v.starts_with('-')))
+                .is_some()
+            {}
+        }
+    }
+    false
 }
+
+/// Claude Code options that take exactly ONE value, which is consumed even
+/// when it starts with `-`, `--` included (commander's rule for a required
+/// option-argument). The script identity shims (`resources/intercept/
+/// identity_shim.bash` / `.cmd`) carry the same two lists; a test pins them.
+/// Case-sensitive, as the CLI is. A flag missing from this list only costs
+/// the old behaviour for its value (it is scanned as a token, so a value
+/// spelled like a session choice leaves the pane unpinned), so the list errs
+/// toward the options a runner or an operator template actually sends.
+/// Options with an OPTIONAL value (`-d/--debug [filter]`, `-w/--worktree
+/// [name]`, …), which take the next token only when it is not an option, are
+/// not modelled yet and get that old behaviour (follow-up edge
+/// `23d2295f-98d4-4eaa-a999-ab2927ae0e4f`).
+pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
+    "--name",
+    "-n",
+    "--model",
+    "--fallback-model",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--output-format",
+    "--input-format",
+    "--settings",
+    "--setting-sources",
+    "--agent",
+    "--agents",
+    "--effort",
+    "--max-turns",
+    "--max-budget-usd",
+    "--json-schema",
+    "--plugin-dir",
+    "--autocompact",
+    "--debug-file",
+    "--environment",
+    "--permission-prompts",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--system-prompt-snapshot",
+];
+
+/// Claude Code options that take one or more values: everything up to the
+/// next token longer than `-` that starts with `-` (a lone `-` is a value).
+pub const CLAUDE_VARIADIC_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--mcp-config",
+    "--tools",
+    "--betas",
+    "--file",
+];
 
 #[cfg(test)]
 mod tests {
@@ -160,5 +250,223 @@ mod tests {
         let detail = inherited_markers_detail(&[CLAUDECODE_ENV, CLAUDE_CHILD_SESSION_ENV]);
         assert!(detail.contains(CLAUDECODE_ENV));
         assert!(detail.contains(CLAUDE_CHILD_SESSION_ENV));
+    }
+
+    #[test]
+    fn session_choice_tokens_are_recognised() {
+        for argv in [
+            &["--session-id", "x"][..],
+            &["--resume"],
+            &["-r", "x"],
+            &["resume"],
+            &["--continue"],
+            &["-c"],
+            &["--Session-Id=x"],
+            &["--resume=x"],
+            &["--verbose", "resume"],
+            &["--model", "opus", "-c"],
+            &["--add-dir", "a", "b", "--continue"],
+            &["--name", "--", "-c"],
+        ] {
+            assert!(
+                claude_argv_chooses_session(argv),
+                "{argv:?} chooses a session"
+            );
+        }
+    }
+
+    #[test]
+    fn an_option_value_is_not_a_session_choice() {
+        for argv in [
+            &["--name", "resume"][..],
+            &["-n", "-c"],
+            &["--model", "-r"],
+            &["--name", "resume", "--verbose"],
+            &["--add-dir", "a", "resume"],
+            &["--allowedTools", "Bash", "resume", "--", "-c"],
+            &["--session-id-ish"],
+            &["--", "resume"],
+            &["--name=resume"],
+            &["--add-dir", "a", "--", "-c"],
+            &["--plugin-dir", "p", "--verbose"],
+            &["--add-dir", "a", "-", "resume"],
+        ] {
+            assert!(
+                !claude_argv_chooses_session(argv),
+                "{argv:?} chooses no session"
+            );
+        }
+    }
+
+    /// One argv table every session-choice scan is held to: the Rust scan
+    /// here, and the bash / .cmd identity shim loops below. `true` = the argv
+    /// already chooses a session, so the shim must not pin.
+    const SCAN_CASES: &[(&[&str], bool)] = &[
+        (&["--session-id", "x"], true),
+        (&["--resume"], true),
+        (&["-r", "x"], true),
+        (&["resume"], true),
+        (&["--continue"], true),
+        (&["-c"], true),
+        (&["--verbose", "resume"], true),
+        (&["--model", "opus", "-c"], true),
+        (&["--add-dir", "a", "b", "--continue"], true),
+        (&["--name", "--", "-c"], true),
+        (&["--name", "", "-c"], true),
+        (&["--name", "resume"], false),
+        (&["-n", "-c"], false),
+        (&["--model", "-r"], false),
+        (&["--add-dir", "a", "resume"], false),
+        (&["--add-dir", "", "resume"], false),
+        (&["--allowedTools", "Bash", "resume", "--", "-c"], false),
+        (&["--", "resume"], false),
+        (&["--add-dir", "a", "--", "-c"], false),
+        (&["--plugin-dir", "p", "--verbose"], false),
+        (&["--add-dir", "a", "-", "resume"], false),
+        (&["-p", "hi"], false),
+        (&["--file", "a", "resume"], false),
+        (&["--file", "a", "b", "-c"], true),
+        (&["--system-prompt-snapshot", "-c"], false),
+        (&["--autocompact", "resume"], false),
+        (&["--environment", "-r", "--continue"], true),
+        (&["--name", "Why?", "-c"], true),
+        (&["--name", "x*", "-c"], true),
+    ];
+
+    #[test]
+    fn the_rust_scan_matches_the_shared_table() {
+        for (argv, want) in SCAN_CASES {
+            assert_eq!(claude_argv_chooses_session(argv), *want, "{argv:?}");
+        }
+    }
+
+    /// Run `script` (one shim's scan, extracted verbatim, plus a line printing
+    /// its verdict) over every row of [`SCAN_CASES`] and compare what it prints
+    /// with the table. A failure names the exit status and stderr, so a script
+    /// that errored reads as an error, not as a bare 0-vs-1 mismatch.
+    ///
+    /// The `cmd /c` line holds more than two quotes on the empty-argument
+    /// rows, so a temp dir whose path contains a space would break it (cmd
+    /// strips the first and last quote); CI and default Windows temp paths
+    /// have none.
+    fn assert_script_scan_matches(program: &str, pre_args: &[&str], file_name: &str, script: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, script).unwrap();
+        for (argv, want) in SCAN_CASES {
+            let out = std::process::Command::new(program)
+                .args(pre_args)
+                .arg(&path)
+                .args(argv.iter())
+                .output()
+                .unwrap_or_else(|e| panic!("{program} did not start: {e}"));
+            let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let want = if *want { "1" } else { "0" };
+            assert_eq!(
+                got,
+                want,
+                "{program} scan of {argv:?} (status {:?}, stderr {:?})",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bash_shim_scan_matches_the_shared_table() {
+        const BASH: &str = include_str!("../resources/intercept/identity_shim.bash");
+        let start = BASH
+            .find("user_chose_session=0\n")
+            .expect("bash shim has the scan");
+        let end = BASH
+            .get(start..)
+            .and_then(|rest| rest.find("\ndone\n"))
+            .expect("bash scan loop closes")
+            + start
+            + "\ndone\n".len();
+        let body = BASH.get(start..end).expect("scan slice");
+        let script = format!("{body}echo \"$user_chose_session\"\n");
+        assert_script_scan_matches("bash", &[], "scan.sh", &script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_cmd_shim_scan_matches_the_shared_table() {
+        const CMD: &str = include_str!("../resources/intercept/identity_shim.cmd");
+        let start = CMD
+            .find("set \"USER_CHOSE=0\"")
+            .expect("cmd shim has the scan");
+        // Anchor on the LABEL line: the text `:scan_args_done` first appears
+        // in the loop's own `goto :scan_args_done`, and a slice ending there
+        // would drop the loop body (review round 3, A1).
+        const LABEL: &str = "\n:scan_args_done";
+        let end = CMD
+            .get(start..)
+            .and_then(|rest| rest.find(LABEL))
+            .expect("cmd scan loop closes")
+            + start
+            + LABEL.len();
+        let body = CMD.get(start..end).expect("scan slice");
+        let script = format!(
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\n{}\r\necho !USER_CHOSE!\r\n",
+            body.replace("\r\n", "\n").replace('\n', "\r\n")
+        );
+        assert_script_scan_matches("cmd.exe", &["/d", "/c"], "scan.cmd", &script);
+    }
+
+    /// The script shims carry their own copies of the two option lists. Every
+    /// option the Rust scan skips must be skipped by both scripts too, or a
+    /// script-shim pane is left unpinned where the runner predicts a pin
+    /// (review round 5, A1).
+    #[test]
+    fn script_shims_carry_the_same_option_lists() {
+        const BASH: &str = include_str!("../resources/intercept/identity_shim.bash");
+        const CMD: &str = include_str!("../resources/intercept/identity_shim.cmd");
+        // The `case` pattern line that starts with `first|` (the whole pattern,
+        // first flag included).
+        let bash_list = |first: &str| -> Vec<String> {
+            let marker = format!("{first}|");
+            let line = BASH
+                .lines()
+                .find(|l| l.trim_start().starts_with(&marker))
+                .unwrap_or_else(|| panic!("bash shim has no `{marker}` pattern line"));
+            line.trim()
+                .trim_end_matches(')')
+                .split('|')
+                .map(|f| f.trim().to_string())
+                .collect()
+        };
+        let cmd_list = |var: &str| -> Vec<String> {
+            let prefix = format!("set \"{var}= ");
+            let line = CMD
+                .lines()
+                .find(|l| l.trim_start().starts_with(&prefix))
+                .unwrap_or_else(|| panic!("cmd shim has no `{var}` list"));
+            line.trim_start()
+                .trim_start_matches(&prefix)
+                .trim_end_matches(" \"")
+                .split(' ')
+                .map(str::to_string)
+                .collect()
+        };
+        let mut want_value: Vec<String> =
+            CLAUDE_VALUE_FLAGS.iter().map(|s| s.to_string()).collect();
+        let mut want_variadic: Vec<String> = CLAUDE_VARIADIC_FLAGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want_value.sort();
+        want_variadic.sort();
+        for (got, want, which) in [
+            (bash_list("--name"), &want_value, "bash value"),
+            (bash_list("--add-dir"), &want_variadic, "bash variadic"),
+            (cmd_list("VALUE_FLAGS"), &want_value, "cmd value"),
+            (cmd_list("VARIADIC_FLAGS"), &want_variadic, "cmd variadic"),
+        ] {
+            let mut got = got;
+            got.sort();
+            assert_eq!(&got, want, "{which} list drifted from the Rust list");
+        }
     }
 }

@@ -3659,7 +3659,7 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
 /// | `GET /ui-bridge/control/components` | none — relayed, it carries the runner's own registry only: `ui_bridge::elements::ComponentSources` withholds every WebSocket-registered app's reply from a request bearing `relay_path_policy::RELAYED_REQUEST_HEADER`. What remains is `serializeComponent` metadata (ids, names, descriptions, actions with declared effects) and no component state; some names embed a saved project's name, or a registered app's self-declared name while the runner's UI Bridge integration page lists that app |
 /// | `POST /ui-bridge/control/page-health` | terminal stream, strictest, refuse — its text findings quote the same webview as the snapshot |
-/// | `POST /ui-bridge/control/visibility` | terminal stream, strictest, refuse — relayed, its report drops every occlusion entry's `element`, `occludedBy`, `label` and `text` (`ui_bridge::screenshots::disclose_occlusion_text`) and says `occlusionText: "withheld"`; the verdict, counts, `occlusionDataObserved`, the request echo (`minRatio`, `includeExpected`), the overlay-classifier status `expectedOverlayDetection` and per-entry `ratio` / `hidesText` / `isExpectedOverlay` / `source` remain, and those still describe the same webview |
+/// | `POST /ui-bridge/control/visibility` | terminal stream, strictest, refuse — relayed, its report drops every occlusion entry's `element`, `occludedBy`, `label` and `text` and every clipped entry's `element`, `label` and `text` (`ui_bridge::screenshots::disclose_occlusion_text`) and says `occlusionText: "withheld"`; the verdict, counts, `occlusionDataObserved`, the request echo (`minRatio`, `includeExpected`), the overlay-classifier status `expectedOverlayDetection`, per-occlusion `ratio` / `hidesText` / `isExpectedOverlay` / `source` and per-clipped `ratio` / `scrollReachable` remain, and those still describe the same webview |
 /// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
 /// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
 /// | `GET /task-runs/{id}/events`, `/output`, `/session-state`, `/workflow-state`, `/screenshots` | terminal stream, that run's tenant, refuse |
@@ -5983,32 +5983,42 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
-        // door-scan: spawn — the door's real spawn; the context is in hand until here.
-        match tm.create(
-            title,
-            working_dir,
-            None,
-            cols,
-            rows,
-            api_state.app_handle.clone(),
-            None,
-            extra_env,
-            // UNATTENDED spawn — respect the critical floor. This is
-            // qontinui-web asking the runner to open a terminal over the relay
-            // WebSocket: the request originates on another machine, so the
-            // memory it is about to consume is this machine's and the person
-            // who could approve the risk is not here. The refusal travels back
-            // over the relay as this frame's error, naming lane/headroom/floor,
-            // which is what lets the web UI tell the user why.
-            false,
-            // The account is chosen after this point (a shell the relay
-            // types into), so the every-account mint applies.
-            crate::terminal::TrustArm::AccountChosenLater,
-            // No spawn tenant — see the allocate above.
-            None,
-            // A relay create names no reason — the same origin its drain gate uses.
-            crate::coord_drain_state::SpawnOrigin::Unknown,
-        ) {
+        let create_app_handle = api_state.app_handle.clone();
+        // Off the API runtime's workers: this create can block for seconds to
+        // minutes (see `spawn_off_worker`).
+        let created = {
+            let tm = tm.clone();
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                // door-scan: spawn — the door's real spawn; the context is in hand until here.
+                tm.create(
+                    title,
+                    working_dir,
+                    None,
+                    cols,
+                    rows,
+                    create_app_handle,
+                    None,
+                    extra_env,
+                    // UNATTENDED spawn — respect the critical floor. This is
+                    // qontinui-web asking the runner to open a terminal over the relay
+                    // WebSocket: the request originates on another machine, so the
+                    // memory it is about to consume is this machine's and the person
+                    // who could approve the risk is not here. The refusal travels back
+                    // over the relay as this frame's error, naming lane/headroom/floor,
+                    // which is what lets the web UI tell the user why.
+                    false,
+                    // The account is chosen after this point (a shell the relay
+                    // types into), so the every-account mint applies.
+                    crate::terminal::TrustArm::AccountChosenLater,
+                    // No spawn tenant — see the allocate above.
+                    None,
+                    // A relay create names no reason — the same origin its drain gate uses.
+                    crate::coord_drain_state::SpawnOrigin::Unknown,
+                )
+            })
+            .await
+        };
+        match created {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {
                     if let Some(session) = tm.get(&info.id) {

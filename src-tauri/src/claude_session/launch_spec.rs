@@ -482,6 +482,9 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut template_model: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
     let mut session_via_placeholder = false;
+    // Index in `other_units` of the placeholder-positioned session flag that
+    // carries the pin, so a second one can replace or be dropped (review A6).
+    let mut kept_session_unit: Option<usize> = None;
 
     if let Some(t) = &template {
         // `had_placeholder` only says the template MENTIONS `{sessionId}`.
@@ -529,21 +532,60 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Session flags that NAME an id — `--session-id`, `--resume`,
                 // `-r` and the `--session-id=` / `--resume=` inline forms: when
                 // the operator positioned the id via the `{sessionId}`
-                // placeholder, keep the flag in place; otherwise the spec owns
-                // session and we drop the template's.
+                // placeholder, keep the flag that carries it in place;
+                // otherwise the spec owns session and we drop the template's.
+                // When the spec pins the session, a session flag that does NOT
+                // carry the pin is dropped even beside a placeholder: in
+                // `--session-id {sessionId} --resume <literal>` the literal
+                // would ship a second, different id (review A1 of
+                // qontinui-runner#3149). Only ONE flag that carries the pin is
+                // kept: `--session-id {sessionId} --resume {sessionId}` would
+                // otherwise ship two session flags, a pair Claude Code refuses
+                // without `--fork-session`. The kept one is the flag of the
+                // kind the spec pins with (`--resume`/`-r` for `resume_id`,
+                // `--session-id` for `session_id`), else the first.
                 n if names_session_id(n) => {
                     if had_placeholder {
                         let carries_pin = match pin {
                             Some(p) => unit.name.contains(p) || unit.values.iter().any(|v| v == p),
                             None => true,
                         };
-                        session_via_placeholder |= carries_pin;
-                        other_units.push(unit);
+                        if !carries_pin {
+                            tracing::warn!(
+                                flag = %flag_name_only(&unit.name),
+                                "launch template flag dropped: it names a session other than \
+                                 the one the spec pins"
+                            );
+                        } else if let (Some(_), Some(idx)) = (pin, kept_session_unit) {
+                            let wants_resume = spec.resume_id.is_some();
+                            let kept_matches = other_units
+                                .get(idx)
+                                .is_some_and(|u| is_resume_flag(&u.name) == wants_resume);
+                            let new_matches = is_resume_flag(&unit.name) == wants_resume;
+                            let dropped = if new_matches && !kept_matches {
+                                other_units
+                                    .get_mut(idx)
+                                    .map(|kept| std::mem::replace(kept, unit))
+                            } else {
+                                Some(unit)
+                            };
+                            if let Some(d) = dropped {
+                                tracing::warn!(
+                                    flag = %flag_name_only(&d.name),
+                                    "launch template flag dropped: another template flag \
+                                     already carries the pinned session"
+                                );
+                            }
+                        } else {
+                            session_via_placeholder = true;
+                            kept_session_unit = Some(other_units.len());
+                            other_units.push(unit);
+                        }
                     }
                 }
                 // Every other session choice — `--continue` / `-c` ("the most
-                // recent conversation in this cwd") and the `resume`
-                // subcommand, i.e. the rest of the one token set
+                // recent conversation in this cwd") and a bare `resume`
+                // token, i.e. the rest of the one token set
                 // `claude_env::claude_argv_chooses_session` — cannot stand
                 // beside the spec's `--session-id` / `--resume`: Claude Code
                 // refuses the pair ("--session-id with --continue or --resume
@@ -761,6 +803,13 @@ fn names_session_id(name: &str) -> bool {
     matches!(t.as_str(), "--session-id" | "--resume" | "-r")
         || t.starts_with("--session-id=")
         || t.starts_with("--resume=")
+}
+
+/// Whether a session-naming flag (see [`names_session_id`]) RESUMES a session
+/// (`--resume`, `-r`, `--resume=…`) rather than starting one under an id.
+fn is_resume_flag(name: &str) -> bool {
+    let t = name.to_ascii_lowercase();
+    t == "--resume" || t == "-r" || t.starts_with("--resume=")
 }
 
 /// Whether `s` is a recognizable `claude …` invocation (vs. an opaque alias).
@@ -1468,6 +1517,109 @@ mod tests {
                 "{template}: {argv:?}"
             );
             assert!(!argv.iter().any(|a| a == "-c"), "{template}: {argv:?}");
+        }
+    }
+
+    /// Beside a `{sessionId}` placeholder, a template session flag that names a
+    /// DIFFERENT, literal id is dropped when the spec pins the session: argv
+    /// carries exactly one session flag, and it is the pin (review round 5,
+    /// A1 of qontinui-runner#3149). Of two template flags that both carry the
+    /// pin, one is kept: the spec's kind, else the first (review of the A1
+    /// fix, A6).
+    #[test]
+    fn a_literal_session_flag_beside_a_placeholder_is_dropped() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+        for template in [
+            format!("claude --session-id {{sessionId}} --resume {OTHER}"),
+            format!("claude --resume {OTHER} --session-id {{sessionId}}"),
+            format!("claude --session-id={{sessionId}} -r {OTHER}"),
+            format!("claude --session-id {{sessionId}} --resume={OTHER}"),
+            // Two flags that BOTH carry the pin: one is kept, the one of the
+            // spec's kind (`--session-id` for the session_id spec here).
+            "claude --session-id {sessionId} --resume {sessionId}".to_string(),
+        ] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(&template), "claude");
+            let session_flags = argv
+                .iter()
+                .filter(|a| {
+                    let t = a.as_str();
+                    t == "--session-id"
+                        || t == "--resume"
+                        || t == "-r"
+                        || t.starts_with("--session-id=")
+                        || t.starts_with("--resume=")
+                })
+                .count();
+            assert_eq!(session_flags, 1, "{template}: {argv:?}");
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)),
+                "{template}: {argv:?}"
+            );
+            assert!(argv.iter().any(|a| a.contains(ID)), "{template}: {argv:?}");
+        }
+    }
+
+    /// Of two template flags that both carry the pin, the one kept is the
+    /// flag of the kind the spec pins with, in either template order: a
+    /// `resume_id` pin keeps `--resume`, a `session_id` pin keeps
+    /// `--session-id` (review round 2 of the A1 fix, A6).
+    #[test]
+    fn of_two_pinned_session_flags_the_specs_kind_is_kept() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // The other resume spellings: a resume_id pin keeps them over
+        // `--session-id`, whichever comes first.
+        for template in [
+            "claude --session-id {sessionId} -r {sessionId}",
+            "claude --session-id={sessionId} --resume={sessionId}",
+            "claude -r {sessionId} --session-id={sessionId}",
+        ] {
+            let mut s = spec();
+            s.resume_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "--session-id" || a.starts_with("--session-id=")),
+                "{template}: {argv:?}"
+            );
+            let inline = format!("--resume={ID}");
+            assert!(
+                value_after(&argv, "-r") == Some(ID) || argv.iter().any(|a| *a == inline),
+                "{template}: the pinned id must follow the kept resume flag: {argv:?}"
+            );
+        }
+        for template in [
+            "claude --session-id {sessionId} --resume {sessionId}",
+            "claude --resume {sessionId} --session-id {sessionId}",
+        ] {
+            let mut s = spec();
+            s.resume_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                value_after(&argv, "--resume"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--session-id"),
+                "{template}: {argv:?}"
+            );
+
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--resume"),
+                "{template}: {argv:?}"
+            );
         }
     }
 

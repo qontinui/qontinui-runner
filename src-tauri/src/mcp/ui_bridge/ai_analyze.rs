@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::request::ui_bridge_request_sync;
-use super::types::{recovery_hint_for, UiBridgeError, UiBridgeErrorCode};
+use super::types::{next_action_for, UiBridgeError, UiBridgeErrorCode};
 use super::{ipc_handler_get, ipc_handler_post};
 
 // Semantic search & diff
@@ -102,8 +102,8 @@ fn recovery_error_code(code: &str) -> UiBridgeErrorCode {
         // the wire's top-level `code`, so without the arm the token would reach
         // a caller as `ACTION_FAILED`, the same answer as `RECOVERY_FAILED`.
         // `INTERNAL_ERROR` is the true class (the reply came from the runner's
-        // own frontend bundle), and its `UNRECOVERABLE` hint tells a caller not
-        // to re-run an attempt whose effect is unknown.
+        // own frontend bundle), and its `report_defect` next action tells a
+        // caller not to re-run an attempt whose effect is unknown.
         RECOVERY_VERDICT_MISSING => UiBridgeErrorCode::InternalError,
         // `RECOVERY_FAILED` and any future token: recovery RAN against the
         // addressed element and did not recover it. That is an action failure.
@@ -120,7 +120,7 @@ fn recovery_error_detail(
     prior_context: Option<serde_json::Value>,
 ) -> UiBridgeError {
     let mapped = recovery_error_code(code);
-    let recovery = Some(recovery_hint_for(&mapped));
+    let recovery = Some(next_action_for(&mapped));
     let mut obj = match prior_context {
         Some(serde_json::Value::Object(m)) => m,
         _ => serde_json::Map::new(),

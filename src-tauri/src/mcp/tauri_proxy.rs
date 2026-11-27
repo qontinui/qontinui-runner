@@ -274,7 +274,10 @@ pub async fn tauri_invoke_handler(
 
     info!(command = %req.command, "tauri_proxy: dispatching command");
 
-    let response = dispatch(state, req).await;
+    // Detached, so a client that disconnects cannot drop a command mid-way. The
+    // `terminal_create` arm's create runs off-worker, and dropped there it would
+    // release its isolated context's claims under the terminal it opened.
+    let response = crate::spawn_off_worker::run_detached(dispatch(state, req)).await;
     Ok((response.status.unwrap_or(StatusCode::OK), Json(response)))
 }
 
@@ -420,33 +423,43 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant,
             };
 
-            // door-scan: spawn — the door's real spawn; the context is in hand until here.
-            match tm.create(
-                a.title,
-                working_dir,
-                a.page_id,
-                a.cols,
-                a.rows,
-                state.app_handle.clone(),
-                None,
-                extra_env,
-                // UNATTENDED by default — respect the critical floor. This is
-                // the HTTP proxy for the `terminal_create` Tauri command, used
-                // by external tooling that has no webview to show a dialog in,
-                // so an absent `resourceOverride` is `false` and the typed
-                // refusal is returned verbatim as the invoke response's error.
-                // A caller that IS fronted by a UI recognises the
-                // `resource_guard:critical:` prefix, asks its own operator, and
-                // re-invokes with `resourceOverride: true` — see the field's
-                // doc. Nothing is ever assumed on the caller's behalf here.
-                a.resource_override,
-                // The account is chosen after this point, so the every-account
-                // mint applies.
-                crate::terminal::TrustArm::AccountChosenLater,
-                spawn_tenant,
-                // External tooling through the HTTP proxy: reason unnamed.
-                crate::coord_drain_state::SpawnOrigin::Unknown,
-            ) {
+            let create_app_handle = state.app_handle.clone();
+            // Off the API runtime's workers: this create can block for seconds to
+            // minutes (see `spawn_off_worker`).
+            let create_result = {
+                let tm = tm.clone();
+                crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                    // door-scan: spawn — the door's real spawn; the context is in hand until here.
+                    tm.create(
+                        a.title,
+                        working_dir,
+                        a.page_id,
+                        a.cols,
+                        a.rows,
+                        create_app_handle,
+                        None,
+                        extra_env,
+                        // UNATTENDED by default — respect the critical floor. This is
+                        // the HTTP proxy for the `terminal_create` Tauri command, used
+                        // by external tooling that has no webview to show a dialog in,
+                        // so an absent `resourceOverride` is `false` and the typed
+                        // refusal is returned verbatim as the invoke response's error.
+                        // A caller that IS fronted by a UI recognises the
+                        // `resource_guard:critical:` prefix, asks its own operator, and
+                        // re-invokes with `resourceOverride: true` — see the field's
+                        // doc. Nothing is ever assumed on the caller's behalf here.
+                        a.resource_override,
+                        // The account is chosen after this point, so the every-account
+                        // mint applies.
+                        crate::terminal::TrustArm::AccountChosenLater,
+                        spawn_tenant,
+                        // External tooling through the HTTP proxy: reason unnamed.
+                        crate::coord_drain_state::SpawnOrigin::Unknown,
+                    )
+                })
+                .await
+            };
+            match create_result {
                 Ok(info) => {
                     let door = ProxyTerminalCreateDoor {
                         terminal_manager: tm.clone(),

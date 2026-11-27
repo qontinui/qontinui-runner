@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
+use super::child_path::{child_base_path, compose_child_path};
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
@@ -1116,8 +1117,11 @@ pub enum PtyWriteCaller {
     TauriTerminalWrite,
     /// The same command reached through the HTTP Tauri-invoke proxy.
     TauriInvokeProxy,
-    /// A remote (coord-relayed) terminal's `terminal_input` frame.
-    RemoteTerminalInput,
+    /// A remote (coord-relayed) terminal's `terminal_input` frame, with the
+    /// relay's stamps from that frame kept beside it (plan
+    /// `2026-10-28-one-session-lifecycle-authority` Phase 80). Recorded, never
+    /// authority — see [`super::input_funnel::RelayInputProvenance`].
+    RemoteTerminalInput(super::input_funnel::RelayInputProvenance),
     /// `POST /terminals/{id}/write`.
     HttpWrite,
     /// The `/terminals/{id}/ws` socket's `input` frame.
@@ -1161,7 +1165,7 @@ impl PtyWriteCaller {
             Self::ReviewNotes => "review_notes",
             Self::TauriTerminalWrite => "tauri_terminal_write",
             Self::TauriInvokeProxy => "tauri_invoke_proxy",
-            Self::RemoteTerminalInput => "remote_terminal_input",
+            Self::RemoteTerminalInput(_) => "remote_terminal_input",
             Self::HttpWrite => "http_write",
             Self::WebSocketInput => "websocket_input",
             Self::PtyTransport => "pty_transport",
@@ -1208,11 +1212,23 @@ pub struct PtyInputObservation {
 /// through the same `write` path as keystrokes; counting those answers as input
 /// would mask nearly every phantom turn. They are kept, not dropped, so an
 /// investigator can still see the emulator was talking.
+///
+/// A fourth, `last_insert`, holds a prompt pasted WITHOUT its submitting CR
+/// (`insert_prompt`) — a runner-inserted draft. It used to land in
+/// `last_submit`, which made the draft indistinguishable from a submitted turn
+/// (plan `2026-10-28-one-session-lifecycle-authority` Phase 80). It is input,
+/// so [`Self::latest`] considers it.
+///
+/// `funnel` is the pane's input funnel proper — the draft state and the
+/// writer-tagged history the lifecycle kernel reads
+/// ([`super::input_funnel::InputFunnel`]), folded under the same lock.
 #[derive(Clone, Debug, Default)]
 pub struct PtyInputSlots {
     pub last_write: Option<PtyInputObservation>,
     pub last_submit: Option<PtyInputObservation>,
+    pub last_insert: Option<PtyInputObservation>,
     pub last_control_response: Option<PtyInputObservation>,
+    pub funnel: super::input_funnel::InputFunnel,
 }
 
 /// Which [`PtyInputSlots`] field one observation lands in.
@@ -1220,17 +1236,35 @@ pub struct PtyInputSlots {
 enum InputSlot {
     Write,
     Submit,
+    Insert,
     ControlResponse,
 }
 
-impl PtyInputSlots {
-    /// The more recent of the two INPUT slots, whichever choke point it came
-    /// from. `last_control_response` is never input and never considered.
-    pub fn latest(&self) -> Option<&PtyInputObservation> {
-        match (&self.last_write, &self.last_submit) {
-            (Some(w), Some(s)) => Some(if s.at >= w.at { s } else { w }),
-            (w, s) => w.as_ref().or(s.as_ref()),
+impl InputSlot {
+    fn funnel_kind(self) -> super::input_funnel::InputKind {
+        use super::input_funnel::InputKind;
+        match self {
+            Self::Write => InputKind::Write,
+            Self::Submit => InputKind::Submit,
+            Self::Insert => InputKind::Insert,
+            Self::ControlResponse => InputKind::ControlResponse,
         }
+    }
+}
+
+impl PtyInputSlots {
+    /// The most recent of the INPUT slots (write, submit, insert), whichever
+    /// choke point it came from. `last_control_response` is never input and
+    /// never considered. On a tie the later-listed slot wins (insert over
+    /// submit over write), as submit over write always did.
+    pub fn latest(&self) -> Option<&PtyInputObservation> {
+        [&self.last_write, &self.last_submit, &self.last_insert]
+            .into_iter()
+            .flatten()
+            .fold(None, |best: Option<&PtyInputObservation>, o| match best {
+                Some(b) if b.at > o.at => Some(b),
+                _ => Some(o),
+            })
     }
 }
 
@@ -1396,63 +1430,6 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
         buf.clear();
     }
     completed
-}
-
-/// The PATH a PTY child gets: `runner_path` with every qontinui shim dir
-/// ([`is_qontinui_shim_dir`]) removed, then `own_dirs` prepended in order.
-///
-/// Two defects this closes (plan
-/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
-/// Phase 2):
-///
-/// 1. A runner started from inside another runner's session (a supervisor
-///    launched there, then a temp runner) INHERITS that session's
-///    `qontinui-identity-*` dir. Passed through, it reached every pane's PATH,
-///    where two identity shims could dispatch to each other for ever.
-/// 2. The install-intercept seam rebuilt the child PATH from the runner's own
-///    and discarded the identity seam's prepend. Both seams now build through
-///    here, the install seam passing `[identity_dir, install_dir]`.
-///
-/// An entry equal to one of `own_dirs` is dropped from the tail as well, since
-/// it is already at the head. Every other entry keeps its position and its
-/// spelling, empty entries included. The separator is the platform's.
-///
-/// [`is_qontinui_shim_dir`]: crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir
-pub(crate) fn compose_child_path(
-    runner_path: Option<&str>,
-    own_dirs: &[&std::path::Path],
-) -> String {
-    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
-
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
-    let own: Vec<String> = own_dirs
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
-    let own_trimmed: Vec<String> = own.iter().map(|d| trim(d)).collect();
-    let is_own = |entry: &str| {
-        let entry = trim(entry);
-        own_trimmed.iter().any(|o| {
-            if cfg!(windows) {
-                o.eq_ignore_ascii_case(&entry)
-            } else {
-                *o == entry
-            }
-        })
-    };
-    let mut parts: Vec<&str> = own.iter().map(String::as_str).collect();
-    if let Some(path) = runner_path.filter(|p| !p.is_empty()) {
-        for entry in path.split(sep) {
-            if !entry.is_empty()
-                && (is_own(entry) || is_qontinui_shim_dir(std::path::Path::new(entry)))
-            {
-                continue;
-            }
-            parts.push(entry);
-        }
-    }
-    parts.join(&sep.to_string())
 }
 
 /// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
@@ -2014,7 +1991,12 @@ impl TerminalSession {
         // PATH + set the loopback port/mode so an agent that types `npm install …`
         // is transparently declared/observed. Fail-open: any materialize failure
         // injects nothing.
-        Self::apply_install_intercept_env(&mut cmd, &id, seam.identity_dir.as_deref());
+        Self::apply_install_intercept_env(
+            &mut cmd,
+            &id,
+            seam.identity_dir.as_deref(),
+            &std::env::temp_dir(),
+        );
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the ordering is unit-testable; see the
@@ -2061,6 +2043,10 @@ impl TerminalSession {
         // grant, so the pad never answers its prompts.
         session.set_permission_request_hook(permission_request_hook);
         session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        // This process spawned the child: its input funnel has seen every byte
+        // written into the pane (an adopted holder pane or a remote mirror
+        // skips this and reads UNKNOWN).
+        session.mark_input_funnel_observed_from_spawn();
         Ok(session)
     }
 
@@ -3271,8 +3257,10 @@ impl TerminalSession {
         cmd: &mut CommandBuilder,
         identity_dir: &std::path::Path,
     ) {
-        let current_path = std::env::var("PATH").ok();
-        let new_path = compose_child_path(current_path.as_deref(), &[identity_dir]);
+        // The base carries the user's toolchain dirs after the runner's own
+        // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path).
+        let base = child_base_path();
+        let new_path = compose_child_path(base.as_deref(), &[identity_dir]);
         Self::set_child_path(cmd, &new_path);
         // The identity shim reads this to skip its own dir in the
         // real-tool scan (reusing the install shim's env contract).
@@ -3280,6 +3268,15 @@ impl TerminalSession {
             "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
             identity_dir.to_string_lossy().as_ref(),
         );
+    }
+
+    /// The identity seam's fail-open PATH: no own dir prepended, foreign shim
+    /// dirs still stripped, and the toolchain dirs [`child_base_path`] appends
+    /// still carried. A runner with no PATH at all leaves the child's untouched.
+    fn apply_fail_open_child_path(cmd: &mut CommandBuilder) {
+        if let Some(base) = child_base_path() {
+            Self::set_child_path(cmd, &compose_child_path(Some(&base), &[]));
+        }
     }
 
     /// Extract the explicit session id a built PTY child command's argv NAMES,
@@ -3419,9 +3416,10 @@ impl TerminalSession {
         title: &str,
         pinned: &str,
     ) {
-        if let Ok(current_path) = std::env::var("PATH") {
-            Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
-        }
+        // No own dir; foreign shim dirs stripped; the toolchain dirs
+        // `child_base_path` appends still carried. A runner with no PATH at
+        // all leaves the child's untouched.
+        Self::apply_fail_open_child_path(cmd);
         if Self::pane_loses_shim_pin(cmd) {
             warn!(
                 terminal_id = %terminal_id,
@@ -3513,33 +3511,37 @@ impl TerminalSession {
     /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
     /// Phase 2 this seam re-read the runner's PATH and silently DROPPED the
     /// identity prepend whenever interception was on.
+    ///
+    /// `base_dir` is where the per-terminal shim dir is materialized (and stale
+    /// ones swept): production passes `std::env::temp_dir()`, a test its own
+    /// fixture dir so it never has to repoint the process's temp dir.
     fn apply_install_intercept_env(
         cmd: &mut CommandBuilder,
         terminal_id: &str,
         identity_dir: Option<&std::path::Path>,
+        base_dir: &std::path::Path,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
         if !shim_materializer::intercept_enabled() {
             return; // ships dark — byte-identical child env
         }
-        let base_dir = std::env::temp_dir();
         let port = crate::install_effects_producer::intercept::bound_port();
         // The MODE the terminal gets is resolved from the runner's OWN env
         // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
         // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
         let mode = shim_materializer::resolve_mode();
-        let seam = match shim_materializer::materialize(&base_dir, terminal_id, port, mode) {
+        let seam = match shim_materializer::materialize(base_dir, terminal_id, port, mode) {
             Some(s) => s,
             None => return, // fail-open: couldn't write shims ⇒ inject nothing
         };
 
-        let current_path = std::env::var("PATH").ok();
+        let base = child_base_path();
         let own_dirs: Vec<&std::path::Path> = identity_dir
             .into_iter()
             .chain(std::iter::once(seam.shim_dir.as_path()))
             .collect();
-        let new_path = compose_child_path(current_path.as_deref(), &own_dirs);
+        let new_path = compose_child_path(base.as_deref(), &own_dirs);
         Self::set_child_path(cmd, &new_path);
         cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
         cmd.env(shim_materializer::MODE_ENV, &seam.mode);
@@ -3904,27 +3906,33 @@ impl TerminalSession {
             writer
                 .flush()
                 .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-        } // writer lock released before observation
+            debug!(
+                terminal_id = %self.id,
+                caller = %caller,
+                bytes = data.len(),
+                "terminal pty write"
+            );
+            let slot = if is_terminal_control_response(data) {
+                InputSlot::ControlResponse
+            } else {
+                InputSlot::Write
+            };
+            // Recorded while the writer lock is still held, so the input
+            // funnel folds writes in the order their bytes reached the PTY —
+            // the draft fold is order-dependent (Phase 80). Lock order is
+            // always writer → last_input; nothing takes them the other way.
+            self.record_input(
+                PtyInputObservation {
+                    caller,
+                    at: Instant::now(),
+                    bytes: data.len(),
+                },
+                slot,
+                slot.funnel_kind(),
+                data,
+            );
+        } // writer lock released before the typed-line observation
 
-        debug!(
-            terminal_id = %self.id,
-            caller = %caller,
-            bytes = data.len(),
-            "terminal pty write"
-        );
-        let slot = if is_terminal_control_response(data) {
-            InputSlot::ControlResponse
-        } else {
-            InputSlot::Write
-        };
-        self.record_input(
-            PtyInputObservation {
-                caller,
-                at: Instant::now(),
-                bytes: data.len(),
-            },
-            slot,
-        );
         self.observe_input(data);
         Ok(())
     }
@@ -3973,6 +3981,32 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// The pane's input funnel: its composer draft state and the
+    /// writer-tagged input history (plan
+    /// `2026-10-28-one-session-lifecycle-authority` Phase 80). A snapshot.
+    pub fn input_funnel(&self) -> super::input_funnel::InputFunnel {
+        self.last_input
+            .lock()
+            .map(|g| g.funnel.clone())
+            .unwrap_or_else(|e| e.into_inner().funnel.clone())
+    }
+
+    /// The composer's draft state, as the input funnel reads it — the
+    /// lifecycle kernel's I axis. `Draft` for a runner-inserted draft.
+    pub fn draft_state(&self) -> super::input_funnel::PaneDraftState {
+        let slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.draft_state().clone()
+    }
+
+    /// This process spawned the pane: its input funnel has seen every byte
+    /// written into it. Only the local spawn path calls this; an adopted
+    /// holder pane or a remote mirror is built by `spawn_with_io` alone and
+    /// keeps reading UNKNOWN.
+    pub(crate) fn mark_input_funnel_observed_from_spawn(&self) {
+        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.mark_observed_from_spawn();
+    }
+
     /// A snapshot of who last wrote to this PTY, through either choke point.
     pub fn last_input(&self) -> PtyInputSlots {
         self.last_input
@@ -3985,13 +4019,46 @@ impl TerminalSession {
     /// skipped: the slot is diagnostic evidence, and silently losing it on one
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
-    fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
+    ///
+    /// The same event is folded into the input funnel under the same lock, as
+    /// `kind` — which differs from `slot` for one case: a `submit_prompt`
+    /// paste fills the `Submit` slot (the phantom-turn detector's question)
+    /// but folds as an `Insert` until its CR is written
+    /// ([`Self::fold_submit_enter`]). `data` is the written bytes for a
+    /// `Write` (the draft fold reads them — never stored), and ignored for the
+    /// paste kinds. Callers hold the writer lock, so folds follow wire order.
+    fn record_input(
+        &self,
+        obs: PtyInputObservation,
+        slot: InputSlot,
+        kind: super::input_funnel::InputKind,
+        data: &[u8],
+    ) {
         let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .funnel
+            .record(obs.caller.clone(), kind, obs.at, obs.bytes, data);
         match slot {
             InputSlot::Write => slots.last_write = Some(obs),
             InputSlot::Submit => slots.last_submit = Some(obs),
+            InputSlot::Insert => slots.last_insert = Some(obs),
             InputSlot::ControlResponse => slots.last_control_response = Some(obs),
         }
+    }
+
+    /// Fold a `submit_prompt`'s submitting CR into the input funnel, once it
+    /// is on the wire: the composer — the paste and any draft it joined — is
+    /// submitted. Funnel only: the `Submit` slot was filled when the paste was
+    /// written, which is what the phantom-turn detector needs.
+    fn fold_submit_enter(&self, caller: PtyWriteCaller) {
+        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.record(
+            caller,
+            super::input_funnel::InputKind::Submit,
+            Instant::now(),
+            SUBMIT_ENTER.len(),
+            &[],
+        );
     }
 
     /// Observe raw typed input bytes — feed them through the per-terminal
@@ -4083,7 +4150,7 @@ impl TerminalSession {
         message: &str,
         caller: PtyWriteCaller,
     ) -> Result<SubmitPayload, String> {
-        let report = self.paste_prompt(message, caller, PromptOp::Submit)?;
+        let report = self.paste_prompt(message, caller.clone(), PromptOp::Submit)?;
 
         // Sleep so Claude Code's readline can fully process the paste
         // sequence BEFORE the submit byte arrives. Without this, the
@@ -4109,6 +4176,12 @@ impl TerminalSession {
         writer.flush().map_err(|e| {
             format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but flushing the submit enter failed: {e}")
         })?;
+        // The CR is on the wire: only now does the input funnel read the
+        // composer submitted (any failure above leaves it reading `Draft`,
+        // which is what the input box holds). Folded under the writer lock,
+        // like every other fold, so it follows wire order.
+        self.fold_submit_enter(caller);
+        drop(writer);
         // Both halves are on the wire, so this describes a write that really
         // happened rather than one that was merely predicted.
         Ok(submit_payload_of(&report))
@@ -4244,20 +4317,30 @@ impl TerminalSession {
             writer.flush().map_err(|e| {
                 format!("{PROMPT_PARTIALLY_WRITTEN}: the paste block was written but flushing it failed: {e}")
             })?;
-        } // writer lock released
 
-        // The body is on the wire now, so this is an input event the PTY
-        // child can act on even if a submit's trailing CR then fails — record
-        // it here rather than after the CR, or a half-written submit would
-        // read as "no input" to the phantom-turn detector.
-        self.record_input(
-            PtyInputObservation {
-                caller,
-                at: Instant::now(),
-                bytes: block.len(),
-            },
-            InputSlot::Submit,
-        );
+            // The body is on the wire now, so this is an input event the PTY
+            // child can act on even if a submit's trailing CR then fails —
+            // record it here rather than after the CR, or a half-written
+            // submit would read as "no input" to the phantom-turn detector.
+            // An insert lands in its own slot: a draft nobody submitted, not a
+            // turn. For the input funnel BOTH ops fold as an insert here — the
+            // text is in the composer, unsent — and a submit's CR folds the
+            // submit once it is written (`fold_submit_enter`; Phase 80).
+            // Recorded under the writer lock, so folds follow wire order.
+            self.record_input(
+                PtyInputObservation {
+                    caller,
+                    at: Instant::now(),
+                    bytes: block.len(),
+                },
+                match op {
+                    PromptOp::Submit => InputSlot::Submit,
+                    PromptOp::Insert => InputSlot::Insert,
+                },
+                super::input_funnel::InputKind::Insert,
+                &[],
+            );
+        } // writer lock released
 
         Ok(report)
     }
@@ -7549,6 +7632,10 @@ pub(crate) mod tests {
             format!("{}/", identity.display()), // our own, already inherited
             marked.to_string_lossy().into_owned(),
             p("usr-bin"),
+            // A toolchain dir `child_base_path` appended after the runner's own
+            // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path):
+            // it must survive both seams and the fail-open composition, last.
+            p("toolchain-appended"),
         ]
         .join(sep);
 
@@ -7560,6 +7647,7 @@ pub(crate) mod tests {
             String::new(),
             p("node-bin"),
             p("usr-bin"),
+            p("toolchain-appended"),
         ]
         .join(sep);
         assert_eq!(got, want);
@@ -7567,6 +7655,7 @@ pub(crate) mod tests {
         // The identity seam alone, and a runner with no PATH at all.
         let only_identity = compose_child_path(Some(&runner_path), &[&identity]);
         assert!(only_identity.starts_with(&*identity.to_string_lossy()));
+        assert!(only_identity.ends_with(&p("toolchain-appended")));
         assert!(!only_identity.contains("qontinui-shim-xyz"));
         assert!(!only_identity.contains("qontinui-identity-abc"));
         assert_eq!(
@@ -7581,8 +7670,163 @@ pub(crate) mod tests {
         // No own dir (the identity seam failed open): the foreign dirs are
         // still stripped and nothing is prepended.
         let bare = compose_child_path(Some(&runner_path), &[]);
-        let want_bare = [p("cargo-bin"), String::new(), p("node-bin"), p("usr-bin")].join(sep);
+        let want_bare = [
+            p("cargo-bin"),
+            String::new(),
+            p("node-bin"),
+            p("usr-bin"),
+            p("toolchain-appended"),
+        ]
+        .join(sep);
         assert_eq!(bare, want_bare);
+    }
+
+    /// The child PATH a `CommandBuilder` carries, split on the platform's
+    /// separator.
+    fn child_path_entries(cmd: &CommandBuilder) -> Vec<String> {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        cmd.get_env(TerminalSession::PATH_ENV_KEY)
+            .map(|v| v.to_string_lossy().split(sep).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The fixture every toolchain-PATH test runs under: the env-isolation
+    /// guard, the login-shell read OFF, `CARGO_HOME` unset and `HOME` at the
+    /// fixture dir, whose `.cargo/bin` exists. Returns the fixture, the env
+    /// restore guard and that dir. The restore guard is declared after the
+    /// fixture so it drops first, while the env lock is still held.
+    fn toolchain_fixture(
+        extra_keys: &[&'static str],
+    ) -> (
+        crate::test_env::IsolatedAmbient,
+        crate::test_env::EnvVarRestore,
+        String,
+    ) {
+        let amb = crate::test_env::isolated_ambient();
+        let mut keys = vec!["CARGO_HOME", "QONTINUI_CHILD_PATH_SHELL_READ"];
+        keys.extend_from_slice(extra_keys);
+        let restore = crate::test_env::EnvVarRestore::capture(&keys);
+        std::env::set_var("QONTINUI_CHILD_PATH_SHELL_READ", "0");
+        std::env::remove_var("CARGO_HOME");
+        let cargo_bin = amb.dir().join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo_bin = cargo_bin.to_string_lossy().into_owned();
+        (amb, restore, cargo_bin)
+    }
+
+    /// The Phase 1 arming test (plan
+    /// `2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path`): a hosted
+    /// child's PATH — direct-exec terminal pane and headless spawn alike —
+    /// carries `$HOME/.cargo/bin` after the runner's own entries. Enters ONLY
+    /// through the two production seams, so deleting the wiring at either one
+    /// reddens it.
+    #[test]
+    fn hosted_child_path_carries_the_user_toolchain_after_the_runner_entries() {
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let runner_path = std::env::var("PATH").expect("the test process has a PATH");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        // The runner's own entries a child keeps (foreign shim dirs are
+        // stripped by design, and a test hosted by a runner inherits one).
+        let kept: Vec<String> = runner_path
+            .split(sep)
+            .filter(|e| {
+                e.is_empty()
+                    || !crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir(
+                        std::path::Path::new(e),
+                    )
+            })
+            .map(str::to_string)
+            .collect();
+
+        // PTY plane: the identity seam. Its dir stays first.
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_identity_path_shim(&mut cmd, &identity);
+        let pty = child_path_entries(&cmd);
+        assert_eq!(
+            pty.first().map(String::as_str),
+            Some(&*identity.to_string_lossy())
+        );
+        assert_eq!(
+            &pty[1..pty.len() - 1],
+            kept.as_slice(),
+            "runner entries keep their order"
+        );
+        assert_eq!(
+            pty.last(),
+            Some(&cargo_bin),
+            "toolchain dir appended last: {pty:?}"
+        );
+
+        // Headless plane.
+        let mut headless = tokio::process::Command::new("dummy");
+        crate::agent_runtime::finalize_headless_child_env(
+            &mut headless,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
+        let path = headless
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+            .expect("the headless seam sets PATH");
+        let entries: Vec<String> = path.split(sep).map(str::to_string).collect();
+        assert_eq!(&entries[..entries.len() - 1], kept.as_slice());
+        assert_eq!(entries.last(), Some(&cargo_bin), "{entries:?}");
+    }
+
+    #[test]
+    fn install_intercept_seam_keeps_the_appended_toolchain_dirs() {
+        use crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG;
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[ENABLE_FLAG]);
+        std::env::set_var(ENABLE_FLAG, "1");
+        // The shim materializer writes — and sweeps — in the fixture, never in
+        // the box's shared temp dir.
+        let shim_base = amb.dir().join("tmp");
+        std::fs::create_dir_all(&shim_base).unwrap();
+
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_install_intercept_env(
+            &mut cmd,
+            "term-toolchain",
+            Some(&identity),
+            &shim_base,
+        );
+        let got = child_path_entries(&cmd);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some(&*identity.to_string_lossy()),
+            "{got:?}"
+        );
+        assert!(
+            got.get(1)
+                .is_some_and(|d| d.contains("qontinui-shim-term-toolchain")),
+            "the install shim dir is second: {got:?}"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
+    }
+
+    #[test]
+    fn identity_fail_open_branch_keeps_the_appended_toolchain_dirs() {
+        let (_amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let mut cmd = CommandBuilder::new("dummy");
+        // The `None` arm's own helper, not `apply_fail_open_child_path`
+        // alone: a helper that went back to reading the raw runner PATH
+        // would drop the appended toolchain dirs and red this test.
+        TerminalSession::start_without_identity_shim(&mut cmd, "term-failopen", "pane", "");
+        let got = child_path_entries(&cmd);
+        assert!(
+            !got.is_empty(),
+            "the fail-open branch still composes a PATH"
+        );
+        assert!(
+            !got.iter().any(|d| d.contains("qontinui-identity-armtest")),
+            "no own dir is prepended"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
     }
 
     #[test]
@@ -9014,6 +9258,119 @@ pub(crate) mod tests {
         assert!(payload.sanitized, "the embedded paste END was neutralized");
     }
 
+    /// Phase 80 of plan `2026-10-28-one-session-lifecycle-authority` (its
+    /// Gate): a runner-inserted draft reads `Draft` through the session's own
+    /// funnel — the review notes' insert (`mcp/session_review.rs`,
+    /// `ReviewNotes`) is the caller — and lands in its own slot, not in
+    /// `last_submit` as an unsubmitted turn did before. A submit then clears it.
+    #[test]
+    fn a_runner_inserted_draft_reads_draft_through_the_funnel() {
+        use super::super::input_funnel::{DraftSource, PaneDraftState};
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf);
+        session
+            .insert_prompt("review note", PtyWriteCaller::ReviewNotes)
+            .expect("insert_prompt failed");
+        match session.draft_state() {
+            PaneDraftState::Draft { source, caller, .. } => {
+                assert_eq!(source, DraftSource::Inserted);
+                assert_eq!(caller, PtyWriteCaller::ReviewNotes);
+            }
+            other => panic!("a runner-inserted draft must read Draft, got {other:?}"),
+        }
+        let slots = session.last_input();
+        assert!(slots.last_submit.is_none(), "an insert is not a submit");
+        assert_eq!(
+            slots.last_insert.as_ref().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::ReviewNotes)
+        );
+        assert_eq!(
+            slots.latest().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::ReviewNotes),
+            "an insert is still input to the phantom-turn detector"
+        );
+
+        session
+            .submit_prompt("go", PtyWriteCaller::WorkerSession)
+            .expect("submit_prompt failed");
+        assert_eq!(session.draft_state(), PaneDraftState::NoDraft);
+        let history: Vec<_> = session
+            .input_funnel()
+            .history()
+            .map(|r| r.caller.clone())
+            .collect();
+        // The submit is two events: its paste (folded as an insert) and its
+        // CR (folded as the submit, once written).
+        assert_eq!(
+            history,
+            vec![
+                PtyWriteCaller::ReviewNotes,
+                PtyWriteCaller::WorkerSession,
+                PtyWriteCaller::WorkerSession
+            ]
+        );
+    }
+
+    /// Only the local spawn path marks a pane's funnel observed-from-spawn.
+    /// `spawn_with_io` — the path an adopted PTY-holder pane and a remote
+    /// mirror take alone — must not, or those panes would read "nobody
+    /// wrote" over input this process never saw. A full spawn needs an
+    /// `AppHandle`, so this pins the call sites in the source instead.
+    #[test]
+    fn only_the_local_spawn_path_marks_the_funnel() {
+        let src = include_str!("session.rs");
+        let call = concat!("session.mark_input_funnel_", "observed_from_spawn();");
+        // `spawn(` and `spawn_with_io(` cannot prefix-match each other.
+        let spawn_at = src.find("    pub fn spawn(").expect("spawn");
+        let with_io_at = src
+            .find("    pub fn spawn_with_io(")
+            .expect("spawn_with_io");
+        assert!(
+            spawn_at < with_io_at,
+            "spawn is defined before spawn_with_io"
+        );
+        // Production code only: fixtures below call the mark by hand.
+        let tests_at = src.find("pub(crate) mod tests {").expect("tests module");
+        let hits: Vec<usize> = src
+            .match_indices(call)
+            .map(|(i, _)| i)
+            .filter(|&i| i < tests_at)
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one production mark call");
+        assert!(
+            hits[0] > spawn_at && hits[0] < with_io_at,
+            "the mark is in `spawn`, not `spawn_with_io`"
+        );
+    }
+
+    /// A pane this process did not observe from its spawn (the fixture, like
+    /// an adopted holder pane, skips the spawn path's mark) answers UNKNOWN
+    /// for its writers, never "nobody wrote"; the local spawn path's mark
+    /// makes it answerable.
+    #[test]
+    fn the_funnel_is_unknown_until_the_spawn_path_marks_it() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        assert_eq!(session.input_funnel().written_only_by_creator(), None);
+
+        let session = LiveTestSession::new(buf);
+        session.mark_input_funnel_observed_from_spawn();
+        session
+            .write(b"claude\r", PtyWriteCaller::HttpCreateInitialCommand)
+            .expect("write failed");
+        session
+            .write(b"\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        assert_eq!(session.input_funnel().written_only_by_creator(), Some(true));
+        session
+            .write(b"x", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        assert_eq!(
+            session.input_funnel().written_only_by_creator(),
+            Some(false)
+        );
+    }
+
     /// The insert shares submit's liveness gate: nothing reaches a dead PTY.
     #[test]
     fn insert_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
@@ -9135,7 +9492,7 @@ pub(crate) mod tests {
             PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
-            PtyWriteCaller::RemoteTerminalInput,
+            PtyWriteCaller::RemoteTerminalInput(Default::default()),
             PtyWriteCaller::HttpWrite,
             PtyWriteCaller::WebSocketInput,
             PtyWriteCaller::PtyTransport,

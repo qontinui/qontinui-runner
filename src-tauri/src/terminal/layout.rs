@@ -69,6 +69,11 @@ pub struct RegisteredPage {
     pub label: Option<String>,
     /// The tab's left-to-right position (0 = leftmost), as registered.
     pub order: u32,
+    /// The window the page is shown in: a pop-out window's label, or `"main"`.
+    /// `None` when the webview sent none (a build predating plan
+    /// `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`
+    /// D8) — never guessed.
+    pub window: Option<String>,
 }
 
 /// One consistent read of the registered tab labels.
@@ -159,6 +164,9 @@ pub struct ArrangedPage<T> {
     pub label: Option<String>,
     /// The registered position; `None` when the page was never registered.
     pub order: Option<u32>,
+    /// The registered window; `None` when the page was never registered or
+    /// its registration named none.
+    pub window: Option<String>,
     /// What sits on the page (terminals, session rows).
     pub items: Vec<T>,
 }
@@ -185,6 +193,7 @@ pub fn arrange_pages<T>(
             page_id: registered.page_id.clone(),
             label: registered.label.clone(),
             order: Some(registered.order),
+            window: registered.window.clone(),
             items: items.unwrap_or_default(),
         });
     }
@@ -192,6 +201,7 @@ pub fn arrange_pages<T>(
         page_id,
         label: None,
         order: None,
+        window: None,
         items,
     }));
     out
@@ -405,6 +415,7 @@ mod tests {
                     page_id: id.to_string(),
                     label: label.map(str::to_string),
                     order: *order,
+                    window: None,
                 })
                 .collect(),
             DateTime::<Utc>::from_timestamp_millis(FINISHED_AT).unwrap(),
@@ -699,6 +710,7 @@ mod tests {
                 page_id: "p2".to_string(),
                 label: Some("Deux".to_string()),
                 order: 0,
+                window: None,
             }]
         );
     }

@@ -2720,7 +2720,7 @@ fn run_analyzer(
 /// vision-core.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one argument per EvalContext field, listed so a field vision-core adds fails the build here"
+    reason = "one argument per EvalContext field the runner fills (the literal below names every field), listed so a field vision-core adds fails the build here"
 )]
 fn evaluate_assertions(
     assertions: &[qontinui_vision_core::Assertion],
@@ -2740,6 +2740,10 @@ fn evaluate_assertions(
         ocr_blocks,
         baselines,
         timeline,
+        // Filled by plan 2026-11-13-ui-bridge-matches-isolated-render-assertion
+        // Phase 3 (the component-baseline store and the in-situ capture).
+        component_baselines: None,
+        component_captures: None,
     };
     assertions
         .iter()
@@ -3192,7 +3196,8 @@ impl RequestHints for AssertRequest {
              image_dims_reserved, lcp_image_prioritized, image_has_text_alternative, \
              image_not_oversized, image_weight_within, offscreen_image_lazy, \
              no_duplicate_images, settled_within, state_entered_within, \
-             text_over_image_contrast."
+             text_over_image_contrast, matches_isolated_render (answers unknown \
+             input_missing on this runner until component baselines are wired)."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id), \
@@ -3244,7 +3249,8 @@ impl RequestHints for AssertRequest {
                 "no_duplicate_images",
                 "settled_within",
                 "state_entered_within",
-                "text_over_image_contrast"
+                "text_over_image_contrast",
+                "matches_isolated_render"
             ],
             "exampleAssertion": {
                 "type": "no_overlap",
@@ -4057,12 +4063,13 @@ mod tests {
             A::SettledWithin { .. } => "settled_within",
             A::StateEnteredWithin { .. } => "state_entered_within",
             A::TextOverImageContrast { .. } => "text_over_image_contrast",
+            A::MatchesIsolatedRender { .. } => "matches_isolated_render",
         }
     }
 
     /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
     /// two together: an arm added there belongs here too.
-    const ASSERTION_WIRE_NAMES: [&str; 33] = [
+    const ASSERTION_WIRE_NAMES: [&str; 34] = [
         "no_overlap",
         "element_above",
         "contains_text",
@@ -4096,6 +4103,7 @@ mod tests {
         "settled_within",
         "state_entered_within",
         "text_over_image_contrast",
+        "matches_isolated_render",
     ];
 
     /// One parsed instance of every assertion type, from the wire form a
@@ -4138,7 +4146,8 @@ mod tests {
                 {"type":"no_duplicate_images"},
                 {"type":"settled_within","ms":500},
                 {"type":"state_entered_within","state":"checkout","ms":500},
-                {"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5.0}
+                {"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5.0},
+                {"type":"matches_isolated_render","component":"c","baseline":"b"}
             ]"#,
         )
         .expect("every advertised assertion type must parse against the linked vision-core")
@@ -4321,7 +4330,7 @@ mod tests {
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 33] = [
+        const EXPECTED: [&str; 34] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -4355,6 +4364,7 @@ mod tests {
             "settled_within",
             "state_entered_within",
             "text_over_image_contrast",
+            "matches_isolated_render",
         ];
 
         // The names the exhaustive match knows are the advertised ones.

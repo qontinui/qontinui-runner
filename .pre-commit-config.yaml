@@ -79,10 +79,17 @@ repos:
       # That same range is why the hook no longer blames every pusher for the
       # drift it finds: a PEER's schema commit inside the pushed range fires it
       # while the pusher's own diff is unrelated. `lib/gen-events-attribution.sh`
-      # splits the verdict into pusher-caused (hard failure, unchanged) and
-      # pre-existing (reported in full, not blocking; STRICT still blocks), and
-      # fails closed when it cannot tell. Its tests need no Rust toolchain and
-      # are wired up as `gen-events-attribution-test` below.
+      # splits the verdict into pusher-caused (blocking) and pre-existing
+      # (reported in full, not blocking; STRICT still blocks), and fails closed
+      # when it cannot tell. A pusher-caused verdict is then refined FILE BY
+      # FILE by `lib/gen-events-file-attribution.sh`: the push is held only to
+      # the drifted files its changed inputs can move, and the rest is reported
+      # as pre-existing (non-blocking, unless STRICT). When that refinement
+      # cannot decide, the whole-push verdict stands.
+      #
+      # Neither suite needs a Rust toolchain (the per-file one needs `node`, as
+      # the hook does). They are wired up below as `gen-events-attribution-test`
+      # and `gen-events-file-attribution-test`.
       - id: gen-events-drift
         name: Tauri Event Bindings Drift Guard
         entry: bash .pre-commit-hooks/gen-events-drift.sh

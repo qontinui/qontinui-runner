@@ -210,7 +210,20 @@ pub(crate) fn resolve_api_base_url(inputs: &ApiBaseUrlInputs) -> (String, ApiBas
 ///   value would. Refusing one spelling of the outage and honouring the other
 ///   would leave the hole the refusal exists to close.
 pub(crate) fn persisted_backend_url_refused(raw: &str, is_debug: bool) -> bool {
-    !is_debug && (is_loopback_backend_url(raw) || is_unspecified_backend_url(raw))
+    !is_debug && is_machine_local_backend_url(raw)
+}
+
+/// Is `raw` a *machine-local* backend URL — one only THIS machine can reach?
+///
+/// The composition of the two host classes [`persisted_backend_url_refused`]
+/// refuses on a release build: [`is_loopback_backend_url`] (`127.0.0.0/8`,
+/// `::1`, `localhost`) OR [`is_unspecified_backend_url`] (the bind-all `0.0.0.0`
+/// and `::`). It carries no build flag — it is the URL's CLASS, served as
+/// `backendUrlMachineLocal` by `get_web_integration_status` so the frontend
+/// never re-implements the host classes. Whether the build would refuse it is
+/// [`persisted_backend_url_refused`]'s question, not this one's.
+pub(crate) fn is_machine_local_backend_url(raw: &str) -> bool {
+    is_loopback_backend_url(raw) || is_unspecified_backend_url(raw)
 }
 
 /// Parse `raw` down to a URL [`Host`](url::Host), or `None` if no reading of it
@@ -1653,5 +1666,35 @@ mod tests {
                 arm.remedy()
             );
         }
+    }
+
+    /// `is_machine_local_backend_url` is exactly loopback OR bind-all, and
+    /// `persisted_backend_url_refused` is exactly `!is_debug &&` that class.
+    #[test]
+    fn machine_local_is_loopback_or_bind_all_and_refusal_composes_it() {
+        for local in [
+            "http://[::]:8000",
+            "http://0.0.0.0:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+        ] {
+            assert!(
+                is_machine_local_backend_url(local),
+                "{local} is machine-local"
+            );
+            assert!(
+                persisted_backend_url_refused(local, false),
+                "release must refuse {local}"
+            );
+            assert!(
+                !persisted_backend_url_refused(local, true),
+                "debug must accept {local}"
+            );
+        }
+        let remote = "https://api.example.com";
+        assert!(!is_machine_local_backend_url(remote));
+        assert!(!persisted_backend_url_refused(remote, false));
+        assert!(!persisted_backend_url_refused(remote, true));
     }
 }
