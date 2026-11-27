@@ -470,15 +470,16 @@ Two thread-through styles, mirroring the `tabId` split:
   fallback in `evaluate_js_expression` returns whatever string the WebView
   produced, including `undefined` from a swallowed exception.
 
-> **Still open (deliberately, on this family):** a *resolved miss* —
-> `click-by-text` / `click-by-selector` finding no match — is still an HTTP 200
-> whose payload says `clicked: false`. `type-into` and `read-value` report a
-> miss as HTTP 400 (`read-value` delegates to the SDK's `readValuePrimitive`,
-> whose `ELEMENT_NOT_FOUND` the IPC envelope maps to 400). Aligning the
-> other three is a breaking change to an automation surface with cross-repo
-> consumers (`@qontinui/ui-bridge`, `scripts/contract-smoke.ps1`,
-> `UI-BRIDGE-AUTOMATION.md`), so it needs its own change and a `contract-smoke`
-> run, not a drive-by.
+> **Resolved misses on this family:** `find-by-text`, `click-by-text`,
+> `click-by-selector` and `read-value` dispatch the relay's IPC request
+> (`find_by_text` / `click_by_text` / `click_by_selector` / `read_value`) to the
+> SDK's §4.6-gated primitives. A miss is HTTP 400 (`ELEMENT_NOT_FOUND`), not
+> HTTP 200 `clicked: false`; content inside a `data-bridge-redact` boundary is
+> never matched, and a click echo is scrubbed to `[REDACTED]`. `click-by-text`
+> rejects `index` with a 400 (the primitive clicks the first match); matching no
+> longer filters on visibility and a click response is `{clicked, element:{tag,text,rect}}`; a non-integer
+> or negative `index` on `click-by-selector` / `read-value` is a 400 naming it.
+> Only `type-into` still evaluates injected JS (a resolution expression).
 
 An unknown `windowLabel` (no such window — e.g. a pop-out that already closed)
 returns an immediate, structured error naming the missing window and the
@@ -623,7 +624,7 @@ there. To answer "did my panel render?":
   live frontend IPC listener, like the relay door. Response shape is
   `{value, length, totalMatches, values?}`; the older `found/tag/type/
   placeholder/disabled/readOnly` fields are gone.
-- **`find-by-text`** (`elements.rs:3158`) locates elements by visible text.
+- **`find-by-text`** (`elements.rs`, `ui_bridge_find_by_text_handler`) locates elements by visible text through the SDK's `findByTextPrimitive` (relay `find_by_text`); redacted elements are dropped.
 
 ### `page/evaluate` result envelope: ONE discriminated shape, always
 `data` is always `{value, type}`, where `type` is one of
