@@ -1491,9 +1491,9 @@ pub fn spawn_budget_republisher(role: MachineRole) {
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
-                // On a tick with an OOM kill to place, the reporter waits out
-                // its journal lookahead and reads (`slice_oom::collect_from`):
-                // this loop is then late by at most 3 s + 5 s.
+                // A kill tick adds at most 3 s + 5 s here: the reporter waits
+                // out its journal lookahead, then reads under a 5 s deadline
+                // (`slice_oom::collect_from`).
                 resource_sample::publish_once().await;
                 reporter.tick().await;
 

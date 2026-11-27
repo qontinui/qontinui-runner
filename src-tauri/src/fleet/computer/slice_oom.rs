@@ -136,19 +136,16 @@ fn window_end(read_at: DateTime<Utc>) -> DateTime<Utc> {
     read_at + chrono::Duration::seconds(JOURNAL_LOOKAHEAD_SECS)
 }
 
-/// How long to wait so `lookahead` has passed since the counter read at
-/// `read_at`: never more than `lookahead` itself, whatever the wall clock
-/// did meanwhile (a clock stepped back would otherwise make it unbounded),
-/// and nothing once it has passed. PURE.
+/// How long to wait so `lookahead` has passed since the counter read, both
+/// taken on the MONOTONIC clock (a wall-clock step cannot move them): never
+/// more than `lookahead` itself, and nothing once it has passed. PURE.
 pub(crate) fn lookahead_wait(
-    read_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    read_at: std::time::Instant,
+    now: std::time::Instant,
     lookahead: Duration,
 ) -> Duration {
-    let ahead = chrono::Duration::from_std(lookahead).unwrap_or_else(|_| chrono::Duration::zero());
-    (read_at + ahead - now)
-        .to_std()
-        .unwrap_or_default()
+    (read_at + lookahead)
+        .saturating_duration_since(now)
         .min(lookahead)
 }
 
@@ -441,9 +438,9 @@ pub(crate) async fn collect(prev: Option<&ComputerObs>, input: &ObsInput<'_>) ->
 /// sources' one deadline.
 ///
 /// `Reporter::tick` is awaited INLINE in `spawn_budget_republisher`'s loop, so
-/// on such a tick this delays that loop — the CI-node capacity refresh and the
-/// budget re-assert after it — by at most the lookahead plus the journal
-/// deadline (3 s + 5 s). The loop's cadence is the resource-sample interval,
+/// a kill tick adds at most 3 s + 5 s (the lookahead plus the journal
+/// deadline) to that loop — to the CI-node capacity refresh and the budget
+/// re-assert after it. The loop's cadence is the resource-sample interval,
 /// 30 s ± 20 % by default and never under 10 s, and kill ticks are rare, so
 /// the wait stays inline rather than taking a task of its own (which the
 /// reporter's gate forbids). The sleep is async: it holds no thread.
@@ -468,18 +465,28 @@ pub(crate) async fn collect_from(
         .map(|w| w.row.unit.clone())
         .collect();
     let (root, euid) = (src.cgroup_root.clone(), src.euid);
-    let slices =
-        spawn_blocking_tracked(move || read_from(&root, &tracked, &watched, euid, Utc::now()))
-            .await
-            .unwrap_or_else(|_| SliceOomRead {
+    // The read's monotonic instant, taken beside its wall-clock `read_at`:
+    // the wait below is measured on it.
+    let (read_mono, slices) = spawn_blocking_tracked(move || {
+        let at = std::time::Instant::now();
+        (at, read_from(&root, &tracked, &watched, euid, Utc::now()))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            std::time::Instant::now(),
+            SliceOomRead {
                 source: SliceSource::Unreadable,
                 read_at: Utc::now(),
                 euid,
                 slices: Vec::new(),
-            });
+            },
+        )
+    });
     let (journal, kernel) = match journal_window(prev, input, &slices) {
         Some(w) => {
-            tokio::time::sleep(lookahead_wait(slices.read_at, Utc::now(), src.lookahead)).await;
+            let wait = lookahead_wait(read_mono, std::time::Instant::now(), src.lookahead);
+            tokio::time::sleep_until(tokio::time::Instant::now() + wait).await;
             journal_oom::read_all(
                 &src.journalctl,
                 w.since,
@@ -681,7 +688,8 @@ fn plan_slice<'a>(
         since: prev.map(|p| p.observed_at),
         listing: children_base,
         named_before: prev.map(|p| &p.named),
-        carried_before: prev.map_or(0, |p| p.carried),
+        // A reboot restarts the counter at 0: nothing is carried across it.
+        carried_before: if rebooted { 0 } else { prev.map_or(0, |p| p.carried) },
         next,
     }
 }
@@ -1108,8 +1116,9 @@ fn clamp_to_budget(drafts: &mut [Draft<'_>], budget: u64) -> bool {
 fn carry_into_next(plans: &mut [SlicePlan<'_>], drafts: &[Draft<'_>], read_at: DateTime<Utc>) {
     let read_us = micros(read_at);
     for (p, d) in plans.iter_mut().zip(drafts) {
-        let delta = p.base.map_or(0, |b| p.read.oom_kill.saturating_sub(b));
-        let fresh = delta.saturating_sub(p.carried_before);
+        // This tick's own new kills: what the slice delta left after the
+        // watched units inside it, minus the part carried in.
+        let fresh = p.left.saturating_sub(p.carried_before);
         let carry = if p.carried_before == 0 {
             d.cut_slice
         } else {
@@ -2924,8 +2933,8 @@ esac
         let r1 = collect_from(Some(&o0), &base, &src).await;
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(1200), "{took:?}");
-        // Round-4 A5: and no longer than the lookahead plus the reads.
-        assert!(took < Duration::from_millis(1200 + 3000), "{took:?}");
+        // Round-4 A5: and no longer than the lookahead plus the deadline.
+        assert!(took < Duration::from_millis(1200 + 5000), "{took:?}");
         assert!(matches!(r1.journal, Some(JournalRead::Read(ref e)) if e.len() == 1), "{r1:?}");
         assert_eq!(r1.kernel, Some(KernelRead::Unreadable));
         let inp = ObsInput {
@@ -3194,19 +3203,18 @@ esac
 
     // ---- round-4 review fixes -------------------------------------------
 
-    /// Round-4 A1: the wait is never longer than the lookahead, whatever the
-    /// clock did, and nothing once the lookahead has passed.
+    /// Round-4 A1 / round-5 A3: the wait is measured on the monotonic clock,
+    /// never longer than the lookahead, and nothing once it has passed.
     #[test]
     fn the_lookahead_wait_is_bounded_both_ways() {
-        let read = t("2026-11-27T00:15:10Z");
+        let read = std::time::Instant::now();
         let three = Duration::from_secs(3);
         assert_eq!(lookahead_wait(read, read, three), three);
-        assert_eq!(lookahead_wait(read, t("2026-11-27T00:15:11Z"), three), Duration::from_secs(2));
+        assert_eq!(lookahead_wait(read, read + Duration::from_secs(1), three), Duration::from_secs(2));
         // The read is long past: no wait.
-        assert_eq!(lookahead_wait(read, t("2026-11-27T00:16:00Z"), three), Duration::ZERO);
-        // The wall clock stepped back an hour after the read (the read now
-        // looks like it is in the future): still at most the lookahead.
-        assert_eq!(lookahead_wait(read, t("2026-11-26T23:15:10Z"), three), three);
+        assert_eq!(lookahead_wait(read, read + Duration::from_secs(50), three), Duration::ZERO);
+        // A read that looks later than now: still at most the lookahead.
+        assert_eq!(lookahead_wait(read + Duration::from_secs(3600), read, three), three);
         assert_eq!(lookahead_wait(read, read, Duration::ZERO), Duration::ZERO);
     }
 
@@ -3251,5 +3259,52 @@ esac
         assert_eq!(ev2.len(), 1, "{ev2:?}");
         assert_eq!(ev2[0].detail["attribution"], "slice_memory_events");
         assert_eq!(ev2[0].detail["victim_unit"], serde_json::Value::Null);
+    }
+
+    // ---- round-5 review fixes -------------------------------------------
+
+    /// Round-5 A1: a carried excess vmstat never covers is dropped after one
+    /// tick even when a watched unit in the same slice dies on that tick —
+    /// the unit's own kill is not one of the slice's new kills.
+    #[test]
+    fn a_watched_unit_kill_does_not_keep_a_dead_carry_alive() {
+        let units = watched(RUNNER_SERVICE, Some(0));
+        let killed = watched(RUNNER_SERVICE, Some(1));
+        let r0 = read("2026-11-27T00:14:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])]);
+        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        // Tick 1: a slice kill vmstat does not count — carried once.
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
+        let (_, o1) = derive(Some(&o0), &input(&units, Some(10), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        assert_eq!(o1.slices["qontinui-runner.slice"].carried, 1);
+        // Tick 2: the runner service dies in the slice (vmstat +1 for it);
+        // the carried excess is still uncovered.
+        let r2 = read("2026-11-27T00:15:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])]);
+        let (ev2, o2) = derive(Some(&o1), &input(&killed, Some(11), Some(&r2)), t("2026-11-27T00:15:40Z"));
+        let o = ooms(&ev2);
+        assert_eq!(o.len(), 1, "{ev2:?}");
+        assert_eq!(o[0].detail["victim_unit"], "qontinui-runner.service");
+        assert_eq!(o2.slices["qontinui-runner.slice"].carried, 0, "dropped, not carried again");
+        assert_eq!(o2.slices["qontinui-runner.slice"].oom_kill, 6);
+    }
+
+    /// Round-5 A2: a carry does not cross a reboot. The new boot's lag cut
+    /// is carried as a first carry, not dropped as a re-cut of the old one.
+    #[test]
+    fn a_reboot_resets_the_carry() {
+        let o0 = baseline(&[]);
+        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let (_, o1) = derive(Some(&o0), &input(&[], Some(34078), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        assert_eq!(o1.slices["agent-builds.slice"].carried, 1);
+        let new_boot = "11111111-2222-4333-8444-555555555555";
+        // One kill since boot in the slice, not yet in vmstat.
+        let r2 = read("2026-11-27T03:01:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let inp = ObsInput {
+            boot_id: Some(new_boot),
+            booted_at: Some("2026-11-27T03:00:00Z"),
+            ..input(&[], Some(0), Some(&r2))
+        };
+        let (_, o2) = derive(Some(&o1), &inp, t("2026-11-27T03:01:00Z"));
+        assert_eq!(o2.slices["agent-builds.slice"].carried, 1, "carried in the new boot");
+        assert_eq!(o2.slices["agent-builds.slice"].oom_kill, 0);
     }
 }
