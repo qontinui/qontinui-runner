@@ -440,12 +440,29 @@ if [ "$TOOL" = "claude" ] && [ -n "${QONTINUI_MCP_CONFIG:-}" ] \
 fi
 
 # Does the user's argv already choose a session? Then don't double-pin.
+# The VALUE of a Claude Code option is not a session choice (`--name resume`,
+# `--model -c`), so it is skipped. A single-value option consumes its next
+# token even when that is `--`; a variadic one consumes up to the next token
+# that is an option, i.e. longer than `-` and starting with it (commander's
+# rules; a lone `-` is a value). The two lists below are the Rust
+# CLAUDE_VALUE_FLAGS / CLAUDE_VARIADIC_FLAGS in src/claude_env.rs, and a test
+# there pins them together: keep each list on ONE line, starting with --name|
+# and --add-dir| respectively.
 user_chose_session=0
+skip_values=0   # 1 = consume exactly one value; 2 = consume a variadic run
 for a in "$@"; do
+  if [ "$skip_values" = 1 ]; then skip_values=0; continue; fi
+  if [ "$skip_values" = 2 ]; then
+    case "$a" in -?*) skip_values=0 ;; *) continue ;; esac
+  fi
   case "$a" in
     --) break ;;
     --session-id|--session-id=*|--resume|--resume=*|-r|resume|--continue|-c)
       user_chose_session=1; break ;;
+    --name|-n|--model|--fallback-model|--permission-mode|--permission-prompt-tool|--append-system-prompt|--append-system-prompt-file|--system-prompt|--system-prompt-file|--output-format|--input-format|--settings|--setting-sources|--agent|--agents|--effort|--max-turns|--max-budget-usd|--json-schema|--plugin-dir|--autocompact|--debug-file|--environment|--permission-prompts|--plugin-url|--remote-control-session-name-prefix|--system-prompt-snapshot)
+      skip_values=1 ;;
+    --add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--mcp-config|--tools|--betas|--file)
+      skip_values=2 ;;
   esac
 done
 
