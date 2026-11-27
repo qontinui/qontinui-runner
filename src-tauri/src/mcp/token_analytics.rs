@@ -297,7 +297,12 @@ pub async fn get_account_usage(
 
     let futures: Vec<_> = config_dirs
         .into_iter()
-        .map(|dir| crate::commands::ai_settings::probe_account_usage(dir))
+        .map(|dir| {
+            crate::commands::ai_settings::probe_account_usage(
+                dir,
+                crate::commands::ai_settings::USAGE_PROBE_POLL_MAX_AGE,
+            )
+        })
         .collect();
 
     let results = futures::future::join_all(futures).await;

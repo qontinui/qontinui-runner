@@ -541,16 +541,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // usage stats carry the 5-hour window's actual reset time, cool down
     // until then (clamped) instead of the blanket hour — the account comes
     // back into rotation the moment its session window rolls over.
-    let cooldown = usage
-        .iter()
-        .find(|i| i.config_dir == src)
-        .and_then(|i| i.session_resets_at)
-        .and_then(|reset_ts| {
-            let now = chrono::Utc::now().timestamp();
-            let secs = (reset_ts as i64) - now;
-            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
-        })
-        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN);
+    let cooldown = source_cooldown(&usage, &src, chrono::Utc::now().timestamp());
     crate::ai_provider::mark_account_rate_limited_with_duration(&src, cooldown);
     crate::ai_provider::pick_best_account();
 
@@ -622,6 +613,25 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     );
 }
 
+/// How long the account a session migrates OFF is cooled: until its 5-hour
+/// window's reset when the usage stats carry one (clamped to 5 minutes .. 6
+/// hours), else [`EXHAUSTED_ACCOUNT_COOLDOWN`]. `now_secs` is unix seconds.
+fn source_cooldown(
+    usage: &[crate::commands::ai_settings::AccountUsageInfo],
+    src: &str,
+    now_secs: i64,
+) -> std::time::Duration {
+    usage
+        .iter()
+        .find(|i| i.config_dir == src)
+        .and_then(|i| i.session_resets_at)
+        .and_then(|reset_ts| {
+            let secs = (reset_ts as i64) - now_secs;
+            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
+        })
+        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN)
+}
+
 /// [`super::limit_hint::HintEnv`] over the runner's real settings, probes,
 /// transcript, park list and idle watcher, for one session.
 struct ProdHintEnv<'a> {
@@ -653,7 +663,12 @@ impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
     }
 
     async fn own_probe(&self) -> crate::commands::ai_settings::AccountUsageInfo {
-        crate::commands::ai_settings::probe_account_usage(self.src.to_string()).await
+        // Confirming the limit this session just hit is the reason to probe.
+        crate::commands::ai_settings::probe_account_usage(
+            self.src.to_string(),
+            crate::commands::ai_settings::USAGE_PROBE_CONFIRM_MAX_AGE,
+        )
+        .await
     }
 
     fn known_exhausted(&self) -> bool {
@@ -2546,6 +2561,37 @@ fn carried_gate_identity_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account a session leaves on a 5-hour limit cools until that
+    /// window's reset as the header probe parsed it from
+    /// `-unified-5h-reset`, not the blanket hour.
+    #[test]
+    fn a_header_probe_row_cools_the_source_until_its_parsed_five_hour_reset() {
+        const NOW: i64 = 1_800_000_000;
+        let reset = (NOW + 7200).to_string();
+        let row = crate::ai_provider::usage_probe::probe_row_from_headers(
+            "/src",
+            &[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                (
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "five_hour",
+                ),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.3"),
+                ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+                ("anthropic-ratelimit-unified-5h-reset", reset.as_str()),
+            ],
+        );
+        assert_eq!(
+            source_cooldown(&[row], "/src", NOW),
+            std::time::Duration::from_secs(7200)
+        );
+        assert_eq!(
+            source_cooldown(&[], "/src", NOW),
+            std::time::Duration::from_secs(3600),
+            "no row, the blanket hour"
+        );
+    }
 
     #[test]
     fn carried_gate_identity_keeps_the_stored_consuming_device() {

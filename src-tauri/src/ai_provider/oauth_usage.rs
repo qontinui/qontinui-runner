@@ -24,6 +24,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tracing::debug;
 
+use super::usage_probe::SessionWindow;
+
 const OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 /// The OAuth scope the usage endpoint requires of the token that asks it.
@@ -127,6 +129,10 @@ pub struct OauthUsageSnapshot {
     /// primary exhaustion signal; this catches server-side enforcement that
     /// fires below 100%.
     pub blocking_severity: bool,
+    /// Whether the body reports a five-hour session window, classified on the
+    /// WIRE shape ([`session_window_of`]): `five_hour: None` above conflates
+    /// a null window, a missing one and an unreadable one.
+    pub session_window: SessionWindow,
 }
 
 // ── Wire shapes (subset — unknown fields ignored) ───────────────────────────
@@ -183,7 +189,30 @@ fn severity_is_blocking(severity: &str) -> bool {
     s.contains("reject") || s.contains("block") || s.contains("exceed") || s.contains("at_limit")
 }
 
+/// The body's five-hour window, from the wire shape (D1). `Reported` for a
+/// `five_hour` object with a utilization; `Unread` for one without (the
+/// window exists, its figure did not come); `Absent` when `five_hour` is null
+/// or missing AND `limits[]` has no `kind: "session"` entry; `Unread` when
+/// only such a `limits[]` entry speaks of a session window. The snapshot's own
+/// `five_hour` cannot decide this: `window_from_wire` drops a null
+/// utilization and the snapshot keeps only `weekly_scoped` limits.
+fn session_window_of(wire: &WireUsage) -> SessionWindow {
+    match &wire.five_hour {
+        Some(w) if w.utilization.is_some() => SessionWindow::Reported,
+        Some(_) => SessionWindow::Unread,
+        None if wire
+            .limits
+            .iter()
+            .any(|l| l.kind.as_deref() == Some("session")) =>
+        {
+            SessionWindow::Unread
+        }
+        None => SessionWindow::Absent,
+    }
+}
+
 fn snapshot_from_wire(wire: WireUsage) -> OauthUsageSnapshot {
+    let session_window = session_window_of(&wire);
     let model_limits = wire
         .limits
         .iter()
@@ -211,6 +240,7 @@ fn snapshot_from_wire(wire: WireUsage) -> OauthUsageSnapshot {
         seven_day: wire.seven_day.as_ref().and_then(window_from_wire),
         model_limits,
         blocking_severity,
+        session_window,
     }
 }
 
@@ -330,6 +360,50 @@ mod tests {
         assert!(snap.five_hour.is_none());
         assert!(snap.seven_day.is_none());
         assert!(snap.model_limits.is_empty());
+    }
+
+    fn window_of(body: &str) -> SessionWindow {
+        snapshot_from_wire(serde_json::from_str(body).unwrap()).session_window
+    }
+
+    const WEEKLY_ONLY_LIMITS: &str = r#"[{"kind": "weekly_all", "group": "weekly", "percent": 17,
+        "severity": "normal", "resets_at": "2026-07-18T03:00:00+00:00", "scope": null}]"#;
+
+    #[test]
+    fn a_five_hour_window_with_a_figure_is_reported() {
+        assert_eq!(window_of(SAMPLE), SessionWindow::Reported);
+    }
+
+    #[test]
+    fn a_null_five_hour_with_no_session_limit_is_absent() {
+        let body = format!(
+            r#"{{"five_hour": null, "seven_day": {{"utilization": 17.0, "resets_at": null}}, "limits": {WEEKLY_ONLY_LIMITS}}}"#
+        );
+        assert_eq!(window_of(&body), SessionWindow::Absent);
+    }
+
+    #[test]
+    fn a_missing_five_hour_with_no_session_limit_is_absent() {
+        let body = format!(
+            r#"{{"seven_day": {{"utilization": 17.0, "resets_at": null}}, "limits": {WEEKLY_ONLY_LIMITS}}}"#
+        );
+        assert_eq!(window_of(&body), SessionWindow::Absent);
+    }
+
+    /// The window exists but its figure did not come: not "no window".
+    #[test]
+    fn a_five_hour_object_with_a_null_utilization_is_unread() {
+        let body = r#"{"five_hour": {"utilization": null, "resets_at": "2026-07-17T04:50:00+00:00"}, "limits": []}"#;
+        assert_eq!(window_of(body), SessionWindow::Unread);
+    }
+
+    /// A `limits[]` session entry speaks of a session window that
+    /// `five_hour` does not carry: the two disagree, so it is not absent.
+    #[test]
+    fn a_session_limit_without_a_five_hour_object_is_unread() {
+        let body = r#"{"five_hour": null, "limits": [{"kind": "session", "group": "session",
+            "percent": 16, "severity": "normal", "resets_at": null, "scope": null}]}"#;
+        assert_eq!(window_of(body), SessionWindow::Unread);
     }
 
     /// The measured refusal of an inference-only token, verbatim in shape.

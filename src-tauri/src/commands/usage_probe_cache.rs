@@ -25,10 +25,17 @@
 //!   in-flight request rather than each issuing their own. This is what
 //!   collapses the simultaneous burst (all four callers waking on the same
 //!   tick).
-//! * **TTL.** A result — success *or* failure — is served from cache for
-//!   [`CoalescingCache::ttl`]. This is what collapses the sequential
-//!   re-asks, and caching the failures matters most: without it a
-//!   rate-limited account is re-probed immediately and earns another 429.
+//! * **TTL.** A result — success *or* failure — is served from cache for as
+//!   long as the CALLER says it may be ([`CoalescingCache::get_or_fetch`]'s
+//!   `max_age`), and a failure never longer than the cache's own
+//!   `failure_ttl`. This is what collapses the sequential re-asks, and
+//!   caching the failures matters most: without it a rate-limited account is
+//!   re-probed immediately and earns another 429. The age is the caller's
+//!   because the callers want different things: a poller is served by a
+//!   reading a few minutes old, while confirming a limit that was just hit is
+//!   the whole reason a caller probes (plan
+//!   `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+//!   D7).
 //!
 //! # Why a detached task behind a shared future
 //!
@@ -68,7 +75,8 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 
 /// One key's slot in the cache.
 enum Slot<V: Clone> {
-    /// A completed result, valid until `at + ttl`.
+    /// A completed result, stamped when its fetch completed. Whether it is
+    /// still fresh is decided per call ([`CoalescingCache::get_or_fetch`]).
     Ready { value: V, at: Instant },
     /// A request is in flight; every caller awaits this same handle onto the
     /// detached fetch task. It resolves to `None` only if that task panicked
@@ -148,23 +156,43 @@ fn clear_if_ours<V: Clone>(slots: &Mutex<HashMap<String, Slot<V>>>, key: &str, g
 
 /// A keyed single-flight + TTL cache.
 pub(crate) struct CoalescingCache<V: Clone + Send> {
-    ttl: Duration,
+    /// The longest a FAILED result is reused, whatever a caller's `max_age`.
+    failure_ttl: Duration,
+    /// Which values are failures.
+    is_failure: fn(&V) -> bool,
     slots: Slots<V>,
     next_generation: AtomicU64,
 }
 
 impl<V: Clone + Send + Sync + 'static> CoalescingCache<V> {
-    /// Build a cache whose entries stay fresh for `ttl`.
-    pub(crate) fn new(ttl: Duration) -> Self {
+    /// Build a cache that reuses a value `is_failure` names a failure for at
+    /// most `failure_ttl`, and any other value for the caller's `max_age`.
+    pub(crate) fn new(failure_ttl: Duration, is_failure: fn(&V) -> bool) -> Self {
         Self {
-            ttl,
+            failure_ttl,
+            is_failure,
             slots: Arc::new(Mutex::new(HashMap::new())),
             next_generation: AtomicU64::new(0),
         }
     }
 
+    /// Whether a result completed at `at` may still be served to a caller
+    /// that accepts `max_age`: younger than `max_age`, and for a failure also
+    /// younger than the failure TTL.
+    fn fresh(&self, value: &V, at: Instant, max_age: Duration) -> bool {
+        let limit = if (self.is_failure)(value) {
+            max_age.min(self.failure_ttl)
+        } else {
+            max_age
+        };
+        at.elapsed() < limit
+    }
+
     /// Return `key`'s value, issuing at most one `fetch` for all concurrent
-    /// callers and reusing a completed result for the cache's TTL.
+    /// callers and reusing a completed result no older than `max_age` (a
+    /// failure no older than the failure TTL either). A caller that joins a
+    /// fetch already in flight takes its result whatever `max_age` it passed:
+    /// nothing fresher could be had.
     ///
     /// `fetch` is invoked only when this call becomes the leader: on a cache
     /// hit or a join it is dropped uncalled. The leader runs it on a detached
@@ -175,7 +203,7 @@ impl<V: Clone + Send + Sync + 'static> CoalescingCache<V> {
     /// If the fetch panics, every caller awaiting that one fetch panics too
     /// (there is no `V` to hand them). The slot is cleared first, so the
     /// panic is not cached: the next call leads a fresh fetch.
-    pub(crate) async fn get_or_fetch<F, Fut>(&self, key: &str, fetch: F) -> V
+    pub(crate) async fn get_or_fetch<F, Fut>(&self, key: &str, max_age: Duration, fetch: F) -> V
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
@@ -190,7 +218,7 @@ impl<V: Clone + Send + Sync + 'static> CoalescingCache<V> {
             let mut slots = lock(&self.slots);
 
             if let Some(Slot::Ready { value, at }) = slots.get(key) {
-                if at.elapsed() < self.ttl {
+                if self.fresh(value, *at, max_age) {
                     return value.clone();
                 }
             }
@@ -265,6 +293,16 @@ impl<V: Clone + Send + Sync + 'static> CoalescingCache<V> {
     pub(crate) fn clear(&self) {
         lock(&self.slots).clear();
     }
+
+    /// Seed `key` with `value` as if its fetch had completed `age` ago.
+    /// Test-only, for pinning freshness with production-scale literals.
+    #[cfg(test)]
+    pub(crate) fn insert_aged(&self, key: &str, value: V, age: Duration) {
+        let at = Instant::now()
+            .checked_sub(age)
+            .expect("the monotonic clock reaches back that far");
+        lock(&self.slots).insert(key.to_string(), Slot::Ready { value, at });
+    }
 }
 
 #[cfg(test)]
@@ -273,13 +311,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    /// A cache whose values are never failures, so `max_age` alone decides.
+    fn cache<V: Clone + Send + Sync + 'static>() -> CoalescingCache<V> {
+        CoalescingCache::new(Duration::from_secs(60), |_| false)
+    }
+
+    /// The pollers' age in production (`usage_probe::USAGE_PROBE_POLL_MAX_AGE`).
+    const MAX_AGE: Duration = Duration::from_secs(270);
+
     /// N concurrent callers for the same key must produce exactly ONE
     /// upstream request — the stampede half of the fix.
     // Multi-threaded, so the callers genuinely race for the leader slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_callers_produce_one_upstream_request() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_secs(60)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let calls = Arc::new(AtomicUsize::new(0));
         // A LATCHING gate: `watch` remembers the release, so this test cannot
         // deadlock on a wake that fires before the leader is polled (which is
@@ -293,7 +338,7 @@ mod tests {
             let mut gate = gate.clone();
             handles.push(tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", MAX_AGE, move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         // Hold the request open so every caller is
                         // demonstrably in flight at once.
@@ -332,7 +377,7 @@ mod tests {
     /// requests — the re-ask half of the fix.
     #[tokio::test]
     async fn a_second_call_within_the_ttl_produces_no_request() {
-        let cache: CoalescingCache<u32> = CoalescingCache::new(Duration::from_secs(60));
+        let cache: CoalescingCache<u32> = cache();
         let calls = Arc::new(AtomicUsize::new(0));
 
         let fetch = |calls: Arc<AtomicUsize>| {
@@ -342,11 +387,21 @@ mod tests {
             }
         };
 
-        assert_eq!(cache.get_or_fetch("acct-a", fetch(calls.clone())).await, 11);
+        assert_eq!(
+            cache
+                .get_or_fetch("acct-a", MAX_AGE, fetch(calls.clone()))
+                .await,
+            11
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         for _ in 0..10 {
-            assert_eq!(cache.get_or_fetch("acct-a", fetch(calls.clone())).await, 11);
+            assert_eq!(
+                cache
+                    .get_or_fetch("acct-a", MAX_AGE, fetch(calls.clone()))
+                    .await,
+                11
+            );
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -360,13 +415,13 @@ mod tests {
     #[tokio::test]
     async fn a_failed_result_is_cached_too() {
         let cache: CoalescingCache<Result<u32, String>> =
-            CoalescingCache::new(Duration::from_secs(60));
+            CoalescingCache::new(Duration::from_secs(60), Result::is_err);
         let calls = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..5 {
             let calls = calls.clone();
             let out = cache
-                .get_or_fetch("acct-a", move || async move {
+                .get_or_fetch("acct-a", MAX_AGE, move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err::<u32, String>("API error (429)".to_string())
                 })
@@ -376,15 +431,82 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A failure is reused for the failure TTL only, however long the
+    /// caller would accept a success: a 61-second-old 429 is re-asked by a
+    /// 270-second poller, a 59-second-old one is not.
+    #[tokio::test]
+    async fn a_failure_is_reused_only_for_the_failure_ttl() {
+        let cache: CoalescingCache<Result<u32, String>> =
+            CoalescingCache::new(Duration::from_secs(60), Result::is_err);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refetch = |calls: Arc<AtomicUsize>| {
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<u32, String>(7)
+            }
+        };
+        cache.insert_aged(
+            "fresh",
+            Err("API error (429)".into()),
+            Duration::from_secs(59),
+        );
+        cache.insert_aged(
+            "stale",
+            Err("API error (429)".into()),
+            Duration::from_secs(61),
+        );
+        assert!(cache
+            .get_or_fetch("fresh", MAX_AGE, refetch(calls.clone()))
+            .await
+            .is_err());
+        assert_eq!(
+            cache
+                .get_or_fetch("stale", MAX_AGE, refetch(calls.clone()))
+                .await,
+            Ok(7)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The max age is the CALLER's, per call, on one key: a 100-second-old
+    /// success is served to a 270-second poller and refetched for a
+    /// 60-second confirming caller.
+    #[tokio::test]
+    async fn the_max_age_is_per_call_on_one_key() {
+        let cache: CoalescingCache<u32> = cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refetch = |calls: Arc<AtomicUsize>| {
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                2u32
+            }
+        };
+        cache.insert_aged("acct-a", 1, Duration::from_secs(100));
+        assert_eq!(
+            cache
+                .get_or_fetch("acct-a", Duration::from_secs(270), refetch(calls.clone()))
+                .await,
+            1
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache
+                .get_or_fetch("acct-a", Duration::from_secs(60), refetch(calls.clone()))
+                .await,
+            2
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     /// The cache must not conflate accounts.
     #[tokio::test]
     async fn distinct_keys_do_not_share_a_result() {
-        let cache: CoalescingCache<String> = CoalescingCache::new(Duration::from_secs(60));
+        let cache: CoalescingCache<String> = cache();
         let a = cache
-            .get_or_fetch("acct-a", || async { "a".to_string() })
+            .get_or_fetch("acct-a", MAX_AGE, || async { "a".to_string() })
             .await;
         let b = cache
-            .get_or_fetch("acct-b", || async { "b".to_string() })
+            .get_or_fetch("acct-b", MAX_AGE, || async { "b".to_string() })
             .await;
         assert_eq!(a, "a");
         assert_eq!(b, "b");
@@ -394,7 +516,7 @@ mod tests {
     /// stampede, it does not freeze the data.
     #[tokio::test]
     async fn a_call_after_the_ttl_refetches() {
-        let cache: CoalescingCache<u32> = CoalescingCache::new(Duration::from_millis(30));
+        let cache: CoalescingCache<u32> = cache();
         let calls = Arc::new(AtomicUsize::new(0));
 
         let fetch = |calls: Arc<AtomicUsize>| {
@@ -404,9 +526,13 @@ mod tests {
             }
         };
 
-        cache.get_or_fetch("acct-a", fetch(calls.clone())).await;
+        cache
+            .get_or_fetch("acct-a", Duration::from_millis(30), fetch(calls.clone()))
+            .await;
         tokio::time::sleep(Duration::from_millis(60)).await;
-        cache.get_or_fetch("acct-a", fetch(calls.clone())).await;
+        cache
+            .get_or_fetch("acct-a", Duration::from_millis(30), fetch(calls.clone()))
+            .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -416,8 +542,7 @@ mod tests {
     /// stale-weekly-utilization bug, qontinui-runner#1839).
     #[tokio::test]
     async fn a_cancelled_leader_does_not_freeze_the_slot() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_millis(30)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let calls = Arc::new(AtomicUsize::new(0));
 
         let leader = {
@@ -425,7 +550,7 @@ mod tests {
             let calls = calls.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", Duration::from_millis(30), move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         1u32
@@ -437,7 +562,11 @@ mod tests {
         // A joiner attaches, then the leader is cancelled while in flight.
         let joiner = {
             let cache = cache.clone();
-            tokio::spawn(async move { cache.get_or_fetch("acct-a", || async { 99u32 }).await })
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch("acct-a", Duration::from_millis(30), || async { 99u32 })
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(5)).await;
         leader.abort();
@@ -447,7 +576,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         let calls2 = calls.clone();
         let v = cache
-            .get_or_fetch("acct-a", move || async move {
+            .get_or_fetch("acct-a", Duration::from_millis(30), move || async move {
                 calls2.fetch_add(1, Ordering::SeqCst);
                 2u32
             })
@@ -466,8 +595,7 @@ mod tests {
     // here because the TTL (std `Instant`) is never meant to lapse.
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_fetch_still_completes_and_publishes() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_secs(60)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let leader = {
@@ -475,7 +603,7 @@ mod tests {
             let finished = finished.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", MAX_AGE, move || async move {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         finished.store(true, Ordering::SeqCst);
                         1u32
@@ -491,7 +619,9 @@ mod tests {
             finished.load(Ordering::SeqCst),
             "the fetch must run to completion with nobody awaiting it"
         );
-        let v = cache.get_or_fetch("acct-a", || async { 99u32 }).await;
+        let v = cache
+            .get_or_fetch("acct-a", MAX_AGE, || async { 99u32 })
+            .await;
         assert_eq!(v, 1, "the unattended result must have been published");
     }
 
@@ -499,8 +629,7 @@ mod tests {
     /// fetch see the panic, and the next call fetches afresh.
     #[tokio::test]
     async fn a_panicking_fetch_does_not_poison_the_slot() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_secs(60)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let calls = Arc::new(AtomicUsize::new(0));
 
         let first = {
@@ -508,7 +637,7 @@ mod tests {
             let calls = calls.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", MAX_AGE, move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         panic!("probe blew up");
                         #[allow(unreachable_code)]
@@ -521,7 +650,7 @@ mod tests {
 
         let calls2 = calls.clone();
         let v = cache
-            .get_or_fetch("acct-a", move || async move {
+            .get_or_fetch("acct-a", MAX_AGE, move || async move {
                 calls2.fetch_add(1, Ordering::SeqCst);
                 3u32
             })
@@ -534,8 +663,7 @@ mod tests {
     /// overwrite nor clear the newer slot (the generation guard).
     #[tokio::test]
     async fn a_late_fetch_does_not_overwrite_a_newer_slot() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_secs(60)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let (release, gate) = tokio::sync::oneshot::channel::<()>();
         let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
 
@@ -543,7 +671,7 @@ mod tests {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", MAX_AGE, move || async move {
                         let _ = started_tx.send(());
                         let _ = gate.await;
                         1u32
@@ -554,12 +682,19 @@ mod tests {
         // The fetch is running, so generation 1's in-flight slot is in place.
         started.await.unwrap();
         cache.clear();
-        assert_eq!(cache.get_or_fetch("acct-a", || async { 2u32 }).await, 2);
+        assert_eq!(
+            cache
+                .get_or_fetch("acct-a", MAX_AGE, || async { 2u32 })
+                .await,
+            2
+        );
 
         release.send(()).unwrap();
         assert_eq!(old.await.unwrap(), 1);
         assert_eq!(
-            cache.get_or_fetch("acct-a", || async { 99u32 }).await,
+            cache
+                .get_or_fetch("acct-a", MAX_AGE, || async { 99u32 })
+                .await,
             2,
             "the late generation must not replace the newer result"
         );
@@ -569,8 +704,7 @@ mod tests {
     /// only its OWN slot, never a newer one.
     #[tokio::test]
     async fn a_late_panicking_fetch_does_not_clear_a_newer_slot() {
-        let cache: Arc<CoalescingCache<u32>> =
-            Arc::new(CoalescingCache::new(Duration::from_secs(60)));
+        let cache: Arc<CoalescingCache<u32>> = Arc::new(cache());
         let (release, gate) = tokio::sync::oneshot::channel::<()>();
         let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
 
@@ -578,7 +712,7 @@ mod tests {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch("acct-a", move || async move {
+                    .get_or_fetch("acct-a", MAX_AGE, move || async move {
                         let _ = started_tx.send(());
                         let _ = gate.await;
                         panic!("late probe blew up");
@@ -590,12 +724,19 @@ mod tests {
         };
         started.await.unwrap();
         cache.clear();
-        assert_eq!(cache.get_or_fetch("acct-a", || async { 2u32 }).await, 2);
+        assert_eq!(
+            cache
+                .get_or_fetch("acct-a", MAX_AGE, || async { 2u32 })
+                .await,
+            2
+        );
 
         release.send(()).unwrap();
         assert!(old.await.unwrap_err().is_panic());
         assert_eq!(
-            cache.get_or_fetch("acct-a", || async { 99u32 }).await,
+            cache
+                .get_or_fetch("acct-a", MAX_AGE, || async { 99u32 })
+                .await,
             2,
             "the late generation's cleanup must not clear the newer result"
         );
@@ -603,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_drops_cached_entries() {
-        let cache: CoalescingCache<u32> = CoalescingCache::new(Duration::from_secs(60));
+        let cache: CoalescingCache<u32> = cache();
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = |calls: Arc<AtomicUsize>| {
             move || async move {
@@ -611,9 +752,9 @@ mod tests {
                 1u32
             }
         };
-        cache.get_or_fetch("k", fetch(calls.clone())).await;
+        cache.get_or_fetch("k", MAX_AGE, fetch(calls.clone())).await;
         cache.clear();
-        cache.get_or_fetch("k", fetch(calls.clone())).await;
+        cache.get_or_fetch("k", MAX_AGE, fetch(calls.clone())).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

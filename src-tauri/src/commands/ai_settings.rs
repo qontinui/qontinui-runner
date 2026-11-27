@@ -21,7 +21,10 @@ use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
-pub use crate::ai_provider::usage_probe::probe_account_usage;
+pub use crate::ai_provider::usage_probe::{
+    probe_account_usage, USAGE_PROBE_CONFIRM_MAX_AGE, USAGE_PROBE_POLL_MAX_AGE,
+};
+use std::time::Duration;
 
 // ============================================================================
 // Keychain Operations for API Keys
@@ -1098,13 +1101,26 @@ pub struct AccountUsageInfo {
     pub period_elapsed_fraction: Option<f64>,
     /// Days remaining until the billing period resets.
     pub period_remaining_days: Option<f64>,
-    /// Session-window (5-hour) utilization 0.0–1.0. Only populated when the
-    /// stats came from the OAuth usage endpoint (`source == "oauth_usage"`).
+    /// Session-window (5-hour) utilization 0.0–1.0, from the OAuth usage
+    /// endpoint or the header probe's `-unified-5h-utilization`. `None` when
+    /// no figure was read; [`Self::session_window`] says whether that is
+    /// because the account HAS no such window here or because it went unread.
     #[serde(default)]
     pub session_utilization: Option<f64>,
-    /// Unix seconds when the 5-hour session window resets.
+    /// Unix seconds when the 5-hour session window resets (the endpoint's
+    /// `five_hour.resets_at`, or the header probe's `-unified-5h-reset`).
     #[serde(default)]
     pub session_resets_at: Option<u64>,
+    /// Whether this reading reports a five-hour session window, has positive
+    /// evidence of none, or did not read it
+    /// ([`crate::ai_provider::usage_probe::SessionWindow`]). A deserialized
+    /// row that carries none reads `unread`.
+    #[serde(default)]
+    pub session_window: crate::ai_provider::usage_probe::SessionWindow,
+    /// The header probe's `-unified-representative-claim` (`five_hour`,
+    /// `seven_day`, …), passed through for diagnosis. No decision reads it.
+    #[serde(default)]
+    pub representative_claim: Option<String>,
     /// Per-model scoped weekly limits (e.g. the Fable-only cap).
     #[serde(default)]
     pub model_limits: Vec<ModelLimitInfo>,
@@ -1221,10 +1237,11 @@ pub(crate) fn account_hash_for(config_dir: &str, home: Option<&std::path::Path>)
 pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandResponse, String> {
     info!("Checking usage for {} Claude accounts", config_dirs.len());
 
-    // Probe all accounts concurrently
+    // Probe all accounts concurrently. The Terminal page polls this every 5
+    // minutes and the Settings button sits beside it: a poller's max age.
     let futures: Vec<_> = config_dirs
         .into_iter()
-        .map(|dir| async move { probe_account_usage(dir).await })
+        .map(|dir| async move { probe_account_usage(dir, USAGE_PROBE_POLL_MAX_AGE).await })
         .collect();
 
     let results = futures::future::join_all(futures).await;
@@ -1338,10 +1355,25 @@ pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
 /// Which of the two refresh entry points is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageRefreshCaller {
-    /// Startup and `account_migration`: feeds the account picker.
+    /// Startup, `account_migration`'s roster probe and
+    /// `limit_hit::cool_until_reset`: feeds the account picker, and confirms a
+    /// limit that was just hit.
     SelectionSnapshot,
     /// The 10-minute timer: the fleet report to coord.
     FleetReport,
+}
+
+impl UsageRefreshCaller {
+    /// How old a successful probe result this caller accepts (plan
+    /// `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+    /// D7): a fresh reading is the point of the selection snapshot, while the
+    /// fleet report is a poller.
+    fn max_age(self) -> Duration {
+        match self {
+            UsageRefreshCaller::SelectionSnapshot => USAGE_PROBE_CONFIRM_MAX_AGE,
+            UsageRefreshCaller::FleetReport => USAGE_PROBE_POLL_MAX_AGE,
+        }
+    }
 }
 
 /// What one refresh does, decided from how many Claude config dirs the runner
@@ -1540,9 +1572,10 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
             .map(|a| a.config_dir)
             .collect()
     };
+    let max_age = caller.max_age();
     let futures: Vec<_> = config_dirs
         .into_iter()
-        .map(|dir| async move { probe_account_usage(dir).await })
+        .map(|dir| async move { probe_account_usage(dir, max_age).await })
         .collect();
     let results = futures::future::join_all(futures).await;
     if plan.record_snapshot {
@@ -1598,6 +1631,12 @@ mod usage_twin_report {
         weekly_resets_at: Option<u64>,
         session_utilization: Option<f64>,
         session_resets_at: Option<u64>,
+        /// `reported` | `absent` | `unread`
+        /// ([`crate::ai_provider::usage_probe::SessionWindow`]). Coord's
+        /// ingest ignores it until Phase 4 of plan
+        /// `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+        /// stores it; a runner that sends none reads `unread` there.
+        session_window: crate::ai_provider::usage_probe::SessionWindow,
         model_limits: &'a [super::ModelLimitInfo],
         exhausted: bool,
         source: Option<&'a str>,
@@ -1738,6 +1777,7 @@ mod usage_twin_report {
                     weekly_resets_at: r.resets_at,
                     session_utilization: r.session_utilization,
                     session_resets_at: r.session_resets_at,
+                    session_window: r.session_window,
                     model_limits: &r.model_limits,
                     exhausted: super::probe_result_exhausted(r),
                     source: r.source.as_deref(),
@@ -2057,6 +2097,7 @@ mod usage_twin_report {
                     weekly_resets_at: Some(1_700_000_000),
                     session_utilization: Some(0.5),
                     session_resets_at: None,
+                    session_window: crate::ai_provider::usage_probe::SessionWindow::Absent,
                     model_limits: &limits,
                     exhausted: false,
                     source: Some("oauth_usage"),
@@ -2089,6 +2130,9 @@ mod usage_twin_report {
             );
             // coord's `WireAccount::account_hash` reads exactly this key.
             assert_eq!(acct["account_hash"], serde_json::json!(HASH));
+            // Phase 4 of plan `2026-11-26-runner-usage-source-is-dark-…` reads
+            // exactly this key and these three spellings.
+            assert_eq!(acct["session_window"], serde_json::json!("absent"));
         }
 
         /// An expired credential against coord's uniform
@@ -2189,6 +2233,7 @@ mod usage_twin_report {
                     weekly_resets_at: None,
                     session_utilization: None,
                     session_resets_at: None,
+                    session_window: crate::ai_provider::usage_probe::SessionWindow::Absent,
                     model_limits: &limits,
                     exhausted: false,
                     source: None,
@@ -3169,7 +3214,9 @@ mod usage_report_scope_tests {
             ..Default::default()
         };
         USAGE_PROBE_CACHE
-            .get_or_fetch(&dir, move || async move { reading })
+            .get_or_fetch(&dir, super::USAGE_PROBE_POLL_MAX_AGE, move || async move {
+                reading
+            })
             .await;
         dir
     }
@@ -3208,6 +3255,21 @@ mod usage_report_scope_tests {
         /// The fleet report covers a runner with fewer than two accounts by
         /// probing the account it spends, only when it reports lone accounts; from
         /// two up it is the roster, exactly as the picker sees it.
+        /// D7 through the refresh entry points: the selection snapshot
+        /// (startup, migration's roster probe, `cool_until_reset`) wants a
+        /// fresh reading, the fleet report is a poller.
+        #[test]
+        fn each_refresh_caller_passes_its_max_age() {
+            assert_eq!(
+                UsageRefreshCaller::SelectionSnapshot.max_age(),
+                std::time::Duration::from_secs(60)
+            );
+            assert_eq!(
+                UsageRefreshCaller::FleetReport.max_age(),
+                std::time::Duration::from_secs(270)
+            );
+        }
+
         #[test]
         fn the_fleet_report_covers_single_and_unlisted_accounts() {
             let c = UsageRefreshCaller::FleetReport;

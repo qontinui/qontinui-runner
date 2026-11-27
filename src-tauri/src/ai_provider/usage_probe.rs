@@ -9,10 +9,13 @@
 //! is owed. The usage row type (`AccountUsageInfo`), the exhaustion predicate
 //! and the refresh entry points stay there.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::oauth_usage_gate::{UsageEndpointInfo, UsageEndpointState};
@@ -108,30 +111,175 @@ pub(crate) fn is_oauth_token_expired(creds_path: &std::path::Path) -> bool {
     now_ms >= expires_at_ms
 }
 
-/// How long a probe result — success OR failure — is reused before the
-/// account is asked again.
+/// How long a SUCCESSFUL probe result is reused for the pollers: the
+/// Terminal page's 5-minute usage poll (`check_accounts_usage`), the Settings
+/// "check usage" button beside it, `/analytics/account-usage`, and the
+/// 10-minute fleet report (plan
+/// `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+/// D7).
 ///
-/// Sized to swallow the burst: the four independent callers
-/// (`check_accounts_usage`, `/analytics/account-usage`, the 10-minute
-/// snapshot timer, `account_migration`'s confirmation) no longer each cost a
-/// request, and a 429'd account is not immediately re-probed into another
-/// 429. A minute is well inside the resolution of the weekly/5-hour windows
-/// these numbers describe, so nothing downstream reads a materially staler
-/// figure than before.
-const USAGE_PROBE_TTL: Duration = Duration::from_secs(60);
+/// 270 s, strictly below the 300 s Terminal period minus a fetch's latency,
+/// so each Terminal poll refetches and the 10-minute timer is absorbed
+/// wherever it phases: about 18 -> 12 calls an hour per account where the two
+/// are out of phase. A max age EQUAL to the period would make every poll a
+/// race between timer lateness and fetch latency, since a result is stamped
+/// when its fetch completes. A reading this old is well inside the picker's
+/// own snapshot TTLs (`ai_provider::config`, 15 minutes and 1 hour).
+pub const USAGE_PROBE_POLL_MAX_AGE: Duration = Duration::from_secs(270);
+
+/// How long a successful probe result is reused for a caller whose reason to
+/// probe is a FRESH reading: the selection snapshot (startup, and
+/// `account_migration`'s roster probe), `account_migration`'s own-account
+/// probe, and `limit_hit::cool_until_reset` — confirming a limit that was just
+/// hit. A minute, the probe's reuse before D7.
+pub const USAGE_PROBE_CONFIRM_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// How long a FAILED probe result (an `error` row) is reused, whatever the
+/// caller's max age: a minute, so a 429'd account is not re-probed into
+/// another 429 on the next caller's tick, nor held unprobed for minutes.
+pub(crate) const USAGE_PROBE_FAILURE_TTL: Duration = Duration::from_secs(60);
 
 /// Shared single-flight + TTL cache in front of the live probe. Keyed by
 /// `config_dir`, which is exactly the per-account identity the probe and the
 /// selection snapshot already use.
 pub(crate) static USAGE_PROBE_CACHE: Lazy<
     crate::commands::usage_probe_cache::CoalescingCache<AccountUsageInfo>,
-> = Lazy::new(|| crate::commands::usage_probe_cache::CoalescingCache::new(USAGE_PROBE_TTL));
+> = Lazy::new(|| {
+    crate::commands::usage_probe_cache::CoalescingCache::new(USAGE_PROBE_FAILURE_TTL, |info| {
+        info.error.is_some()
+    })
+});
+
+/// Whether a usage reading says the account has a five-hour session window
+/// (plan `2026-11-26-…` D1). Sent to coord beside the reading, so the launch
+/// budget can tell an account that HAS no session window on this path from
+/// one whose window simply was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionWindow {
+    /// The source reported a five-hour window; `session_utilization` holds it.
+    Reported,
+    /// Positive evidence there is no five-hour window on this path: the
+    /// header probe's answer carries the whole unified rate-limit family
+    /// (`-unified-status`, `-unified-representative-claim` and
+    /// `-unified-7d-utilization`) and no `-unified-5h-*` header at all, or a
+    /// 2xx OAuth usage body reports `five_hour` null or missing with no
+    /// `kind: "session"` limit. Measured for every Max 20x account on the
+    /// box this plan was written on.
+    Absent,
+    /// Neither: the reading says nothing either way (a failed probe, a
+    /// response missing the unified family, a five-hour object with no
+    /// usable figure). UNKNOWN, never "no window".
+    #[default]
+    Unread,
+}
+
+/// The rate-limit header family every usage-probe header starts with.
+const UNIFIED: &str = "anthropic-ratelimit-unified-";
+
+/// Classify a header-probe response's session window (D1). Pure. Reads the
+/// headers only, never the status: a 429 carrying the unified family is as
+/// much an observation of which windows exist as a 200.
+pub fn classify_session_window(headers: &reqwest::header::HeaderMap) -> SessionWindow {
+    let five_hour = format!("{UNIFIED}5h-");
+    let utilization_5h = headers
+        .get(format!("{five_hour}utilization").as_str())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok());
+    if utilization_5h.is_some() {
+        return SessionWindow::Reported;
+    }
+    if headers.keys().any(|k| k.as_str().starts_with(&five_hour)) {
+        // A five-hour header with no readable utilization: the window exists
+        // and its figure was not read.
+        return SessionWindow::Unread;
+    }
+    let family = ["status", "representative-claim", "7d-utilization"]
+        .iter()
+        .all(|suffix| headers.contains_key(format!("{UNIFIED}{suffix}").as_str()));
+    if family {
+        SessionWindow::Absent
+    } else {
+        SessionWindow::Unread
+    }
+}
+
+/// The accounts for which the OAuth usage endpoint has reported a five-hour
+/// window this process lifetime (D1's guard). Keyed by `account_hash`, else by
+/// `config_dir` for a dir with no readable identity.
+static FIVE_HOUR_SEEN: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn latch_key(info: &AccountUsageInfo) -> String {
+    match &info.account_hash {
+        Some(hash) => format!("hash:{hash}"),
+        None => format!("dir:{}", info.config_dir),
+    }
+}
+
+/// D1's latch over one reading, after its `account_hash` is known. An OAuth
+/// reading that reports a five-hour window latches the account; from then on a
+/// header-probe `Absent` for that account is reported `Unread`, because the two
+/// sources disagreeing is evidence that the header inference is wrong for it.
+fn apply_five_hour_latch(seen: &mut HashSet<String>, info: &mut AccountUsageInfo) {
+    let key = latch_key(info);
+    match info.source.as_deref() {
+        Some("oauth_usage") if info.session_window == SessionWindow::Reported => {
+            seen.insert(key);
+        }
+        Some("probe") if info.session_window == SessionWindow::Absent && seen.contains(&key) => {
+            info.session_window = SessionWindow::Unread;
+        }
+        _ => {}
+    }
+}
+
+/// The `anthropic-ratelimit-*` header NAMES of a response, sorted and
+/// deduplicated. Names only: the values are never logged beyond what the
+/// probe's own line prints.
+fn rate_limit_header_names(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    let mut names: Vec<String> = headers
+        .keys()
+        .map(|k| k.as_str().to_string())
+        .filter(|k| k.starts_with("anthropic-ratelimit-"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The (account, token fingerprint) pairs whose header names were logged.
+static HEADER_NAMES_LOGGED: Lazy<Mutex<HashSet<(String, u64)>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Log the rate-limit header names a probe saw, once per account and token
+/// per process at INFO: the evidence D1's header inference is drawn from.
+fn log_header_names_once(
+    config_dir: &str,
+    label: &str,
+    token_fp: u64,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let first = HEADER_NAMES_LOGGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((config_dir.to_string(), token_fp));
+    if first {
+        info!(
+            "Account '{}': header probe rate-limit header names: {}",
+            label,
+            rate_limit_header_names(headers).join(",")
+        );
+    }
+}
 
 /// Probe a single account for its weekly rate limit utilization.
 ///
 /// Reads through a shared single-flight + TTL cache
 /// ([`USAGE_PROBE_CACHE`]): concurrent callers for the same account await ONE
-/// upstream request, and a result is reused for [`USAGE_PROBE_TTL`].
+/// upstream request, and a successful result is reused for `max_age`
+/// ([`USAGE_PROBE_POLL_MAX_AGE`] for a poller, [`USAGE_PROBE_CONFIRM_MAX_AGE`]
+/// where a fresh reading is the point), a failed one for at most
+/// [`USAGE_PROBE_FAILURE_TTL`].
 ///
 /// This is not an optimization. The probe has four independent callers that
 /// each fanned out one request per configured account with no coalescing and
@@ -141,7 +289,7 @@ pub(crate) static USAGE_PROBE_CACHE: Lazy<
 /// and then reported the 429s it earned as account exhaustion.
 ///
 /// See [`crate::commands::usage_probe_cache`] for the mechanism.
-pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+pub async fn probe_account_usage(config_dir: String, max_age: Duration) -> AccountUsageInfo {
     // Subscription accounts are off while a model gateway is declared, and a
     // subscription token must not be spent or sent on their behalf
     // (`crate::model_gateway`). Answered before the cache so no stale sample
@@ -160,7 +308,7 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     }
     let key = config_dir.clone();
     USAGE_PROBE_CACHE
-        .get_or_fetch(&key, move || async move {
+        .get_or_fetch(&key, max_age, move || async move {
             // Identity is read here, after the probe, so every return path of
             // the probe (token error, probe error, success) carries it: an
             // errored row is exactly the one a consumer must collapse onto its
@@ -168,6 +316,10 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
             let hash_dir = config_dir.clone();
             let mut info = probe_account_usage_uncached(config_dir).await;
             info.account_hash = account_hash_for(&hash_dir, dirs::home_dir().as_deref());
+            apply_five_hour_latch(
+                &mut FIVE_HOUR_SEEN.lock().unwrap_or_else(|e| e.into_inner()),
+                &mut info,
+            );
             info
         })
         .await
@@ -263,6 +415,12 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     match response {
         Ok(resp) => {
             let headers = resp.headers().clone();
+            log_header_names_once(
+                &config_dir,
+                &label,
+                super::oauth_refresh::token_fingerprint(&token),
+                &headers,
+            );
             let error = if resp.status().is_success() {
                 None
             } else {
@@ -343,6 +501,8 @@ fn oauth_usage_row(
         // Filled by `probe_account_usage`'s cached closure.
         account_hash: None,
         usage_endpoint: Some(endpoint),
+        session_window: snap.session_window,
+        representative_claim: None,
     }
 }
 
@@ -365,9 +525,11 @@ pub(crate) fn header_probe_row(
     let status_7d = header("anthropic-ratelimit-unified-7d-status").map(|s| s.to_string());
     let resets_at_7d =
         header("anthropic-ratelimit-unified-7d-reset").and_then(|v| v.parse::<u64>().ok());
-    // Also grab 5-hour utilization for context
+    // The 5-hour session window, where the provider sends one, and its reset.
     let utilization_5h =
         header("anthropic-ratelimit-unified-5h-utilization").and_then(|v| v.parse::<f64>().ok());
+    let resets_at_5h =
+        header("anthropic-ratelimit-unified-5h-reset").and_then(|v| v.parse::<u64>().ok());
 
     let (expected, delta, elapsed_frac, remaining_days) =
         compute_expected_usage(utilization_7d, resets_at_7d);
@@ -385,10 +547,38 @@ pub(crate) fn header_probe_row(
         period_elapsed_fraction: elapsed_frac,
         period_remaining_days: remaining_days,
         session_utilization: utilization_5h,
+        session_resets_at: resets_at_5h,
         source: Some("probe".to_string()),
         usage_endpoint: Some(endpoint),
+        session_window: classify_session_window(headers),
+        representative_claim: header("anthropic-ratelimit-unified-representative-claim")
+            .map(str::to_string),
         ..Default::default()
     }
+}
+
+/// A header-probe row built from literal `(name, value)` headers, as the
+/// probe builds it from a real response. Test support for the consumers of
+/// the row's fields.
+#[cfg(test)]
+pub(crate) fn probe_row_from_headers(
+    config_dir: &str,
+    headers: &[(&str, &str)],
+) -> AccountUsageInfo {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        map.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            value.parse().expect("header value"),
+        );
+    }
+    header_probe_row(
+        config_dir.to_string(),
+        account_label(config_dir),
+        &map,
+        None,
+        UsageEndpointInfo::bare(UsageEndpointState::ScopeRefused),
+    )
 }
 
 #[cfg(test)]
@@ -455,5 +645,257 @@ mod tests {
         );
         assert_eq!(row.error, None);
         assert!(!probe_result_exhausted(&row));
+    }
+
+    // ── D1: the session window, from literal header maps ──────────────────
+
+    fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    /// Why 4's first set: a hashed Max 20x account (`.claude-paktis`). The
+    /// whole unified family, a seven-day representative claim, and no
+    /// `-unified-5h-*` header at all.
+    const MAX_20X: &[(&str, &str)] = &[
+        ("anthropic-ratelimit-unified-status", "allowed"),
+        ("anthropic-ratelimit-unified-reset", "1800300000"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day",
+        ),
+        ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "org_level_disabled",
+        ),
+        ("anthropic-ratelimit-unified-7d-utilization", "0.41"),
+        ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ("anthropic-ratelimit-unified-7d-reset", "1800300000"),
+    ];
+
+    /// Why 4's second set: an unhashed account (`.claude-peter`). The same
+    /// family plus the three five-hour headers, claim `five_hour`.
+    const FIVE_HOUR: &[(&str, &str)] = &[
+        ("anthropic-ratelimit-unified-status", "allowed"),
+        ("anthropic-ratelimit-unified-reset", "1800010000"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "five_hour",
+        ),
+        ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ("anthropic-ratelimit-unified-5h-utilization", "0.12"),
+        ("anthropic-ratelimit-unified-5h-status", "allowed"),
+        ("anthropic-ratelimit-unified-5h-reset", "1800010000"),
+        ("anthropic-ratelimit-unified-7d-utilization", "0.33"),
+        ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ("anthropic-ratelimit-unified-7d-reset", "1800300000"),
+    ];
+
+    fn row(pairs: &[(&str, &str)], error: Option<&str>) -> AccountUsageInfo {
+        header_probe_row(
+            "/test/acct".to_string(),
+            "acct".to_string(),
+            &headers(pairs),
+            error.map(str::to_string),
+            UsageEndpointInfo::bare(UsageEndpointState::ScopeRefused),
+        )
+    }
+
+    #[test]
+    fn a_max_20x_header_set_reads_the_session_window_absent() {
+        let r = row(MAX_20X, None);
+        assert_eq!(r.session_window, SessionWindow::Absent);
+        assert_eq!(r.session_utilization, None);
+        assert_eq!(r.session_resets_at, None);
+        assert_eq!(r.representative_claim.as_deref(), Some("seven_day"));
+    }
+
+    #[test]
+    fn a_five_hour_header_set_reads_reported_with_its_reset() {
+        let r = row(FIVE_HOUR, None);
+        assert_eq!(r.session_window, SessionWindow::Reported);
+        assert_eq!(r.session_utilization, Some(0.12));
+        assert_eq!(r.session_resets_at, Some(1_800_010_000));
+        assert_eq!(r.representative_claim.as_deref(), Some("five_hour"));
+    }
+
+    /// Without `-unified-status` the family is incomplete: no evidence of
+    /// absence, so UNKNOWN.
+    #[test]
+    fn a_response_without_the_unified_status_is_unread() {
+        let partial: Vec<(&str, &str)> = MAX_20X
+            .iter()
+            .copied()
+            .filter(|(n, _)| *n != "anthropic-ratelimit-unified-status")
+            .collect();
+        assert_eq!(row(&partial, None).session_window, SessionWindow::Unread);
+        assert_eq!(row(&[], None).session_window, SessionWindow::Unread);
+    }
+
+    /// The classification reads the headers, not the status: a 429 that
+    /// carries the unified family is an observation of which windows exist.
+    #[test]
+    fn a_429_carrying_the_unified_family_is_absent() {
+        let r = row(MAX_20X, Some("API error (429): rate limited"));
+        assert!(r.error.is_some());
+        assert_eq!(r.session_window, SessionWindow::Absent);
+    }
+
+    /// A five-hour header with no readable utilization: the window exists,
+    /// its figure did not come.
+    #[test]
+    fn a_five_hour_header_without_a_utilization_is_unread() {
+        let r = row(
+            &[
+                ("anthropic-ratelimit-unified-status", "allowed"),
+                (
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "five_hour",
+                ),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.33"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ],
+            None,
+        );
+        assert_eq!(r.session_window, SessionWindow::Unread);
+    }
+
+    // ── D1's latch ────────────────────────────────────────────────────────
+
+    fn reading(
+        dir: &str,
+        hash: Option<&str>,
+        source: &str,
+        window: SessionWindow,
+    ) -> AccountUsageInfo {
+        AccountUsageInfo {
+            config_dir: dir.to_string(),
+            account_hash: hash.map(str::to_string),
+            source: Some(source.to_string()),
+            session_window: window,
+            ..Default::default()
+        }
+    }
+
+    /// A hashed account: the OAuth source reported a five-hour window under
+    /// one dir, so a probe `absent` for the SAME account under another dir
+    /// reads `unread`; a different account is untouched.
+    #[test]
+    fn the_latch_turns_a_hashed_accounts_probe_absent_unread() {
+        let mut seen = HashSet::new();
+        let mut oauth = reading("/a", Some("h1"), "oauth_usage", SessionWindow::Reported);
+        apply_five_hour_latch(&mut seen, &mut oauth);
+        assert_eq!(oauth.session_window, SessionWindow::Reported);
+        let mut same = reading("/b", Some("h1"), "probe", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut same);
+        assert_eq!(same.session_window, SessionWindow::Unread);
+        let mut other = reading("/c", Some("h2"), "probe", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut other);
+        assert_eq!(other.session_window, SessionWindow::Absent);
+    }
+
+    /// An unhashed dir has no identity, so the latch keys on its config dir:
+    /// it flips that dir only, never another unhashed one.
+    #[test]
+    fn the_latch_turns_an_unhashed_dirs_probe_absent_unread() {
+        let mut seen = HashSet::new();
+        let mut oauth = reading("/peter", None, "oauth_usage", SessionWindow::Reported);
+        apply_five_hour_latch(&mut seen, &mut oauth);
+        let mut same = reading("/peter", None, "probe", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut same);
+        assert_eq!(same.session_window, SessionWindow::Unread);
+        let mut other = reading("/other", None, "probe", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut other);
+        assert_eq!(other.session_window, SessionWindow::Absent);
+    }
+
+    /// Before the OAuth source has shown a window, a probe `absent` stands;
+    /// an OAuth `absent` latches nothing.
+    #[test]
+    fn without_an_oauth_five_hour_window_the_probe_absent_stands() {
+        let mut seen = HashSet::new();
+        let mut oauth = reading("/a", Some("h1"), "oauth_usage", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut oauth);
+        let mut probe = reading("/a", Some("h1"), "probe", SessionWindow::Absent);
+        apply_five_hour_latch(&mut seen, &mut probe);
+        assert_eq!(probe.session_window, SessionWindow::Absent);
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn the_logged_header_names_are_the_rate_limit_family_sorted() {
+        let h = headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("x-request-id", "req"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+            ("anthropic-ratelimit-unified-5h-reset", "1"),
+        ]);
+        assert_eq!(
+            rate_limit_header_names(&h),
+            vec![
+                "anthropic-ratelimit-unified-5h-reset".to_string(),
+                "anthropic-ratelimit-unified-7d-utilization".to_string(),
+                "anthropic-ratelimit-unified-status".to_string(),
+            ]
+        );
+    }
+
+    // ── D7: the probe's per-call max age, at production scale ─────────────
+
+    #[test]
+    fn the_production_ages_are_270_60_and_a_60_second_failure() {
+        assert_eq!(USAGE_PROBE_POLL_MAX_AGE, Duration::from_secs(270));
+        assert_eq!(USAGE_PROBE_CONFIRM_MAX_AGE, Duration::from_secs(60));
+        assert_eq!(USAGE_PROBE_FAILURE_TTL, Duration::from_secs(60));
+    }
+
+    /// One key, one 100-second-old success: a poller (270 s) is served it, a
+    /// confirming caller (60 s) is not and probes again. The dir has no
+    /// credentials, so the re-probe answers from the filesystem and reaches
+    /// no provider.
+    #[tokio::test]
+    async fn a_100_second_old_success_serves_a_poller_but_not_a_confirming_caller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().to_string_lossy().into_owned();
+        let seeded = AccountUsageInfo {
+            config_dir: key.clone(),
+            label: "seeded".to_string(),
+            utilization: 0.25,
+            ..Default::default()
+        };
+        USAGE_PROBE_CACHE.insert_aged(&key, seeded, Duration::from_secs(100));
+        let polled = probe_account_usage(key.clone(), USAGE_PROBE_POLL_MAX_AGE).await;
+        assert_eq!(polled.label, "seeded");
+        let confirmed = probe_account_usage(key.clone(), USAGE_PROBE_CONFIRM_MAX_AGE).await;
+        assert_ne!(
+            confirmed.label, "seeded",
+            "a confirming caller must re-probe"
+        );
+        assert!(confirmed.error.is_some(), "no credentials: an error row");
+    }
+
+    /// A failure is reused for the failure TTL only, even for a poller.
+    #[tokio::test]
+    async fn a_61_second_old_failure_is_not_served_even_to_a_poller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().to_string_lossy().into_owned();
+        let seeded = AccountUsageInfo {
+            config_dir: key.clone(),
+            label: "seeded".to_string(),
+            error: Some("API error (429): seeded".to_string()),
+            ..Default::default()
+        };
+        USAGE_PROBE_CACHE.insert_aged(&key, seeded, Duration::from_secs(61));
+        let polled = probe_account_usage(key.clone(), USAGE_PROBE_POLL_MAX_AGE).await;
+        assert_ne!(polled.label, "seeded");
     }
 }

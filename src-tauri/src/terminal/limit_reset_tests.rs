@@ -874,3 +874,24 @@ fn a_menu_quoted_above_the_bottom_rows_is_history() {
     }
     assert!(!shows_rate_limit_menu(&screen(&text)));
 }
+
+/// A header-probe row whose 5-hour window is full parks until that window's
+/// reset as the probe parsed it from `-unified-5h-reset`, in milliseconds.
+#[test]
+fn a_header_probe_row_parks_until_its_parsed_five_hour_reset() {
+    let row = crate::ai_provider::usage_probe::probe_row_from_headers(
+        "/a",
+        &[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+            ("anthropic-ratelimit-unified-7d-reset", "1800500000"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-5h-reset", "1800010000"),
+        ],
+    );
+    assert_eq!(exhausted_window_reset_ms(&row), Some(1_800_010_000_000));
+}
