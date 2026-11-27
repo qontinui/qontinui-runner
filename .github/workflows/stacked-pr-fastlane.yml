@@ -307,8 +307,9 @@ jobs:
       # RESTORE-ONLY, and deliberately pointed at ci.yml's cache scope.
       #
       # rust-cache builds its key prefix from `shared-key` if given, otherwise
-      # from $GITHUB_JOB — so `shared-key: test` reproduces the prefix ci.yml's
-      # `test` job generates, and the OS/arch and rustc/env/lockfile hashes match
+      # from $GITHUB_JOB. ci.yml's test legs (`test` and `test-windows`, one
+      # shared step list) pin `shared-key: "test"` explicitly on their rust-cache
+      # step, so `shared-key: test` here reproduces their prefix, and the OS/arch and rustc/env/lockfile hashes match
       # because this job pins the same 1.95.0 toolchain on the same ubuntu-22.04
       # image with the same CARGO_TERM_COLOR. That cache is saved only from main
       # (ci.yml's `save-if`) and contains dependency artifacts for every flag set
@@ -316,7 +317,8 @@ jobs:
       # cache instead of paying a cold dep graph on every stacked push.
       #
       # Restore is unrestricted, so this costs the `test` job nothing. A miss
-      # (someone renames that job, or bumps the toolchain here and not there) is
+      # (someone changes ci.yml's explicit `shared-key: "test"`, or bumps the
+      # toolchain here and not there) is
       # SLOWER, never WRONG — the 25-minute timeout is sized to absorb it.
       #
       # `save-if: false` is not incidental. This lane must never write a cache

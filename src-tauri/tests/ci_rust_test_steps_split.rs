@@ -290,8 +290,9 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
     // HISTORY. A rewrite of the run step dropped its `shell: bash` line, and
     // nothing here noticed: five review rounds and a mutation-proof pass went
     // by, while this file's own comments REASONED FROM `shell: bash` being
-    // present. This job's matrix includes windows-latest, GitHub's default
-    // shell there is PowerShell, and this workflow declares no `defaults:`
+    // present. These steps also run as `test-windows` (one shared step list,
+    // pinned identical below), on windows-latest, where GitHub's default
+    // shell is PowerShell, and this workflow declares no `defaults:`
     // block — so a bash body with no `shell:` is dot-sourced into pwsh and dies
     // at parse, on a branch-protection-required check.
     for name in [BUILD, RUN] {
@@ -300,8 +301,8 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
                 .get("shell")
                 .and_then(|v| v.as_str()),
             Some("bash"),
-            "step `{name}` must declare `shell: bash`. The `test` job's matrix \
-             includes windows-latest, where the default shell is PowerShell and \
+            "step `{name}` must declare `shell: bash`. The same steps run as \
+             `test-windows` on windows-latest, where the default shell is PowerShell and \
              this bash body would fail to parse; the workflow carries no \
              `defaults:` block to inherit from."
         );
@@ -672,20 +673,26 @@ fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
     let steps = job_steps(&doc, "test");
     let build_bound = timeout_minutes(find_step(&steps, BUILD), BUILD);
     let run_bound = timeout_minutes(find_step(&steps, RUN), RUN);
-    let job_cap = doc
-        .get("jobs")
-        .and_then(|j| j.get("test"))
-        .and_then(|j| j.get("timeout-minutes"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| panic!("job `test` must carry an integer job-level `timeout-minutes`"));
     let floor = build_bound + run_bound + MEASURED_OVERHEAD_MAX_MINUTES;
-    assert!(
-        job_cap >= floor,
-        "job `test` timeout-minutes ({job_cap}) must be >= `{BUILD}` ({build_bound}) \
-         + `{RUN}` ({run_bound}) + measured non-Rust overhead ({MEASURED_OVERHEAD_MAX_MINUTES}) \
-         = {floor}. A smaller cap turns a build-bound expiry into a job-level \
-         `cancelled`, which the `if: failure()` expiry summariser never explains."
-    );
+    // Both legs run these steps, so both carry the cap (the windows leg is the
+    // slower one the overhead was measured on).
+    for job in ["test", "test-windows"] {
+        let job_cap = doc
+            .get("jobs")
+            .and_then(|j| j.get(job))
+            .and_then(|j| j.get("timeout-minutes"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                panic!("job `{job}` must carry an integer job-level `timeout-minutes`")
+            });
+        assert!(
+            job_cap >= floor,
+            "job `{job}` timeout-minutes ({job_cap}) must be >= `{BUILD}` ({build_bound}) \
+             + `{RUN}` ({run_bound}) + measured non-Rust overhead ({MEASURED_OVERHEAD_MAX_MINUTES}) \
+             = {floor}. A smaller cap turns a build-bound expiry into a job-level \
+             `cancelled`, which the `if: failure()` expiry summariser never explains."
+        );
+    }
 }
 
 #[test]
@@ -1174,9 +1181,8 @@ fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
         .and_then(|v| v.as_str())
         .expect("job `test` must carry a `runs-on` expression string");
     // The forced arm is the JSON array literal in `runs-on` that names
-    // `self-hosted` AND `Linux`: since the windows leg routes too, the windows
-    // arm also names `self-hosted` (pinned by the Windows twin below), and the
-    // hosted arms name `windows-latest` / `ubuntu-22.04`.
+    // `self-hosted` AND `Linux`; the hosted arm names `ubuntu-22.04`. (The
+    // windows leg is `test-windows`, pinned by the Windows twin below.)
     let forced = forced_label_set(runs_on, "Linux", "test");
 
     assert_eq!(
@@ -1242,8 +1248,8 @@ fn job_runs_on(doc: &serde_yaml::Value, job: &str) -> String {
 /// The Windows twin of the test above (plan
 /// `2026-11-03-route-qontinui-runner-windows-ci-legs-to-dell-2020`). The
 /// Windows pool's label set is spelled in `route-windows`' `--self-hosted-labels`
-/// and in the forced arm of EVERY Windows leg's `runs-on` — `test`'s windows
-/// leg, `clippy-windows` and `holder-crates`. A leg edited alone would route
+/// and in the forced arm of EVERY Windows leg's `runs-on` — `test-windows`,
+/// `clippy-windows` and `holder-crates`. A leg edited alone would route
 /// its forced lane to a different pool than `auto` does.
 #[test]
 fn the_windows_pool_label_set_is_the_same_in_route_windows_and_every_forced_windows_arm() {
@@ -1253,7 +1259,7 @@ fn the_windows_pool_label_set_is_the_same_in_route_windows_and_every_forced_wind
         routed.iter().any(|l| l == "Windows") && routed.iter().any(|l| l == "self-hosted"),
         "`route-windows` must route to a self-hosted Windows pool: {routed:?}"
     );
-    for job in ["test", "clippy-windows", "holder-crates"] {
+    for job in ["test-windows", "clippy-windows", "holder-crates"] {
         let runs_on = job_runs_on(&doc, job);
         assert!(
             runs_on.contains("needs['route-windows'].outputs.labels"),
@@ -1275,7 +1281,7 @@ fn the_windows_pool_label_set_is_the_same_in_route_windows_and_every_forced_wind
 #[test]
 fn every_windows_leg_waits_on_route_windows_and_is_never_skipped() {
     let doc = ci_workflow();
-    for job in ["test", "clippy-windows", "holder-crates"] {
+    for job in ["test-windows", "clippy-windows", "holder-crates"] {
         let spec = doc
             .get("jobs")
             .and_then(|j| j.get(job))
@@ -1327,7 +1333,7 @@ fn every_windows_pool_arm_carries_its_pull_request_and_rerun_guards() {
                                 && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '[";
     const ROUTED: &str = "needs['route-windows'].outputs.labels";
     const ROUTED_GUARD: &str = "github.run_attempt == 1 && ";
-    for job in ["test", "clippy-windows", "holder-crates"] {
+    for job in ["test-windows", "clippy-windows", "holder-crates"] {
         let runs_on = job_runs_on(&doc, job);
         let forced_guard = FORCED_GUARD
             .split_whitespace()
@@ -1488,7 +1494,7 @@ fn the_self_hosted_steps_are_split_by_operating_system() {
     }
     const PREP: &str =
         "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target";
-    for job in ["test", "clippy-windows", "holder-crates"] {
+    for job in ["test-windows", "clippy-windows", "holder-crates"] {
         let steps = job_steps(&doc, job);
         let prep = find_step(&steps, PREP);
         let cond = prep.get("if").and_then(|v| v.as_str()).unwrap_or_default();
@@ -1555,5 +1561,285 @@ fn the_linux_pool_arms_keep_fork_prs_and_reruns_on_the_floor() {
                 .is_some_and(|before| before.ends_with("github.run_attempt == 1 && ")),
             "`test` must read `{ROUTED}` on attempt 1 only: {runs_on}"
         );
+    }
+}
+
+/// `needs:` of one job as a list (a bare string is a one-element list).
+fn job_needs(doc: &serde_yaml::Value, job: &str) -> Vec<String> {
+    let spec = doc
+        .get("jobs")
+        .and_then(|j| j.get(job))
+        .unwrap_or_else(|| panic!("ci.yml has no job `{job}`"));
+    match spec.get("needs") {
+        Some(serde_yaml::Value::String(one)) => vec![one.clone()],
+        Some(serde_yaml::Value::Sequence(many)) => many
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("`{job}` has a non-string `needs:` entry: {v:?}"))
+                    .to_string()
+            })
+            .collect(),
+        None => Vec::new(),
+        Some(other) => panic!("`{job}` has an unreadable `needs:`: {other:?}"),
+    }
+}
+
+/// Asserts `job`'s WHOLE `strategy.matrix` mapping is exactly
+/// `{platform: [<platform>]}`. Reading only `matrix.platform` would let an
+/// `include:` (or any other matrix key) add a leg unseen.
+fn assert_matrix_is_exactly(doc: &serde_yaml::Value, job: &str, platform: &str) {
+    let matrix = doc
+        .get("jobs")
+        .and_then(|j| j.get(job))
+        .and_then(|s| s.get("strategy"))
+        .and_then(|s| s.get("matrix"))
+        .unwrap_or_else(|| panic!("`{job}` must carry strategy.matrix"));
+    let want: serde_yaml::Value =
+        serde_yaml::from_str(&format!("platform: [{platform}]")).expect("expected matrix parses");
+    assert_eq!(
+        matrix, &want,
+        "`{job}`'s strategy.matrix must be exactly {{platform: [{platform}]}} — no \
+         `include:`, `exclude:` or other key, each of which adds or removes a leg"
+    );
+}
+
+/// Plan `2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue`,
+/// Phase 2. The windows leg of the Rust/Tauri tests is its own job,
+/// `test-windows`, so it waits on its own router (`route-windows`) and never on
+/// the ubuntu leg's (`route`): one matrix job could not do that, because
+/// `needs:` cannot vary per matrix entry. What must hold, on LITERALS:
+/// - `test` needs exactly `[route]` and `test-windows` exactly
+///   `[route-windows]` (a `route` on the windows job puts the wait back; a
+///   missing `route-windows` lets the leg start before its pool is decided);
+/// - the WHOLE matrices are exactly `{platform: [ubuntu-22.04]}` and
+///   `{platform: [windows-latest]}`, no `include:` (a
+///   windows entry left in `test` would run the windows leg twice, the second
+///   time behind `route` and with no windows routing);
+/// - both are named `test (${{ matrix.platform }})`, so the two required
+///   contexts keep their exact spelling;
+/// - the two `steps:` lists are IDENTICAL (one YAML anchor in ci.yml; this
+///   is what catches someone replacing the alias with a copy that drifts);
+/// - every other job-level key is identical, so an `env:`, `defaults:` or
+///   `continue-on-error:` on one leg only cannot change what the shared steps
+///   do there or make one required context unable to fail.
+#[test]
+fn the_windows_test_leg_is_its_own_job_waiting_only_on_route_windows() {
+    let doc = ci_workflow();
+
+    assert_eq!(
+        job_needs(&doc, "test"),
+        vec!["route".to_string()],
+        "`test` (the ubuntu leg) must need exactly [route]"
+    );
+    assert_eq!(
+        job_needs(&doc, "test-windows"),
+        vec!["route-windows".to_string()],
+        "`test-windows` must need exactly [route-windows]: waiting on `route` too \
+         puts the ubuntu leg's router back in front of the longest required leg"
+    );
+    assert_matrix_is_exactly(&doc, "test", "ubuntu-22.04");
+    assert_matrix_is_exactly(&doc, "test-windows", "windows-latest");
+
+    let job = |name: &str| -> serde_yaml::Value {
+        doc.get("jobs")
+            .and_then(|j| j.get(name))
+            .unwrap_or_else(|| panic!("ci.yml has no job `{name}`"))
+            .clone()
+    };
+    let test = job("test");
+    let windows = job("test-windows");
+    for (spec, name) in [(&test, "test"), (&windows, "test-windows")] {
+        assert_eq!(
+            spec.get("name").and_then(|n| n.as_str()),
+            Some("test (${{ matrix.platform }})"),
+            "`{name}` must be named `test (${{{{ matrix.platform }}}})`, so its required \
+             context renders exactly `test (<platform>)`"
+        );
+        assert!(
+            spec.get("continue-on-error").is_none(),
+            "`{name}` must carry no job-level `continue-on-error`: it turns a red \
+             required context green"
+        );
+    }
+
+    // Only the keys that ARE the split may differ. `strategy` differs only in
+    // its matrix, so compare it with the matrix removed.
+    const MAY_DIFFER: [&str; 3] = ["needs", "runs-on", "strategy"];
+    let rest = |spec: &serde_yaml::Value| -> serde_yaml::Mapping {
+        let mut m = spec.as_mapping().cloned().unwrap_or_default();
+        for k in MAY_DIFFER {
+            m.remove(k);
+        }
+        m
+    };
+    let strategy_sans_matrix = |spec: &serde_yaml::Value| -> serde_yaml::Mapping {
+        let mut m = spec
+            .get("strategy")
+            .and_then(|s| s.as_mapping())
+            .cloned()
+            .unwrap_or_default();
+        m.remove("matrix");
+        m
+    };
+    assert_eq!(
+        strategy_sans_matrix(&test),
+        strategy_sans_matrix(&windows),
+        "`test` and `test-windows` must share their `strategy:` apart from the matrix"
+    );
+    let (test_rest, windows_rest) = (rest(&test), rest(&windows));
+    if test_rest != windows_rest {
+        let keys = |m: &serde_yaml::Mapping| -> Vec<String> {
+            m.keys()
+                .map(|k| k.as_str().unwrap_or("<non-string>").to_string())
+                .collect()
+        };
+        let differing: Vec<String> = keys(&test_rest)
+            .into_iter()
+            .chain(keys(&windows_rest))
+            .filter(|k| test_rest.get(k.as_str()) != windows_rest.get(k.as_str()))
+            .collect();
+        panic!(
+            "`test` and `test-windows` may differ only in {MAY_DIFFER:?}; these differ too: \
+             {differing:?}"
+        );
+    }
+    // `steps` is part of `rest` above; restated so the failure names the step.
+    let test_steps = job_steps(&doc, "test");
+    let windows_steps = job_steps(&doc, "test-windows");
+    if test_steps != windows_steps {
+        let names = |s: &[serde_yaml::Value]| -> Vec<String> {
+            s.iter()
+                .map(|st| step_name(st).unwrap_or("<unnamed>").to_string())
+                .collect()
+        };
+        let first_diff = test_steps
+            .iter()
+            .zip(windows_steps.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(test_steps.len().min(windows_steps.len()));
+        panic!(
+            "`test` and `test-windows` must run IDENTICAL `steps:` (the `test-steps` anchor). \
+             First difference at index {first_diff}: test={:?} test-windows={:?}",
+            names(&test_steps).get(first_diff),
+            names(&windows_steps).get(first_diff)
+        );
+    }
+
+    // The ubuntu leg's runs-on carries no windows arm any more, and the
+    // windows leg's no Linux arm: each leg reads only its own router.
+    let test_runs_on = job_runs_on(&doc, "test");
+    assert!(
+        !test_runs_on.contains("route-windows") && !test_runs_on.contains("windows-latest"),
+        "`test` is the ubuntu leg only; its runs-on must not route a windows leg: {test_runs_on}"
+    );
+    let windows_runs_on = job_runs_on(&doc, "test-windows");
+    assert!(
+        !windows_runs_on.contains("needs.route.") && !windows_runs_on.contains("\"Linux\""),
+        "`test-windows`' runs-on must not read `route` or name a Linux pool: {windows_runs_on}"
+    );
+}
+
+/// published-parity.yml restores the windows leg's cache by
+/// `shared-key: "test"`, and rust-cache otherwise keys on the job id, which is
+/// now `test-windows` for that leg. So the shared step pins the key, and
+/// published-parity asserts this exact line exists in ci.yml.
+#[test]
+fn the_shared_rust_cache_step_saves_under_the_key_published_parity_reads() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let cache = find_step(&steps, "Cache Rust dependencies");
+    assert_eq!(
+        cache
+            .get("with")
+            .and_then(|w| w.get("shared-key"))
+            .and_then(|k| k.as_str()),
+        Some("test"),
+        "`Cache Rust dependencies` must pin `shared-key: \"test\"`: the windows leg's \
+         job id is `test-windows`, and published-parity.yml restores by `test`"
+    );
+    let parity_path = repo_root()
+        .join(".github")
+        .join("workflows")
+        .join("published-parity.yml");
+    let parity = std::fs::read_to_string(&parity_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", parity_path.display()));
+    let ci_text =
+        std::fs::read_to_string(repo_root().join(".github").join("workflows").join("ci.yml"))
+            .expect("read ci.yml");
+    const LINE: &str = "          shared-key: \"test\"";
+    assert!(
+        ci_text.lines().any(|l| l == LINE),
+        "published-parity.yml greps ci.yml for the whole line `{LINE}`; keep it spelled so"
+    );
+    assert!(
+        parity.contains("grep -qE '^          shared-key: \"test\"$' .github/workflows/ci.yml"),
+        "published-parity.yml must guard the coupling on ci.yml's shared-key line, not \
+         on a job name"
+    );
+}
+
+/// The light self-hosted lane expression `frontend-tests`, `seam-gate` and
+/// `security` use, with the `ubuntu-latest` fallback, at the route jobs' size
+/// class.
+const LIGHT_LANE_RUNS_ON: &str = "${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '[\"self-hosted\",\"Linux\",\"X64\",\"qontinui-host-nawa\",\"qontinui\",\"ram-2g\"]' || '\"ubuntu-latest\"') }}";
+
+/// Plan `2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue`,
+/// Phase 1b. Every test leg `needs` a route job, so a route job on the hosted
+/// queue puts that queue back in front of a leg routed to the pool. Both route
+/// jobs run on the light self-hosted lane with the hosted fallback; their
+/// router gets per-event thresholds (pull_request strict, push tolerant) as
+/// explicit numbers in both arms; and the re-run floor is still asked for.
+#[test]
+fn both_route_jobs_run_on_the_light_lane_with_per_event_thresholds() {
+    let doc = ci_workflow();
+    for (job, prefix) in [
+        ("route", "RUNNER_CI_LINUX"),
+        ("route-windows", "RUNNER_CI_WINDOWS"),
+    ] {
+        assert_eq!(
+            job_runs_on(&doc, job),
+            LIGHT_LANE_RUNS_ON,
+            "`{job}` must run on the light self-hosted lane with the ubuntu-latest fallback"
+        );
+        let step = job_steps(&doc, job)
+            .into_iter()
+            .find(|s| {
+                s.get("run")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|r| r.contains("route-ci-lane.py"))
+            })
+            .unwrap_or_else(|| panic!("`{job}` must run .github/scripts/route-ci-lane.py"));
+        let run = step.get("run").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            run.split_whitespace().any(|w| w == "--hosted-on-rerun"),
+            "`{job}` must still pass `--hosted-on-rerun`: {run}"
+        );
+        assert!(
+            run.split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w == ["--env-prefix", prefix]),
+            "`{job}` must read its thresholds under `{prefix}`: {run}"
+        );
+        let env = step
+            .get("env")
+            .unwrap_or_else(|| panic!("`{job}`'s route step must carry an `env:` mapping"));
+        for (var, strict, tolerant) in
+            [("MAX_QUEUE_DEPTH", "1", "8"), ("STALL_MINUTES", "10", "20")]
+        {
+            let name = format!("{prefix}_{var}");
+            assert_eq!(
+                env.get(name.as_str()).and_then(|v| v.as_str()),
+                Some(
+                    format!(
+                        "${{{{ github.event_name == 'pull_request' && '{strict}' || '{tolerant}' }}}}"
+                    )
+                    .as_str()
+                ),
+                "`{job}` must set `{name}` per event: '{strict}' (strict) on pull_request, \
+                 '{tolerant}' (tolerant) on push"
+            );
+        }
     }
 }

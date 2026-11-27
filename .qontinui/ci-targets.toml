@@ -44,7 +44,7 @@
 # .gitleaks.toml and docs/ included). Any tracked file can therefore change
 # the emitted CSS, hence ../dist, hence what `tauri::generate_context!`
 # embeds. Every job that runs `pnpm run build` (or `tauri build`, whose
-# beforeBuildCommand runs it) observes `**`: `test`, `clippy-windows`,
+# beforeBuildCommand runs it) observes `**`: `test`, `test-windows`, `clippy-windows`,
 # `clippy-tiers:clippy-diff`, `stacked-pr-fastlane` and
 # `published-parity:negative-control`. Narrowing them needs a CI-side change
 # (an explicit Tailwind `source()`), not an edit here.
@@ -108,7 +108,8 @@ global = [
 # ---------------------------------------------------------------------------
 
 [[targets]]
-# test (ubuntu-22.04) + test (windows-latest): CI-tooling node tests, purge
+# test (ubuntu-22.04) (and, with the same steps, `test-windows` below):
+# CI-tooling node tests, purge
 # script, pnpm install/lint/effect-fixture/typecheck/vitest/BUILD, cargo fmt,
 # clippy (ubuntu), cargo test -p qontinui-runner -p session-lifecycle (dist
 # embedded), the Windows PS 5.1 contract smokes and the CI-integrity guard.
@@ -120,6 +121,16 @@ global = [
 # assumptions.{json,md} and docs/workspace-assumptions.dispositions.toml
 # (workspace_assumptions_are_enumerated.rs), and the frontend config files.
 name = "test"
+observes = [
+  "**",
+]
+
+[[targets]]
+# test (windows-latest): the windows leg, its own job since plan
+# 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue so
+# it waits only on `route-windows`. Runs the SAME steps as `test` (one YAML
+# anchor in ci.yml), so it observes what `test` observes: the whole tree.
+name = "test-windows"
 observes = [
   "**",
 ]

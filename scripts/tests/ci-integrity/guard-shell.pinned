@@ -56,12 +56,22 @@ grep '^!PARSE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
 echo "An unverifiable gate cannot be declared away."
 exit 1
 fi
-if grep -q '^!ALIAS' <<< "${FINDINGS}"; then
-echo "::error::A gating file uses YAML anchors, aliases or a merge key at head:"
-grep '^!ALIAS' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
-echo "GitHub Actions does not support them, while this check RESOLVES them --"
-echo "so an anchored rewrite can digest as unchanged while the gate stops"
-echo "running. Write the file without anchors so it can be verified."
+if grep -q '^!MERGE' <<< "${FINDINGS}"; then
+echo "::error::A gating file uses a YAML merge key (<<: or !!merge) at head:"
+grep '^!MERGE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "Merge keys are not documented as supported by GitHub Actions, and this"
+echo "check RESOLVES them -- so a merge-key rewrite can digest as unchanged"
+echo "while the gate stops running. Write the mapping out (anchors and"
+echo "aliases are fine)."
+exit 1
+fi
+if grep -q '^!ALIASBOMB' <<< "${FINDINGS}"; then
+echo "::error::A gating file's YAML aliases expand past the guard's budget at head:"
+grep '^!ALIASBOMB' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "Expanded, it exceeds the expansion budget (nodes plus scalar bytes,"
+echo "ALIAS_EXPANSION_BUDGET) or aliases itself, so it cannot be digested in"
+echo "bounded time. Use fewer nested aliases, or do not alias a large scalar"
+echo "many times."
 exit 1
 fi
 LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
@@ -153,4 +163,4 @@ cat "${RUNNER_TEMP}/notice.md" >> "${GITHUB_STEP_SUMMARY}"
 gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${RUNNER_TEMP}/notice.md"
 echo ""
 echo "Gating change declared, verified and recorded — CI integrity intact."
-PY body sha256 987a96ea10572a39d813bb3506335e254d81837eedd90c2ce62b084c36dc90aa
+PY body sha256 3b0b6d7fd4b81fe38b7c68c4ddda4d3e59ef0df4ea3401e72717d55ba2a25616
