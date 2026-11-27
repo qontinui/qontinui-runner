@@ -31,7 +31,9 @@
 
 use std::collections::HashMap;
 
-use super::process_tree::{inclusive_subtree_pids, is_countable_claude, ProcessSnapshot};
+use super::process_tree::{
+    image_stem, inclusive_subtree_pids, is_countable_claude, ProcessSnapshot,
+};
 
 /// `(image stem, agent kind)` — a process whose image, lowercased with any
 /// path and `.exe` stripped, equals the stem IS that agent. `claude` is not
@@ -75,23 +77,6 @@ const AGENT_PACKAGES: &[(&str, &str)] = &[
     ("/bin/aider", "aider"),
     ("/scripts/aider", "aider"),
 ];
-
-/// An image name as the checks compare it: last path component, lowercased,
-/// `.exe` stripped — and the ` (deleted)` the kernel appends to a
-/// `/proc/<pid>/exe` target whose binary was replaced on disk (a package
-/// upgrade under a running agent).
-fn image_stem(name: &str) -> String {
-    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .to_ascii_lowercase();
-    match base.strip_suffix(".exe") {
-        Some(stem) => stem.to_string(),
-        None => base,
-    }
-}
 
 /// The agent kind `pid`'s image alone proves, if any.
 fn agent_by_image(pid: u32, snapshot: &ProcessSnapshot) -> Option<&'static str> {
