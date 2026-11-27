@@ -28,6 +28,18 @@
 //! does not stand against a hostile process running as the same user, which
 //! could read the secret and derive the key itself.
 //!
+//! It also does not stop a same-user process from moving the RECORD the proof
+//! is checked against. `POST /control/session-open`
+//! (`install_effects_producer/mod.rs`, the provider's SessionStart hook) takes
+//! no credential. It writes the session's lifecycle record onto whatever
+//! `terminal_id` the body names, as `authoritative`, and confirms it. So a
+//! same-user process can re-point a PEER's session at the process's own terminal
+//! and then present that terminal's real proof. `POST /sessions/transcript-bind`'s
+//! shared-key arm, which trusts an authoritative, confirmed record, then admits
+//! it for the peer's session. The fix is owned by plan
+//! `2026-11-06-transcript-bind-unhosted-arm-binds-peer-sessions` Phase 4, where
+//! live evidence of which terminal runs the session outranks the record.
+//!
 //! ## The derivation
 //!
 //! ```text
