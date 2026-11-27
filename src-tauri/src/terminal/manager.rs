@@ -1306,16 +1306,22 @@ mod tests {
 
     /// The body of the `manager.rs` function whose signature starts with
     /// `signature`, sliced out of this file up to its closing brace.
-    fn fn_body(signature: &str) -> &'static str {
-        const SRC: &str = include_str!("manager.rs");
-        let start = SRC
+    fn fn_body(signature: &str) -> String {
+        // Read at run time, not `include_str!`: the codegen premise guard
+        // refuses an `include_*!` in a file that mentions `schemars(`.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/terminal/manager.rs"
+        ))
+        .expect("manager.rs is readable");
+        let start = src
             .find(signature)
             .unwrap_or_else(|| panic!("`{signature}` is in manager.rs"));
-        let rest = &SRC[start..];
+        let rest = &src[start..];
         let end = rest
             .find("\n    }")
             .unwrap_or_else(|| panic!("`{signature}` has a closing brace"));
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     /// OSC title churn lands on the session's `activity_title` and in the
