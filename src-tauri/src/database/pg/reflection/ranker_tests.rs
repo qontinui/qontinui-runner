@@ -5,8 +5,8 @@
 //! describes; run them with
 //! `cargo-guard.sh test -- --ignored database::pg::reflection::ranker_tests`.
 use super::knowledge_ranker::{
-    effectiveness_weight, recency_weight, require_window, velocity_factor_for,
-    velocity_from_count, NORMALIZED_FILE_CHANGED_SQL, SCORED_KNOWLEDGE_SQL,
+    effectiveness_weight, recency_weight, require_window, velocity_factor_for, velocity_from_count,
+    NORMALIZED_FILE_CHANGED_SQL, SCORED_KNOWLEDGE_SQL,
 };
 use super::tests::{cleanup, disposable_pg, insert_reflection_run, insert_run, unique_workflow};
 use super::*;
@@ -28,7 +28,10 @@ fn weight_by_linked_fix_verdict() {
     // Linked, by verdict.
     assert_eq!(effectiveness_weight(true, Some("effective")), Ok(1.0));
     assert_eq!(effectiveness_weight(true, Some("ineffective")), Ok(0.0));
-    assert_eq!(effectiveness_weight(true, Some("caused_regression")), Ok(0.0));
+    assert_eq!(
+        effectiveness_weight(true, Some("caused_regression")),
+        Ok(0.0)
+    );
     assert_eq!(effectiveness_weight(true, Some("inconclusive")), Ok(0.5));
     // Linked and not yet judged.
     assert_eq!(effectiveness_weight(true, None), Ok(0.5));
@@ -38,7 +41,10 @@ fn weight_by_linked_fix_verdict() {
 fn a_linked_fix_with_an_unrecognised_verdict_is_an_error_not_a_default() {
     let err = effectiveness_weight(true, Some("mostly_fine"))
         .expect_err("an unrecognised verdict must not map to a weight");
-    assert!(err.contains("mostly_fine"), "the error names the verdict: {err}");
+    assert!(
+        err.contains("mostly_fine"),
+        "the error names the verdict: {err}"
+    );
 }
 
 #[test]
@@ -68,7 +74,10 @@ fn velocity_over_zero_one_and_many_fixes_and_a_window_of_zero() {
     assert_eq!(velocity_from_count(3, 1), Ok(3.0));
     let err = velocity_from_count(3, 0).expect_err("a window of 0 has no rate");
     assert!(err.contains("window"), "{err}");
-    assert!(velocity_from_count(0, 0).is_err(), "zero fixes does not excuse a zero window");
+    assert!(
+        velocity_from_count(0, 0).is_err(),
+        "zero fixes does not excuse a zero window"
+    );
     assert!(require_window(0).is_err());
     assert!(require_window(1).is_ok());
 }
@@ -184,9 +193,8 @@ fn entry<'a>(scored: &'a [ScoredKnowledge], id: &str) -> &'a ScoredKnowledge {
 async fn pg_sql_normalization_agrees_with_normalize_component_path() {
     let pg = disposable_pg().await;
     let conn = pg.pool.get().await.expect("PG pool");
-    let query = format!(
-        "SELECT {NORMALIZED_FILE_CHANGED_SQL} FROM (SELECT $1::text AS file_changed) t"
-    );
+    let query =
+        format!("SELECT {NORMALIZED_FILE_CHANGED_SQL} FROM (SELECT $1::text AS file_changed) t");
     // (input, what both normalizers must produce)
     let literals = [
         ("src\\Main\\Lib.RS", "src/main/lib.rs"), // backslashes, mixed case
@@ -423,7 +431,9 @@ async fn pg_both_reads_err_without_select_on_reflection_fixes() {
             format!("GRANT USAGE ON SCHEMA project, public TO {role}"),
             format!("GRANT SELECT ON project.task_knowledge, project.task_runs TO {role}"),
         ] {
-            conn.batch_execute(&statement).await.expect("set up the role");
+            conn.batch_execute(&statement)
+                .await
+                .expect("set up the role");
         }
     }
 
@@ -431,9 +441,8 @@ async fn pg_both_reads_err_without_select_on_reflection_fixes() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (disposable_pg checked it)");
     let separator = if url.contains('?') { '&' } else { '?' };
     let as_role = format!("{url}{separator}options=-c%20role%3D{role}");
-    let limited = PgDb::from_pool(
-        PgDb::build_pool(&as_role).expect("a pool that connects as the role"),
-    );
+    let limited =
+        PgDb::from_pool(PgDb::build_pool(&as_role).expect("a pool that connects as the role"));
 
     let denied_rank = limited.score_knowledge_relevance(&wf, 10).await;
     let denied_velocity = limited.compute_change_velocity("src/x.rs", 5).await;
@@ -463,6 +472,9 @@ async fn pg_both_reads_err_without_select_on_reflection_fixes() {
     assert!(rank_err.contains("permission denied"), "{rank_err}");
     let velocity_err = denied_velocity.expect_err("velocity must not read a denied table as 0");
     assert!(velocity_err.contains("permission denied"), "{velocity_err}");
-    assert_eq!(control_rank.expect("with the grant the ranker runs").len(), 1);
+    assert_eq!(
+        control_rank.expect("with the grant the ranker runs").len(),
+        1
+    );
     assert_eq!(control_velocity, Ok(0.0));
 }

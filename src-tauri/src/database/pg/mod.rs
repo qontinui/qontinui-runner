@@ -66,12 +66,12 @@ pub mod reasoning_traces;
 pub mod recordings;
 pub mod reflection;
 mod reflection_unknown_self_heal;
-#[cfg(test)]
-pub(crate) mod schema_oracle;
 pub mod regression;
 pub mod restate;
 pub mod reviews;
 pub mod scheduler;
+#[cfg(test)]
+pub(crate) mod schema_oracle;
 pub mod security_audit;
 pub mod session_file_snapshots;
 pub mod session_pr_ops;
