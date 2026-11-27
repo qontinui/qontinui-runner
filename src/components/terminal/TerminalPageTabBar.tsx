@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight, BrushCleaning } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
+import { SESSION_ORG_DRAG_MIME, decodeSessionOrgDrag, isSessionOrgDrag } from "./sessionOrgDrag";
 import { NAME_IN_USE } from "./pageNaming";
 import { pruneNoticeText, type PageRename } from "./pagePrune";
 
@@ -39,6 +40,11 @@ interface TerminalPageTabBarProps {
   /** Last-known count of tabs the button would close; 0 disables it. Omitted = unknown, stays enabled. */
   emptyPageCount?: number;
   /**
+   * A Session Manager row or group was dropped on a page tab: move its live
+   * terminal tabs (`tabIds`) to that page.
+   */
+  onDropSessionTabs?: (pageId: string, tabIds: string[]) => void;
+  /**
    * The last auto-prune of empty auto-created pages and/or the one-time name
    * repair, while its Undo window is open (the page hook times it out). Shown
    * in the note slot; `null`/omitted shows nothing.
@@ -68,6 +74,7 @@ export function TerminalPageTabBar({
   onReorganize,
   onCloseEmptyPages,
   emptyPageCount,
+  onDropSessionTabs,
   pruneNotice,
   onUndoPrune,
   onPopOut,
@@ -89,7 +96,11 @@ export function TerminalPageTabBar({
       // null = occupancy could not be fully read (a source failed, or coord's
       // drain withheld the restorable set): UNKNOWN, never "no empty tabs".
       setCloseEmptyNote(
-        n === null ? "Couldn't verify which tabs are empty" : n > 0 ? `Closed ${n} empty` : "No empty tabs",
+        n === null
+          ? "Couldn't verify which tabs are empty"
+          : n > 0
+            ? `Closed ${n} empty`
+            : "No empty tabs",
       );
     } catch {
       setCloseEmptyNote("Couldn't close empty tabs");
@@ -247,6 +258,14 @@ export function TerminalPageTabBar({
                 setDragOverId(null);
               }}
               onDragOver={(e) => {
+                // A session dragged out of the Session Manager onto this page.
+                if (onDropSessionTabs && isSessionOrgDrag(e.dataTransfer.types)) {
+                  if (isActive) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  if (dragOverId !== page.id) setDragOverId(page.id);
+                  return;
+                }
                 if (!onReorderPage || !draggedId || draggedId === page.id) return;
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
@@ -257,6 +276,16 @@ export function TerminalPageTabBar({
               }}
               onDrop={(e) => {
                 e.preventDefault();
+                const sessionDrag = decodeSessionOrgDrag(
+                  e.dataTransfer.getData(SESSION_ORG_DRAG_MIME),
+                );
+                if (sessionDrag) {
+                  setDragOverId(null);
+                  if (onDropSessionTabs && !isActive && sessionDrag.tabIds.length > 0) {
+                    onDropSessionTabs(page.id, sessionDrag.tabIds);
+                  }
+                  return;
+                }
                 const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
                 setDraggedId(null);
                 setDragOverId(null);

@@ -706,7 +706,7 @@ fn bfs_descendants_from(
 
 /// Every descendant of `root` in `snapshot`, each with the exact FILETIME the
 /// snapshot carries for it (W2: a later kill compares it exactly).
-fn collect_descendants_from_snapshot(
+pub(crate) fn collect_descendants_from_snapshot(
     root: u32,
     snapshot: &ProcessSnapshot,
 ) -> Vec<PidWithSpawnedAt> {

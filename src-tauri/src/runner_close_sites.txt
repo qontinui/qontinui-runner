@@ -98,6 +98,7 @@ mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any 
 
 # ── local closes
 commands/terminal.rs | terminal_close | webview | the plain `terminal_close` Tauri command — every webview close today, gestures included, until R0b-1's `operator_terminal_close` twin splits off the operator's
+commands/session_close.rs | terminal_graceful_close | webview | the Session Manager close dialog's graceful close — `TerminalManager::graceful_exit` with no CloseAuthority, so a live claude answers `no_close_authority` until the Closer mints one
 commands/session.rs | session_close | webview | the `session_close` Tauri command (SessionContext `closeSession`): closes a registry session by id, which kills a PTY-hosted session's pane through its transport
 mcp/terminals.rs | close_terminal_handler | agent | DELETE /terminals/{id} — any local process; never the operator's tab close (N5-1)
 mcp/steward.rs | reap_emptied_panes | exempt | no live claude in the pane: a steward pane already emptied of its claude (`steward_pane_is_emptied` over the process table), reaped before its kind restarts

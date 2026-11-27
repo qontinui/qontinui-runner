@@ -23,6 +23,8 @@ import { describe, expect, it } from "vitest";
 
 import { GLOBAL_CHORDS, isCtrlShiftChord, matchesChord } from "@/lib/globalChords";
 
+import { SHORTCUT_GROUPS } from "./KeyboardShortcutsOverlay";
+
 const SOURCE = readFileSync(join(__dirname, "useKeyboardShortcuts.ts"), "utf8");
 
 describe("useKeyboardShortcuts — chord matching", () => {
@@ -95,8 +97,57 @@ describe("useKeyboardShortcuts — chord matching", () => {
     ).toBe(false);
   });
 
+  it("keeps the session search chord (Ctrl+Shift+Space) off every inline chord", () => {
+    // Plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search
+    // Phase 4: Chrome's tab search is Ctrl+Shift+A, which the terminal already
+    // claims inline, so the palette takes the free Ctrl+Shift+Space.
+    const inline = [...SOURCE.matchAll(/isCtrlShiftChord\(e, "([^"]+)"\)/g)].map((m) =>
+      m[1].toLowerCase(),
+    );
+    expect(inline).toContain("a");
+    expect(GLOBAL_CHORDS.sessionSearch).toEqual({ key: " ", shift: true, meta: false });
+    expect(inline).not.toContain(" ");
+    const others = Object.entries(GLOBAL_CHORDS)
+      .filter(([name]) => name !== "sessionSearch")
+      .map(([, c]) => c);
+    expect(others).not.toContainEqual(GLOBAL_CHORDS.sessionSearch);
+    expect(
+      matchesChord({ key: " ", ctrlKey: true, shiftKey: true }, GLOBAL_CHORDS.sessionSearch),
+    ).toBe(true);
+    expect(
+      matchesChord({ key: " ", ctrlKey: true, shiftKey: false }, GLOBAL_CHORDS.sessionSearch),
+    ).toBe(false);
+  });
+
   it("still matches when CapsLock lowercased the key (the actual failure)", () => {
     expect(isCtrlShiftChord({ key: "b", ctrlKey: true, shiftKey: true }, "b")).toBe(true);
     expect(isCtrlShiftChord({ key: "B", ctrlKey: true, shiftKey: true }, "b")).toBe(true);
+  });
+});
+
+describe("useKeyboardShortcuts — the help overlay lists every inline chord", () => {
+  /** How the overlay spells a chord's `e.key`. */
+  const SPELLING: Record<string, string> = {
+    ArrowDown: "↓",
+    ArrowLeft: "←",
+    ArrowRight: "→",
+    ArrowUp: "↑",
+  };
+  const spelled = (key: string) =>
+    `Ctrl+Shift+${SPELLING[key] ?? (key.length === 1 ? key.toUpperCase() : key)}`;
+  const listed = new Set(SHORTCUT_GROUPS.flatMap((g) => g.shortcuts.map((s) => s.keys)));
+  const inline = [
+    ...new Set([...SOURCE.matchAll(/isCtrlShiftChord\(e, "([^"]+)"\)/g)].map((m) => m[1])),
+  ];
+
+  it("has a row for each `isCtrlShiftChord(e, …)` claim", () => {
+    expect(inline.map(spelled).filter((k) => !listed.has(k))).toEqual([]);
+  });
+
+  it("includes the Phase 5 triage chords, claimed inline", () => {
+    // plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search
+    expect(inline).toEqual(expect.arrayContaining(["n", "ArrowDown", "Backspace"]));
+    expect(listed.has("Ctrl+Shift+↓")).toBe(true);
+    expect(listed.has("Ctrl+Shift+Backspace")).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { sameNames } from "./useLiveClaudeSessionNames";
+import { sameEntries, sameNames } from "./useLiveClaudeSessions";
 
 /**
  * `sameNames` is the invariant the whole polling design rests on: the store
@@ -75,5 +75,26 @@ describe("sameNames", () => {
 
   it("is true for two empty maps", () => {
     expect(sameNames(new Map(), new Map())).toBe(true);
+  });
+});
+
+describe("sameEntries", () => {
+  const e = (pid: number, status: string, runnerManaged: boolean) => ({
+    pid,
+    status,
+    runnerManaged,
+  });
+
+  it("is true for equal content in distinct maps", () => {
+    expect(
+      sameEntries(new Map([["a", e(1, "idle", true)]]), new Map([["a", e(1, "idle", true)]])),
+    ).toBe(true);
+  });
+
+  it("is false when a status, pid or runnerManaged changed — each must republish", () => {
+    const base = new Map([["a", e(1, "idle", true)]]);
+    expect(sameEntries(base, new Map([["a", e(1, "busy", true)]]))).toBe(false);
+    expect(sameEntries(base, new Map([["a", e(2, "idle", true)]]))).toBe(false);
+    expect(sameEntries(base, new Map([["a", e(1, "idle", false)]]))).toBe(false);
   });
 });

@@ -64,6 +64,8 @@ export function body(overrides: Partial<SessionInfoBody> = {}): SessionInfoBody 
       lastSeenAt: 1_700_000_100_000,
       closedAt: null,
       closeReason: null,
+      finishedAt: null,
+      finishReason: null,
       confirmed: true,
       transcriptExists: true,
       restorable: true,

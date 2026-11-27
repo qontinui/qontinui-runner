@@ -5,10 +5,10 @@
  * `/ui-bridge/test/inject-session` route) carries an `injected_tab` spec on its
  * transcript-session record. This module turns each such spec into a minimal
  * `TerminalTab` that is fed THROUGH the real `useSessionManager` /
- * `useSessionStateTracking` correlation path — the only mechanism that can
- * place a fake into the `idle` (pre-aged stale tab) or tab-backed
- * `error` / `completed` (dead-tab exit-code) StatusStrip buckets, which the
- * `injected_live_status` short-circuit cannot reach.
+ * `useSessionStateTracking` correlation path and the status classifier, so a
+ * fake's dead-tab exit code (`Exited` / `Exited — error`) or silent, digest-less
+ * tab (`Unknown`) is classified by production code rather than stated by the
+ * `injected_location` / `injected_activity` short-circuit.
  *
  * No build-flag gating is needed: the function is data-driven. `injected_tab`
  * can only be non-null when the cfg-gated Rust seam produced it, so in a
@@ -19,6 +19,12 @@
  * they never back a real PTY pane (see `TerminalSessionContext.tsx` wiring).
  */
 
+import {
+  injectedStatus,
+  isSessionActivity,
+  isSessionLocation,
+  type SessionStatus,
+} from "./sessionStatusModel";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TranscriptSession } from "./useTranscriptSessions";
 
@@ -62,16 +68,19 @@ export interface InjectedSessionProbe {
    * The transcript record this session was projected from; `null` for a
    * tab-sourced row (`sessionManagerLiveRows.ts`), which no transcript backs.
    */
-  _transcript: Pick<TranscriptSession, "injected_live_status" | "injected_tab"> | null;
+  _transcript: Pick<
+    TranscriptSession,
+    "injected_location" | "injected_activity" | "injected_tab"
+  > | null;
 }
 
 /**
  * True when a unified session row is a debug-gated injected fake — covering
  * BOTH projection modes:
  *
- *   - **short-circuit** fakes (working / needs-input / orphan-frozen): carry
- *     `_transcript.injected_live_status`, `zoneTabId == null`.
- *   - **tab-backed** fakes (idle / error / completed): carry
+ *   - **short-circuit** fakes (any location × activity): carry
+ *     `_transcript.injected_location` / `injected_activity`, `zoneTabId == null`.
+ *   - **tab-backed** fakes (exited / exited-error / unknown): carry
  *     `_transcript.injected_tab` and resolve to a synthetic `zoneTabId`.
  *
  * Real transcripts set neither field and never carry a `synthetic-` tab
@@ -82,7 +91,8 @@ export interface InjectedSessionProbe {
  */
 export function isInjectedSession(session: InjectedSessionProbe): boolean {
   return (
-    session._transcript?.injected_live_status != null ||
+    session._transcript?.injected_location != null ||
+    session._transcript?.injected_activity != null ||
     session._transcript?.injected_tab != null ||
     isSyntheticTab(session.zoneTabId)
   );
@@ -140,4 +150,25 @@ export function deriveSyntheticTabs(
   }
 
   return { tabs, seedLastOutput };
+}
+
+/**
+ * The status a short-circuit injected fake states outright, or `null` when the
+ * record carries no (or an unrecognized) override — a malformed injection is
+ * then classified like any other row rather than trusted.
+ */
+export function injectedStatusOf(
+  transcript: Pick<TranscriptSession, "injected_location" | "injected_activity">,
+): SessionStatus | null {
+  const { injected_location: location, injected_activity: activity } = transcript;
+  return isSessionLocation(location) && isSessionActivity(activity)
+    ? injectedStatus(location, activity)
+    : null;
+}
+
+/** Does this record carry a short-circuit status override? */
+export function isInjectedStatus(
+  transcript: Pick<TranscriptSession, "injected_location" | "injected_activity">,
+): boolean {
+  return transcript.injected_location != null || transcript.injected_activity != null;
 }

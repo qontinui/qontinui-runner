@@ -24,7 +24,15 @@ vi.mock("@/lib/instance-storage", () => ({
     setItem: () => {},
   },
 }));
-vi.mock("./useLiveClaudeSessionNames", () => ({ useLiveClaudeSessionNames: () => new Map() }));
+vi.mock("./useLiveClaudeSessions", () => ({
+  refreshLiveClaudeSessions: () => Promise.resolve(),
+  useLiveClaudeSessions: () => ({
+    read: "ok",
+    bySessionId: new Map(),
+    names: new Map(),
+    pids: new Set(),
+  }),
+}));
 
 import type { TerminalTab } from "./useTerminalManager";
 import { useSessionManager, type UseSessionManagerReturn } from "./useSessionManager";
@@ -73,6 +81,7 @@ describe("useSessionManager — live tabs with no transcript", () => {
         onResumeSession: () => {},
         onSelectSession,
         onFocusSessionTab,
+        visibleTabIds: new Set<string>(),
       });
       return null;
     }
@@ -80,7 +89,8 @@ describe("useSessionManager — live tabs with no transcript", () => {
 
     const row = manager!.sessions.find((s) => s.zoneTabId === "tab-shell");
     expect(row).toBeDefined();
-    expect(row!.liveStatus).toBe("needs-input");
+    expect(row!.status.activity).toBe("needs-you");
+    expect(row!.status.location).toBe("hidden-here");
 
     act(() => manager!.openSession(row!));
     expect(onFocusSessionTab).toHaveBeenCalledWith("tab-shell", "tab-shell", "tab");
@@ -111,6 +121,7 @@ describe("useSessionManager — live tabs with no transcript", () => {
         onResumeSession: () => {},
         onSelectSession: () => {},
         onFocusSessionTab: () => {},
+        visibleTabIds: new Set<string>(),
       });
       return null;
     }
@@ -118,8 +129,9 @@ describe("useSessionManager — live tabs with no transcript", () => {
 
     const row = manager!.sessions.find((s) => s.zoneTabId === "tab-idle-shell");
     expect(row?.source).toBe("tab");
-    expect(row?.liveStatus).not.toBe("frozen");
-    expect(manager!.frozenCount).toBe(0);
+    // A tab row has no transcript: its silence is a prompt, not a stuck run.
+    expect(row?.status.activity).toBe("idle-at-prompt");
+    expect(manager!.noOutputCount).toBe(0);
   });
 });
 
@@ -139,6 +151,7 @@ describe("useSessionManager — closing a session from its row", () => {
         onSelectSession: () => {},
         onFocusSessionTab: () => {},
         onCloseSessionTab,
+        visibleTabIds: new Set<string>(),
       });
       return null;
     }
@@ -148,12 +161,12 @@ describe("useSessionManager — closing a session from its row", () => {
 
   const shell: TerminalTab = { id: "tab-x", title: "bash", pid: 9, isAlive: true, exitCode: null };
 
-  it("closes the row's live tab through the page's close path", () => {
+  it("force-closes the row's live tab through the page's close path", () => {
     const close = vi.fn();
     const manager = mountManager([shell], close);
     const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
     expect(manager.closableTabId(row)).toBe("tab-x");
-    act(() => manager.closeSession(row));
+    act(() => void manager.forceCloseSessions([row]));
     expect(close.mock.calls).toEqual([["tab-x"]]);
   });
 
@@ -163,7 +176,7 @@ describe("useSessionManager — closing a session from its row", () => {
     const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
     const transcriptOnly = { ...row, source: "transcript" as const, zoneTabId: null };
     expect(manager.closableTabId(transcriptOnly as typeof row)).toBeNull();
-    act(() => manager.closeSession(transcriptOnly as typeof row));
+    act(() => void manager.forceCloseSessions([transcriptOnly as typeof row]));
     expect(close).not.toHaveBeenCalled();
     expect(mountManager([shell]).closableTabId(row)).toBeNull();
   });
