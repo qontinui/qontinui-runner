@@ -2398,6 +2398,55 @@ mod tests {
         );
     }
 
+    /// The cwd half of A4: with the cwd UNtrusted everywhere, a pinned arm that
+    /// states no account while the PTY pins `CLAUDE_CONFIG_DIR` writes the
+    /// cwd's primary-checkout key into the PIN's config file — and leaves the
+    /// ambient default (`$HOME/.claude.json`) untouched. Deriving in the
+    /// ambient default instead would trust a file the child never reads.
+    #[test]
+    fn a_pinned_arm_with_no_stated_account_derives_the_cwd_key_in_the_ptys_pin() {
+        use crate::claude_session::spawn_preconditions::{trust_verdict_in, TrustVerdict};
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        let ambient_file = fx
+            ._amb
+            .dir()
+            .join(crate::claude_session::workspace_trust::CONFIG_FILE);
+        assert_ne!(ambient_file, fx.config_file);
+        std::fs::write(
+            &ambient_file,
+            serde_json::json!({ "projects": {} }).to_string(),
+        )
+        .unwrap();
+        let ambient_before = std::fs::read(&ambient_file).unwrap();
+        let cwd_primary_key = key(&fx.cwd_primary);
+        assert_ne!(
+            trust_verdict_in(&fx.config_file, &cwd_primary_key),
+            TrustVerdict::Trusted
+        );
+
+        assert_eq!(
+            establish_spawn_trust(
+                &fx.cwd,
+                None,
+                &TrustArm::Pinned(None),
+                Some(&fx.account),
+                |_| Some("test-scope"),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            trust_verdict_in(&fx.config_file, &cwd_primary_key),
+            TrustVerdict::Trusted,
+            "the cwd's primary key must land in the account the child reads"
+        );
+        assert_eq!(
+            std::fs::read(&ambient_file).unwrap(),
+            ambient_before,
+            "the ambient default account must not be written when the PTY is pinned"
+        );
+    }
+
     /// A2: a sibling that IS a primary checkout, named directly, goes through
     /// the same mint guards as one reached through a linked worktree. It is
     /// not an allocated worktree, so conjunct 1 fails and — even at the most
