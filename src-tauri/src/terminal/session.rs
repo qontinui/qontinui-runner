@@ -2949,7 +2949,13 @@ impl TerminalSession {
     #[cfg(unix)]
     fn scratch_root_from_env(value: Option<&str>) -> Option<std::path::PathBuf> {
         let p = std::path::Path::new(value?);
-        if p.is_absolute() {
+        // A `..` component would let the root wander out of the tree the
+        // operator named; refuse it as the account name's traversal is refused.
+        if p.is_absolute()
+            && !p
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             Some(p.to_path_buf())
         } else {
             None
@@ -3010,6 +3016,11 @@ impl TerminalSession {
     /// - **It is Unix-only.** The tmpfs `/tmp` this exists for is a Unix
     ///   arrangement; on Windows `std::env::temp_dir()` is already disk-backed
     ///   and there is nothing to redirect.
+    ///
+    /// `QONTINUI_SCRATCH_ROOT` (absolute, no `..`) replaces the
+    /// `<~/.qontinui>/scratch` base; install-claude-accounts.sh honours the same
+    /// knob (qontinui-claude-config#3289). The rest of this note describes the
+    /// default arrangement.
     ///
     /// The root shape is kept byte-identical to the installer's
     /// (`$HOME/.qontinui/scratch/<basename of CLAUDE_CONFIG_DIR>`) so a session
@@ -3083,10 +3094,13 @@ impl TerminalSession {
             // No account in force at all. Fail open.
             None => return,
         };
-        let qontinui_dir = match qontinui_dir {
-            Some(d) => d,
-            // No home, so no `~/.qontinui`. Fail open.
-            None => return,
+        let qontinui_dir = match (qontinui_dir, scratch_root) {
+            (Some(d), _) => d,
+            // An explicit scratch root needs no home: `session_temp_root_for`
+            // never reads `qontinui_dir` when the override is present.
+            (None, Some(_)) => std::path::Path::new(""),
+            // No home and no override, so no scratch root. Fail open.
+            (None, None) => return,
         };
         let root = match Self::session_temp_root_for(qontinui_dir, scratch_root, &config_dir) {
             Some(r) => r,
@@ -6042,13 +6056,41 @@ pub(crate) mod tests {
             )),
             "the override must replace the ~/.qontinui/scratch base and keep <account>"
         );
-        for bad in [None, Some(""), Some("relative/scratch"), Some("./x")] {
+        for bad in [
+            None,
+            Some(""),
+            Some("relative/scratch"),
+            Some("./x"),
+            Some("/data/../etc"),
+        ] {
             assert_eq!(
                 TerminalSession::scratch_root_from_env(bad),
                 None,
                 "{bad:?} is not an absolute override and must fall back to the default"
             );
         }
+    }
+
+    /// An explicit scratch root applies even with no resolvable home.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_temp_root_override_needs_no_home() {
+        let root = std::env::temp_dir().join(format!("scratch-root-nohome-{}", std::process::id()));
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
+        TerminalSession::apply_session_temp_root_in(
+            &mut cmd,
+            None,
+            Some(root.as_path()),
+            Some("/anywhere/.claude-sales"),
+        );
+        let expected = root.join(".claude-sales");
+        assert_eq!(
+            cmd.get_env("TMPDIR").and_then(|v| v.to_str()),
+            expected.to_str(),
+            "an absolute override must set TMPDIR even when no home resolves"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Every input that must yield NO root, so the caller leaves `TMPDIR`
@@ -6177,7 +6219,12 @@ pub(crate) mod tests {
         let mut no_home = CommandBuilder::new("dummy");
         no_home.env("TMPDIR", "/pre/existing");
         no_home.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
-        TerminalSession::apply_session_temp_root_in(&mut no_home, None, None, Some("/x/.claude-sales"));
+        TerminalSession::apply_session_temp_root_in(
+            &mut no_home,
+            None,
+            None,
+            Some("/x/.claude-sales"),
+        );
         assert_eq!(
             no_home.get_env("TMPDIR").and_then(|v| v.to_str()),
             Some("/pre/existing"),
