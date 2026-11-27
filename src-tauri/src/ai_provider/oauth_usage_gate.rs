@@ -22,8 +22,11 @@
 //!   access token whose recorded `scopes` include `user:profile`. A background
 //!   refresh is requested from [`REFRESH_AHEAD`] before it expires
 //!   (`oauth_refresh::request_background_refresh`, deduped and backed off),
-//!   only while the grant is still refreshable (the hard-failure memo), so a
-//!   live grant is normally renewed before any probe finds it expired. An
+//!   only while the grant is still refreshable (the hard-failure memo). The
+//!   lead is twice the fleet report's poll interval, so at least one scheduled
+//!   probe falls inside it and a grant whose refresh succeeds is renewed before
+//!   that cadence reaches its expiry; a refresh that fails or lands late still
+//!   leaves a probe to meet the expired token. An
 //!   expired one is NOT sent: the probe reports `profile_refresh_pending` (or
 //!   `profile_grant_dead` once the grant is rejected) rather than the state of
 //!   a fallback token, and the next probe after the refresh lands reads the
@@ -82,9 +85,13 @@ pub(crate) const COOLDOWN: Backoff = Backoff {
 };
 
 /// How long before a profile access token's `expiresAt` its background
-/// refresh is requested, so that a live grant never leaves a probe without a
-/// token that can read the endpoint.
-pub(crate) const REFRESH_AHEAD: Duration = Duration::from_secs(5 * 60);
+/// refresh is requested: twice the fleet report's poll interval, the only
+/// steady prober (`usage_probe::FLEET_USAGE_REPORT_INTERVAL`), so at least one
+/// scheduled probe always falls inside the lead. A lead at or under that
+/// interval let about half of all token lifetimes reach a probe already
+/// expired. The refresh itself can still fail or land late.
+pub(crate) const REFRESH_AHEAD: Duration =
+    Duration::from_secs(2 * super::usage_probe::FLEET_USAGE_REPORT_INTERVAL.as_secs());
 
 /// A cooling entry whose `retry_at` passed this long ago without the token
 /// being asked again belongs to a token no longer in use (a refreshed access
@@ -136,7 +143,7 @@ pub enum UsageEndpointState {
     /// token (no response arrived). The next probe asks again.
     Unavailable,
     /// The account holds no token the endpoint could be asked with: no
-    /// profile-scoped grant and no inference token at all.
+    /// profile-scoped grant, and no unexpired inference token.
     NoProfileToken,
     /// The profile-scoped grant's access token has expired and the grant can
     /// still be refreshed: a refresh is due (requested in the background for a
@@ -144,9 +151,10 @@ pub enum UsageEndpointState {
     /// a dir without one). Reported instead of the fallback token's state,
     /// which would otherwise read `scope_refused` for every expiry.
     ProfileRefreshPending,
-    /// The profile-scoped grant's access token has expired and the token
-    /// endpoint rejected the grant (the hard-failure memo): only a `/login`
-    /// of this account brings the endpoint, and its per-model caps, back.
+    /// The profile-scoped grant's access token has expired and the grant
+    /// cannot be refreshed: no refresh token, or rejected by the token
+    /// endpoint (the hard-failure memo). Only a `/login` of this account
+    /// brings the endpoint, and its per-model caps, back.
     ProfileGrantDead,
     /// The account's token is not a subscription OAuth token (an API key),
     /// which has no usage windows to read.
@@ -1279,8 +1287,20 @@ mod tests {
             )
         );
 
+        let creds = dir.path().join(".credentials.json");
+        assert_eq!(
+            super::super::oauth_refresh::refresh_requests_for_test(&creds),
+            0,
+            "an hour out, outside the lead: no refresh yet"
+        );
+
         write_creds(dir.path(), NOW_MS - 1, PROFILE, "rt-live");
         let expired = ok.read(&g, candidates_for_dir(dir.path(), NOW_MS)).await;
+        assert_eq!(
+            super::super::oauth_refresh::refresh_requests_for_test(&creds),
+            1,
+            "the expired probe requests the refresh"
+        );
         assert_eq!(
             ok.calls(),
             1,
@@ -1303,17 +1323,34 @@ mod tests {
             )
         );
         assert_eq!(ok.calls(), 1);
-        super::super::oauth_refresh::refresh_requests_for_test(
-            &dir.path().join(".credentials.json"),
+        assert_eq!(
+            super::super::oauth_refresh::refresh_requests_for_test(&creds),
+            0,
+            "a dead grant is not asked to refresh"
         );
     }
 
-    /// The refresh is requested AHEAD of expiry: a profile token four minutes
-    /// from its `expiresAt` is still asked, and its refresh is already wanted.
+    /// The lead must exceed the only steady prober's interval, or a token can
+    /// expire between two ticks with no tick inside the lead.
+    #[test]
+    fn the_refresh_lead_exceeds_the_fleet_report_interval() {
+        let interval = super::super::usage_probe::FLEET_USAGE_REPORT_INTERVAL;
+        assert_eq!(interval, Duration::from_secs(600));
+        assert!(
+            REFRESH_AHEAD > interval,
+            "{REFRESH_AHEAD:?} <= {interval:?}"
+        );
+        assert_eq!(REFRESH_AHEAD, Duration::from_secs(1200));
+    }
+
+    /// The refresh is requested AHEAD of expiry: a profile token a minute
+    /// inside the lead is still asked, and its refresh is already wanted; a
+    /// minute outside it, not yet.
     #[test]
     fn a_profile_token_near_expiry_is_still_asked_and_its_refresh_requested() {
         let _log = super::super::oauth_refresh::refresh_log_guard_for_test();
-        let dir = long_lived_dir_with_profile_creds(NOW_MS + 4 * 60_000, PROFILE, "rt-live");
+        let lead_ms = REFRESH_AHEAD.as_millis() as i64;
+        let dir = long_lived_dir_with_profile_creds(NOW_MS + lead_ms - 60_000, PROFILE, "rt-live");
         let creds = dir.path().join(".credentials.json");
         super::super::oauth_refresh::refresh_requests_for_test(&creds);
         let set = candidates_for_dir(dir.path(), NOW_MS);
@@ -1325,8 +1362,8 @@ mod tests {
             super::super::oauth_refresh::refresh_requests_for_test(&creds),
             1
         );
-        // Six minutes out, outside the lead: no refresh yet.
-        write_creds(dir.path(), NOW_MS + 6 * 60_000, PROFILE, "rt-live");
+        // A minute outside the lead: no refresh yet.
+        write_creds(dir.path(), NOW_MS + lead_ms + 60_000, PROFILE, "rt-live");
         candidates_for_dir(dir.path(), NOW_MS);
         assert_eq!(
             super::super::oauth_refresh::refresh_requests_for_test(&creds),

@@ -134,6 +134,11 @@ pub const USAGE_PROBE_POLL_MAX_AGE: Duration = Duration::from_secs(270);
 /// hit. A minute, the probe's reuse before D7.
 pub const USAGE_PROBE_CONFIRM_MAX_AGE: Duration = Duration::from_secs(60);
 
+/// The fleet report's poll period (`main.rs`'s 10-minute timer driving
+/// `refresh_fleet_usage_report`): the only steady prober of every account.
+/// `oauth_usage_gate::REFRESH_AHEAD` is derived from it.
+pub const FLEET_USAGE_REPORT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// How long a FAILED probe result (an `error` row) is reused, whatever the
 /// caller's max age: a minute, so a 429'd account is not re-probed into
 /// another 429 on the next caller's tick, nor held unprobed for minutes.
