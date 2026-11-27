@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -234,92 +233,118 @@ impl PhysicalDeviceRegistry {
     // Health Monitor
     // -----------------------------------------------------------------------
 
-    /// Spawn a background task that checks `GET {proxy_url}/ui-bridge/health`
-    /// every 15 seconds for every registered device's active transport.
+    /// One pass of the health monitor ([`spawn_health_monitor`]): checks
+    /// `GET {proxy_url}/ui-bridge/health` for every registered device's active
+    /// transport.
     ///
     /// On three consecutive failures the transport is removed and the next
     /// best transport is promoted.  If no transports survive the device is
     /// marked `Unreachable`.
-    pub fn start_health_monitor(
-        self: Arc<Self>,
-        client: reqwest::Client,
-        mut shutdown: watch::Receiver<bool>,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            info!("Physical device health monitor shutting down");
-                            break;
-                        }
-                    }
-                }
+    pub async fn check_transports_once(&self, client: &reqwest::Client) {
+        // Collect (device_id, transport_kind, proxy_url) for active transports
+        let targets: Vec<(String, TransportKind, String)> = {
+            let map = self.devices.read().await;
+            map.values()
+                .filter_map(|d| {
+                    d.transports
+                        .get(d.active_transport_idx)
+                        .map(|t| (d.info.id.clone(), t.kind, t.proxy_url.clone()))
+                })
+                .collect()
+        };
 
-                // Collect (device_id, transport_kind, proxy_url) for active transports
-                let targets: Vec<(String, TransportKind, String)> = {
-                    let map = self.devices.read().await;
-                    map.values()
-                        .filter_map(|d| {
-                            d.transports
-                                .get(d.active_transport_idx)
-                                .map(|t| (d.info.id.clone(), t.kind, t.proxy_url.clone()))
-                        })
-                        .collect()
-                };
+        for (id, kind, proxy_url) in targets {
+            let url = format!("{}/ui-bridge/health", proxy_url);
+            let ok = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.get(&url).send(),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp.status().is_success(),
+                _ => false,
+            };
 
-                for (id, kind, proxy_url) in targets {
-                    let url = format!("{}/ui-bridge/health", proxy_url);
-                    let ok = match tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        client.get(&url).send(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resp)) => resp.status().is_success(),
-                        _ => false,
-                    };
+            let mut map = self.devices.write().await;
+            let device = match map.get_mut(&id) {
+                Some(d) => d,
+                None => continue,
+            };
 
-                    let mut map = self.devices.write().await;
-                    let device = match map.get_mut(&id) {
-                        Some(d) => d,
-                        None => continue,
-                    };
+            // Find the transport in the device's list
+            let transport = match device.transports.iter_mut().find(|t| t.kind == kind) {
+                Some(t) => t,
+                None => continue,
+            };
 
-                    // Find the transport in the device's list
-                    let transport = match device.transports.iter_mut().find(|t| t.kind == kind) {
-                        Some(t) => t,
-                        None => continue,
-                    };
+            if ok {
+                transport.last_healthy_at = chrono::Utc::now().timestamp_millis();
+                transport.fail_count = 0;
+                device.health_state = HealthState::Healthy;
+            } else {
+                transport.fail_count += 1;
+                let fail_count = transport.fail_count;
+                warn!(
+                    id = %id,
+                    %kind,
+                    fail_count,
+                    "Health check failed for transport"
+                );
 
-                    if ok {
-                        transport.last_healthy_at = chrono::Utc::now().timestamp_millis();
-                        transport.fail_count = 0;
-                        device.health_state = HealthState::Healthy;
-                    } else {
-                        transport.fail_count += 1;
-                        let fail_count = transport.fail_count;
-                        warn!(
-                            id = %id,
-                            %kind,
-                            fail_count,
-                            "Health check failed for transport"
-                        );
-
-                        if fail_count >= 3 {
-                            // Drop the write lock before calling remove_transport
-                            drop(map);
-                            self.remove_transport(&id, kind).await;
-                        } else {
-                            device.health_state =
-                                HealthState::Degraded(format!("{} health check failed", kind));
-                        }
-                    }
+                if fail_count >= 3 {
+                    // Drop the write lock before calling remove_transport
+                    drop(map);
+                    self.remove_transport(&id, kind).await;
+                } else {
+                    device.health_state =
+                        HealthState::Degraded(format!("{} health check failed", kind));
                 }
             }
-        });
+        }
     }
+}
+
+/// The `worker_supervisor` registry name of the loop [`spawn_health_monitor`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const HEALTH_MONITOR_WORKER: &str = "physical_device.health_monitor";
+
+/// How long the monitor waits before its first pass, so the USB scanner has
+/// registered what it found first.
+pub const HEALTH_MONITOR_START_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause before every pass, the first included.
+pub const HEALTH_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run [`PhysicalDeviceRegistry::check_transports_once`] for the life of the
+/// process: wait `start_delay`, then sleep `period` before every pass.
+///
+/// The loop runs under the panic supervisor, which also owns its cancellation:
+/// a panicking pass is logged, counted on `/health` and the loop rebuilt after
+/// a backoff. Rebuilding is safe: the loop keeps no state of its own, and the
+/// failure counts it advances live in the shared registry, which a rebuilt run
+/// picks up where the last one left them.
+///
+/// A rebuilt run starts from the top, so after the supervisor's backoff it
+/// waits `start_delay` again before its first pass: a restart costs the backoff
+/// plus the boot delay, not the backoff alone.
+pub fn spawn_health_monitor(
+    registry: Arc<PhysicalDeviceRegistry>,
+    client: reqwest::Client,
+    start_delay: std::time::Duration,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(HEALTH_MONITOR_WORKER, move |hb| {
+        let registry = registry.clone();
+        let client = client.clone();
+        async move {
+            tokio::time::sleep(start_delay).await;
+            loop {
+                tokio::time::sleep(period).await;
+                hb.tick();
+                registry.check_transports_once(&client).await;
+            }
+        }
+    })
 }
 
 impl Default for PhysicalDeviceRegistry {
@@ -526,5 +551,76 @@ mod tests {
         assert!(!registry.prefer_transport("ghost", TransportKind::Usb).await);
         registry.remove_transport(id, TransportKind::Lan).await;
         assert!(!registry.prefer_transport(id, TransportKind::Lan).await);
+    }
+
+    /// A port nothing listens on: bind, read the port, drop the listener.
+    fn dead_proxy_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// One pass per call: the third consecutive failure removes the transport
+    /// and leaves the device Unreachable; the first two only degrade it.
+    #[tokio::test]
+    async fn check_transports_once_removes_a_transport_after_three_failures() {
+        let registry = PhysicalDeviceRegistry::new();
+        let mut transport = usb_transport(0);
+        transport.proxy_url = dead_proxy_url();
+        registry.register(sample_info("DEAD0001"), transport).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build a client");
+
+        for pass in 1..=2 {
+            registry.check_transports_once(&client).await;
+            let device = registry
+                .get_device("DEAD0001")
+                .await
+                .expect("still registered");
+            assert_eq!(
+                device.transports.len(),
+                1,
+                "pass {pass} must not remove it yet"
+            );
+            assert_eq!(device.transports[0].fail_count, pass);
+            assert!(matches!(device.health_state, HealthState::Degraded(_)));
+        }
+
+        registry.check_transports_once(&client).await;
+        assert!(
+            !registry
+                .has_transport_kind("DEAD0001", TransportKind::Usb)
+                .await,
+            "the third failure must remove the transport"
+        );
+        let device = registry.get_device("DEAD0001").await.expect("entry stays");
+        assert!(matches!(device.health_state, HealthState::Unreachable));
+    }
+
+    /// The door `create_router` calls registers the monitor with the panic
+    /// supervisor under its `/health` name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_health_monitor_registers_with_the_panic_supervisor() {
+        let handle = spawn_health_monitor(
+            Arc::new(PhysicalDeviceRegistry::new()),
+            reqwest::Client::new(),
+            HEALTH_MONITOR_START_DELAY,
+            HEALTH_MONITOR_PERIOD,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == HEALTH_MONITOR_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_health_monitor never registered {HEALTH_MONITOR_WORKER}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        handle.abort();
     }
 }

@@ -129,7 +129,7 @@ async fn cascade_stream_handler(
                         return None;
                     }
 
-                    // Note: ring buffer is populated by the background task (start_buffer_task),
+                    // Note: ring buffer is populated by the background task (spawn_buffer_task),
                     // so we don't push here to avoid duplicates.
 
                     match serde_json::to_string(&event) {
@@ -163,15 +163,36 @@ async fn cascade_stream_handler(
     )
 }
 
+/// The `worker_supervisor` registry name of the loop [`spawn_buffer_task`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const CASCADE_BUFFER_WORKER: &str = "cascade.buffer";
+
 /// Start the background task that populates the cascade ring buffer.
 ///
 /// Subscribes to the broadcast channel and filters cascade events into the
 /// ring buffer even when no SSE clients are connected. This ensures
 /// `/cascade/events` has data available immediately.
-pub fn start_buffer_task(state: &Arc<ApiState>) {
-    let mut rx = state.app_state.event_broadcast.subscribe();
+///
+/// The loop runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff. Each run subscribes afresh
+/// ([`buffer_run`]): a receiver moved into one run dies with it. A closed
+/// channel ends the loop on purpose, which `/health` records as `exited`.
+pub fn spawn_buffer_task(
+    event_broadcast: tokio::sync::broadcast::Sender<Value>,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised(CASCADE_BUFFER_WORKER, move || {
+        buffer_run(&event_broadcast)
+    })
+}
 
-    tokio::spawn(async move {
+/// One run of the buffer loop: subscribes NOW (when the supervisor calls the
+/// factory, not when the future is first polled) and returns the loop that
+/// drains that receiver into the ring buffer.
+fn buffer_run(
+    event_broadcast: &tokio::sync::broadcast::Sender<Value>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut rx = event_broadcast.subscribe();
+    async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -188,7 +209,7 @@ pub fn start_buffer_task(state: &Arc<ApiState>) {
                 }
             }
         }
-    });
+    }
 }
 
 /// Create routes for this module.
@@ -196,4 +217,92 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/cascade/events", get(cascade_events_handler))
         .route("/cascade/stream", get(cascade_stream_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait until the ring buffer holds an event carrying `marker`.
+    async fn buffered(marker: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if get_buffer()
+                .lock()
+                .await
+                .iter()
+                .any(|e| e["marker"] == marker)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn cascade_event(marker: &str) -> Value {
+        serde_json::json!({ "event_type": "cascade_test", "marker": marker })
+    }
+
+    /// What a supervisor restart does: call the factory a second time. Each run
+    /// subscribes for itself, so the rebuilt run still receives — a receiver
+    /// taken once before the spawn would have died with the first run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_factory_run_receives_events_broadcast_after_it_subscribes() {
+        let (tx, _keep) = tokio::sync::broadcast::channel::<Value>(16);
+
+        let first = tokio::spawn(buffer_run(&tx));
+        let marker = format!("first-{}", uuid::Uuid::new_v4());
+        tx.send(cascade_event(&marker))
+            .expect("a receiver is subscribed");
+        assert!(
+            buffered(&marker).await,
+            "the first run never buffered its event"
+        );
+        // A panic ends the run; aborting it is the same loss of its receiver.
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn(buffer_run(&tx));
+        let marker = format!("second-{}", uuid::Uuid::new_v4());
+        tx.send(cascade_event(&marker))
+            .expect("a receiver is subscribed");
+        assert!(
+            buffered(&marker).await,
+            "the rebuilt run never buffered its event"
+        );
+        second.abort();
+    }
+
+    /// A closed channel ends a run: the loop returns, which the supervisor
+    /// records as `exited` rather than restarting it.
+    #[tokio::test]
+    async fn a_run_returns_when_the_channel_closes() {
+        let (tx, _) = tokio::sync::broadcast::channel::<Value>(16);
+        let run = buffer_run(&tx);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run must return once its channel is closed");
+    }
+
+    /// The door `create_router` calls registers the loop with the panic
+    /// supervisor under its `/health` name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_buffer_task_registers_with_the_panic_supervisor() {
+        let (tx, _keep) = tokio::sync::broadcast::channel::<Value>(16);
+        let handle = spawn_buffer_task(tx.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == CASCADE_BUFFER_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_buffer_task never registered {CASCADE_BUFFER_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+    }
 }

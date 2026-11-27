@@ -23,9 +23,10 @@ use crate::mcp::adb_helper;
 /// no subprocess fallback is needed.
 ///
 /// `Clone` is cheap — both registries are `Arc<Mutex<_>>` shared across clones.
-/// We rely on cloning so the shutdown handler in `main.rs` can call
-/// `release_all` on the same forward/reverse registries the USB scanner task
-/// owns.
+/// We rely on cloning so the shutdown handler (`mcp/ai_session.rs`) can call
+/// `release_all` on the same forward/reverse registries the USB scanner
+/// (`usb_scanner.rs`) drives — every supervised run of it holds a clone of the
+/// one transport published into `AppState::usb_transport`.
 #[derive(Clone)]
 pub struct UsbTransport {
     /// Maps ADB serial number → locally forwarded TCP port.
@@ -49,11 +50,20 @@ impl UsbTransport {
     /// library-level `host:forward` call. Pre-allocates the local port on the
     /// loopback interface because the library discards the response body and
     /// cannot return an adb-chosen port. Stores the mapping for later teardown.
+    ///
+    /// A forward this transport already holds for `adb_serial` is released
+    /// first. The scanner re-establishes a forward whenever the registry has no
+    /// live USB transport for the device (the health monitor evicted it), and
+    /// the old `adb forward` rule is still installed then: inserting over its
+    /// map entry would orphan that rule, which no disconnect sweep or shutdown
+    /// `release_all` could find again.
     pub async fn establish_forward(
         &self,
         adb_serial: &str,
         remote_port: u16,
     ) -> Result<u16, TransportError> {
+        self.release_forward(adb_serial).await?;
+
         let local_port = adb_helper::pick_free_local_port().await.map_err(|e| {
             TransportError::ForwardFailed {
                 device_id: adb_serial.to_string(),
@@ -235,5 +245,39 @@ impl UsbTransport {
         adb_helper::get_wlan_ipv4(adb_serial.to_string())
             .await
             .map_err(|e| TransportError::AdbCommandFailed(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A re-establish releases the forward the transport already holds for the
+    /// serial before it installs a new one, so the old entry cannot be
+    /// overwritten and orphaned. The serial names no device, so whatever the
+    /// adb server says (absent, or "device not found") the new forward fails —
+    /// and the stale entry must be gone all the same.
+    #[tokio::test]
+    async fn establish_forward_releases_the_forward_already_held_for_the_serial() {
+        let transport = UsbTransport::new();
+        let serial = "a7-no-such-device-stale-forward";
+        transport
+            .active_forwards
+            .lock()
+            .await
+            .insert(serial.to_string(), 1);
+
+        let result = transport.establish_forward(serial, 1).await;
+
+        assert!(
+            result.is_err(),
+            "a serial naming no device cannot be forwarded"
+        );
+        assert_eq!(
+            transport.get_forwarded_port(serial).await,
+            None,
+            "the forward held before the re-establish must have been released, not left \
+             behind for a later insert to overwrite"
+        );
     }
 }

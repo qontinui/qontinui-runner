@@ -13315,361 +13315,36 @@ pub fn create_router(
 
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
-    {
-        let state = api_state.clone();
-        tokio::spawn(async move {
-            // Wait for ADB and other services to initialize
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // Supervised; the transport it drives is published into AppState::usb_transport before
+    // the spawn, so a restarted run and the shutdown release_all share one transport.
+    crate::mcp::transport::usb_scanner::spawn_adb_scanner(
+        api_state.app_state.clone(),
+        api_state.physical_device_registry.clone(),
+        crate::mcp::transport::usb_scanner::ADB_SCANNER_START_DELAY,
+        crate::mcp::transport::usb_scanner::ADB_SCANNER_PERIOD,
+    );
 
-            let mobile_settings = crate::settings::get_mobile_settings();
-            let usb_transport = crate::mcp::transport::usb::UsbTransport::new();
-
-            // Publish for the CloseRequested shutdown handler in main.rs, which
-            // calls release_all so this process's `adb forward` entries don't
-            // linger. Graceful-only — supervisor force-kill (taskkill /F) still
-            // leaks. See plan adb-forwarder-port.md §1.6a.
-            if state
-                .app_state
-                .usb_transport
-                .set(usb_transport.clone())
-                .is_err()
-            {
-                tracing::warn!("UsbTransport OnceCell already populated; scanner task restarted?");
-            }
-
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-
-            loop {
-                interval.tick().await;
-
-                let devices = usb_transport.scan_devices().await;
-                let registry = &state.physical_device_registry;
-
-                // Register newly connected physical devices.
-                //
-                // Re-establishment after transport eviction: the dedup below
-                // skips a device only when it already has a live USB transport
-                // entry in the registry. If the health monitor removed the
-                // USB transport (3 consecutive failures → `remove_transport`
-                // leaves the device entry with `transports: []` and
-                // `health_state: Unreachable`), the next scanner pass must
-                // retry `establish_forward` — otherwise the device is
-                // permanently dead in the registry while still being a live
-                // adb target. Previously the dedup checked `get_device(...).is_some()`,
-                // which also matched the empty-transport "stuck" state and
-                // produced `transports: []` + `healthState: unreachable`
-                // responses on /ui-bridge/devices even though raw probes to
-                // localhost:<ui_bridge_port> succeeded.
-                for (device_id, status, model) in &devices {
-                    if status != "device" {
-                        continue;
-                    }
-                    if device_id.starts_with("emulator-") {
-                        continue; // Skip emulators — handled by app_discovery
-                    }
-
-                    // Reverse the runner HTTP API port back to the device so the
-                    // qontinui-mobile app's data path can reach the runner at
-                    // `localhost:<port>` on the phone. Without this, USB-attached
-                    // phones see "Network request failed". This is independent of
-                    // UI Bridge discovery below — the data path is needed whenever
-                    // a physical device is attached, registered or not — so it runs
-                    // before the already-registered skip. Idempotent + only logged
-                    // on first install per serial (re-runs are skipped via the
-                    // active_reverses map).
-                    if usb_transport
-                        .active_reverses
-                        .lock()
-                        .await
-                        .get(device_id)
-                        .is_none()
-                    {
-                        let runner_port = state.app_state.api_port.load(Ordering::Relaxed);
-                        if let Err(e) = usb_transport
-                            .establish_reverse(device_id, runner_port)
-                            .await
-                        {
-                            tracing::debug!(
-                                "Failed to establish ADB reverse for {} (port {}): {}",
-                                device_id,
-                                runner_port,
-                                e
-                            );
-                        }
-                    }
-
-                    // Skip devices that already have a live USB transport.
-                    // A device entry with empty `transports` (or only
-                    // non-USB transports) falls through to re-establishment.
-                    if registry
-                        .has_transport_kind(device_id, crate::mcp::transport::TransportKind::Usb)
-                        .await
-                    {
-                        continue;
-                    }
-
-                    // Attempt ADB port forward to the UI Bridge port
-                    match usb_transport
-                        .establish_forward(device_id, mobile_settings.ui_bridge_port)
-                        .await
-                    {
-                        Ok(local_port) => {
-                            // Quick health check, direct: the port is this machine's.
-                            let client = reqwest::Client::builder()
-                                .no_proxy()
-                                .timeout(std::time::Duration::from_secs(2))
-                                .build()
-                                .unwrap_or_else(|_| reqwest::Client::new());
-                            let base_url = format!("http://127.0.0.1:{}", local_port);
-                            let url = format!("{base_url}/ui-bridge/health");
-                            if let Ok(resp) = client.get(&url).send().await {
-                                // Over the forward the phone admits this runner as on the
-                                // phone itself, and so hands over its pairing token with no
-                                // code: fetch it now, so the same phone is reachable over
-                                // Wi-Fi once the cable is out.
-                                let gate = resp.json::<serde_json::Value>().await.ok().and_then(
-                                    |health| {
-                                        crate::mcp::transport::pairing::DeviceGate::from_health(
-                                            &health,
-                                        )
-                                    },
-                                );
-                                if let Some(gate) = gate.filter(|gate| gate.admits_as_local()) {
-                                    if let Some(ui_bridge_id) = gate.device_id {
-                                        crate::mcp::transport::pairing::spawn_token_fetch(
-                                            base_url.clone(),
-                                            ui_bridge_id,
-                                            true,
-                                        );
-                                    }
-                                }
-                                let now = chrono::Utc::now().timestamp_millis();
-                                let info = crate::mcp::physical_device::PhysicalDeviceInfo {
-                                    id: device_id.clone(),
-                                    os: crate::mcp::transport::DeviceOs::Android,
-                                    device_kind: "physical".to_string(),
-                                    model: model.clone(),
-                                    app_id: None,
-                                    ui_bridge_version: None,
-                                    first_seen_at: now,
-                                };
-                                let transport = crate::mcp::physical_device::ActiveTransport {
-                                    kind: crate::mcp::transport::TransportKind::Usb,
-                                    proxy_url: format!("http://127.0.0.1:{}", local_port),
-                                    established_at: now,
-                                    last_healthy_at: now,
-                                    fail_count: 0,
-                                };
-                                registry.register(info, transport).await;
-                                tracing::info!(
-                                    "USB device registered: {} (local port {})",
-                                    device_id,
-                                    local_port
-                                );
-                            } else {
-                                // No UI Bridge on device — release the forward
-                                let _ = usb_transport.release_forward(device_id).await;
-                                tracing::debug!(
-                                    "USB device {} reachable via ADB but no UI Bridge (port {})",
-                                    device_id,
-                                    local_port
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Failed to establish ADB forward for {}: {}",
-                                device_id,
-                                e
-                            );
-                        }
-                    }
-                }
-
-                // Clean up devices that are no longer connected via USB
-                let registered = registry.list_all().await;
-                for device in registered {
-                    let has_usb = device
-                        .transports
-                        .iter()
-                        .any(|t| t.kind == crate::mcp::transport::TransportKind::Usb);
-                    if !has_usb {
-                        continue;
-                    }
-                    let still_connected = devices
-                        .iter()
-                        .any(|(id, status, _)| id == &device.info.id && status == "device");
-                    if !still_connected {
-                        registry
-                            .remove_transport(
-                                &device.info.id,
-                                crate::mcp::transport::TransportKind::Usb,
-                            )
-                            .await;
-                        let _ = usb_transport.release_forward(&device.info.id).await;
-                        tracing::info!("USB device disconnected: {}", device.info.id);
-                    }
-                }
-
-                // Tear down ADB reverses for devices no longer attached. Reverses
-                // are installed for every physical device (even those without a UI
-                // Bridge, which never register in the registry above), so they need
-                // their own disconnect sweep keyed off the live `adb devices` list.
-                let reversed_serials: Vec<String> = {
-                    let reverses = usb_transport.active_reverses.lock().await;
-                    reverses.keys().cloned().collect()
-                };
-                for serial in reversed_serials {
-                    let still_connected = devices
-                        .iter()
-                        .any(|(id, status, _)| id == &serial && status == "device");
-                    if !still_connected {
-                        let _ = usb_transport.release_reverse(&serial).await;
-                        tracing::info!("USB device reverse released (disconnected): {}", serial);
-                    }
-                }
-            }
-        });
-    }
-
-    // Physical device health monitor (15-second interval)
-    // Checks liveness of registered devices and removes unhealthy transports.
-    {
-        let registry = api_state.physical_device_registry.clone();
-        tokio::spawn(async move {
-            // Wait for USB scanner to do its first pass
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            // Intentionally leaked — monitor runs for the entire app lifetime
-            std::mem::forget(shutdown_tx);
-
-            registry.start_health_monitor(client, shutdown_rx);
-        });
-    }
+    // Physical device health monitor (15-second interval, first pass after 10 s)
+    // Checks liveness of registered devices and removes unhealthy transports. Supervised.
+    crate::mcp::physical_device::spawn_health_monitor(
+        api_state.physical_device_registry.clone(),
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        crate::mcp::physical_device::HEALTH_MONITOR_START_DELAY,
+        crate::mcp::physical_device::HEALTH_MONITOR_PERIOD,
+    );
 
     // Cloud device registry poller (if cloud device bridge is enabled)
-    // Polls the qontinui.io backend for remotely registered devices.
-    {
-        let state = api_state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-
-            let cloud_settings =
-                crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
-            if !cloud_settings.device_bridge_enabled {
-                tracing::debug!("Cloud device bridge disabled, skipping registry poller");
-                return;
-            }
-
-            let poller = crate::mcp::discovery::cloud_registry::CloudRegistryPoller::new(
-                cloud_settings.backend_url.clone(),
-                cloud_settings.cloud_registry_poll_secs,
-            );
-            // Use localhost for the tunnel WS connection — runner is co-located
-            // with the backend. The tunnel URL (Cloudflare) may reject WS upgrades.
-            let cloud_transport =
-                std::sync::Arc::new(crate::mcp::transport::cloud::CloudTransport::new(
-                    crate::api_config::get_api_base_url(),
-                ));
-
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                cloud_settings.cloud_registry_poll_secs,
-            ));
-
-            loop {
-                interval.tick().await;
-
-                // Refresh auth token on each poll cycle
-                let token = crate::auth::AuthManager::new().get_access_token().ok();
-                if let Some(token) = token {
-                    match poller.poll(&token).await {
-                        Ok(devices) => {
-                            let registry = &state.physical_device_registry;
-                            for device in devices {
-                                tracing::debug!(
-                                    "Cloud device available: {} ({})",
-                                    device.device_id,
-                                    device.display_name
-                                );
-                                // Skip a device that already has a cloud tunnel. One known
-                                // only over LAN or USB still gets one: a phone on Wi-Fi that
-                                // requires pairing this runner has not done is reached over
-                                // the relay instead, which its pairing gate does not cover.
-                                if registry
-                                    .has_transport_kind(
-                                        &device.device_id,
-                                        crate::mcp::transport::TransportKind::Cloud,
-                                    )
-                                    .await
-                                {
-                                    continue;
-                                }
-                                // Open a cloud tunnel for this device so the registry
-                                // has a working proxy URL. The tunnel stays open for
-                                // the device's lifetime in the registry.
-                                match cloud_transport.open_tunnel(&device.device_id, &token).await {
-                                    Ok(local_port) => {
-                                        let os = match device.platform.to_lowercase().as_str() {
-                                            "ios" => crate::mcp::transport::DeviceOs::Ios,
-                                            _ => crate::mcp::transport::DeviceOs::Android,
-                                        };
-                                        let now = chrono::Utc::now().timestamp_millis();
-                                        let info =
-                                            crate::mcp::physical_device::PhysicalDeviceInfo {
-                                                id: device.device_id.clone(),
-                                                os,
-                                                device_kind: "physical".to_string(),
-                                                model: None,
-                                                app_id: if device.app_id.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(device.app_id.clone())
-                                                },
-                                                ui_bridge_version: None,
-                                                first_seen_at: now,
-                                            };
-                                        let transport =
-                                            crate::mcp::physical_device::ActiveTransport {
-                                                kind: crate::mcp::transport::TransportKind::Cloud,
-                                                proxy_url: format!(
-                                                    "http://127.0.0.1:{}",
-                                                    local_port
-                                                ),
-                                                established_at: now,
-                                                last_healthy_at: now,
-                                                fail_count: 0,
-                                            };
-                                        registry.register(info, transport).await;
-                                        tracing::info!(
-                                            "Cloud device registered: {} via tunnel on port {}",
-                                            device.device_id,
-                                            local_port
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to open cloud tunnel for {}: {}",
-                                            device.device_id,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Cloud registry poll failed: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // Polls the qontinui.io backend for remotely registered devices. Supervised, and
+    // started only when the bridge is enabled, so a disabled bridge is absent from
+    // /health rather than `exited`.
+    crate::mcp::discovery::cloud_registry::spawn_registry_poller(
+        api_state.physical_device_registry.clone(),
+        &crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>(),
+        crate::mcp::discovery::cloud_registry::CLOUD_REGISTRY_POLLER_START_DELAY,
+    );
 
     // mDNS LAN discovery (if enabled)
     // Discovers UI Bridge instances advertising themselves on the local network.
@@ -13752,8 +13427,9 @@ pub fn create_router(
         });
     }
 
-    // Start cascade event buffer (collects cascade detection events for /cascade/events)
-    crate::mcp::cascade::start_buffer_task(&api_state);
+    // Start cascade event buffer (collects cascade detection events for /cascade/events).
+    // Supervised; each run subscribes to the broadcast channel afresh.
+    crate::mcp::cascade::spawn_buffer_task(api_state.app_state.event_broadcast.clone());
 
     // Build GraphQL schema with ApiState as context data
     let graphql_schema = crate::graphql::build_schema(api_state.clone());
@@ -23850,7 +23526,10 @@ mod supervised_workers_health_tests {
     /// - tasks a callee starts beneath a classified row:
     ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
     ///   (`wrappers/manager.rs`), the trigger service's nested bridge loop
-    ///   (`trigger_system/service.rs`), and the browse `std::thread` that
+    ///   (`trigger_system/service.rs`), the per-device one-shot
+    ///   `pairing::spawn_token_fetch` inside `usb.adb_scanner`'s body
+    ///   (`mcp/transport/usb_scanner.rs`), which left this region when Phase 1
+    ///   moved that body out of it, and the browse `std::thread` that
     ///   `MdnsScanner::start` (`mcp/discovery/mdns_scanner.rs`) spawns — that
     ///   call itself IS counted, as the DEFERRED `mdns_scanner.browse_thread`
     ///   row;
@@ -23863,18 +23542,48 @@ mod supervised_workers_health_tests {
     /// moves with them and reads `boot_tasks::spawn_all` instead.
     #[test]
     fn every_create_router_boot_task_is_classified() {
-        const PHASE1_2: &str = "migration target of plan \
-            2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised Phase 1/2";
+        const PHASE2: &str = "migration target of plan \
+            2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised Phase 2";
 
         // (site, needle in create_router, file under src/, entry fn signature
         // at column 0, worker_supervisor registry name).
-        const SUPERVISED: &[(Site, &str, &str, &str, &str)] = &[(
-            Site::Call,
-            "crate::mcp::sdk_client::spawn_stored_bearer_recheck(",
-            "mcp/sdk_client.rs",
-            "pub fn spawn_stored_bearer_recheck(",
-            "sdk_client.stored_bearer_recheck",
-        )];
+        const SUPERVISED: &[(Site, &str, &str, &str, &str)] = &[
+            (
+                Site::Call,
+                "crate::mcp::sdk_client::spawn_stored_bearer_recheck(",
+                "mcp/sdk_client.rs",
+                "pub fn spawn_stored_bearer_recheck(",
+                "sdk_client.stored_bearer_recheck",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::transport::usb_scanner::spawn_adb_scanner(",
+                "mcp/transport/usb_scanner.rs",
+                "pub fn spawn_adb_scanner(",
+                "usb.adb_scanner",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::physical_device::spawn_health_monitor(",
+                "mcp/physical_device.rs",
+                "pub fn spawn_health_monitor(",
+                "physical_device.health_monitor",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::discovery::cloud_registry::spawn_registry_poller(",
+                "mcp/discovery/cloud_registry.rs",
+                "pub fn spawn_registry_poller(",
+                "cloud_registry.poller",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::cascade::spawn_buffer_task(",
+                "mcp/cascade.rs",
+                "pub fn spawn_buffer_task(",
+                "cascade.buffer",
+            ),
+        ];
         // (site, needle, reason).
         const TASK_SUPERVISED_REASON: &str =
             "under mcp::task_supervisor — restarts on panic or return, no /health registry";
@@ -23960,12 +23669,6 @@ mod supervised_workers_health_tests {
                 ".cleanup_old_audit_events(",
                 "one-shot audit-event retention cleanup",
             ),
-            (
-                Site::Call,
-                "crate::mcp::transport::pairing::spawn_token_fetch(",
-                "one-shot pairing-token fetch per newly admitted USB device (inside the USB \
-                 scanner's body)",
-            ),
         ];
         // (site, needle, reason). Spawned from a Tauri event listener per
         // event, not at boot.
@@ -23998,37 +23701,19 @@ mod supervised_workers_health_tests {
                 Site::Spawn,
                 "crate::helper_tasks::poller::run_forever()",
                 "helper_tasks.poller",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Spawn,
                 "cleanup_registry.cleanup_stale(&cleanup_db)",
                 "file_registry.stale_sweep",
-                PHASE1_2,
-            ),
-            (
-                Site::Spawn,
-                "crate::mcp::transport::usb::UsbTransport::new()",
-                "usb.adb_scanner",
-                PHASE1_2,
-            ),
-            (
-                Site::Spawn,
-                ".start_health_monitor(",
-                "physical_device.health_monitor",
-                PHASE1_2,
-            ),
-            (
-                Site::Spawn,
-                "crate::mcp::transport::cloud::CloudTransport::new(",
-                "cloud_registry.poller",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Spawn,
                 "crate::mcp::discovery::mdns_scanner::MdnsScanner::new()",
                 "mdns_scanner.events",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Call,
@@ -24045,37 +23730,31 @@ mod supervised_workers_health_tests {
                 Site::Call,
                 "crate::util::egress_context::spawn_baseline_logger()",
                 "egress_context.baseline_logger",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Call,
                 "crate::mcp::app_registry::spawn_sweeper(",
                 "app_registry.sweeper",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Call,
                 "crate::canonical_corpus::start_refresh_loop()",
                 "canonical_corpus.refresh_loop",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Call,
                 "crate::coord_mcp::start_stale_breadcrumb_sweep(",
                 "coord_mcp.stale_breadcrumb_sweep",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Call,
                 "crate::zombie_sweep::start_zombie_sweep(",
                 "zombie_sweep.task_run_sweep",
-                PHASE1_2,
-            ),
-            (
-                Site::Call,
-                "crate::mcp::cascade::start_buffer_task(",
-                "cascade.buffer",
-                PHASE1_2,
+                PHASE2,
             ),
             (
                 Site::Spawn,
