@@ -83,7 +83,8 @@ export interface EffectivenessReport {
   regression_count: number;
   inconclusive_count: number;
   unevaluated_count: number;
-  effectiveness_rate: number;
+  /** Fraction (0-1) of judged fixes that were effective; null when none is judged. */
+  effectiveness_rate: number | null;
   fixes: ReflectionFix[];
 }
 

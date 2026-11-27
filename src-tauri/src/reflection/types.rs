@@ -271,7 +271,8 @@ pub struct EffectivenessReport {
     pub regression_count: u32,
     pub inconclusive_count: u32,
     pub unevaluated_count: u32,
-    pub effectiveness_rate: f64,
+    /// `None` when no fix is judged.
+    pub effectiveness_rate: Option<f64>,
     pub fixes: Vec<ReflectionFix>,
 }
 

@@ -37,11 +37,13 @@ import type {
   FixEffectiveness,
   ConvergenceStatus,
 } from "../../types/reflection";
-import type {
-  WorkflowTrends,
-  EffectivenessOverTime,
-  EffectivenessBucket,
-} from "../../types/architecture";
+import type { WorkflowTrends, EffectivenessOverTime } from "../../types/architecture";
+import {
+  effectivenessChartData,
+  formatRatePercent,
+  trendEnds,
+} from "@/lib/effectivenessRate";
+import type { EffectivenessChartPoint } from "@/lib/effectivenessRate";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { CrossRunPatternsPanel } from "./CrossRunPatternsPanel";
 import { StepProvenanceTimeline } from "./StepProvenanceTimeline";
@@ -151,7 +153,7 @@ function EffectivenessChartTooltip({
   payload,
 }: {
   active?: boolean;
-  payload?: { payload: EffectivenessBucket & { ratePercent: number } }[];
+  payload?: { payload: EffectivenessChartPoint }[];
 }) {
   if (active && payload && payload.length) {
     const d = payload[0].payload;
@@ -159,10 +161,12 @@ function EffectivenessChartTooltip({
       <div className="bg-popover border border-border rounded-lg p-2 shadow-lg text-xs">
         <p className="font-medium">{d.bucket}</p>
         <p className="text-green-400">
-          Effective: {d.effective}/{d.total} ({d.ratePercent.toFixed(1)}%)
+          Effective: {d.effective}/{d.total} ({formatRatePercent(d.ratePercent)})
         </p>
         {d.ineffective > 0 && <p className="text-yellow-400">Ineffective: {d.ineffective}</p>}
         {d.regression > 0 && <p className="text-red-400">Regression: {d.regression}</p>}
+        {d.inconclusive > 0 && <p className="text-zinc-400">Inconclusive: {d.inconclusive}</p>}
+        {d.unjudged > 0 && <p className="text-zinc-400">Unjudged: {d.unjudged}</p>}
       </div>
     );
   }
@@ -551,13 +555,12 @@ export function ReflectionDashboard() {
                 {effectivenessTrend &&
                   effectivenessTrend.buckets.length > 0 &&
                   (() => {
-                    const chartData = effectivenessTrend.buckets.map((b) => ({
-                      ...b,
-                      ratePercent: b.effectiveness_rate * 100,
-                    }));
-                    const firstRate = chartData[0]?.ratePercent ?? 0;
-                    const lastRate = chartData[chartData.length - 1]?.ratePercent ?? 0;
-                    const trendColor = lastRate >= firstRate ? "#22c55e" : "#ef4444";
+                    const chartData = effectivenessChartData(effectivenessTrend.buckets);
+                    const { first: firstRate, last: lastRate } = trendEnds(chartData);
+                    const trendColor =
+                      firstRate == null || lastRate == null || lastRate >= firstRate
+                        ? "#22c55e"
+                        : "#ef4444";
                     return (
                       <div className="bg-card border border-border rounded-lg p-3">
                         <h4 className="text-[11px] font-medium text-muted-foreground mb-1">
