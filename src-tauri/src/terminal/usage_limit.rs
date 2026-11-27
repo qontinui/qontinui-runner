@@ -40,9 +40,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use tracing::{debug, info, warn};
 
 use super::output_scan::normalize;
@@ -102,7 +104,7 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // reads this menu by the same option text. The label is conditional in
     // the CLI (2.1.323): it is just "Stop" for a usage-billed account, and for
     // a `credits_required` overage rejection on any account, and this entry
-    // does not match that shorter menu (plan follow-up d5c89e8e). A weekly or
+    // is read by `limit_menu_stop` instead (plan follow-up d5c89e8e). A weekly or
     // 5-hour limit on a subscription account, the measured case, draws the
     // full text.
     "stop and wait for limit to reset",
@@ -114,12 +116,91 @@ const HINT_DEBOUNCE: Duration = Duration::from_secs(300);
 
 // ── Pattern matching ────────────────────────────────────────────────────────
 
+/// Label returned for the bare-"Stop" `/rate-limit-options` menu (plan
+/// 2026-11-14-a-rate-limit-menu-whose-first-option-is-a-bare-stop-is-never-read-as-a-usage-limit).
+/// Not in [`USAGE_LIMIT_PATTERNS`]: it is a structural match, not a substring.
+const LIMIT_MENU_STOP_LABEL: &str = "rate-limit menu: stop";
+
+/// The menu's first option as a whole option: `1. stop` and then either the
+/// numbered second row (capture 1 = `2. `) or the key hint (`enter to confirm`),
+/// optionally after one selection glyph (`❯` when the cursor is on row 2).
+/// "1. stop hook" fails because "hook" follows. Runs on NORMALIZED text, where
+/// row breaks are already single spaces.
+static LIMIT_MENU_STOP_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^0-9a-z])1\.\s*stop\s+(?:[^\sa-z0-9]\s*)?(2\. |enter to confirm)")
+        .expect("valid regex")
+});
+
+/// The menu's question, tolerant of the dropped characters the renderer
+/// produces ("what do you wan to do?").
+static LIMIT_MENU_QUESTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"wh?at do you \w{0,6} ?to do").expect("valid regex"));
+
+/// The menu's key hint.
+static LIMIT_MENU_HINT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"enter to confirm\s*\S?\s*esc to cancel").expect("valid regex"));
+
+/// How far before the option the question may sit, and how far after it the
+/// key hint may sit, in bytes of normalized text.
+const LIMIT_MENU_QUESTION_SPAN: usize = 200;
+const LIMIT_MENU_HINT_SPAN: usize = 600;
+
+/// Structural recognition of the `/rate-limit-options` menu when its first
+/// option is drawn as a bare "Stop" (usage-billed accounts, `credits_required`
+/// rejections). Reads only the fixed skeleton: `1. stop` as a whole option,
+/// anchored by the question or a numbered second row, then the key hint within
+/// [`LIMIT_MENU_HINT_SPAN`] with no other "enter to confirm" between. Options 2
+/// and 3 are never read: their wording on this variant is unmeasured.
+fn limit_menu_stop(normalized: &str) -> Option<&'static str> {
+    for caps in LIMIT_MENU_STOP_OPTION.captures_iter(normalized) {
+        let (Some(whole), Some(tail)) = (caps.get(0), caps.get(1)) else {
+            continue;
+        };
+        let option_at = whole.start();
+
+        let numbered_row = tail.as_str() == "2. ";
+        let question = {
+            let mut from = option_at.saturating_sub(LIMIT_MENU_QUESTION_SPAN);
+            while !normalized.is_char_boundary(from) {
+                from += 1;
+            }
+            normalized
+                .get(from..option_at)
+                .is_some_and(|before| LIMIT_MENU_QUESTION.is_match(before))
+        };
+        if !(numbered_row || question) {
+            continue;
+        }
+
+        let Some(rest) = normalized.get(tail.start()..) else {
+            continue;
+        };
+        let Some(first_hint) = rest.find("enter to confirm") else {
+            continue;
+        };
+        if first_hint > LIMIT_MENU_HINT_SPAN {
+            continue;
+        }
+        // The nearest "enter to confirm" must be the full hint; an older menu
+        // above a later dialog has its own hint in between.
+        let hint_at_nearest = rest
+            .get(first_hint..)
+            .and_then(|from_hint| LIMIT_MENU_HINT.find(from_hint))
+            .is_some_and(|m| m.start() == 0);
+        if hint_at_nearest {
+            return Some(LIMIT_MENU_STOP_LABEL);
+        }
+    }
+    None
+}
+
 /// First matching usage-limit pattern in ALREADY-normalized screen text, if any.
 fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
     USAGE_LIMIT_PATTERNS
         .iter()
         .find(|p| normalized.contains(*p))
         .copied()
+        .or_else(|| limit_menu_stop(normalized))
 }
 
 /// First matching usage-limit pattern in a raw (un-normalized) screen/window.
@@ -434,16 +515,166 @@ mod tests {
     }
 
     #[test]
-    fn the_short_stop_label_is_not_matched() {
-        // The known limitation, pinned: the CLI's short "Stop" label (a
-        // usage-billed account, or a credits_required overage rejection) is
-        // not matched by the menu entry (plan follow-up d5c89e8e).
+    fn the_short_stop_label_without_a_hint_is_not_matched() {
+        // The short "Stop" label (a usage-billed account, or a
+        // credits_required overage rejection) is read structurally by
+        // `limit_menu_stop`, which needs the key hint; without it, no match.
         assert_eq!(
             window_indicates_usage_limit(
                 "What do you want to do?\n ❯ 1. Stop\n   2. Switch to usage credits"
             ),
             None
         );
+    }
+
+    // SYNTHETIC fixtures: the bare-"Stop" menu's layout is unmeasured. Option 1
+    // is `1. Stop`; options 2 and 3 are invented and never read by the matcher.
+    const STOP_MENU: &str = "\
+✻ Waiting for 1 background agent to finish
+
+ What do you want to do?
+
+ ❯ 1. Stop
+   2. Add funds to continue with extra usage
+   3. Wait for limit to reset
+
+ Enter to confirm · Esc to cancel
+";
+
+    #[test]
+    fn bare_stop_menu_fires() {
+        assert_eq!(
+            window_indicates_usage_limit(STOP_MENU),
+            Some("rate-limit menu: stop")
+        );
+    }
+
+    #[test]
+    fn bare_stop_menu_with_damaged_or_dropped_question_fires() {
+        let damaged = STOP_MENU.replace("What do you want to do?", "What do you wan to do?");
+        assert_eq!(
+            window_indicates_usage_limit(&damaged),
+            Some("rate-limit menu: stop")
+        );
+        let dropped = STOP_MENU.replace("What do you want to do?", "");
+        assert_eq!(
+            window_indicates_usage_limit(&dropped),
+            Some("rate-limit menu: stop")
+        );
+    }
+
+    #[test]
+    fn bare_stop_menu_with_the_cursor_on_row_two_fires() {
+        let cursor_on_two = STOP_MENU
+            .replace(" ❯ 1. Stop", "   1. Stop")
+            .replace("   2. Add funds", " ❯ 2. Add funds");
+        assert!(cursor_on_two.contains(" ❯ 2. Add funds") && !cursor_on_two.contains("❯ 1."));
+        assert_eq!(
+            window_indicates_usage_limit(&cursor_on_two),
+            Some("rate-limit menu: stop")
+        );
+        // Same, with the question dropped: only the numbered-row arm can fire.
+        let dropped = cursor_on_two.replace("What do you want to do?", "");
+        assert_eq!(
+            window_indicates_usage_limit(&dropped),
+            Some("rate-limit menu: stop")
+        );
+    }
+
+    #[test]
+    fn question_span_start_inside_a_multibyte_char_still_reads_the_question() {
+        // `❯` is 3 bytes. The question sits inside the 200-byte span, and the
+        // span's start lands inside the `❯` run: at byte 34 + pad, so pads 0..3
+        // hit byte offsets 1, 2 and 0 of a char. Without the boundary walk the
+        // `.get()` returns None, the question is not seen, and this fails.
+        for pad in 0..3 {
+            let screen = format!(
+                "{}{} What do you want to do? 1. Stop Enter to confirm · Esc to cancel",
+                "❯".repeat(70),
+                "a".repeat(pad)
+            );
+            assert_eq!(
+                window_indicates_usage_limit(&screen),
+                Some("rate-limit menu: stop"),
+                "pad {pad}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_stop_menu_with_damaged_question_and_one_option_fires() {
+        assert_eq!(
+            window_indicates_usage_limit(
+                "What do you wan to do?\n 1. Stop\n Enter to confirm · Esc to cancel"
+            ),
+            Some("rate-limit menu: stop")
+        );
+    }
+
+    #[test]
+    fn bare_stop_menu_with_only_one_option_fires_via_question() {
+        assert_eq!(
+            window_indicates_usage_limit(
+                "What do you want to do?\n ❯ 1. Stop\n\n Enter to confirm · Esc to cancel"
+            ),
+            Some("rate-limit menu: stop")
+        );
+    }
+
+    #[test]
+    fn banners_beside_the_bare_stop_menu_keep_their_label() {
+        assert_eq!(
+            window_indicates_usage_limit(&format!("{STOP_MENU}\nYou've hit your weekly limit")),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit(&format!("{STOP_MENU}\nlimit reached · resets 3am")),
+            Some("limit reached")
+        );
+    }
+
+    #[test]
+    fn bare_stop_menu_negatives_return_none() {
+        let hint = "Enter to confirm · Esc to cancel";
+        let cases = [
+            // "1. Stop hook" is not the whole option.
+            format!("What do you want to do?\n 1. Stop hook\n 2. No\n {hint}"),
+            // Other options.
+            format!("What do you want to do?\n 1. Yes\n 2. No\n {hint}"),
+            // No hint.
+            "What do you want to do?\n ❯ 1. Stop\n   2. Add funds".to_string(),
+            // A hint with no `1. Stop`.
+            format!("What do you want to do?\n {hint}"),
+            // An older menu with no hint of its own, then a later dialog whose
+            // nearest "enter to confirm" is not this menu's full hint.
+            "What do you want to do?\n 1. Stop\n 2. Wait\n\nTrust this folder? Press Enter to confirm".to_string(),
+            // Hint farther than the span after the option.
+            format!(
+                "What do you want to do?\n 1. Stop\n 2. Wait\n{}\n {hint}",
+                "x".repeat(700)
+            ),
+            // `1. Stop` as a list item with no menu anchor.
+            "Steps:\n 1. Stop the server\n Enter to confirm · Esc to cancel".to_string(),
+            // No anchor at all: no question, and the option is followed by the hint.
+            "1. Stop Enter to confirm · Esc to cancel".to_string(),
+            // "2." that is a number, not a row.
+            format!("1. Stop 2.5s elapsed {hint}"),
+            // Question farther than the span before the option.
+            format!("What do you want to do?{} 1. Stop Enter to confirm · Esc to cancel", "z".repeat(300)),
+            format!("11. Stop\n 2. Wait\n {hint}"),
+        ];
+        for (i, screen) in cases.iter().enumerate() {
+            assert_eq!(
+                window_indicates_usage_limit(screen),
+                None,
+                "case {i} must not fire: {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_list_pattern_equals_the_structural_label() {
+        assert!(!USAGE_LIMIT_PATTERNS.contains(&LIMIT_MENU_STOP_LABEL));
     }
 
     #[test]
