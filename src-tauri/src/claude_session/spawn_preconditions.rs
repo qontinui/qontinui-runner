@@ -1127,8 +1127,24 @@ pub struct SpawnStalledBody {
     /// How long the child produced no output at all.
     pub silent_secs: u64,
     pub pid: Option<i64>,
+    /// For a terminal continuation's stall only (absent from a headless
+    /// child's body, which is unchanged): whether the runner closed the pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_closed: Option<bool>,
+    /// For a terminal continuation's stall only: whether the transcript was
+    /// known-absent where the pinned account writes it (`false` is UNKNOWN —
+    /// the report-only arm that never closes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_location_known: Option<bool>,
     #[serde(flatten)]
     pub preconditions: SpawnPreconditionSnapshot,
+}
+
+/// What a terminal continuation's stall adds to [`SpawnStalledBody`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalStallFacts {
+    pub pane_closed: bool,
+    pub transcript_location_known: bool,
 }
 
 impl SpawnStalledBody {
@@ -1137,8 +1153,20 @@ impl SpawnStalledBody {
             phase: "spawn_stalled",
             silent_secs: silent.as_secs(),
             pid,
+            pane_closed: None,
+            transcript_location_known: None,
             preconditions: pre.snapshot(),
         }
+    }
+
+    /// Attach a terminal continuation's stall facts. Additive on the wire: a
+    /// body without them serializes exactly as before.
+    pub fn with_terminal_facts(mut self, facts: Option<TerminalStallFacts>) -> Self {
+        if let Some(f) = facts {
+            self.pane_closed = Some(f.pane_closed);
+            self.transcript_location_known = Some(f.transcript_location_known);
+        }
+        self
     }
 }
 
@@ -1476,6 +1504,8 @@ mod tests {
         assert_eq!(pre.add_dir_trust().len(), 1);
         let body =
             serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None)).unwrap();
+        assert!(body.get("pane_closed").is_none(), "{body}");
+        assert!(body.get("transcript_location_known").is_none(), "{body}");
         let row = &body["add_dir_trust"][0];
         assert_eq!(row["dir"], sibling.as_str());
         assert_eq!(row["trust"]["verdict"], "trusted");
@@ -1484,6 +1514,32 @@ mod tests {
             row["explicit_trust"]["primary_key"].as_str(),
             workspace_trust::project_key(&primary).as_deref()
         );
+    }
+
+    /// A terminal continuation's stall carries whether the runner closed the
+    /// pane and whether the transcript location was known; a body without
+    /// them is unchanged.
+    #[tokio::test]
+    async fn the_stalled_body_carries_terminal_stall_facts_only_when_given() {
+        let cwd = tempfile::tempdir().unwrap();
+        let pre = SpawnPreconditions::evaluate(cwd.path().to_str().unwrap(), None, None, "manual");
+        let bare = serde_json::to_value(
+            SpawnStalledBody::new(&pre, Duration::from_secs(1), None).with_terminal_facts(None),
+        )
+        .unwrap();
+        assert!(bare.get("pane_closed").is_none(), "{bare}");
+        let body = serde_json::to_value(
+            SpawnStalledBody::new(&pre, Duration::from_secs(1), None).with_terminal_facts(Some(
+                TerminalStallFacts {
+                    pane_closed: true,
+                    transcript_location_known: false,
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(body["pane_closed"], true);
+        assert_eq!(body["transcript_location_known"], false);
+        assert_eq!(body["phase"], "spawn_stalled");
     }
 
     /// A sibling that is not a linked worktree has no primary-checkout reading
