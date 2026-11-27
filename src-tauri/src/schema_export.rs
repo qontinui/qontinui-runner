@@ -1256,6 +1256,43 @@ mod tests {
         );
     }
 
+    /// The presence loop in `test_export_all_schemas` only proves each
+    /// verdict key exists, so registering the wrong type under one of those
+    /// names would keep it green. Each entry must BE its type's schema, in
+    /// the form `add!` exports. Mutation: registering another type under a
+    /// verdict name — `qsc::SpecAssertionVerdict` as `AssertionOutcome`,
+    /// `OutcomeCounts` and `FoldedOutcome` swapped, or `qout::AssertionOutcome`
+    /// as `SpecAssertionVerdict` — reds this. Registering vision-core's
+    /// `AssertionOutcome` as `AssertionOutcome` would NOT, and need not:
+    /// `outcome_twins_have_identical_schemas` holds that twin to the same
+    /// schema, so the exported entry would be byte-identical.
+    #[test]
+    fn verdict_entries_are_their_own_types_schemas() {
+        use qontinui_types::outcome as qout;
+        use qontinui_types::spec_check::SpecAssertionVerdict;
+        let schemas = export_all_schemas();
+        assert_eq!(
+            schemas["AssertionOutcome"],
+            serde_json::to_value(schema_for!(qout::AssertionOutcome)).unwrap(),
+            "AssertionOutcome is registered as another type"
+        );
+        assert_eq!(
+            schemas["OutcomeCounts"],
+            serde_json::to_value(schema_for!(qout::OutcomeCounts)).unwrap(),
+            "OutcomeCounts is registered as another type"
+        );
+        assert_eq!(
+            schemas["FoldedOutcome"],
+            serde_json::to_value(schema_for!(qout::FoldedOutcome)).unwrap(),
+            "FoldedOutcome is registered as another type"
+        );
+        assert_eq!(
+            schemas["SpecAssertionVerdict"],
+            serde_json::to_value(schema_for!(SpecAssertionVerdict)).unwrap(),
+            "SpecAssertionVerdict is registered as another type"
+        );
+    }
+
     /// The two Rust copies of the shared vocabulary — qontinui-types' AGPL
     /// `outcome` module and vision-core's MIT twin (plan
     /// 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D2) —
