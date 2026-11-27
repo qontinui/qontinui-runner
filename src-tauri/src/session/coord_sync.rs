@@ -3192,11 +3192,14 @@ pub(crate) async fn drain_body(mut resp: reqwest::Response) {
 /// Phase 0 item 4, which absorbed the `[timeout]` / `[connect]` split that
 /// used to live here).
 pub(crate) fn transport_error(e: &reqwest::Error) -> String {
-    let chain = crate::util::error_chain::error_chain(e);
-    format!(
-        "[{}] {chain}",
-        qontinui_runner_lib::outbound_net::failure_kind(e)
-    )
+    tagged_transport_error(qontinui_runner_lib::outbound_net::failure_kind(e), e)
+}
+
+/// The rendering half of [`transport_error`], over any error chain, so a
+/// chain a real `reqwest::Error` cannot be built with (an OS connect timeout)
+/// is testable end to end through [`classify_push_failure`].
+fn tagged_transport_error(kind: &str, e: &(dyn std::error::Error + 'static)) -> String {
+    format!("[{kind}] {}", crate::util::error_chain::error_chain(e))
 }
 
 /// Resolve which tenant binding OWNS an outbox record's session — the slot
@@ -8856,6 +8859,39 @@ mod tests {
             classify_push_failure("[timeout] operation timed out", false),
             ("timeout", None)
         );
+    }
+
+    /// An OS connect timeout (`io::ErrorKind::TimedOut` in the source chain,
+    /// with `reqwest::Error::is_timeout` false) is tagged `[timeout]` — it was
+    /// `[connect]` before the one runner classifier — and so types as
+    /// `timeout`, not `network`.
+    #[test]
+    fn an_os_connect_timeout_classifies_as_timeout() {
+        #[derive(Debug)]
+        struct Wrap(&'static str, std::io::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.1)
+            }
+        }
+        let err = Wrap(
+            "client error (Connect)",
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"),
+        );
+        let kind = qontinui_runner_lib::outbound_net::chain_kind(&err)
+            .expect("an io TimedOut in the chain is named");
+        let msg = tagged_transport_error(kind, &err);
+        assert!(msg.starts_with("[timeout] "), "{msg}");
+        assert!(
+            msg.contains("connection timed out"),
+            "chain rendered: {msg}"
+        );
+        assert_eq!(classify_push_failure(&msg, false), ("timeout", None));
     }
 
     #[test]

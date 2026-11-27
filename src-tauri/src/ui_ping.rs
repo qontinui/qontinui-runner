@@ -462,6 +462,37 @@ mod tests {
         }
     }
 
+    /// The debug hook must not ship, pinned on the SOURCE so it fails in every
+    /// build: the env read exists only in the `debug-hooks` arm, the inert
+    /// twin is the constant `Off`, and no `debug_assertions` gate decides it
+    /// (a test build has `debug_assertions` on, so a runtime check cannot tell
+    /// the two gates apart — the release-checked primary keeps it on too).
+    #[test]
+    fn the_stop_hook_is_compiled_only_into_debug_hooks_builds() {
+        let src = include_str!("ui_ping.rs").replace("\r\n", "\n");
+        let prod = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let hook_arm = prod
+            .split("#[cfg(feature = \"debug-hooks\")]\nfn debug_stop() -> DebugStop {")
+            .nth(1)
+            .expect("a debug-hooks-gated debug_stop");
+        assert!(hook_arm
+            .trim_start()
+            .starts_with("parse_debug_stop(std::env::var(DEBUG_STOP_ENV)"));
+        let inert_arm = prod
+            .split("#[cfg(not(feature = \"debug-hooks\"))]\nfn debug_stop() -> DebugStop {")
+            .nth(1)
+            .expect("an inert twin");
+        assert!(
+            inert_arm.trim_start().starts_with("DebugStop::Off"),
+            "the inert twin must be the constant Off, not an env read"
+        );
+        assert_eq!(prod.matches("std::env::var(DEBUG_STOP_ENV)").count(), 1);
+        assert!(
+            !prod.contains("cfg(debug_assertions)") && !prod.contains("cfg(not(debug_assertions))"),
+            "debug_assertions must not gate the hook"
+        );
+    }
+
     /// The debug hook must not ship: without the `debug-hooks` feature the
     /// hook is the constant `Off`, whatever the environment holds.
     /// (`debug_assertions` is not the gate — the release-checked primary

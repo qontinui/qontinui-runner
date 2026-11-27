@@ -13362,7 +13362,10 @@ async fn post_spawn_failed(agent_id: uuid::Uuid, body: &SpawnFailedBody) -> Spaw
             }
         }
         Err(e) => {
-            // The FULL source chain, tagged `[timeout]` / `[connect]`:
+            // The FULL source chain, tagged by the one runner classifier
+            // (`outbound_net::failure_kind`): `[timeout]` (reqwest's timer OR
+            // an OS connect timeout in the chain), `[connect]`, `[dns]`,
+            // `[tls]`, `[body]` or `[other]`:
             // reqwest's own Display is only "error sending request for url
             // (…)", which on 2026-11-14 hid whether 296 failures on spaceship
             // were timeouts (plan

@@ -64,7 +64,9 @@ pub const RUNTIME_STARVED_AFTER_MS: u64 = 5_000;
 /// episode bookkeeping is not being kept: every episode-derived field reads
 /// `null` (UNKNOWN). `starved` is unaffected — it is derived from tick age.
 pub const WATCHER_STALE_AFTER_MS: u64 = 2_000;
-/// At most one attribution capture per this interval, process-wide.
+/// At most one attribution capture per this interval PER RUNTIME: the rate
+/// limit is each probe's own `last_capture_ms` slot, so two runtimes starving
+/// together can each capture once per interval.
 pub const CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// The watch thread's name.
 pub const WATCH_THREAD_NAME: &str = "runtime-lag-watch";
@@ -263,10 +265,9 @@ fn spawn_tick_task(handle: &tokio::runtime::Handle, probe: Arc<RuntimeProbe>, pe
 
 /// One capture request: which runtime starved, and how old its stamp was.
 struct CaptureRequest {
-    /// The runtime whose episode triggered it. The capture itself is
-    /// process-wide (every thread's name × wait), so the record does not
-    /// carry it today; kept so the message names its cause.
-    #[allow(dead_code)]
+    /// The runtime whose episode triggered it, written to the record's
+    /// `runtime` field. The thread walk itself is process-wide (every
+    /// thread's name × wait).
     runtime: &'static str,
     age_ms: u64,
 }
@@ -326,6 +327,7 @@ pub fn install_attribution(dir: std::path::PathBuf) {
                 let workers = worker_tids();
                 diag.capture_and_append_with_tally(
                     "runtime_starved",
+                    req.runtime,
                     Duration::from_millis(req.age_ms),
                     &workers,
                 );
@@ -963,6 +965,45 @@ mod tests {
         p.last_tick_ms.store(95_000, Ordering::Relaxed);
         assert_eq!(step(&p, 95_100, 5_000), Transition::Ended(14_000));
         assert_eq!(starved_total_at(&p, 200_000), 25_000);
+    }
+
+    /// The park hook must not ship, pinned on the SOURCE so it fails in every
+    /// build: the env read is under `debug-hooks` with a constant-`None` inert
+    /// twin, the spawning entry point has a no-op twin, and no
+    /// `debug_assertions` gate decides either (a test build has it on, so the
+    /// runtime check below cannot tell the two gates apart).
+    #[test]
+    fn the_worker_park_hook_is_compiled_only_into_debug_hooks_builds() {
+        let src = include_str!("runtime_lag.rs").replace("\r\n", "\n");
+        let prod = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let hook_arm = prod
+            .split("#[cfg(feature = \"debug-hooks\")]\nfn debug_block_secs() -> Option<u64> {")
+            .nth(1)
+            .expect("a debug-hooks-gated debug_block_secs");
+        assert!(hook_arm
+            .trim_start()
+            .starts_with("std::env::var_os(DEBUG_BLOCK_APP_WORKERS_ENV)"));
+        let inert_arm = prod
+            .split("#[cfg(not(feature = \"debug-hooks\"))]\nfn debug_block_secs() -> Option<u64> {")
+            .nth(1)
+            .expect("an inert twin");
+        assert!(
+            inert_arm.trim_start().starts_with("None"),
+            "the inert twin must be the constant None, not an env read"
+        );
+        assert_eq!(
+            prod.matches("var_os(DEBUG_BLOCK_APP_WORKERS_ENV)").count(),
+            1
+        );
+        assert!(prod
+            .contains("#[cfg(feature = \"debug-hooks\")]\npub fn debug_block_workers_from_env("));
+        assert!(prod.contains(
+            "#[cfg(not(feature = \"debug-hooks\"))]\npub fn debug_block_workers_from_env("
+        ));
+        assert!(
+            !prod.contains("cfg(debug_assertions)") && !prod.contains("cfg(not(debug_assertions))"),
+            "debug_assertions must not gate the hook"
+        );
     }
 
     /// The debug hook that parks `app-rt` must not ship: without the

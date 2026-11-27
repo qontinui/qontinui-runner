@@ -861,6 +861,11 @@ pub struct WedgeDiagnosticRecord {
     /// empty) when the per-thread walk could not be made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads_by_name_and_wait: Option<BTreeMap<String, BTreeMap<String, usize>>>,
+    /// The runtime whose starvation episode triggered a `runtime_starved`
+    /// capture (e.g. `"app-rt"`). Written only by that capture; absent from
+    /// every other record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<&'static str>,
 }
 
 /// Serialize one record as a single JSONL line (trailing `\n` included).
@@ -2066,6 +2071,7 @@ impl WedgeDiagnostics {
             ui_thread,
             children,
             threads_by_name_and_wait: None,
+            runtime: None,
         }
     }
 
@@ -2130,7 +2136,7 @@ impl WedgeDiagnostics {
     ///
     /// The per-thread walk runs INLINE on the caller — the dedicated
     /// `runtime-lag-capture` OS thread `runtime_lag::install_attribution`
-    /// starts at boot, at most once per `runtime_lag::CAPTURE_MIN_INTERVAL`
+    /// starts at boot, at most once per `runtime_lag::CAPTURE_MIN_INTERVAL` per runtime
     /// (never the `runtime-lag-watch` thread, which only hands it a request
     /// and never waits) — not through the bounded capturer, whose step
     /// protocol carries the two fixed censuses only. It is the same `NtQuerySystemInformation` read plus one
@@ -2139,12 +2145,14 @@ impl WedgeDiagnostics {
     pub fn capture_and_append_with_tally(
         &mut self,
         event: &'static str,
+        runtime: &'static str,
         unresponsive_for: Duration,
         worker_tids: &std::collections::HashSet<u64>,
     ) {
         let mut record = self.sample(event, 0, unresponsive_for);
         record.threads_by_name_and_wait =
             capture_thread_rows().map(|rows| tally_by_name_and_wait(&rows, worker_tids));
+        record.runtime = Some(runtime);
         let day = record.ts.get(..10).unwrap_or("unknown").to_string();
         let line = render_record(&record);
         self.append(&day, &line);
@@ -2937,6 +2945,7 @@ mod tests {
                 }],
             }),
             threads_by_name_and_wait: None,
+            runtime: None,
         }
     }
 
@@ -2971,6 +2980,21 @@ mod tests {
             !line.contains("threads_by_name_and_wait"),
             "the tally is written only by the runtime_starved capture: {line}"
         );
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).expect("valid JSON");
+        assert!(
+            v.get("runtime").is_none(),
+            "`runtime` is written only by the runtime_starved capture: {line}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_starved_record_names_the_runtime_that_starved() {
+        let mut record = fixture_record();
+        record.event = "runtime_starved";
+        record.runtime = Some("app-rt");
+        let line = render_record(&record);
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).expect("valid JSON");
+        assert_eq!(v["runtime"], "app-rt", "{line}");
     }
 
     #[test]
