@@ -1265,7 +1265,11 @@ mod tests {
     /// as `SpecAssertionVerdict` — reds this. Registering vision-core's
     /// `AssertionOutcome` as `AssertionOutcome` would NOT, and need not:
     /// `outcome_twins_have_identical_schemas` holds that twin to the same
-    /// schema, so the exported entry would be byte-identical.
+    /// schema, so the exported entry would be byte-identical. The same holds
+    /// for `UnknownCode`: registering qontinui-types' AGPL copy in place of
+    /// vision-core's MIT one would not red this either (the twins are held
+    /// schema-identical), and the bindings cannot show which crate's copy is
+    /// registered; a non-twin type under that name does red it.
     #[test]
     fn verdict_entries_are_their_own_types_schemas() {
         use qontinui_types::outcome as qout;
