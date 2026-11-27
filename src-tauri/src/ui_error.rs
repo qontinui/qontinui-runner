@@ -395,8 +395,11 @@ fn record_event_pong_at(now_ms: u64) {
     let prev = LAST_EVENT_PONG_MS.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
     if now_ms >= prev {
         // The stamp (fetch_max above) and this snapshot are separate writes, so
-        // racing pongs can pair the newest stamp with an older snapshot; that
-        // only enlarges starved-since for a fresh pong, which is benign.
+        // racing pongs can pair the newest stamp with another pong's snapshot,
+        // in EITHER direction (a preempted older pong can store a later total
+        // after a newer pong stored its own). The error is bounded by the
+        // starvation accrued during that preemption window: small against the
+        // 90 s dead window, and it can shift starved-since either way.
         // This pong is the newest: pair it with `app-rt`'s cumulative starved
         // time, so a later reader can tell how much of the pong's age was
         // starvation ([`app_runtime_starved_since_last_event_pong_ms`]).
@@ -414,7 +417,9 @@ static LAST_EVENT_PONG_STARVED_TOTAL_MS: std::sync::atomic::AtomicU64 =
 
 /// How many ms `app-rt` has spent starved since the newest event pong was
 /// recorded. `None` = UNKNOWN: no snapshot beside that pong, or the probe
-/// cannot answer now. An upper bound, not exact: an episode's start is
+/// cannot answer now. Approximate, not exact (see the stamp/snapshot race in
+/// [`record_event_pong_at`]); apart from that race it is an upper bound: an
+/// episode's start is
 /// backdated to its last tick, so a pong landing in the up-to-~5.25 s before
 /// the watcher notices that episode has the episode's pre-pong part counted
 /// here too (at most once per pong; small against the 90 s dead window).
@@ -1476,8 +1481,11 @@ pub fn apply_app_runtime_starvation(
     }
     // The hard cap binds BOTH arms: a hung native main thread can starve
     // `app-rt` too (blocked sync window calls), and off Windows no Win32 probe
-    // would ever measure it — so starvation never hides a pong this old.
-    if pong_past_starvation_cap(&v) {
+    // would ever measure it — so starvation never hides a pong this old. It
+    // binds only where the loop is UNMEASURED: a Win32 probe that answered
+    // `Some(false)` measured the loop pumping, and an unmeasured stale pong
+    // must not override that measurement.
+    if v.probe_wedged != Some(false) && pong_past_starvation_cap(&v) {
         return v;
     }
     let starved_now = app_runtime_starved == Some(true);
@@ -1928,6 +1936,19 @@ mod tests {
             "at/under the cap starvation withdraws"
         );
         assert_eq!(v.reason, "app_runtime_starved");
+    }
+
+    /// The cap does not override a measurement: a Win32 probe that answered
+    /// `Some(false)` keeps a stale, starved pong withdrawn past the cap.
+    #[test]
+    fn past_the_cap_a_probe_that_answered_pumping_still_withdraws() {
+        let cap = UI_EVENT_DEAD_AFTER_MS * 3;
+        let mut past = fired_by_events(Some(false));
+        past.event_pong_age_ms = Some(cap + 1);
+        let v = apply_app_runtime_starvation(past, Some(true), None);
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, Some(false));
+        assert_eq!(v.reason, "pumping");
     }
 
     #[test]
