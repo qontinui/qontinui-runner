@@ -1360,7 +1360,10 @@ mod in_process_dispatch_tests {
         assert_eq!(entry.args_schema, "{}");
         assert_eq!(entry.response_schema, "string");
         assert!(
-            entry.description.contains("NOT a coord device JWT"),
+            entry.description.contains("coord DEVICE JWT")
+                && entry
+                    .description
+                    .contains("NOT the operator's Cognito token"),
             "the description must say which token this is"
         );
     }
