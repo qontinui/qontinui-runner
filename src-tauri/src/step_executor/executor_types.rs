@@ -408,7 +408,7 @@ pub struct ExecutionStepConfig {
     )]
     pub ui_bridge_severity_threshold: Option<String>,
 
-    /// UI Bridge: Snapshot target — "control" (default), "sdk", or "proxy:PORT"
+    /// UI Bridge: Snapshot target — "control" (default) or "sdk"
     #[serde(alias = "uiBridgeSnapshotTarget", alias = "ui_bridge_snapshot_target")]
     pub ui_bridge_snapshot_target: Option<String>,
 
