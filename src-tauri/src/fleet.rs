@@ -9265,6 +9265,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget,
+            app_runtime_starved: None,
         };
         let absent = serde_json::to_value(payload(None)).unwrap();
         assert!(
