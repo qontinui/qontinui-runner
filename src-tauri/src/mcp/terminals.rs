@@ -320,7 +320,22 @@ pub async fn list_terminals_handler(
     let terminal_manager = get_terminal_manager(&state);
     let (rows, holder_states) = terminal_manager
         .list_with_permission_request_hooks_and_holder_states()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error_detailed(
+                    e.clone(),
+                    crate::mcp::ui_bridge::UiBridgeError {
+                        code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::InternalError,
+                        message: e,
+                        recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+                        context: Some(serde_json::json!({
+                            "reason": "terminal_registry_unreadable",
+                        })),
+                    },
+                )),
+            )
+        })?;
     let terminals = terminal_list_entries(rows, &holder_states);
 
     Ok(Json(ApiResponse::success(serde_json::json!({
