@@ -19,13 +19,24 @@
 //! # What it decides
 //!
 //! * **The token** ([`candidates_for_dir`], D4). First the `.credentials.json`
-//!   access token whose recorded `scopes` include `user:profile`. When it has
-//!   expired it is NOT sent; instead a background refresh is requested
+//!   access token whose recorded `scopes` include `user:profile`. A background
+//!   refresh is requested from [`REFRESH_AHEAD`] before it expires
 //!   (`oauth_refresh::request_background_refresh`, deduped and backed off),
-//!   only while the grant is still refreshable (the hard-failure memo), and the
-//!   next probe after the refresh lands reads the new token. The blocking
-//!   `refresh_credentials_blocking` is never called from here. Second, the
-//!   inference token the header probe sends, asked only until it is refused.
+//!   only while the grant is still refreshable (the hard-failure memo), so a
+//!   live grant is normally renewed before any probe finds it expired. An
+//!   expired one is NOT sent: the probe reports `profile_refresh_pending` (or
+//!   `profile_grant_dead` once the grant is rejected) rather than the state of
+//!   a fallback token, and the next probe after the refresh lands reads the
+//!   new token. The blocking `refresh_credentials_blocking` is never called
+//!   from here. Second, the inference token the header probe sends, asked only
+//!   until it is refused.
+//!
+//!   A refresh ROTATES the grant's refresh token (`oauth_refresh` writes the
+//!   one the token endpoint returns). In a long-lived dir the runner did not
+//!   refresh this grant before, so it is now the grant's sole refresher there:
+//!   any other holder of a copy of that `.credentials.json` (a dir copied to
+//!   another box) loses it on the first rotation, which that holder sees as a
+//!   logout elsewhere. Nothing the runner runs uses such a copy.
 //! * **The cooldown** ([`UsageGate`], D5). One shared-core
 //!   [`qontinui_runner_lib::circuit::Circuit`] per token fingerprint, opened by
 //!   one failure, backing off 5, 10, 20, 40, then 60 minutes, and holding for
@@ -69,6 +80,11 @@ pub(crate) const COOLDOWN: Backoff = Backoff {
     factor: 2,
     cap: Duration::from_secs(60 * 60),
 };
+
+/// How long before a profile access token's `expiresAt` its background
+/// refresh is requested, so that a live grant never leaves a probe without a
+/// token that can read the endpoint.
+pub(crate) const REFRESH_AHEAD: Duration = Duration::from_secs(5 * 60);
 
 /// A cooling entry whose `retry_at` passed this long ago without the token
 /// being asked again belongs to a token no longer in use (a refreshed access
@@ -120,9 +136,18 @@ pub enum UsageEndpointState {
     /// token (no response arrived). The next probe asks again.
     Unavailable,
     /// The account holds no token the endpoint could be asked with: no
-    /// unexpired profile-scoped grant and no inference token. An expired
-    /// grant whose refresh was requested reads here until the refresh lands.
+    /// profile-scoped grant and no inference token at all.
     NoProfileToken,
+    /// The profile-scoped grant's access token has expired and the grant can
+    /// still be refreshed: a refresh is due (requested in the background for a
+    /// dir with a long-lived token; the probe's own pre-flight retries it for
+    /// a dir without one). Reported instead of the fallback token's state,
+    /// which would otherwise read `scope_refused` for every expiry.
+    ProfileRefreshPending,
+    /// The profile-scoped grant's access token has expired and the token
+    /// endpoint rejected the grant (the hard-failure memo): only a `/login`
+    /// of this account brings the endpoint, and its per-model caps, back.
+    ProfileGrantDead,
     /// The account's token is not a subscription OAuth token (an API key),
     /// which has no usage windows to read.
     NotSubscription,
@@ -138,6 +163,8 @@ impl UsageEndpointState {
             UsageEndpointState::ScopeRefused => "scope_refused",
             UsageEndpointState::Cooling => "cooling",
             UsageEndpointState::Unavailable => "unavailable",
+            UsageEndpointState::ProfileRefreshPending => "profile_refresh_pending",
+            UsageEndpointState::ProfileGrantDead => "profile_grant_dead",
             UsageEndpointState::NoProfileToken => "no_profile_token",
             UsageEndpointState::NotSubscription => "not_subscription",
             UsageEndpointState::Gateway => "gateway",
@@ -220,6 +247,13 @@ pub(crate) struct CandidateSet {
     /// The profile-scoped grant exists but its access token has expired, so
     /// it was left out. A refresh is the caller's to request.
     profile_expired: bool,
+    /// The profile grant's access token expires within [`REFRESH_AHEAD`] (or
+    /// already has): a refresh is wanted.
+    profile_refresh_wanted: bool,
+    /// When the profile token was left out as expired, what to report about
+    /// it ([`candidates_for_dir`] decides from the hard-failure memo) in place
+    /// of a fallback candidate that is not asked.
+    profile_hold: Option<UsageEndpointState>,
     /// What to report when there is nothing to ask.
     empty_state: UsageEndpointState,
 }
@@ -238,10 +272,14 @@ fn candidates_from(tokens: &DirTokens, now_ms: i64) -> CandidateSet {
     let subscription = |token: &str| token.starts_with(OAUTH_TOKEN_PREFIX);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut profile_expired = false;
+    let mut profile_refresh_wanted = false;
 
     if let Some(creds) = &tokens.credentials {
         let profile = creds.scopes.iter().any(|s| s == PROFILE_SCOPE);
         if profile && subscription(creds.access_token.as_str()) {
+            let ahead_ms = REFRESH_AHEAD.as_millis() as i64;
+            profile_refresh_wanted =
+                creds.expires_at_ms != 0 && now_ms >= creds.expires_at_ms - ahead_ms;
             if expired(creds.expires_at_ms) {
                 profile_expired = true;
             } else {
@@ -284,6 +322,8 @@ fn candidates_from(tokens: &DirTokens, now_ms: i64) -> CandidateSet {
     CandidateSet {
         candidates,
         profile_expired,
+        profile_refresh_wanted,
+        profile_hold: None,
         empty_state,
     }
 }
@@ -320,8 +360,11 @@ fn read_dir_tokens(config_dir: &Path) -> DirTokens {
     }
 }
 
-/// The candidates for `config_dir` at `now_ms`, requesting a background
-/// refresh of an expired profile grant when that grant is still refreshable.
+/// The candidates for `config_dir` at `now_ms`. Requests a background
+/// refresh of the profile grant from [`REFRESH_AHEAD`] before its token
+/// expires, while that grant is still refreshable, and decides what an
+/// expired profile token reports (`profile_refresh_pending` while the grant
+/// is refreshable, `profile_grant_dead` once it is rejected).
 ///
 /// The refresh is requested here only for a dir that holds a long-lived
 /// token. A dir without one already refreshed this probe (the probe's own
@@ -329,10 +372,18 @@ fn read_dir_tokens(config_dir: &Path) -> DirTokens {
 /// asking again here would double the token POST.
 pub(crate) fn candidates_for_dir(config_dir: &Path, now_ms: i64) -> CandidateSet {
     let tokens = read_dir_tokens(config_dir);
-    let set = candidates_from(&tokens, now_ms);
-    if set.profile_expired && tokens.long_lived.is_some() {
+    let mut set = candidates_from(&tokens, now_ms);
+    if set.profile_refresh_wanted {
         let creds = config_dir.join(".credentials.json");
-        if super::oauth_refresh::profile_grant_refreshable(&creds) {
+        let refreshable = super::oauth_refresh::profile_grant_refreshable(&creds);
+        if set.profile_expired {
+            set.profile_hold = Some(if refreshable {
+                UsageEndpointState::ProfileRefreshPending
+            } else {
+                UsageEndpointState::ProfileGrantDead
+            });
+        }
+        if refreshable && tokens.long_lived.is_some() {
             super::oauth_refresh::request_background_refresh(&creds);
         }
     }
@@ -389,7 +440,9 @@ impl UsageGate {
     /// token that was cooling is its circuit's one trial, so the caller MUST
     /// follow it with [`UsageGate::record`].
     pub(crate) fn admit(&self, fp: u64) -> Admit {
-        let entries = self.lock();
+        let mut entries = self.lock();
+        let now = Self::unix_secs(self.clock.wall_now());
+        Self::sweep_stale(&mut entries, now);
         let Some(entry) = entries.get(&fp) else {
             return Admit::Pass;
         };
@@ -398,12 +451,25 @@ impl UsageGate {
         }
         match entry.circuit.allow() {
             Admission::Pass | Admission::ProbePermit => Admit::Pass,
+            // A trial already in flight (the same token asked for another
+            // config dir) rejects with a `retry_at` that has passed: report
+            // now, never a time in the past.
             Admission::Reject(_) => Admit::Cooling {
-                retry_at: entry
-                    .retry_at
-                    .unwrap_or_else(|| Self::unix_secs(self.clock.wall_now())),
+                retry_at: entry.retry_at.map_or(now, |at| at.max(now)),
             },
         }
+    }
+
+    /// Drop the entries of tokens no longer in use: not refused, and cooling
+    /// with a `retry_at` more than [`STALE_ENTRY_AFTER`] past. Run on every
+    /// admit and record, so an entry left in its trial by an ask that never
+    /// recorded (a panicked fetch) is freed on a one-token box too.
+    fn sweep_stale(entries: &mut HashMap<u64, Entry>, now: u64) {
+        entries.retain(|_, e| {
+            e.scope_refused
+                || e.retry_at
+                    .is_none_or(|at| now < at.saturating_add(STALE_ENTRY_AFTER.as_secs()))
+        });
     }
 
     /// Record one ask's outcome and return the state it leaves the token in,
@@ -424,11 +490,7 @@ impl UsageGate {
     ) -> (UsageEndpointState, Option<u64>) {
         let mut entries = self.lock();
         let now = Self::unix_secs(self.clock.wall_now());
-        entries.retain(|_, e| {
-            e.scope_refused
-                || e.retry_at
-                    .is_none_or(|at| now < at.saturating_add(STALE_ENTRY_AFTER.as_secs()))
-        });
+        Self::sweep_stale(&mut entries, now);
         let err = match result {
             Ok(()) => {
                 if let Some(entry) = entries.remove(&fp) {
@@ -488,7 +550,8 @@ pub(crate) struct EndpointRead {
 
 /// Ask the first admitted candidate, at most one ask per probe, and record its
 /// outcome. A candidate that is cooling or refused is skipped for the next;
-/// when none is admitted nothing is asked, and the state reported is the first
+/// when none is admitted nothing is asked, and the state reported is the
+/// expired profile token's (`profile_hold`) when there is one, else the first
 /// candidate's. `fetch` is the endpoint call, injected so tests count asks.
 pub(crate) async fn read_usage<F, Fut>(
     gate: &UsageGate,
@@ -533,7 +596,15 @@ where
     }
     EndpointRead {
         snapshot: None,
-        info: held.unwrap_or_else(|| UsageEndpointInfo::bare(set.empty_state)),
+        info: set
+            .profile_hold
+            .map(|state| UsageEndpointInfo {
+                state,
+                token_kind: Some(UsageTokenKind::Credentials),
+                retry_at: None,
+            })
+            .or(held)
+            .unwrap_or_else(|| UsageEndpointInfo::bare(set.empty_state)),
     }
 }
 
@@ -663,6 +734,8 @@ mod tests {
         CandidateSet {
             candidates: cands.iter().map(|(t, k)| Candidate::new(t, *k)).collect(),
             profile_expired: false,
+            profile_refresh_wanted: false,
+            profile_hold: None,
             empty_state: UsageEndpointState::NoProfileToken,
         }
     }
@@ -1110,11 +1183,12 @@ mod tests {
         );
     }
 
-    /// A refresh that HARD-FAILS marks the grant dead: probed N times inside
-    /// its backoff, the account issues exactly one token POST in all, and the
-    /// expired token is never sent.
+    /// A refresh that HARD-FAILS marks the grant dead: probed N times, the
+    /// gate requests exactly one background refresh in all (the request, not
+    /// the POST: the spawner's own dedupe and backoff are not run under test),
+    /// and the expired token is never sent.
     #[tokio::test]
-    async fn a_hard_failed_grant_probed_n_times_issues_exactly_one_token_post() {
+    async fn a_hard_failed_grant_probed_n_times_issues_exactly_one_refresh_request() {
         let _log = super::super::oauth_refresh::refresh_log_guard_for_test();
         let dir = long_lived_dir_with_profile_creds(NOW_MS - 1, PROFILE, "rt-dead");
         let creds = dir.path().join(".credentials.json");
@@ -1131,7 +1205,7 @@ mod tests {
         assert_eq!(
             super::super::oauth_refresh::refresh_requests_for_test(&creds),
             1,
-            "a dead grant is POSTed once, not once per probe"
+            "a dead grant is asked to refresh once, not once per probe"
         );
         assert!(
             ep.asked().iter().all(|t| t != PROFILE),
@@ -1178,6 +1252,116 @@ mod tests {
             super::super::oauth_refresh::refresh_requests_for_test(&creds),
             0
         );
+    }
+
+    /// Review round 1, finding 1. A dir with a long-lived token beside a live
+    /// profile grant: the profile token answers; once it expires, the probe
+    /// must NOT report the latched long-lived token's `scope_refused` (one
+    /// line per token lifetime, and the wrong state) but the grant's own
+    /// state, asking nothing.
+    #[tokio::test]
+    async fn an_expired_profile_token_reports_its_own_state_not_the_refused_fallback() {
+        let _log = super::super::oauth_refresh::refresh_log_guard_for_test();
+        let (g, _) = gate();
+        // The long-lived token was refused once this start, and is latched.
+        FakeEndpoint::new(Err(err(Some(403), None, true)))
+            .read(&g, set_of(&[(LONG_LIVED, UsageTokenKind::LongLived)]))
+            .await;
+        let dir = long_lived_dir_with_profile_creds(NOW_MS + 3_600_000, PROFILE, "rt-live");
+        let ok = FakeEndpoint::new(Ok(()));
+        let live = ok.read(&g, candidates_for_dir(dir.path(), NOW_MS)).await;
+        assert_eq!(
+            live.info,
+            info(
+                UsageEndpointState::Ok,
+                Some(UsageTokenKind::Credentials),
+                None
+            )
+        );
+
+        write_creds(dir.path(), NOW_MS - 1, PROFILE, "rt-live");
+        let expired = ok.read(&g, candidates_for_dir(dir.path(), NOW_MS)).await;
+        assert_eq!(
+            ok.calls(),
+            1,
+            "nothing is asked while the profile token is expired"
+        );
+        assert_eq!(
+            transition_line(Some(&live.info), &expired.info, ".claude-a").as_deref(),
+            Some("Account '.claude-a': usage endpoint profile_refresh_pending token_kind=credentials retry_at=none")
+        );
+
+        // Once the token endpoint rejects the grant, the state says so.
+        super::super::oauth_refresh::mark_grant_revoked_for_test(&dir.path().to_string_lossy());
+        let dead = ok.read(&g, candidates_for_dir(dir.path(), NOW_MS)).await;
+        assert_eq!(
+            dead.info,
+            info(
+                UsageEndpointState::ProfileGrantDead,
+                Some(UsageTokenKind::Credentials),
+                None
+            )
+        );
+        assert_eq!(ok.calls(), 1);
+        super::super::oauth_refresh::refresh_requests_for_test(
+            &dir.path().join(".credentials.json"),
+        );
+    }
+
+    /// The refresh is requested AHEAD of expiry: a profile token four minutes
+    /// from its `expiresAt` is still asked, and its refresh is already wanted.
+    #[test]
+    fn a_profile_token_near_expiry_is_still_asked_and_its_refresh_requested() {
+        let _log = super::super::oauth_refresh::refresh_log_guard_for_test();
+        let dir = long_lived_dir_with_profile_creds(NOW_MS + 4 * 60_000, PROFILE, "rt-live");
+        let creds = dir.path().join(".credentials.json");
+        super::super::oauth_refresh::refresh_requests_for_test(&creds);
+        let set = candidates_for_dir(dir.path(), NOW_MS);
+        assert_eq!(
+            kinds(&set),
+            vec![UsageTokenKind::Credentials, UsageTokenKind::LongLived]
+        );
+        assert_eq!(
+            super::super::oauth_refresh::refresh_requests_for_test(&creds),
+            1
+        );
+        // Six minutes out, outside the lead: no refresh yet.
+        write_creds(dir.path(), NOW_MS + 6 * 60_000, PROFILE, "rt-live");
+        candidates_for_dir(dir.path(), NOW_MS);
+        assert_eq!(
+            super::super::oauth_refresh::refresh_requests_for_test(&creds),
+            0
+        );
+    }
+
+    /// A trial in flight for the same token (another config dir) rejects a
+    /// second ask; its `retry_at` is now, never one already past.
+    #[tokio::test]
+    async fn a_rejection_behind_a_trial_in_flight_never_reports_a_past_retry_at() {
+        let (g, clock) = gate();
+        let fp = super::super::oauth_refresh::token_fingerprint(LONG_LIVED);
+        FakeEndpoint::new(Err(err(Some(503), None, false)))
+            .read(&g, set_of(&[(LONG_LIVED, UsageTokenKind::LongLived)]))
+            .await;
+        clock.advance(Duration::from_secs(400));
+        assert_eq!(g.admit(fp), Admit::Pass, "the trial");
+        assert_eq!(g.admit(fp), Admit::Cooling { retry_at: T0 + 400 });
+    }
+
+    /// An entry whose trial was admitted and never recorded is swept by the
+    /// next admit once stale, so a one-token box is not wedged for good.
+    #[tokio::test]
+    async fn an_unrecorded_trial_is_swept_by_a_later_admit() {
+        let (g, clock) = gate();
+        let fp = super::super::oauth_refresh::token_fingerprint(LONG_LIVED);
+        FakeEndpoint::new(Err(err(Some(503), None, false)))
+            .read(&g, set_of(&[(LONG_LIVED, UsageTokenKind::LongLived)]))
+            .await;
+        clock.advance(Duration::from_secs(300));
+        assert_eq!(g.admit(fp), Admit::Pass, "the trial, never recorded");
+        assert!(matches!(g.admit(fp), Admit::Cooling { .. }));
+        clock.advance(STALE_ENTRY_AFTER);
+        assert_eq!(g.admit(fp), Admit::Pass, "swept: asked afresh");
     }
 
     // ── The transition line ───────────────────────────────────────────────

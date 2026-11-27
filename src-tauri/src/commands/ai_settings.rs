@@ -3252,9 +3252,6 @@ mod usage_report_scope_tests {
             }
         }
 
-        /// The fleet report covers a runner with fewer than two accounts by
-        /// probing the account it spends, only when it reports lone accounts; from
-        /// two up it is the roster, exactly as the picker sees it.
         /// D7 through the refresh entry points: the selection snapshot
         /// (startup, migration's roster probe, `cool_until_reset`) wants a
         /// fresh reading, the fleet report is a poller.
@@ -3270,6 +3267,9 @@ mod usage_report_scope_tests {
             );
         }
 
+        /// The fleet report covers a runner with fewer than two accounts by
+        /// probing the account it spends, only when it reports lone accounts; from
+        /// two up it is the roster, exactly as the picker sees it.
         #[test]
         fn the_fleet_report_covers_single_and_unlisted_accounts() {
             let c = UsageRefreshCaller::FleetReport;
