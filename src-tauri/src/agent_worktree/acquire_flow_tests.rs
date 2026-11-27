@@ -122,6 +122,9 @@ async fn a_failing_then_succeeding_claim_is_retried_and_the_acquire_proceeds() {
         (CLAIMS, vec![(503, "{}".to_string()), claimed()]),
         (ALLOCATE, vec![wait_answer()]),
         (RELEASE, vec![(200, "{}".to_string())]),
+        // Scripted so the DONE assertion below can fail: an unscripted route
+        // records no hit at all.
+        (DONE, vec![(404, "{}".to_string())]),
     ])
     .await;
     let o = overlap();
@@ -222,12 +225,14 @@ async fn an_exhausted_budget_still_releases_the_claims_already_held() {
     assert_eq!(coord.hits(RELEASE), 1);
     // No allocate answered, so no row path is known; the run's own id is the
     // only handle, and it is handed back by that id alone (plan 2026-11-26 D4).
-    assert_eq!(wait_for_hits(&coord, DONE, 1).await, 1);
+    // The first 404 is "not yet" (the timed-out attempt may still be running
+    // on coord), so it is asked exactly once more.
+    assert_eq!(wait_for_hits(&coord, DONE, 2).await, 2);
     let id = coord.bodies(ALLOCATE)[0]["client_allocation_id"].clone();
-    assert_eq!(
-        coord.bodies(DONE),
-        vec![serde_json::json!({"client_allocation_id": id, "abandoned": true})]
-    );
+    let ask = serde_json::json!({"client_allocation_id": id, "abandoned": true});
+    assert_eq!(coord.bodies(DONE), vec![ask.clone(), ask]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(coord.hits(DONE), 2, "re-asked once, not more");
 }
 
 // ── plan 2026-11-26-allocate-under-a-continuation-burst-sends-isolated-
@@ -371,12 +376,18 @@ async fn a_duplicate_id_answer_ends_the_run_and_hands_its_rows_back() {
 }
 
 /// D2's input: only a BUDGETED run that exhausts on transient failures is
-/// Unavailable. A zero-budget caller's single transient failure stays Other
-/// (and hands nothing back), and a `repo_not_registered` stays typed.
+/// Unavailable. A zero-budget caller's single transient failure stays Other,
+/// and still hands its id back (the hand-back is gated on the id having been
+/// sent on an unanswered attempt, not on the error type); a
+/// `repo_not_registered` stays typed and hands nothing back.
 #[tokio::test]
 async fn only_a_budgeted_exhaustion_is_unavailable() {
     let _amb = super::test_coord::isolate();
-    let coord = ScriptedCoord::start(vec![(ALLOCATE, vec![(503, "{}".to_string())])]).await;
+    let coord = ScriptedCoord::start(vec![
+        (ALLOCATE, vec![(503, "{}".to_string())]),
+        (DONE, vec![(404, "{}".to_string())]),
+    ])
+    .await;
     let out = Run::new()
         .go(
             &coord,
@@ -390,16 +401,21 @@ async fn only_a_budgeted_exhaustion_is_unavailable() {
         "{out:?}"
     );
     assert_eq!(coord.hits(ALLOCATE), 1);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(coord.hits(DONE), 0);
+    assert!(
+        wait_for_hits(&coord, DONE, 1).await >= 1,
+        "the id is handed back"
+    );
 
-    let coord = ScriptedCoord::start(vec![(
-        ALLOCATE,
-        vec![(
-            409,
-            format!(r#"{{"error":"repo_not_registered","repo":"{REPO}"}}"#),
-        )],
-    )])
+    let coord = ScriptedCoord::start(vec![
+        (
+            ALLOCATE,
+            vec![(
+                409,
+                format!(r#"{{"error":"repo_not_registered","repo":"{REPO}"}}"#),
+            )],
+        ),
+        (DONE, vec![(404, "{}".to_string())]),
+    ])
     .await;
     let out = Run::new()
         .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
@@ -408,19 +424,61 @@ async fn only_a_budgeted_exhaustion_is_unavailable() {
         matches!(out, Err(AllocateError::RepoNotRegistered(_))),
         "{out:?}"
     );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(coord.hits(DONE), 0, "an answered refusal committed nothing");
+}
+
+/// A4: a run that DROPPED the id (coord refused it) hands nothing back by it,
+/// even when an earlier id-carrying attempt went unanswered: coord stores no
+/// row under an id it cannot store, and an id-only ask there would 503.
+#[tokio::test]
+async fn a_run_that_dropped_the_id_hands_nothing_back() {
+    let _amb = super::test_coord::isolate();
+    let coord = ScriptedCoord::start(vec![
+        (
+            ALLOCATE,
+            vec![
+                (503, "{}".to_string()),
+                (
+                    503,
+                    r#"{"error":"schema_migration_pending","column":"coord.agent_worktrees.client_allocation_id","cause":"undefined_column"}"#
+                        .to_string(),
+                ),
+                (502, "bad gateway".to_string()),
+            ],
+        ),
+        (DONE, vec![(404, "{}".to_string())]),
+    ])
+    .await;
+    let deadline =
+        RetryDeadline::with_delays(Duration::from_secs(2), tokio::time::Instant::now(), 1, 1);
+    let out = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, deadline)
+        .await;
+    assert!(matches!(out, Err(AllocateError::Unavailable(_))), "{out:?}");
+    let bodies = coord.bodies(ALLOCATE);
+    assert!(bodies.len() >= 3, "{bodies:?}");
+    assert!(bodies[2].get("client_allocation_id").is_none());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(coord.hits(DONE), 0);
 }
 
 #[tokio::test]
 async fn final_answers_are_never_retried() {
     let _amb = super::test_coord::isolate();
     // A held claim before the allocate.
-    let coord = ScriptedCoord::start(vec![(
-        CLAIMS,
-        vec![(
-            200,
-            r#"{"result":"held","current_holder":"peer"}"#.to_string(),
-        )],
-    )])
+    let coord = ScriptedCoord::start(vec![
+        (
+            CLAIMS,
+            vec![(
+                200,
+                r#"{"result":"held","current_holder":"peer"}"#.to_string(),
+            )],
+        ),
+        // Scripted so the DONE assertion below can fail: an unscripted route
+        // records no hit at all.
+        (DONE, vec![(404, "{}".to_string())]),
+    ])
     .await;
     let o = overlap();
     let out = Run::new()

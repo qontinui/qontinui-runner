@@ -1231,7 +1231,10 @@ pub const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
 /// root, and coord re-offers the gate on its bounded spawn-retry schedule
 /// (plan
 /// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
-/// D2). Stable: coord's `classify_spawn_failure` matches it.
+/// D2). Stable, because coord must match it: the re-offer REQUIRES coord's
+/// `classify_spawn_failure` to class this head as retriable (the qontinui-coord
+/// half, plan Phase 1). Until that lands, coord treats the refusal as
+/// deterministic and raises a spawn-failed alert instead of re-offering.
 pub const WORKTREE_ALLOCATE_UNAVAILABLE: &str = "worktree_allocate_unavailable";
 
 /// Whether an allocate may honor coord's `shared_branch` directive, which
@@ -1783,9 +1786,10 @@ const ALLOCATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// and the branch switch like any requested repo (a declared sibling would not).
 ///
 /// On success returns `AllocateResult`. When a non-zero `deadline` runs out on
-/// transient allocate failures, returns `Err(AllocateError::Unavailable)` and
-/// hands back, by the run's `client_allocation_id`, anything an unanswered
-/// attempt committed. On any other non-claim error,
+/// transient allocate failures, returns `Err(AllocateError::Unavailable)`.
+/// Whenever the allocate fails after an attempt carrying the run's
+/// `client_allocation_id` went unanswered, it hands back by that id anything
+/// such an attempt committed. On any other non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
 /// handled at the boundary: if anything fails after coord has minted rows (a
 /// claim, a refused placement, a `git worktree add`), the materialization
@@ -1875,14 +1879,19 @@ pub async fn allocate_and_materialize_with_claim(
     let client_allocation_id = uuid::Uuid::now_v7();
     // Claims already held are released only once the allocate is FINAL: a
     // retried attempt keeps them (plan 2026-10-31 Phase 1).
-    let coord_resp = match post_allocate(&url, &body, scope, deadline, client_allocation_id).await {
+    let (posted, hand_back) =
+        post_allocate(&url, &body, scope, deadline, client_allocation_id).await;
+    let coord_resp = match posted {
         Ok(r) => r,
         Err(e) => {
             release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
-            if matches!(e, AllocateError::Unavailable(_)) {
-                // An attempt that timed out may still have committed rows that
-                // no response named: hand back whatever this run's id holds. A
-                // 404 there means none was committed.
+            if hand_back {
+                // An attempt that carried the id went unanswered (a timeout, a
+                // transport error, a 5xx), so it may still have committed rows
+                // no response named: hand back whatever this run's id holds.
+                // Gated on the id having been SENT, not on the error's type, so
+                // an interactive single-attempt timeout hands back too and a
+                // run that dropped the id hands back nothing.
                 retire_abandoned::spawn_retire_client_allocation(
                     coord_http_base,
                     *machine_id,
@@ -2398,29 +2407,40 @@ async fn materialize_allocation(
 /// Exhausting a NON-ZERO budget on transient failures is
 /// [`AllocateError::Unavailable`]; a zero budget's single failure stays
 /// [`AllocateError::Other`].
+///
+/// The second value says whether the caller must hand the run back by its id
+/// on failure: true when an attempt CARRYING the id went unanswered (a
+/// transient outcome, which may have committed), and the id was never dropped
+/// (a coord that refused it stores no row under it).
 async fn post_allocate(
     url: &str,
     body: &serde_json::Value,
     scope: crate::auth::TenantScope,
     deadline: acquire_retry::RetryDeadline,
     client_allocation_id: uuid::Uuid,
-) -> Result<CoordAllocateResponse, AllocateError> {
+) -> (Result<CoordAllocateResponse, AllocateError>, bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut with_id = body.clone();
     with_id["client_allocation_id"] = serde_json::json!(client_allocation_id);
     let send_id = AtomicBool::new(true);
+    let id_attempt_unanswered = AtomicBool::new(false);
     let budgeted = deadline.is_active();
-    acquire_retry::retry_transient_within(
+    let result = acquire_retry::retry_transient_within(
         "agents/allocate",
         deadline,
         ALLOCATE_REQUEST_TIMEOUT,
         |timeout| {
-            let (with_id, send_id) = (&with_id, &send_id);
+            let (with_id, send_id, unanswered) = (&with_id, &send_id, &id_attempt_unanswered);
             async move {
                 let sending_id = send_id.load(Ordering::Relaxed);
                 let b = if sending_id { with_id } else { body };
                 match post_allocate_once(url, b, scope, timeout).await {
-                    AllocateAttempt::Answer(a) => a,
+                    AllocateAttempt::Answer(a) => {
+                        if sending_id && matches!(a, acquire_retry::Attempt::Transient(_)) {
+                            unanswered.store(true, Ordering::Relaxed);
+                        }
+                        a
+                    }
                     AllocateAttempt::IdRefused(msg) => {
                         // Nothing was allocated. Re-send at once without the
                         // id, inside this same attempt, so a zero-budget caller
@@ -2431,7 +2451,13 @@ async fn post_allocate(
                              re-sending this run without it: {msg}"
                         );
                         send_id.store(false, Ordering::Relaxed);
-                        match post_allocate_once(url, body, scope, timeout).await {
+                        // Bounded by what is left of the budget, not by a fresh
+                        // full bound (None with no budget: the 80 s default).
+                        let resend = deadline.attempt_timeout_within(
+                            ALLOCATE_REQUEST_TIMEOUT,
+                            tokio::time::Instant::now(),
+                        );
+                        match post_allocate_once(url, body, scope, resend).await {
                             AllocateAttempt::Answer(a) => a,
                             AllocateAttempt::IdRefused(m) | AllocateAttempt::IdDuplicate(m) => {
                                 acquire_retry::Attempt::Done(Err(AllocateError::Other(m)))
@@ -2455,7 +2481,11 @@ async fn post_allocate(
             }
         },
     )
-    .await
+    .await;
+    let hand_back = result.is_err()
+        && id_attempt_unanswered.load(Ordering::Relaxed)
+        && send_id.load(Ordering::Relaxed);
+    (result, hand_back)
 }
 
 /// One allocate attempt's result, with the two `client_allocation_id`
