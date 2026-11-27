@@ -532,7 +532,7 @@ mod tests {
         ] {
             reddens(
                 mutate("package.json", &|c| {
-                    c.replace("github:qontinui/qontinui-design-kit#v0.1.1", bad)
+                    c.replace("github:qontinui/qontinui-design-kit#v0.2.0", bad)
                 }),
                 "not a git ref in tag form",
             );

@@ -106,12 +106,12 @@
         "tight": "1.25"
       },
       "letterSpacings": {
-        "normal": "0px",
-        "tight": "-0.4px",
-        "tighter": "-0.8px",
-        "wide": "0.4px",
-        "wider": "0.8px",
-        "widest": "1.6px"
+        "normal": "0em",
+        "tight": "-0.025em",
+        "tighter": "-0.05em",
+        "wide": "0.025em",
+        "wider": "0.05em",
+        "widest": "0.1em"
       }
     },
     "spacing": {
