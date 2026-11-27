@@ -9,7 +9,7 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// What one program run produced. `code` is `None` when the process was ended
@@ -55,7 +55,7 @@ pub struct RealCommandRunner;
 
 impl CommandRunner for RealCommandRunner {
     fn run(&self, program: &Path, args: &[String], timeout: Duration) -> Result<CmdOutput, String> {
-        let mut child = Command::new(program)
+        let mut child = crate::process_helpers::no_window(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -164,15 +164,10 @@ pub fn systemd_user_unit_from_cgroup(cgroup: &str) -> Option<String> {
 }
 
 /// `${QONTINUI_HOME:-~/.qontinui}`.
+/// Resolved through the one seam, [`qontinui_runner_lib::ambient::qontinui_dir_or_cwd`],
+/// which owns the `QONTINUI_HOME` precedence and the no-home fallback.
 pub fn qontinui_home() -> PathBuf {
-    std::env::var_os("QONTINUI_HOME")
-        .filter(|v| !v.to_string_lossy().trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".qontinui")
-        })
+    qontinui_runner_lib::ambient::qontinui_dir_or_cwd()
 }
 
 /// `${QONTINUI_HOME:-~/.qontinui}/runner/upgrades` — the records and the

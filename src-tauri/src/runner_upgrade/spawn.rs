@@ -14,6 +14,7 @@ use std::time::Duration;
 pub fn spawn_detached(exe: &Path, args: &[String]) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    // console-ok: a unix-only arm (`#[cfg(unix)]`); Windows has no console to pop here.
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -68,6 +69,7 @@ pub fn spawn_successor(exe: &Path, args: &[String], fds: &[(String, i32)]) -> Re
         copies.push(dup);
     }
     let sources: Vec<i32> = copies.iter().map(AsRawFd::as_raw_fd).collect();
+    // console-ok: a unix-only arm (`#[cfg(unix)]`); Windows has no console to pop here.
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg("LISTEN_PID=$$; export LISTEN_PID; exec \"$0\" \"$@\"")
