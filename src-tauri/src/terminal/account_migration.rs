@@ -159,20 +159,160 @@ fn last_migrated_at(claude_session_id: &str) -> Option<i64> {
     last.as_ref()?.get(claude_session_id).copied()
 }
 
-/// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
-/// migration that never ran (refused by [`begin_migration`]). Removes exactly
-/// one entry with that stamp under the history lock, so two hints that took
-/// slots in the same millisecond still leave the count right; a stamp already
-/// aged out of the window is a no-op.
-fn refund_migration_cap(claude_session_id: &str, stamp: i64) {
+/// How many more migrations the cap admits for `claude_session_id` at
+/// `now_ms`, without taking one.
+pub(crate) fn migration_cap_left(claude_session_id: &str, now_ms: i64) -> usize {
+    let hist = MIGRATION_HISTORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let used = hist
+        .as_ref()
+        .and_then(|m| m.get(claude_session_id))
+        .map_or(0, |e| {
+            e.iter()
+                .filter(|t| now_ms - **t <= MIGRATION_CAP_WINDOW_MS)
+                .count()
+        });
+    MIGRATION_CAP.saturating_sub(used)
+}
+
+/// Why a cap slot is given back ([`refund_migration_cap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapRefund {
+    /// No respawn ran to a verdict: [`begin_migration`] (or a later re-check)
+    /// refused it, the old pane closed before anything was spawned, a hint
+    /// found no target, or a [`CapSlot`] was dropped before its respawn. Also
+    /// the user closing the OLD pane once a pane HAD been spawned
+    /// (`OldPaneClosed { attempts >= 1 }`, settled as a refusal): that close
+    /// ends the session, so nothing is left to re-trigger a hint and the
+    /// refund cannot feed a loop. Always refunded, unbounded.
+    NeverStarted,
+    /// A respawn ran but its CLI never launched (plan
+    /// `2026-11-10-migration-holds-for-missing-claude-cli` D4): the CLI hold
+    /// ran out, or every attempt was a launch failure. Bounded: at most
+    /// [`MIGRATION_CAP`] such refunds per session per window, so a refund can
+    /// never feed an unbounded respawn loop, whatever re-triggers the hint.
+    NeverLaunched,
+}
+
+/// Per-session stamps of the [`CapRefund::NeverLaunched`] refunds given, for
+/// their bound.
+static LAUNCH_REFUND_HISTORY: Mutex<Option<HashMap<String, Vec<i64>>>> = Mutex::new(None);
+
+/// Give back one cap slot [`migration_cap_permits`] took at `stamp` — the ONE
+/// refund helper for every taker of the cap (the automatic migration, the
+/// resume door, the respawn receiver). Removes exactly one entry with that
+/// stamp under the history lock, so two hints that took slots in the same
+/// millisecond still leave the count right; a stamp already aged out of the
+/// window is a no-op. A [`CapRefund::NeverLaunched`] refund is refused once
+/// the session has had [`MIGRATION_CAP`] of them within a window of `stamp`.
+/// Returns whether a slot was given back.
+pub(crate) fn refund_migration_cap(claude_session_id: &str, stamp: i64, why: CapRefund) -> bool {
+    if why == CapRefund::NeverStarted {
+        return remove_cap_stamp(claude_session_id, stamp);
+    }
+    let mut refunds = LAUNCH_REFUND_HISTORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = refunds.get_or_insert_with(HashMap::new);
+    // Prune every session's refunds older than the window before this one,
+    // and drop the keys left empty, so the map stays bounded. Only OLDER
+    // entries go: a stamp is when its slot was TAKEN (not when it is refunded,
+    // which can be up to a migration's length later), so stamps arrive only
+    // roughly in order, and a refund stamped later than this one (another
+    // taker's) is never pruned by it.
+    map.retain(|_, given| {
+        given.retain(|t| *t >= stamp - MIGRATION_CAP_WINDOW_MS);
+        !given.is_empty()
+    });
+    let given_so_far = map.get(claude_session_id).map_or(0, Vec::len);
+    if given_so_far >= MIGRATION_CAP {
+        warn!(
+            session = %claude_session_id,
+            refunds = given_so_far,
+            "migration cap: launch-failure refund bound reached — this slot stays consumed"
+        );
+        return false;
+    }
+    let removed = remove_cap_stamp(claude_session_id, stamp);
+    if removed {
+        map.entry(claude_session_id.to_string())
+            .or_default()
+            .push(stamp);
+    }
+    removed
+}
+
+/// Remove exactly one `stamp` from the session's cap history. `true` when one
+/// was there.
+fn remove_cap_stamp(claude_session_id: &str, stamp: i64) -> bool {
     let mut hist = MIGRATION_HISTORY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = hist.as_mut().and_then(|m| m.get_mut(claude_session_id)) {
-        if let Some(i) = entry.iter().position(|t| *t == stamp) {
+    hist.as_mut()
+        .and_then(|m| m.get_mut(claude_session_id))
+        .and_then(|entry| {
+            let i = entry.iter().position(|t| *t == stamp)?;
             entry.remove(i);
+            Some(())
+        })
+        .is_some()
+}
+
+/// A cap slot taken at `stamp` that has not yet reached its respawn. Dropped
+/// before [`Self::launch`] — an early return between taking the slot and the
+/// respawn (no target, no app handle, …) — it gives the slot back
+/// ([`CapRefund::NeverStarted`]): no respawn ran. Every taker calls
+/// [`Self::launch`] BEFORE it awaits the respawn, so a respawn cancelled or
+/// panicking after a CLI may have launched never refunds an unbounded slot;
+/// from then on the respawn's own settle decides
+/// ([`refund_cap_if_never_launched`], or the automatic path's
+/// [`CapRefund::NeverLaunched`] arm).
+#[must_use = "a cap slot not launched is refunded on drop"]
+pub(crate) struct CapSlot {
+    claude_session_id: String,
+    stamp: i64,
+    armed: bool,
+}
+
+impl CapSlot {
+    pub(crate) fn new(claude_session_id: &str, stamp: i64) -> Self {
+        Self {
+            claude_session_id: claude_session_id.to_string(),
+            stamp,
+            armed: true,
         }
     }
+
+    /// The respawn is about to run: the slot is no longer refunded on drop.
+    pub(crate) fn launch(mut self) -> i64 {
+        self.armed = false;
+        self.stamp
+    }
+}
+
+impl Drop for CapSlot {
+    fn drop(&mut self) {
+        if self.armed {
+            info!(
+                session = %self.claude_session_id,
+                "migration cap: the respawn never started — the slot is given back"
+            );
+            refund_migration_cap(&self.claude_session_id, self.stamp, CapRefund::NeverStarted);
+        }
+    }
+}
+
+/// The resume door's and the respawn receiver's refund: the slot they took at
+/// `stamp` goes back when the respawn never launched a CLI
+/// ([`super::respawn_launch::outcome_never_launched`]). Returns whether it did.
+pub(crate) fn refund_cap_if_never_launched(
+    claude_session_id: &str,
+    stamp: i64,
+    outcome: &super::respawn_liveness::RespawnOutcome,
+) -> bool {
+    super::respawn_launch::outcome_never_launched(outcome)
+        && refund_migration_cap(claude_session_id, stamp, CapRefund::NeverLaunched)
 }
 
 /// Why [`migrate_session_off_runtime`] did not migrate.
@@ -190,11 +330,24 @@ pub(crate) enum MigrateError {
     /// under proof was closed with the session, as the user asked.
     Refused(MigrationRefusal),
     /// The migration ran and did not move the session: a step before the
-    /// respawn failed, or the FIRST spawn did — the old pane is untouched, still
-    /// at its usage-limit prompt. Also a user close of the resumed pane while it
+    /// respawn failed — the old pane is untouched, still at its usage-limit
+    /// prompt (a failed FIRST spawn is [`Self::SpawnFailed`]). Also a user close of the resumed pane while it
     /// was being proven (`closed_by_user`): the session is back on the old pane
     /// when that still runs, else the close ended it.
     Failed(String),
+    /// The FIRST spawn failed with the CLI judged launchable (on the look
+    /// before the spawn, and on the look after it unless the spawn cap was
+    /// reached): nothing was
+    /// spawned, the old pane is untouched. No CLI launched, so the cap slot is
+    /// given back (bounded, [`CapRefund::NeverLaunched`]).
+    SpawnFailed(String),
+    /// The CLI hold ran to its ceiling with no stably launchable `claude`
+    /// ([`super::cli_availability`]): nothing was spawned, and the session
+    /// stays on the old pane.
+    CliUnavailable {
+        waited: std::time::Duration,
+        kind: super::cli_availability::LastSeen,
+    },
     /// Every respawn attempt exited before painting. With the old pane still
     /// running, rolled back: the row, its account and the continuation are on
     /// the old pane again, and the old pane is open. With the old pane gone
@@ -204,6 +357,8 @@ pub(crate) enum MigrateError {
         attempts: usize,
         /// The last retry's spawn error, when a retry could not even spawn.
         retry_spawn_error: Option<String>,
+        /// Every attempt was a launch failure ([`super::respawn_launch`]).
+        all_launch_failures: bool,
     },
     /// The resumed child runs but never painted by the deadline. With the old
     /// pane still running (its CLI seen, or its subtree unreadable) the
@@ -239,15 +394,53 @@ impl MigrateError {
         matches!(self, Self::RespawnDied { .. } | Self::Unconfirmed { .. })
     }
 
+    /// Whether this failure gives the cap slot back as
+    /// [`CapRefund::NeverLaunched`]: the CLI never launched — the hold ran out,
+    /// or every respawn attempt was a launch failure. (A refusal refunds as
+    /// [`CapRefund::NeverStarted`].)
+    pub(crate) fn returns_cap_slot(&self) -> bool {
+        matches!(
+            self,
+            Self::CliUnavailable { .. }
+                | Self::SpawnFailed(_)
+                | Self::RespawnDied {
+                    all_launch_failures: true,
+                    ..
+                }
+        )
+    }
+
+    /// `claude_cli_unavailable:<kind> after <n>s — the session stays on the
+    /// old pane`.
+    fn cli_unavailable_detail(
+        waited: std::time::Duration,
+        kind: super::cli_availability::LastSeen,
+    ) -> String {
+        format!(
+            "{} — the session stays on the old pane",
+            super::cli_availability::CliUnavailable {
+                waited,
+                last_seen: kind,
+            }
+        )
+    }
+
     /// The `session-account-migration-skipped` reason for this outcome.
     pub(crate) fn skip_reason(&self) -> String {
         match self {
             Self::Refused(refusal) => refusal.to_string(),
-            Self::Failed(e) => format!("migration-failed: {e}"),
+            Self::Failed(e) | Self::SpawnFailed(e) => format!("migration-failed: {e}"),
+            Self::CliUnavailable { waited, kind } => {
+                format!(
+                    "migration-failed: {}",
+                    Self::cli_unavailable_detail(*waited, *kind)
+                )
+            }
             Self::RespawnDied {
                 exit_code,
                 attempts,
                 retry_spawn_error,
+                ..
             } => super::respawn_liveness::RespawnOutcome::died_detail(
                 *exit_code,
                 *attempts,
@@ -274,11 +467,15 @@ impl std::fmt::Display for MigrateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(refusal) => refusal.fmt(f),
-            Self::Failed(e) => f.write_str(e),
+            Self::Failed(e) | Self::SpawnFailed(e) => f.write_str(e),
+            Self::CliUnavailable { waited, kind } => {
+                f.write_str(&Self::cli_unavailable_detail(*waited, *kind))
+            }
             Self::RespawnDied {
                 exit_code,
                 attempts,
                 retry_spawn_error,
+                ..
             } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_detail(
                 *exit_code,
                 *attempts,
@@ -555,40 +752,43 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     crate::ai_provider::pick_best_account();
 
     let cap_stamp = chrono::Utc::now().timestamp_millis();
-    if !migration_cap_permits(&record.claude_session_id, cap_stamp) {
-        warn!(
-            session = %record.claude_session_id,
-            cap = MIGRATION_CAP,
-            "migration cap reached for this session — not migrating again"
-        );
-        report_migration_refused(
-            &app,
-            &record,
-            &src,
-            park_fallback,
-            super::limit_reset::ParkReason::MigrationCapReached,
-        );
-        return;
-    }
-
-    let Some(dst) = crate::ai_provider::pick_migration_target(&src) else {
-        warn!(
-            session = %record.claude_session_id,
-            from = %src,
-            "no usable migration target (every other account exhausted/cooled/unauthenticated)"
-        );
-        // No migration ran, so the cap slot goes back: the parked stop
-        // re-enters within the hour, and three re-entries must not fill the
-        // cap for a session that never moved.
-        refund_migration_cap(&record.claude_session_id, cap_stamp);
-        report_migration_refused(
-            &app,
-            &record,
-            &src,
-            park_fallback,
-            super::limit_reset::ParkReason::NoUsableTarget,
-        );
-        return;
+    let (cap_stamp, dst) = match admit_hint(&record.claude_session_id, cap_stamp, || {
+        crate::ai_provider::pick_migration_target(&src)
+    }) {
+        Ok(admitted) => admitted,
+        Err(HINT_CAP_REACHED) => {
+            warn!(
+                session = %record.claude_session_id,
+                cap = MIGRATION_CAP,
+                "migration cap reached for this session — not migrating again"
+            );
+            report_migration_refused(
+                &app,
+                &record,
+                &src,
+                park_fallback,
+                super::limit_reset::ParkReason::MigrationCapReached,
+            );
+            return;
+        }
+        Err(_) => {
+            // No migration ran, so `admit_hint` already gave the cap slot
+            // back: the parked stop re-enters within the hour, and three
+            // re-entries must not fill the cap for a session that never moved.
+            warn!(
+                session = %record.claude_session_id,
+                from = %src,
+                "no usable migration target (every other account exhausted/cooled/unauthenticated) — the cap slot is given back"
+            );
+            report_migration_refused(
+                &app,
+                &record,
+                &src,
+                park_fallback,
+                super::limit_reset::ParkReason::NoUsableTarget,
+            );
+            return;
+        }
     };
 
     info!(
@@ -616,6 +816,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     settle_hint_migration(
         &record.claude_session_id,
         cap_stamp,
+        chrono::Utc::now().timestamp_millis(),
         result,
         || crate::ai_provider::unrecord_handoff(&dst),
         |reason| emit_skipped(&app, &record, &src, reason),
@@ -1000,23 +1201,61 @@ fn close_rate_limit_menu(terminal_id: &str) {
     }
 }
 
-/// The automatic path's answer to the migration's result.
+/// [`admit_hint`]'s refusal when the session's cap is spent.
+const HINT_CAP_REACHED: &str = "migration-cap-reached";
+/// [`admit_hint`]'s refusal when no account can take the session.
+const HINT_NO_TARGET: &str = "no-usable-target";
+
+/// Take the hint's cap slot, then pick a target. The slot is held in a
+/// [`CapSlot`] until a target is found, so a hint with no usable target gives
+/// it back; with a target it is launched (disarmed) here, BEFORE the migration
+/// is awaited, and the settle decides any refund. `Ok` is the slot's stamp and
+/// the target; `Err` is the skipped reason.
+fn admit_hint(
+    claude_session_id: &str,
+    cap_stamp: i64,
+    pick_target: impl FnOnce() -> Option<String>,
+) -> Result<(i64, String), &'static str> {
+    if !migration_cap_permits(claude_session_id, cap_stamp) {
+        return Err(HINT_CAP_REACHED);
+    }
+    let slot = CapSlot::new(claude_session_id, cap_stamp);
+    let dst = pick_target().ok_or(HINT_NO_TARGET)?;
+    Ok((slot.launch(), dst))
+}
+
+/// The automatic path's answer to the migration's result. Returns the
+/// session's remaining cap slots (`cap_left`) after the refund decision, which
+/// every arm also logs.
 ///
-/// - Migrated: logged.
+/// - Migrated: logged. The slot stays consumed: a hop.
 /// - [`MigrateError::Refused`]: another migration of this session holds its
 ///   slot, or already moved it (or its record is gone, or closed — no pane
-///   is left to migrate). Nothing failed, so it
-///   is logged at info and NOT reported as `session-account-migration-skipped`
-///   — the UI would otherwise toast a "migration failed" for a session that
-///   is migrating or has migrated. The cap slot this hint took at
-///   `cap_stamp` is given back ([`refund_migration_cap`]) since no migration
-///   ran; the refund, not a pre-check, because only the guard inside
-///   [`begin_migration`] decides a refusal race-free.
-/// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`.
-/// - [`MigrateError::RespawnDied`] / [`MigrateError::Unconfirmed`]: warned;
-///   the migration already reported itself (it changed panes), so nothing is
-///   emitted here. The cap slot stays consumed: a dead respawn counts as a
-///   hop.
+///   is left to migrate, including an old pane the user closed while the CLI
+///   hold waited). Nothing failed, so it is logged at info and NOT reported
+///   as `session-account-migration-skipped` — the UI would otherwise toast a
+///   "migration failed" for a session that is migrating or has migrated. The
+///   cap slot this hint took at `cap_stamp` is given back
+///   ([`CapRefund::NeverStarted`]) since no migration ran; the refund, not a
+///   pre-check, because only the guard inside [`begin_migration`] decides a
+///   refusal race-free.
+/// - [`MigrateError::CliUnavailable`]: the CLI hold ran out. Reported
+///   `migration-failed: claude_cli_unavailable:<kind> after <n>s — …`, and
+///   the slot is given back ([`CapRefund::NeverLaunched`]): no CLI launched,
+///   which is no evidence of an exhaustion chain. The report then says
+///   `(cap slot returned)`.
+/// - [`MigrateError::SpawnFailed`]: the FIRST spawn failed with the CLI judged
+///   launchable — no CLI launched. Reported `migration-failed: <error>`, the
+///   slot given back ([`CapRefund::NeverLaunched`]), and the report says
+///   `(cap slot returned)`.
+/// - [`MigrateError::RespawnDied`]: the migration already reported itself (it
+///   changed panes), so nothing is emitted here. The slot is given back
+///   ([`CapRefund::NeverLaunched`]) only when every attempt was a launch
+///   failure; a CLI that launched and then died is a hop, and keeps it.
+/// - [`MigrateError::Unconfirmed`]: reported by the migration; the slot stays
+///   consumed (a CLI runs, or ran).
+/// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`; the
+///   slot stays consumed.
 ///
 /// Every arm but an unconfirmed migration that kept the new pane
 /// ([`MigrateError::reached_destination`]) `unrecord_handoff`s: the session
@@ -1025,10 +1264,11 @@ fn close_rate_limit_menu(terminal_id: &str) {
 fn settle_hint_migration(
     claude_session_id: &str,
     cap_stamp: i64,
+    now_ms: i64,
     result: Result<MigrationOutcome, MigrateError>,
     unrecord_handoff: impl FnOnce(),
     emit_skipped: impl FnOnce(&str),
-) {
+) -> usize {
     match result {
         Ok(outcome) => info!(
             session = %claude_session_id,
@@ -1044,7 +1284,7 @@ fn settle_hint_migration(
                 "usage-limit migration not started — the session is already migrating, has moved, or is closed; nothing to report"
             );
             unrecord_handoff();
-            refund_migration_cap(claude_session_id, cap_stamp);
+            refund_migration_cap(claude_session_id, cap_stamp, CapRefund::NeverStarted);
         }
         Err(e) => {
             warn!(
@@ -1055,11 +1295,26 @@ fn settle_hint_migration(
             if !e.reached_destination() {
                 unrecord_handoff();
             }
+            let refunded = e.returns_cap_slot()
+                && refund_migration_cap(claude_session_id, cap_stamp, CapRefund::NeverLaunched);
             if !e.reported_itself() {
-                emit_skipped(&e.skip_reason());
+                let reason = e.skip_reason();
+                if refunded
+                    && matches!(
+                        e,
+                        MigrateError::CliUnavailable { .. } | MigrateError::SpawnFailed(_)
+                    )
+                {
+                    emit_skipped(&format!("{reason} (cap slot returned)"));
+                } else {
+                    emit_skipped(&reason);
+                }
             }
         }
     }
+    let cap_left = migration_cap_left(claude_session_id, now_ms);
+    info!(session = %claude_session_id, cap_left, "migration cap: settled");
+    cap_left
 }
 
 /// The model the session was last actually running on, from the transcript's
@@ -1559,8 +1814,10 @@ pub(crate) async fn prompt_when_idle_outcome(
 /// drifting copy of the launch-spec + capture-hint wiring.
 pub(crate) struct ResumeSpawn<'a> {
     /// The ABSOLUTE `claude` the PTY child execs — resolved by the caller's
-    /// async pre-step, [`crate::claude_cli_spawn::resolve_resume_claude_bin`], which never
-    /// yields the bare name (a bare name lands on the identity shim, whose
+    /// async pre-step (the migration's CLI hold,
+    /// [`super::cli_availability::launch_with_hold`]; the resume door's and the
+    /// respawn receiver's [`crate::claude_cli_spawn::resolve_resume_claude_bin`]),
+    /// which never yields the bare name (a bare name lands on the identity shim, whose
     /// fall-through exits 127 while the CLI is mid-reinstall).
     pub claude_bin: String,
     /// The Claude session id to `--resume`. NEVER synthesized: a caller with
@@ -1636,7 +1893,9 @@ pub(crate) async fn sniff_transcript_model(path: std::path::PathBuf) -> Option<S
 
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
 /// in a fresh PTY pinned to `spec.config_dir`, tracked in the lifecycle store
-/// and mirrored into coord. Returns `(terminal_id, coord_session_id)`.
+/// and mirrored into coord. Returns the new pane with its launch evidence
+/// ([`super::respawn_launch::SpawnedPane`]: its `created_at`, and whether the
+/// argv carried the `--settings` hook carrier).
 ///
 /// Same resume form the boot-restore path uses (post-#547): bypassPermissions
 /// so the resumed session doesn't wedge on its first tool-approval prompt with
@@ -1653,7 +1912,7 @@ pub(crate) fn spawn_resumed_pane(
     terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
     session_registry: &std::sync::Arc<crate::session::SessionRegistry>,
     spec: ResumeSpawn<'_>,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<super::respawn_launch::SpawnedPane, String> {
     let model = spec.model;
     // Compose the respawn argv through the shared launch seam so the operator's
     // global + per-account (destination) launch flags layer onto the required
@@ -1668,35 +1927,36 @@ pub(crate) fn spawn_resumed_pane(
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
     let prompt_carrier =
         crate::session::spawn_prompt::resolve_system_prompt_carrier(None, spec.policy_tenant);
-    let command = resume_respawn_argv(
-        // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
-        // `claude_bin_path()` cannot be the PTY child's program on Windows,
-        // and `resolve_resume_claude_bin` for why the caller resolves it (async, retried,
-        // never the bare name) rather than this sync seam.
-        &spec.claude_bin,
-        spec.claude_session_id,
-        model,
-        &launch_cfg,
-        // The hook carrier, spelled out because this respawn execs the
-        // resolved binary DIRECTLY — the identity shim,
-        // which is what appends `--settings` for a PATH-resolved `claude`,
-        // is not in this chain. Without it the migrated session runs with no
-        // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
-        // when the policy injection matters most: the session carries its
-        // old context but not the policies as they now stand
-        // ([`crate::mcp::policy_context`]). Empty on a materialize failure
-        // ⇒ no flag, which is the pre-existing behaviour.
-        //
-        // Plus the policy body at spawn (plan
-        // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
-        // this respawn has no briefing, so it carries a BODY-ONLY composed
-        // file when `spec.policy_tenant`'s cache exists, and nothing otherwise.
-        resume_respawn_extra_required(
-            // A migrated GATE continuation keeps its Stop-armed carrier.
-            crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some()),
-            prompt_carrier.as_ref(),
-        ),
-    );
+    // A migrated GATE continuation keeps its Stop-armed carrier.
+    let hook_args = crate::session::claude_hook::spawn_settings_args(spec.gate_identity.is_some());
+    let (command, carried_settings) = resume_command_with_evidence(hook_args, |hook_args| {
+        resume_respawn_argv(
+            // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
+            // `claude_bin_path()` cannot be the PTY child's program on Windows.
+            // The caller resolves it (the migration through its CLI hold, the
+            // resume door and respawn receiver through `resolve_resume_claude_bin`)
+            // rather than this sync seam.
+            &spec.claude_bin,
+            spec.claude_session_id,
+            model,
+            &launch_cfg,
+            // The hook carrier, spelled out because this respawn execs the
+            // resolved binary DIRECTLY — the identity shim,
+            // which is what appends `--settings` for a PATH-resolved `claude`,
+            // is not in this chain. Without it the migrated session runs with no
+            // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
+            // when the policy injection matters most: the session carries its
+            // old context but not the policies as they now stand
+            // ([`crate::mcp::policy_context`]). Empty on a materialize failure
+            // ⇒ no flag, which is the pre-existing behaviour.
+            //
+            // Plus the policy body at spawn (plan
+            // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
+            // this respawn has no briefing, so it carries a BODY-ONLY composed
+            // file when `spec.policy_tenant`'s cache exists, and nothing otherwise.
+            resume_respawn_extra_required(hook_args, prompt_carrier.as_ref()),
+        )
+    });
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: Some(spec.config_dir.to_string()),
         working_dir: spec.working_dir.to_string(),
@@ -1725,22 +1985,31 @@ pub(crate) fn spawn_resumed_pane(
             &command,
         ),
     };
-    crate::commands::terminal::create_tracked_terminal_session_backend(
-        terminal_manager,
-        session_registry,
-        app.clone(),
-        spec.title,
-        spec.working_dir.to_string(),
-        spec.work_unit_slug,
-        spec.correlation_topic,
-        spec.intent_repo,
-        Some(command),
-        None,
-        capture_hint,
-        Some(spec.page_id),
-        spec.resource_override,
-    )
-    .map_err(String::from)
+    let (terminal_id, _coord_session_id) =
+        crate::commands::terminal::create_tracked_terminal_session_backend(
+            terminal_manager,
+            session_registry,
+            app.clone(),
+            spec.title,
+            spec.working_dir.to_string(),
+            spec.work_unit_slug,
+            spec.correlation_topic,
+            spec.intent_repo,
+            Some(command),
+            None,
+            capture_hint,
+            Some(spec.page_id),
+            spec.resource_override,
+        )
+        .map_err(String::from)?;
+    let created_at_ms = terminal_manager
+        .get(&terminal_id)
+        .and_then(|session| i64::try_from(session.info().created_at).ok());
+    Ok(super::respawn_launch::SpawnedPane {
+        terminal_id,
+        created_at_ms,
+        carried_settings,
+    })
 }
 
 /// The full PTY-child argv of the `--resume` respawn. With no operator launch
@@ -1773,8 +2042,10 @@ pub(crate) fn spawn_resumed_pane(
 /// worktree) needs no injection.
 ///
 /// `resolve_claude_bin` does blocking filesystem stats, so it is not called
-/// here: every caller of [`spawn_resumed_pane`] resolves first through
-/// [`crate::claude_cli_spawn::resolve_resume_claude_bin`], off the async worker.
+/// here: every caller of [`spawn_resumed_pane`] resolves first, off the async
+/// worker — the migration through its CLI hold
+/// ([`super::cli_availability::launch_with_hold`]), the resume door and the
+/// respawn receiver through [`crate::claude_cli_spawn::resolve_resume_claude_bin`].
 fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
@@ -1807,6 +2078,21 @@ fn resume_respawn_extra_required(
         out.extend(carrier.argv());
     }
     out
+}
+
+/// The respawn's argv, built by `build_argv` from the runner's hook carrier
+/// args, and the launch evidence plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli` D4 reads from the same
+/// spawn ([`super::respawn_launch::SpawnedPane::carried_settings`]): whether
+/// those hook args were non-empty. Never read off the built argv, where an
+/// operator launch template's `--settings` (which carries no runner hook)
+/// would pass for one.
+fn resume_command_with_evidence(
+    hook_args: Vec<String>,
+    build_argv: impl FnOnce(Vec<String>) -> Vec<String>,
+) -> (Vec<String>, bool) {
+    let carried_settings = !hook_args.is_empty();
+    (build_argv(hook_args), carried_settings)
 }
 
 /// Migrate `record`'s session from `src_config_dir` to `dst_config_dir`: the
@@ -2078,12 +2364,47 @@ fn prepare_migration(
     })
 }
 
-/// The migration's side of [`super::respawn_liveness::RespawnEffects`]: one
-/// resumed pane under the DESTINATION account per call.
-struct MigrationRespawn<'a> {
+/// The held event's `trigger`: `operator` for a move the operator asked for
+/// (the manual command — its account is not necessarily out of tokens),
+/// `usage_limit` for the automatic path.
+fn hold_trigger(origin: crate::coord_drain_state::SpawnOrigin) -> &'static str {
+    if origin == crate::coord_drain_state::SpawnOrigin::OperatorTerminal {
+        "operator"
+    } else {
+        "usage_limit"
+    }
+}
+
+/// The migration hold's `abort`, read off the session's close hold:
+/// [`super::cli_availability::old_pane_aborts_hold`] over a USER close of the
+/// old pane or of any pane in `spawned` (the panes this respawn already
+/// spawned: `confirm_respawn`'s close hold passes its own list to
+/// `spawn_next`, the same list its user-close check reads), and the old pane
+/// being gone (a held close of it, or `old_alive` false). `spawned` empty is
+/// the first spawn.
+pub(super) fn hold_aborts_for(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    claude_session_id: &str,
+    old_terminal_id: &str,
+    old_alive: bool,
+    spawned: &[String],
+) -> bool {
+    let held_old = store.peek_held_close(claude_session_id, old_terminal_id);
+    let user_closed = held_old.as_ref().is_some_and(|c| c.is_user_close())
+        || store
+            .peek_held_user_close(claude_session_id, spawned)
+            .is_some();
+    let gone = held_old.is_some() || !old_alive;
+    super::cli_availability::old_pane_aborts_hold(user_closed, gone, spawned.is_empty())
+}
+
+/// What each resumed pane of the migration is spawned from: one pane under
+/// the DESTINATION account per spawn.
+struct MigrationSpawnSpec<'a> {
     app: &'a tauri::AppHandle,
     terminal_manager: std::sync::Arc<crate::terminal::TerminalManager>,
     session_registry: std::sync::Arc<crate::session::SessionRegistry>,
+    store: std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
     record: &'a TerminalSessionRecord,
     src_config_dir: &'a str,
     dst_config_dir: &'a str,
@@ -2093,17 +2414,68 @@ struct MigrationRespawn<'a> {
     origin: crate::coord_drain_state::SpawnOrigin,
 }
 
-impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
-    fn claude_session_id(&self) -> &str {
-        &self.record.claude_session_id
+/// The migration's side of [`super::respawn_liveness::RespawnEffects`]: the
+/// spawn spec, plus the migration's CLI hold, whose ceiling spans every spawn
+/// of the migration ([`super::cli_availability`]), and the resolver probe that
+/// hold looks through, kept beside it so a failing resolver warns once per
+/// migration rather than once per respawn attempt.
+struct MigrationRespawn<'a> {
+    spec: MigrationSpawnSpec<'a>,
+    cli_hold: super::cli_availability::CliHold,
+    resolver_probe: super::cli_availability::ResolverProbe,
+}
+
+impl MigrationSpawnSpec<'_> {
+    /// The hold's `abort`: [`hold_aborts_for`] with the old pane's liveness
+    /// read from the terminal manager.
+    fn hold_aborts(&self, spawned: &[String]) -> bool {
+        let old = self.record.terminal_id.as_str();
+        hold_aborts_for(
+            &self.store,
+            &self.record.claude_session_id,
+            old,
+            self.terminal_manager.get(old).is_some_and(|s| s.is_alive()),
+            spawned,
+        )
     }
 
-    async fn spawn_next(&mut self) -> Result<String, String> {
-        // The async pre-step (D3.1): the ABSOLUTE binary, retried, never bare.
-        let claude_bin = crate::claude_cli_spawn::resolve_resume_claude_bin(
-            &crate::claude_cli_spawn::RESUME_RESOLVE_DELAYS,
-        )
-        .await?;
+    /// The hold's `on_hold`, once per migration: the log line and the
+    /// `session-account-migration-held` event the held toast reads.
+    fn announce_cli_hold(
+        &self,
+        seen: super::cli_availability::LastSeen,
+        ceiling: std::time::Duration,
+    ) {
+        let trigger = hold_trigger(self.origin);
+        info!(
+            session = %self.record.claude_session_id,
+            from = %self.src_config_dir,
+            to = %self.dst_config_dir,
+            ceiling_secs = ceiling.as_secs(),
+            trigger,
+            "migration: holding for the Claude CLI ({seen})"
+        );
+        if let Err(e) = self.app.emit(
+            "session-account-migration-held",
+            json!({
+                "claudeSessionId": self.record.claude_session_id,
+                "fromConfigDir": self.src_config_dir,
+                "toConfigDir": self.dst_config_dir,
+                "reason": format!("{}{seen}", crate::claude_cli_spawn::CLI_UNAVAILABLE_HEAD),
+                "ceilingSecs": ceiling.as_secs(),
+                "trigger": trigger,
+            }),
+        ) {
+            warn!(error = %e, "failed to emit session-account-migration-held");
+        }
+    }
+
+    /// One resumed pane with `claude_bin`, the binary the hold judged
+    /// launchable.
+    async fn spawn_with(
+        &self,
+        claude_bin: String,
+    ) -> Result<super::respawn_launch::SpawnedPane, String> {
         // Model is sniffed off the SOURCE transcript: `--resume` alone
         // restores the conversation but the model falls back to the target
         // account's default. The read is blocking I/O, so it goes to the
@@ -2173,7 +2545,43 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
                 policy_tenant,
             },
         )
-        .map(|(terminal_id, _coord_session_id)| terminal_id)
+    }
+}
+
+impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
+    fn claude_session_id(&self) -> &str {
+        &self.spec.record.claude_session_id
+    }
+
+    /// Wait out a runner-owned CLI install, then HOLD for a stably launchable
+    /// `claude` (up to the migration's ceiling) and spawn with it
+    /// ([`super::cli_availability::launch_with_hold`]). The same `abort` —
+    /// [`hold_aborts_for`] — is polled through both waits.
+    async fn spawn_next(
+        &mut self,
+        spawned: &[String],
+    ) -> Result<super::respawn_launch::SpawnedPane, super::respawn_launch::SpawnNextError> {
+        let spec = &self.spec;
+        let mut abort = || spec.hold_aborts(spawned);
+        if super::cli_availability::await_unless_aborted(
+            crate::claude_cli_spawn::await_cli_update_quiescent(),
+            &mut abort,
+            super::cli_availability::MIGRATION_CLI_HOLD_TICK,
+        )
+        .await
+        .is_none()
+        {
+            return Err(super::respawn_launch::SpawnNextError::HoldAborted);
+        }
+        let ceiling = self.cli_hold.ceiling();
+        super::cli_availability::launch_with_hold(
+            &mut self.cli_hold,
+            &mut self.resolver_probe,
+            &mut |seen| spec.announce_cli_hold(seen, ceiling),
+            &mut abort,
+            move |bin| spec.spawn_with(bin),
+        )
+        .await
     }
 
     async fn await_liveness(
@@ -2181,7 +2589,7 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
         terminal_id: &str,
     ) -> super::respawn_liveness::LivenessVerdict {
         super::respawn_liveness::await_resumed_cli(
-            &self.terminal_manager,
+            &self.spec.terminal_manager,
             terminal_id,
             super::respawn_liveness::RESUME_LIVENESS_DEADLINE,
         )
@@ -2194,7 +2602,7 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
 
     fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
         std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
-            std::sync::Arc::clone(&self.terminal_manager),
+            std::sync::Arc::clone(&self.spec.terminal_manager),
         ))
     }
 }
@@ -2208,9 +2616,12 @@ impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
 /// is not that: until 2026-10-20 it was treated as one, and one migration in
 /// twelve on merytshost then watched its new child exit 127 while the old pane
 /// was already gone. Now:
-/// - a failure of the first spawn returns [`MigrateError::Failed`] with the
-///   old pane untouched (the 2026-09-18 ordering; every earlier failure is
-///   [`prepare_migration`]'s);
+/// - the first spawn HOLDS while no stably launchable `claude` resolves
+///   ([`super::cli_availability`]), up to its ceiling, under the old pane;
+///   running out is [`MigrateError::CliUnavailable`], the user closing the old
+///   pane meanwhile a refusal, and a spawn that still fails
+///   [`MigrateError::SpawnFailed`] — each with the old pane untouched (the
+///   2026-09-18 ordering; every earlier failure is [`prepare_migration`]'s);
 /// - a child that dies before painting is retried (next pane first, then the
 ///   dead one is superseded and closed), and when every attempt dies the
 ///   pre-migration record is restored onto the old pane while that still
@@ -2318,16 +2729,21 @@ async fn confirm_migration(
     // re-keys the SAME lifecycle row (`--resume <id>`) onto each new terminal
     // synchronously, preserving page/zone.
     let mut effects = MigrationRespawn {
-        app,
-        terminal_manager,
-        session_registry,
-        record: &current_record,
-        src_config_dir,
-        dst_config_dir,
-        working_dir: &working_dir,
-        title,
-        gate_identity,
-        origin,
+        spec: MigrationSpawnSpec {
+            app,
+            terminal_manager,
+            session_registry,
+            store: std::sync::Arc::clone(&store),
+            record: &current_record,
+            src_config_dir,
+            dst_config_dir,
+            working_dir: &working_dir,
+            title,
+            gate_identity,
+            origin,
+        },
+        cli_hold: super::cli_availability::CliHold::for_migration(),
+        resolver_probe: super::cli_availability::ResolverProbe::default(),
     };
     // The rollback target is the record as re-read under the guard, not the
     // caller's copy (read before the usage probe and the carry).
@@ -2365,77 +2781,71 @@ async fn confirm_migration(
         crate::agent_runtime::restore_continuation_registration(host, c, reservation);
     });
 
-    let new_terminal_id = match outcome {
-        RespawnOutcome::Alive { terminal_id, .. } => terminal_id,
-        RespawnOutcome::NotSpawned(e) => return Err(MigrateError::Failed(e)),
-        // The user closed the new pane while it was being proven: no retry;
-        // the session is back on the old pane if that still runs, else the
-        // user's close ended it.
-        RespawnOutcome::ClosedByUser { .. } => {
-            return Err(MigrateError::Failed(
-                "closed_by_user: the user closed the resumed pane mid-migration — nothing retried; the session is back on the old pane if that pane still runs, otherwise the close ended it"
-                    .to_string(),
-            ))
+    // How many panes had been spawned when the user closed the old pane (0:
+    // during the first spawn's CLI hold), for the abandoned toast's wording.
+    let closed_after_attempts = match &outcome {
+        RespawnOutcome::OldPaneClosed { attempts } => *attempts,
+        _ => 0,
+    };
+    // The ONE closing event this outcome gets ([`closing_event`]): emitted
+    // here by `close`, or by the automatic path's settle, or (migrated) below.
+    let held = effects.cli_hold.announced();
+    let closing = closing_event(held, origin, &outcome);
+    let close = |err: MigrateError| {
+        match closing {
+            ClosingEvent::SkippedHere => {
+                emit_skipped(app, record, src_config_dir, &err.skip_reason());
+            }
+            ClosingEvent::OperatorFailed => {
+                emit_operator_move_failed(
+                    app,
+                    record,
+                    src_config_dir,
+                    dst_config_dir,
+                    &err.to_string(),
+                );
+            }
+            ClosingEvent::Abandoned => emit_held_abandoned(
+                app,
+                record,
+                src_config_dir,
+                dst_config_dir,
+                held_abandoned_reason(closed_after_attempts),
+            ),
+            ClosingEvent::Migrated | ClosingEvent::SkippedBySettle | ClosingEvent::Nothing => {}
         }
-        // The old pane closed (before the first spawn, or by the user during
-        // the proof): the same fact `still_migratable` refuses up front, met
-        // one step later — a refusal, not a failure, so the auto path reports
-        // nothing and gives the cap slot back.
-        RespawnOutcome::OldPaneClosed { .. } => {
-            return Err(MigrateError::Refused(MigrationRefusal::Closed {
-                session: record.claude_session_id.clone(),
-            }))
-        }
-        RespawnOutcome::Died {
-            exit_code,
-            attempts,
-            retry_spawn_error,
-        } => {
-            let err = MigrateError::RespawnDied {
-                exit_code,
-                attempts,
-                retry_spawn_error,
-            };
-            warn!(
-                session = %record.claude_session_id,
-                "{err} — rolled back onto the old pane if it still runs, else the session ended"
-            );
-            emit_skipped(app, record, src_config_dir, &err.skip_reason());
-            return Err(err);
-        }
-        RespawnOutcome::Unconfirmed { terminal_id } => {
-            // The new pane keeps the row (the old pane is gone or a bare
-            // shell), so the session now lives on `dst`: top that copy up
-            // with whatever the old writer wrote, as the proven arm does. No
-            // nudge — nothing proved the CLI would take one.
-            let _sync_done = crate::terminal::session_carry::spawn_delta_sync_after_exit(
-                old_writer,
-                record.claude_session_id.clone(),
-                carried,
-            );
-            // The session moved, so its carried stop is not a fresh one on
-            // `dst`: stamp the move, as the proven arm does below. No nudge is
-            // sent here, so the hint path waits out the migration-nudge window
-            // (`limit_reset::MIGRATION_NUDGE_WINDOW_MS`) before it continues
-            // the carried stop itself: a delay, accepted.
-            note_migrated(
-                &record.claude_session_id,
-                chrono::Utc::now().timestamp_millis(),
-            );
-            let err = MigrateError::Unconfirmed {
-                new_terminal_id: terminal_id,
-                rolled_back: false,
-            };
-            emit_skipped(app, record, src_config_dir, &err.skip_reason());
-            return Err(err);
-        }
-        RespawnOutcome::UnconfirmedRolledBack { terminal_id } => {
-            let err = MigrateError::Unconfirmed {
-                new_terminal_id: terminal_id,
-                rolled_back: true,
-            };
-            emit_skipped(app, record, src_config_dir, &err.skip_reason());
-            return Err(err);
+        err
+    };
+    // An unconfirmed migration whose new pane keeps the row leaves the
+    // session on `dst`: top that copy up with whatever the old writer wrote,
+    // as the proven arm does. No nudge — nothing proved the CLI would take one.
+    let keeps_new_pane = matches!(outcome, RespawnOutcome::Unconfirmed { .. });
+    let new_terminal_id = match outcome_result(outcome, &record.claude_session_id) {
+        Ok(terminal_id) => terminal_id,
+        Err(err) => {
+            if keeps_new_pane {
+                let _sync_done = crate::terminal::session_carry::spawn_delta_sync_after_exit(
+                    old_writer,
+                    record.claude_session_id.clone(),
+                    carried,
+                );
+                // The session moved, so its carried stop is not a fresh one on
+                // `dst`: stamp the move, as the proven arm does below. No nudge is
+                // sent here, so the hint path waits out the migration-nudge window
+                // (`limit_reset::MIGRATION_NUDGE_WINDOW_MS`) before it continues
+                // the carried stop itself: a delay, accepted.
+                note_migrated(
+                    &record.claude_session_id,
+                    chrono::Utc::now().timestamp_millis(),
+                );
+            }
+            if matches!(err, MigrateError::RespawnDied { .. }) {
+                warn!(
+                    session = %record.claude_session_id,
+                    "{err} — rolled back onto the old pane if it still runs, else the session ended"
+                );
+            }
+            return Err(close(err));
         }
     };
     // The session now runs on `dst_config_dir`, and its carried transcript
@@ -2510,6 +2920,187 @@ async fn confirm_migration(
         warn!(error = %e, "failed to emit session-account-migrated");
     }
     Ok(outcome)
+}
+
+/// The one closing event a migration's outcome gets, so a held toast is
+/// always followed by exactly one (and an unheld move gets what it always got).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosingEvent {
+    /// `session-account-migrated`, emitted on the proven arm.
+    Migrated,
+    /// `session-account-migration-skipped`, emitted by `confirm_migration`
+    /// (the arms that changed panes).
+    SkippedHere,
+    /// `session-account-migration-skipped`, emitted by the automatic path's
+    /// `settle_hint_migration`.
+    SkippedBySettle,
+    /// `session-account-migration-failed`: a held operator move that failed.
+    OperatorFailed,
+    /// `session-account-migration-abandoned`: a held move whose old pane
+    /// closed or went away.
+    Abandoned,
+    /// Nothing: an unheld refusal, or an unheld operator move whose error the
+    /// Tauri command returns to the UI.
+    Nothing,
+}
+
+/// What `confirm_migration` makes of a respawn outcome: the new pane's
+/// terminal id when it was proven alive, else the [`MigrateError`] the
+/// migration fails with. One pure mapping, so the closing-event choice
+/// ([`closing_event`]) and the settle's own report
+/// ([`MigrateError::reported_itself`]) can be tested against the errors the
+/// migration really builds.
+fn outcome_result(
+    outcome: super::respawn_liveness::RespawnOutcome,
+    claude_session_id: &str,
+) -> Result<String, MigrateError> {
+    use super::respawn_launch::FirstSpawnError;
+    use super::respawn_liveness::RespawnOutcome as O;
+    match outcome {
+        O::Alive { terminal_id, .. } => Ok(terminal_id),
+        // The CLI hold ran to its ceiling: nothing was spawned, the session
+        // stays on the old pane, and the cap slot goes back
+        // (`settle_hint_migration`).
+        O::NotSpawned(FirstSpawnError::CliUnavailable(c)) => Err(MigrateError::CliUnavailable {
+            waited: c.waited,
+            kind: c.last_seen,
+        }),
+        O::NotSpawned(FirstSpawnError::Spawn(e)) => Err(MigrateError::SpawnFailed(e)),
+        // The user closed the new pane while it was being proven: no retry;
+        // the session is back on the old pane if that still runs, else the
+        // user's close ended it.
+        O::ClosedByUser { .. } => Err(MigrateError::Failed(
+            "closed_by_user: the user closed the resumed pane mid-migration — nothing retried; the session is back on the old pane if that pane still runs, otherwise the close ended it"
+                .to_string(),
+        )),
+        // The old pane closed or went (before the first spawn — including a
+        // first-spawn hold that was aborted, which `confirm_respawn` reports
+        // here — or closed by the user during the proof): the same fact
+        // `still_migratable` refuses up front, met one step later — a refusal,
+        // not a failure, so the auto path reports nothing and gives the cap
+        // slot back; a held toast is closed as abandoned.
+        O::OldPaneClosed { .. } => Err(MigrateError::Refused(MigrationRefusal::Closed {
+            session: claude_session_id.to_string(),
+        })),
+        O::Died {
+            exit_code,
+            attempts,
+            retry_spawn_error,
+            all_launch_failures,
+        } => Err(MigrateError::RespawnDied {
+            exit_code,
+            attempts,
+            retry_spawn_error,
+            all_launch_failures,
+        }),
+        // The new pane keeps the row (the old pane is gone or a bare shell),
+        // so the session now lives on `dst`.
+        O::Unconfirmed { terminal_id } => Err(MigrateError::Unconfirmed {
+            new_terminal_id: terminal_id,
+            rolled_back: false,
+        }),
+        O::UnconfirmedRolledBack { terminal_id } => Err(MigrateError::Unconfirmed {
+            new_terminal_id: terminal_id,
+            rolled_back: true,
+        }),
+    }
+}
+
+/// Which [`ClosingEvent`] `outcome` gets. A held OPERATOR move never gets
+/// `-skipped`, whose toast claims the account is out of tokens.
+fn closing_event(
+    held: bool,
+    origin: crate::coord_drain_state::SpawnOrigin,
+    outcome: &super::respawn_liveness::RespawnOutcome,
+) -> ClosingEvent {
+    use super::respawn_liveness::RespawnOutcome as O;
+    let operator_closes = operator_hold_needs_close(held, origin);
+    let automatic = hold_trigger(origin) == "usage_limit";
+    match outcome {
+        O::Alive { .. } => ClosingEvent::Migrated,
+        O::OldPaneClosed { .. } if held => ClosingEvent::Abandoned,
+        O::OldPaneClosed { .. } => ClosingEvent::Nothing,
+        O::NotSpawned(_) | O::ClosedByUser { .. } if operator_closes => {
+            ClosingEvent::OperatorFailed
+        }
+        O::NotSpawned(_) | O::ClosedByUser { .. } if automatic => ClosingEvent::SkippedBySettle,
+        O::NotSpawned(_) | O::ClosedByUser { .. } => ClosingEvent::Nothing,
+        O::Died { .. } | O::Unconfirmed { .. } | O::UnconfirmedRolledBack { .. }
+            if operator_closes =>
+        {
+            ClosingEvent::OperatorFailed
+        }
+        O::Died { .. } | O::Unconfirmed { .. } | O::UnconfirmedRolledBack { .. } => {
+            ClosingEvent::SkippedHere
+        }
+    }
+}
+
+/// Whether a failed migration must emit its own closing
+/// `session-account-migration-failed`: only an OPERATOR move whose hold was
+/// announced. The automatic path's `settle_hint_migration` reports the same
+/// arms as `-skipped`, so it must not emit a second time; a move that never
+/// held showed no held toast to close.
+fn operator_hold_needs_close(held: bool, origin: crate::coord_drain_state::SpawnOrigin) -> bool {
+    held && hold_trigger(origin) == "operator"
+}
+
+/// The closing event of an operator move that held for the CLI and then
+/// failed (the hold ran out, the spawn failed, or the user closed the resumed
+/// pane).
+fn emit_operator_move_failed(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src: &str,
+    dst: &str,
+    reason: &str,
+) {
+    if let Err(e) = app.emit(
+        "session-account-migration-failed",
+        json!({
+            "claudeSessionId": record.claude_session_id,
+            "fromConfigDir": src,
+            "toConfigDir": dst,
+            "reason": reason,
+            "trigger": "operator",
+        }),
+    ) {
+        warn!(error = %e, "failed to emit session-account-migration-failed");
+    }
+}
+
+/// Why a migration that had held for the CLI was abandoned: closed DURING the
+/// hold (no pane spawned yet) or later, while a spawned pane was being proven.
+fn held_abandoned_reason(attempts: usize) -> &'static str {
+    if attempts == 0 {
+        // A first-spawn hold also ends when the old pane exits on its own.
+        "the old pane closed or exited while the migration waited for the Claude CLI"
+    } else {
+        "the old pane was closed during the migration"
+    }
+}
+
+/// The held toast's terminal moment when the migration ended because the old
+/// pane was closed: it settles as a quiet refusal (no skipped toast), so
+/// without this the held toast would be the last word.
+fn emit_held_abandoned(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src: &str,
+    dst: &str,
+    reason: &str,
+) {
+    if let Err(e) = app.emit(
+        "session-account-migration-abandoned",
+        json!({
+            "claudeSessionId": record.claude_session_id,
+            "fromConfigDir": src,
+            "toConfigDir": dst,
+            "reason": reason,
+        }),
+    ) {
+        warn!(error = %e, "failed to emit session-account-migration-abandoned");
+    }
 }
 
 fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &str, reason: &str) {
@@ -2911,6 +3502,52 @@ mod tests {
         assert!(!bare.iter().any(|a| a == APPEND_SYSTEM_PROMPT_FLAG));
     }
 
+    /// Review A2 / r4 A6: the evidence step itself — an operator template's
+    /// `--settings` in the built argv is not hook delivery. With empty hook
+    /// args the argv still carries the template's flag, yet the evidence says
+    /// "not delivered", so the pane's death counts as a launched CLI and the
+    /// cap slot is kept. Wiring the evidence from the argv fails this.
+    #[test]
+    fn an_operator_settings_flag_is_not_hook_delivery() {
+        let cfg = crate::claude_session::launch_spec::LaunchConfig {
+            default_template: Some("claude --settings /operator/own.json".to_string()),
+            ..Default::default()
+        };
+        let build = |hook_args: Vec<String>| {
+            resume_respawn_argv(
+                "/fake/bin/claude",
+                "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
+                None,
+                &cfg,
+                resume_respawn_extra_required(hook_args, None),
+            )
+        };
+        let (argv, carried) = resume_command_with_evidence(Vec::new(), build);
+        assert!(
+            argv.iter().any(|a| a == "--settings"),
+            "fixture: the template's flag reaches the argv: {argv:?}"
+        );
+        assert!(!carried, "no runner hook args: not delivered");
+        let pane = super::super::respawn_launch::SpawnedPane {
+            terminal_id: "new-1".into(),
+            created_at_ms: Some(1_000),
+            carried_settings: carried,
+        };
+        assert!(
+            !super::super::respawn_launch::death_was_launch_failure(&pane, None),
+            "hook delivery unknown: the death counts as launched, the slot is kept"
+        );
+        let (argv, carried) = resume_command_with_evidence(
+            vec!["--settings".to_string(), "hooks.json".to_string()],
+            build,
+        );
+        assert!(carried);
+        assert!(
+            argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
+            "{argv:?}"
+        );
+    }
+
     /// The 2026-09-18 regression: the respawn argv's head was the bare
     /// `claude_bin_path()`, which the PTY spawn resolved against the child's
     /// PATH to the extensionless identity-shim script and `CreateProcessW`
@@ -2920,7 +3557,9 @@ mod tests {
     /// in rather than read from the resolver so this reads no process-global
     /// env (`PATH`, `QONTINUI_CLAUDE_BIN`) that other tests in this binary
     /// mutate; the one-line wiring in `spawn_resumed_pane` is
-    /// `&spec.claude_bin`, which `claude_cli_spawn::resolve_resume_claude_bin` fills.
+    /// `&spec.claude_bin`, which the caller fills: the migration from its CLI
+    /// hold (`cli_availability::launch_with_hold`), the resume door and the
+    /// respawn receiver from `claude_cli_spawn::resolve_resume_claude_bin`.
     #[test]
     fn resume_respawn_argv_head_is_the_binary_the_caller_resolved() {
         let bin = if cfg!(windows) {
@@ -3065,16 +3704,20 @@ mod tests {
         }
         assert_eq!(after.matches("report_migration_refused(").count(), 2);
         assert!(!after.contains("emit_skipped(&app, &record, &src, \""));
-        // A no-target refusal gives its cap slot back.
-        let no_target = after
+        // A no-target refusal gives its cap slot back: the target pick runs
+        // inside `admit_hint`, whose `CapSlot` refunds on drop when no target
+        // is found (pinned by `admit_hint`'s own tests).
+        let (admit, rest) = after
             .split_once("pick_migration_target(")
-            .expect("the target pick")
-            .1;
-        let no_target = no_target
-            .split_once("NoUsableTarget")
-            .expect("the no-target refusal")
-            .0;
-        assert!(no_target.contains("refund_migration_cap("));
+            .expect("the target pick");
+        assert!(
+            admit.contains("admit_hint("),
+            "the target pick runs inside admit_hint, which holds the cap slot"
+        );
+        assert!(
+            rest.contains("NoUsableTarget"),
+            "the no-target refusal parks"
+        );
         let env = source_between("for ProdHintEnv<'_> {", "\n}\n");
         assert!(env.contains("self.record.finished_at.is_some()"));
         assert!(env.contains("hint_switches(&crate::settings::get_ai_settings().claude_cli)"));
@@ -3323,6 +3966,7 @@ mod tests {
         settle_hint_migration(
             sid,
             stamp,
+            stamp + 10,
             result,
             || unrecorded = true,
             |reason| skipped = Some(reason.to_string()),
@@ -3547,6 +4191,7 @@ mod tests {
                 exit_code: Some(127),
                 attempts: 3,
                 retry_spawn_error: None,
+                all_launch_failures: false,
             },
             MigrateError::Unconfirmed {
                 new_terminal_id: "new-1".into(),
@@ -3565,6 +4210,7 @@ mod tests {
             exit_code: Some(127),
             attempts: 3,
             retry_spawn_error: Some("claude not found".into()),
+            all_launch_failures: false,
         };
         assert_eq!(
             e.skip_reason(),
@@ -3585,6 +4231,7 @@ mod tests {
                     exit_code: Some(127),
                     attempts: 3,
                     retry_spawn_error: None,
+                    all_launch_failures: false,
                 },
                 true,
             ),
@@ -3623,9 +4270,13 @@ mod tests {
         let sid = "test/account_migration/refund-one";
         assert!(migration_cap_permits(sid, base));
         assert!(migration_cap_permits(sid, base));
-        refund_migration_cap(sid, base);
+        refund_migration_cap(sid, base, CapRefund::NeverStarted);
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
-        refund_migration_cap("test/account_migration/never-capped", base);
+        assert!(!refund_migration_cap(
+            "test/account_migration/never-capped",
+            base,
+            CapRefund::NeverStarted
+        ));
     }
 
     #[test]
@@ -3638,6 +4289,676 @@ mod tests {
         assert!(
             migration_cap_permits("test/cap/b", base + 10),
             "an unrelated session is not capped"
+        );
+    }
+
+    // ---- plan 2026-11-10-migration-holds-for-missing-claude-cli, Phases 4-5 --
+
+    /// `settle_hint_migration` once, after the hint took its slot at `stamp`:
+    /// (cap_left it returned and logged, skipped reason).
+    fn settled_cap_left(
+        sid: &str,
+        stamp: i64,
+        result: Result<MigrationOutcome, MigrateError>,
+    ) -> (usize, Option<String>) {
+        assert!(migration_cap_permits(sid, stamp), "the hint takes a slot");
+        let mut skipped = None;
+        let left = settle_hint_migration(
+            sid,
+            stamp,
+            stamp + 10,
+            result,
+            || {},
+            |reason| skipped = Some(reason.to_string()),
+        );
+        (left, skipped)
+    }
+
+    fn died(all_launch_failures: bool) -> MigrateError {
+        MigrateError::RespawnDied {
+            exit_code: Some(1),
+            attempts: 3,
+            retry_spawn_error: None,
+            all_launch_failures,
+        }
+    }
+
+    fn cli_unavailable() -> MigrateError {
+        MigrateError::CliUnavailable {
+            waited: std::time::Duration::from_secs(900),
+            kind: super::super::cli_availability::LastSeen::Absent,
+        }
+    }
+
+    /// Phase 5's table: each arm of the automatic path and the slots it
+    /// leaves, as literals.
+    #[test]
+    fn each_settle_arm_leaves_its_literal_cap_left() {
+        let base = 1_795_000_000_000i64;
+        let migrated = || {
+            Ok(MigrationOutcome {
+                new_terminal_id: "new-1".into(),
+                from_config_dir: "C:/a".into(),
+                to_config_dir: "C:/b".into(),
+            })
+        };
+        let refused = || {
+            Err(MigrateError::Refused(MigrationRefusal::InFlight {
+                session: "s".into(),
+                holder: IN_FLIGHT_HOLDER,
+            }))
+        };
+        // `OldPaneClosed` reaches the settle as this refusal (confirm_migration).
+        let old_pane_closed = || {
+            Err(MigrateError::Refused(MigrationRefusal::Closed {
+                session: "s".into(),
+            }))
+        };
+        let rows: Vec<(&str, Result<MigrationOutcome, MigrateError>, usize)> = vec![
+            ("refused", refused(), 3),
+            ("cli-unavailable", Err(cli_unavailable()), 3),
+            ("old-pane-closed", old_pane_closed(), 3),
+            // The boolean only; which death shapes set it is pinned per shape in
+            // `respawn_liveness::every_died_shape_reports_whether_any_attempt_launched`.
+            ("died: all_launch_failures = true", Err(died(true)), 3),
+            ("died: all_launch_failures = false", Err(died(false)), 2),
+            (
+                "spawn-failed: the first spawn failed, no CLI launched",
+                Err(MigrateError::SpawnFailed("exec failed".into())),
+                3,
+            ),
+            (
+                "unconfirmed",
+                Err(MigrateError::Unconfirmed {
+                    new_terminal_id: "new-1".into(),
+                    rolled_back: true,
+                }),
+                2,
+            ),
+            ("alive", migrated(), 2),
+            (
+                "failed",
+                Err(MigrateError::Failed("spawn failed".into())),
+                2,
+            ),
+        ];
+        for (i, (arm, result, want)) in rows.into_iter().enumerate() {
+            let sid = format!("test/account_migration/settle-table-{i}");
+            let (left, _) = settled_cap_left(&sid, base, result);
+            assert_eq!(left, want, "{arm}");
+        }
+    }
+
+    #[test]
+    fn a_cli_unavailable_migration_is_reported_with_its_kind_and_the_returned_slot() {
+        let e = cli_unavailable();
+        assert_eq!(
+            e.skip_reason(),
+            "migration-failed: claude_cli_unavailable:absent after 900s — the session stays on the old pane"
+        );
+        assert!(!e.reported_itself(), "the settle reports it");
+        assert!(!e.reached_destination());
+        let (left, skipped) = settled_cap_left(
+            "test/account_migration/cli-unavailable-toast",
+            1_796_000_000_000,
+            Err(e),
+        );
+        assert_eq!(left, MIGRATION_CAP);
+        assert_eq!(
+            skipped.as_deref(),
+            Some(
+                "migration-failed: claude_cli_unavailable:absent after 900s — the session stays on the old pane (cap slot returned)"
+            )
+        );
+    }
+
+    /// A launch-failure death reports itself (inside `confirm_migration`, a
+    /// toast shared with the manual path), so the settle emits nothing and
+    /// does not name the refund there — the `cap_left` log carries it.
+    #[test]
+    fn a_launch_failure_death_is_not_reported_twice_and_names_no_refund() {
+        let (left, skipped) = settled_cap_left(
+            "test/account_migration/died-launch-failure",
+            1_797_000_000_000,
+            Err(died(true)),
+        );
+        assert_eq!(left, MIGRATION_CAP);
+        assert_eq!(skipped, None);
+    }
+
+    /// D4's no-loop bound, independent of whatever re-fires the hint: however
+    /// many launch failures a session has, at most `MIGRATION_CAP` of them
+    /// are refunded per window, so the cap still stops it.
+    #[test]
+    fn launch_failure_refunds_per_session_are_bounded_by_the_cap() {
+        let sid = "test/account_migration/refund-bound";
+        let base = 1_798_000_000_000i64;
+        let mut admitted = 0;
+        let mut refunded = 0;
+        for i in 0..20i64 {
+            let stamp = base + i;
+            if !migration_cap_permits(sid, stamp) {
+                break;
+            }
+            admitted += 1;
+            if refund_migration_cap(sid, stamp, CapRefund::NeverLaunched) {
+                refunded += 1;
+            }
+        }
+        assert_eq!(refunded, MIGRATION_CAP, "refunds stop at the cap");
+        assert_eq!(admitted, 2 * MIGRATION_CAP, "then the cap holds");
+        assert!(!migration_cap_permits(sid, base + 100));
+        // A window later both bounds have rolled over.
+        let later = base + MIGRATION_CAP_WINDOW_MS + 1_000;
+        assert!(migration_cap_permits(sid, later));
+        assert!(refund_migration_cap(sid, later, CapRefund::NeverLaunched));
+    }
+
+    /// A refusal's refund (nothing ever started) is not bounded: it cannot
+    /// feed a loop, and bounding it would charge a slot for a migration that
+    /// never ran.
+    #[test]
+    fn never_started_refunds_are_not_bounded() {
+        let sid = "test/account_migration/refund-never-started";
+        let base = 1_799_000_000_000i64;
+        for i in 0..(3 * MIGRATION_CAP as i64) {
+            assert!(migration_cap_permits(sid, base + i));
+            assert!(refund_migration_cap(sid, base + i, CapRefund::NeverStarted));
+        }
+        assert_eq!(migration_cap_left(sid, base + 100), MIGRATION_CAP);
+    }
+
+    #[test]
+    fn a_failed_first_spawn_is_reported_and_returns_its_slot() {
+        let e = MigrateError::SpawnFailed("exec failed".into());
+        assert!(e.returns_cap_slot());
+        let (left, skipped) = settled_cap_left(
+            "test/account_migration/spawn-failed",
+            1_796_500_000_000,
+            Err(e),
+        );
+        assert_eq!(left, MIGRATION_CAP);
+        assert_eq!(
+            skipped.as_deref(),
+            Some("migration-failed: exec failed (cap slot returned)")
+        );
+    }
+
+    /// Review r3 A11: the automatic path's slot is held in a `CapSlot`, so a
+    /// hint that finds no usable target gives it back; a spent cap takes none.
+    #[test]
+    fn a_hint_with_no_usable_target_gives_its_slot_back() {
+        let base = 1_793_000_000_000i64;
+        let sid = "test/account_migration/admit-no-target";
+        assert_eq!(admit_hint(sid, base, || None).err(), Some(HINT_NO_TARGET));
+        assert_eq!(migration_cap_left(sid, base + 10), MIGRATION_CAP);
+
+        // Review r4 A2: an admitted hint's slot is already launched — nothing a
+        // cancelled migration drops afterwards can refund it unbounded.
+        let (stamp, dst) = admit_hint(sid, base, || Some("C:/b".into())).expect("admitted");
+        assert_eq!((stamp, dst.as_str()), (base, "C:/b"));
+        assert_eq!(
+            migration_cap_left(sid, base + 10),
+            MIGRATION_CAP - 1,
+            "launched before the migration: kept until the settle decides"
+        );
+
+        let full = "test/account_migration/admit-cap-spent";
+        for i in 0..MIGRATION_CAP as i64 {
+            assert!(migration_cap_permits(full, base + i));
+        }
+        assert_eq!(
+            admit_hint(full, base + 9, || Some("C:/b".into())).err(),
+            Some(HINT_CAP_REACHED)
+        );
+    }
+
+    /// Review r3 A2: the held event names its trigger, so a move the operator
+    /// asked for is not toasted as "out of tokens".
+    #[test]
+    fn the_held_event_names_its_trigger() {
+        use crate::coord_drain_state::SpawnOrigin;
+        assert_eq!(hold_trigger(SpawnOrigin::OperatorTerminal), "operator");
+        assert_eq!(hold_trigger(SpawnOrigin::Respawn), "usage_limit");
+    }
+
+    /// A real lifecycle store with `sid` open on `old`, its closes HELD (as
+    /// `confirm_respawn`'s close hold does before the first spawn), and a
+    /// retry's dead pane `new-1` re-keyed onto it.
+    fn held_store(
+        sid: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+            dir.path().join("terminal-sessions.json"),
+        )
+        .unwrap();
+        store.record_open(session_record(sid, "old", Some("C:/a")));
+        store.hold_session_closes(sid);
+        store.record_open(session_record(sid, "new-1", Some("C:/b")));
+        (dir, store)
+    }
+
+    /// Review r4 A1, through the REAL abort (`hold_aborts_for`, which
+    /// `MigrationSpawnSpec::hold_aborts` calls): a USER close of a pane this
+    /// respawn spawned ends a retry's hold; the first spawn (no pane yet) is
+    /// unaffected by it; an exit-close of that pane is not a user close.
+    #[test]
+    fn a_user_close_of_a_spawned_pane_ends_a_retrys_hold() {
+        let sid = "test/account_migration/hold-abort-spawned";
+        let (_d, store) = held_store(sid);
+        let spawned = vec!["new-1".to_string()];
+        assert!(
+            !hold_aborts_for(&store, sid, "old", true, &spawned),
+            "nothing closed yet"
+        );
+        assert!(
+            !hold_aborts_for(&store, sid, "old", false, &spawned),
+            "a retry does not abort on the old pane gone by itself"
+        );
+        assert!(
+            hold_aborts_for(&store, sid, "old", false, &[]),
+            "the first spawn does"
+        );
+        store.record_close_checked(sid, Some("new-1"), "pty-exit");
+        assert!(
+            !hold_aborts_for(&store, sid, "old", true, &spawned),
+            "the dead pane's own exit-close is no user close"
+        );
+        store.record_close_checked(
+            sid,
+            Some("new-1"),
+            crate::session::session_lifecycle_store::USER_CLOSE_REASON,
+        );
+        assert!(hold_aborts_for(&store, sid, "old", true, &spawned));
+        assert!(
+            !hold_aborts_for(&store, sid, "old", true, &[]),
+            "the first spawn reads only the old pane"
+        );
+    }
+
+    /// Review r4 A1: that close ends the held retry PROMPTLY (the next tick,
+    /// not at the ceiling) with nothing spawned.
+    #[tokio::test(start_paused = true)]
+    async fn a_user_close_during_a_retrys_hold_ends_it_with_nothing_spawned() {
+        use super::super::cli_availability::{launch_with_hold, CliHold, CliProbe, LastSeen, Look};
+        let sid = "test/account_migration/hold-abort-prompt";
+        let (_d, store) = held_store(sid);
+        struct ClosingProbe<'s> {
+            store: &'s crate::session::session_lifecycle_store::SessionLifecycleStore,
+            sid: &'s str,
+            calls: usize,
+        }
+        impl CliProbe for ClosingProbe<'_> {
+            async fn look(&mut self) -> Look {
+                self.calls += 1;
+                if self.calls == 2 {
+                    self.store.record_close_checked(
+                        self.sid,
+                        Some("new-1"),
+                        crate::session::session_lifecycle_store::USER_CLOSE_REASON,
+                    );
+                }
+                Look::Unlaunchable(LastSeen::Absent)
+            }
+        }
+        let spawned = vec!["new-1".to_string()];
+        let mut hold = CliHold::new(
+            std::time::Duration::from_secs(900),
+            std::time::Duration::from_secs(1),
+        );
+        let mut probe = ClosingProbe {
+            store: &store,
+            sid,
+            calls: 0,
+        };
+        let mut spawns = 0;
+        let start = tokio::time::Instant::now();
+        let out = launch_with_hold(
+            &mut hold,
+            &mut probe,
+            &mut |_| {},
+            &mut || hold_aborts_for(&store, sid, "old", true, &spawned),
+            |_bin| {
+                spawns += 1;
+                std::future::ready(Ok(super::super::respawn_launch::SpawnedPane::bare("new-2")))
+            },
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(super::super::respawn_launch::SpawnNextError::HoldAborted)
+        );
+        assert_eq!(spawns, 0, "nothing spawned");
+        assert_eq!(probe.calls, 2);
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_secs(2),
+            "ended on the next tick"
+        );
+    }
+
+    /// Review r5 A5: every (held, origin, outcome) gets its closing event as
+    /// a literal; a held move always gets exactly one, and a held OPERATOR
+    /// move never gets the out-of-tokens `-skipped`.
+    #[test]
+    fn every_outcome_gets_exactly_one_closing_event() {
+        use super::super::respawn_launch::FirstSpawnError;
+        use super::super::respawn_liveness::RespawnOutcome as O;
+        use crate::coord_drain_state::SpawnOrigin;
+        use ClosingEvent::*;
+        let outcomes = [
+            (
+                "alive",
+                O::Alive {
+                    terminal_id: "t".into(),
+                    attempts: 1,
+                },
+            ),
+            ("old-pane-closed", O::OldPaneClosed { attempts: 0 }),
+            (
+                "not-spawned",
+                O::NotSpawned(FirstSpawnError::Spawn("x".into())),
+            ),
+            ("closed-by-user", O::ClosedByUser { attempts: 1 }),
+            (
+                "died",
+                O::Died {
+                    exit_code: Some(1),
+                    attempts: 3,
+                    retry_spawn_error: None,
+                    all_launch_failures: false,
+                },
+            ),
+            (
+                "unconfirmed",
+                O::Unconfirmed {
+                    terminal_id: "t".into(),
+                },
+            ),
+            (
+                "rolled-back",
+                O::UnconfirmedRolledBack {
+                    terminal_id: "t".into(),
+                },
+            ),
+        ];
+        // (held, origin) -> expected per outcome, in `outcomes` order.
+        let table = [
+            (
+                (true, SpawnOrigin::Respawn),
+                [
+                    Migrated,
+                    Abandoned,
+                    SkippedBySettle,
+                    SkippedBySettle,
+                    SkippedHere,
+                    SkippedHere,
+                    SkippedHere,
+                ],
+            ),
+            (
+                (false, SpawnOrigin::Respawn),
+                [
+                    Migrated,
+                    Nothing,
+                    SkippedBySettle,
+                    SkippedBySettle,
+                    SkippedHere,
+                    SkippedHere,
+                    SkippedHere,
+                ],
+            ),
+            (
+                (true, SpawnOrigin::OperatorTerminal),
+                [
+                    Migrated,
+                    Abandoned,
+                    OperatorFailed,
+                    OperatorFailed,
+                    OperatorFailed,
+                    OperatorFailed,
+                    OperatorFailed,
+                ],
+            ),
+            (
+                (false, SpawnOrigin::OperatorTerminal),
+                [
+                    Migrated,
+                    Nothing,
+                    Nothing,
+                    Nothing,
+                    SkippedHere,
+                    SkippedHere,
+                    SkippedHere,
+                ],
+            ),
+        ];
+        for ((held, origin), want) in table {
+            for ((name, outcome), want) in outcomes.iter().zip(want) {
+                let got = closing_event(held, origin, outcome);
+                assert_eq!(got, want, "held={held} origin={origin:?} outcome={name}");
+                if held {
+                    assert_ne!(
+                        got, Nothing,
+                        "a held toast always gets a closing event: {name}"
+                    );
+                }
+                if held && origin == SpawnOrigin::OperatorTerminal {
+                    assert!(
+                        !matches!(got, SkippedHere | SkippedBySettle),
+                        "a held operator move never gets the out-of-tokens toast: {name}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Review r7 C1: every respawn outcome maps to its exact migration
+    /// result — the variant and every field the settle and the refund read.
+    #[test]
+    fn each_outcome_maps_to_its_exact_migration_result() {
+        use super::super::cli_availability::{CliUnavailable, LastSeen};
+        use super::super::respawn_launch::FirstSpawnError;
+        use super::super::respawn_liveness::RespawnOutcome as O;
+        let waited = std::time::Duration::from_secs(900);
+        assert!(matches!(
+            outcome_result(O::Alive { terminal_id: "new".into(), attempts: 2 }, "sid"),
+            Ok(t) if t == "new"
+        ));
+        assert!(matches!(
+            outcome_result(
+                O::NotSpawned(FirstSpawnError::CliUnavailable(CliUnavailable {
+                    waited,
+                    last_seen: LastSeen::Changing,
+                })),
+                "sid"
+            ),
+            Err(MigrateError::CliUnavailable { waited: w, kind: LastSeen::Changing }) if w == waited
+        ));
+        assert!(matches!(
+            outcome_result(O::NotSpawned(FirstSpawnError::Spawn("exec".into())), "sid"),
+            Err(MigrateError::SpawnFailed(e)) if e == "exec"
+        ));
+        assert!(matches!(
+            outcome_result(O::ClosedByUser { attempts: 1 }, "sid"),
+            Err(MigrateError::Failed(m)) if m.starts_with("closed_by_user:")
+        ));
+        assert!(matches!(
+            outcome_result(O::OldPaneClosed { attempts: 0 }, "sid"),
+            Err(MigrateError::Refused(MigrationRefusal::Closed { session })) if session == "sid"
+        ));
+        assert!(matches!(
+            outcome_result(
+                O::Died {
+                    exit_code: Some(7),
+                    attempts: 3,
+                    retry_spawn_error: Some("again".into()),
+                    all_launch_failures: true,
+                },
+                "sid"
+            ),
+            Err(MigrateError::RespawnDied {
+                exit_code: Some(7),
+                attempts: 3,
+                retry_spawn_error: Some(r),
+                all_launch_failures: true,
+            }) if r == "again"
+        ));
+        assert!(matches!(
+            outcome_result(
+                O::Died {
+                    exit_code: None,
+                    attempts: 1,
+                    retry_spawn_error: None,
+                    all_launch_failures: false,
+                },
+                "sid"
+            ),
+            Err(MigrateError::RespawnDied {
+                all_launch_failures: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            outcome_result(O::Unconfirmed { terminal_id: "new".into() }, "sid"),
+            Err(MigrateError::Unconfirmed { new_terminal_id: t, rolled_back: false }) if t == "new"
+        ));
+        assert!(matches!(
+            outcome_result(O::UnconfirmedRolledBack { terminal_id: "new".into() }, "sid"),
+            Err(MigrateError::Unconfirmed { new_terminal_id: t, rolled_back: true }) if t == "new"
+        ));
+    }
+
+    /// Review r6 A2: the closing event `confirm_migration` emits and the
+    /// report the automatic path's `settle_hint_migration` makes agree, over
+    /// the errors the migration really builds ([`outcome_result`]): on the
+    /// automatic path the settle reports exactly the outcomes `closing_event`
+    /// leaves to it, so a held toast gets exactly one closing event; on the
+    /// operator path no settle runs, so nothing is left to it.
+    #[test]
+    fn the_closing_event_and_the_settles_report_agree() {
+        use super::super::cli_availability::{CliUnavailable, LastSeen};
+        use super::super::respawn_launch::FirstSpawnError;
+        use super::super::respawn_liveness::RespawnOutcome as O;
+        use crate::coord_drain_state::SpawnOrigin;
+        let outcomes = || {
+            vec![
+                O::Alive {
+                    terminal_id: "t".into(),
+                    attempts: 1,
+                },
+                O::OldPaneClosed { attempts: 0 },
+                O::OldPaneClosed { attempts: 2 },
+                O::NotSpawned(FirstSpawnError::Spawn("x".into())),
+                O::NotSpawned(FirstSpawnError::CliUnavailable(CliUnavailable {
+                    waited: std::time::Duration::from_secs(900),
+                    last_seen: LastSeen::Absent,
+                })),
+                O::ClosedByUser { attempts: 1 },
+                O::Died {
+                    exit_code: Some(1),
+                    attempts: 3,
+                    retry_spawn_error: None,
+                    all_launch_failures: true,
+                },
+                O::Unconfirmed {
+                    terminal_id: "t".into(),
+                },
+                O::UnconfirmedRolledBack {
+                    terminal_id: "t".into(),
+                },
+            ]
+        };
+        for held in [true, false] {
+            for origin in [SpawnOrigin::Respawn, SpawnOrigin::OperatorTerminal] {
+                for outcome in outcomes() {
+                    let name = format!("{outcome:?}");
+                    let closing = closing_event(held, origin, &outcome);
+                    // What `settle_hint_migration` itself emits for this
+                    // result (review r7 A2: the real settle, not a model of
+                    // it). It runs on the automatic path only.
+                    let settle_emits = origin == SpawnOrigin::Respawn
+                        && match outcome_result(outcome, "sid") {
+                            Ok(_) => false,
+                            Err(e) => {
+                                let mut emitted = false;
+                                let sid = format!("closing-agree-{name}");
+                                settle_hint_migration(
+                                    &sid,
+                                    1,
+                                    2,
+                                    Err(e),
+                                    || {},
+                                    |_| emitted = true,
+                                );
+                                emitted
+                            }
+                        };
+                    assert_eq!(
+                        closing == ClosingEvent::SkippedBySettle,
+                        settle_emits,
+                        "held={held} origin={origin:?} outcome={name}"
+                    );
+                    let emitted_here = !matches!(
+                        closing,
+                        ClosingEvent::SkippedBySettle | ClosingEvent::Nothing
+                    );
+                    if held {
+                        assert_eq!(
+                            usize::from(emitted_here) + usize::from(settle_emits),
+                            1,
+                            "a held toast gets exactly one closing event: {name}"
+                        );
+                    } else {
+                        assert!(
+                            usize::from(emitted_here) + usize::from(settle_emits) <= 1,
+                            "never two closing events: {name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Review r4 A3: only an operator move that held emits its own closing
+    /// `-failed`; the automatic path's settle already reports `-skipped`.
+    #[test]
+    fn only_a_held_operator_move_emits_its_own_failure() {
+        use crate::coord_drain_state::SpawnOrigin;
+        assert!(operator_hold_needs_close(
+            true,
+            SpawnOrigin::OperatorTerminal
+        ));
+        assert!(
+            !operator_hold_needs_close(true, SpawnOrigin::Respawn),
+            "the settle reports it"
+        );
+        assert!(
+            !operator_hold_needs_close(false, SpawnOrigin::OperatorTerminal),
+            "no held toast"
+        );
+        assert!(!operator_hold_needs_close(false, SpawnOrigin::Respawn));
+    }
+
+    /// Review r3 A3: the abandoned toast says the close came during the CLI
+    /// hold only when no pane had been spawned yet.
+    #[test]
+    fn the_abandoned_reason_depends_on_when_the_old_pane_closed() {
+        assert_eq!(
+            held_abandoned_reason(0),
+            "the old pane closed or exited while the migration waited for the Claude CLI"
+        );
+        assert_eq!(
+            held_abandoned_reason(1),
+            "the old pane was closed during the migration"
+        );
+        assert_eq!(
+            held_abandoned_reason(3),
+            "the old pane was closed during the migration"
         );
     }
 

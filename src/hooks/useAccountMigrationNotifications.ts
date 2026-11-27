@@ -23,6 +23,18 @@
  * - `session-limit-reset-continue-gave-up` when the runner stopped trying to
  *   continue such a session (its continue never reached the pane) — a
  *   coalesced error toast, since the session now needs the operator.
+ * - `session-account-migration-held` once per migration, when the respawn has
+ *   to WAIT for the Claude CLI to come back (a reinstall in progress) — an
+ *   info toast saying why the session has not moved yet. Exactly one later
+ *   toast ends it (`closing_event` in `account_migration.rs`): migrated;
+ *   `-skipped` (the AUTOMATIC path only: the wait ran out, the spawn failed,
+ *   the resumed pane was closed, or the resumed CLI died or never painted);
+ *   `-failed` (every failure of a held OPERATOR move, the deaths and unpainted
+ *   respawns included, so an operator move is never told it is out of tokens);
+ *   or `-abandoned` (the old pane closed or exited, which otherwise settles as
+ *   a silent refusal).
+ * - `session-account-migration-failed` — the operator path's closing event
+ *   for a held move (`emit_operator_move_failed` in `account_migration.rs`).
  *
  * Mount once at App level, next to `useErrorNotifications`.
  */
@@ -153,6 +165,39 @@ function carrySummary(c: SessionDirCarry | undefined): {
   };
 }
 
+/** `session-account-migration-held` (`announce_cli_hold` in `account_migration.rs`). */
+export interface HeldPayload {
+  claudeSessionId?: string;
+  fromConfigDir?: string;
+  toConfigDir?: string;
+  /** `claude_cli_unavailable:<absent|stub|not_executable|changing>`. */
+  reason?: string;
+  /** How long the migration waits for the CLI before giving up. */
+  ceilingSecs?: number;
+  /**
+   * `usage_limit` (the automatic move off an exhausted account) or `operator`
+   * (a move the operator asked for, whose account need not be exhausted).
+   * Absent on older builds, which only held on the automatic path.
+   */
+  trigger?: "usage_limit" | "operator";
+}
+
+/** `session-account-migration-abandoned` (`emit_held_abandoned` in `account_migration.rs`). */
+export interface AbandonedPayload {
+  claudeSessionId?: string;
+  fromConfigDir?: string;
+  toConfigDir?: string;
+  reason?: string;
+}
+
+/** `session-account-migration-failed`: a held operator move that failed. */
+export interface FailedPayload {
+  claudeSessionId?: string;
+  fromConfigDir?: string;
+  toConfigDir?: string;
+  reason?: string;
+}
+
 interface SkippedPayload {
   claudeSessionId?: string;
   fromConfigDir?: string;
@@ -278,6 +323,53 @@ export function gaveUpBurstToast(gaveUp: LimitGaveUpPayload[]): {
   };
 }
 
+/** `Session <first 8 of the id>`, or `A session` when the payload carries none. */
+function sessionLabel(id: string | undefined): string {
+  const short = (id ?? "").slice(0, 8);
+  return short ? `Session ${short}` : "A session";
+}
+
+/** The toast for one `session-account-migration-held` event. */
+export function heldToast(p: HeldPayload): { message: string; type: ToastType } {
+  // No ceiling in the payload: say nothing about the bound rather than invent one.
+  const bound =
+    p.ceilingSecs === undefined ? "" : ` (up to ${Math.max(1, Math.ceil(p.ceilingSecs / 60))} min)`;
+  const wait = `is waiting for the Claude CLI to come back${bound}`;
+  const from = accountLabel(p.fromConfigDir);
+  const to = accountLabel(p.toConfigDir);
+  const session = sessionLabel(p.claudeSessionId);
+  return {
+    message:
+      p.trigger === "operator"
+        ? `Moving ${session.charAt(0).toLowerCase()}${session.slice(1)} from ${from} to ${to} ${wait}`
+        : `${session} is out of tokens on ${from}; moving it to ${to} ${wait}`,
+    type: "info",
+  };
+}
+
+/** The toast for one `session-account-migration-abandoned` event: ends a held toast. */
+export function abandonedToast(p: AbandonedPayload): { message: string; type: ToastType } {
+  return {
+    message: `${sessionLabel(p.claudeSessionId)} was not moved from ${accountLabel(
+      p.fromConfigDir,
+    )} to ${accountLabel(p.toConfigDir)}: ${
+      p.reason ?? "the old pane closed or exited during the migration"
+    }`,
+    type: "info",
+  };
+}
+
+/** The toast for one `session-account-migration-failed` event: ends a held operator move. */
+export function failedToast(p: FailedPayload): { message: string; type: ToastType } {
+  const session = sessionLabel(p.claudeSessionId);
+  return {
+    message: `Moving ${session.charAt(0).toLowerCase()}${session.slice(1)} from ${accountLabel(
+      p.fromConfigDir,
+    )} to ${accountLabel(p.toConfigDir)} failed: ${p.reason ?? "unknown reason"}`,
+    type: "error",
+  };
+}
+
 /** Whether a park is worth a toast: not the runner's own short retry. */
 export function parkIsToasted(p: LimitParkedPayload): boolean {
   return p.reason !== "continue-retry" && p.reason !== "migration-nudge-wait";
@@ -311,6 +403,7 @@ export function createBurstCoalescer<T>(
     },
   };
 }
+
 
 export function useAccountMigrationNotifications(showToast: ShowToastFn) {
   useEffect(() => {
@@ -355,7 +448,23 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
         continued.push(event.payload ?? {});
       },
     );
+    const unlistenHeld = listen<HeldPayload>("session-account-migration-held", (event) => {
+      const toast = heldToast(event.payload ?? {});
+      showToast(toast.message, toast.type);
+    });
+    const unlistenAbandoned = listen<AbandonedPayload>(
+      "session-account-migration-abandoned",
+      (event) => {
+        const toast = abandonedToast(event.payload ?? {});
+        showToast(toast.message, toast.type);
+      },
+    );
+    const unlistenFailed = listen<FailedPayload>("session-account-migration-failed", (event) => {
+      const toast = failedToast(event.payload ?? {});
+      showToast(toast.message, toast.type);
+    });
     return () => {
+      unlistenFailed.then((fn) => fn());
       unlistenMigrated.then((fn) => fn());
       unlistenSkipped.then((fn) => fn());
       unlistenParked.then((fn) => fn());
@@ -364,6 +473,8 @@ export function useAccountMigrationNotifications(showToast: ShowToastFn) {
       parked.cancel();
       continued.cancel();
       gaveUp.cancel();
+      unlistenHeld.then((fn) => fn());
+      unlistenAbandoned.then((fn) => fn());
     };
   }, [showToast]);
 }

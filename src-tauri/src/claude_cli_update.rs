@@ -62,8 +62,10 @@
 //! While an install runs, the updater holds an in-process flag
 //! ([`wait_if_updating`]). Headless spawns through
 //! `claude_cli_spawn::spawn_tokio_with_retry` and the `--resume` respawn seam
-//! (`claude_cli_spawn::resolve_resume_claude_bin`: account migration, the resume
-//! door, the respawn receiver) wait it out. Fresh PTY panes do not wait yet, and
+//! wait it out: the resume door and the respawn receiver through
+//! `claude_cli_spawn::resolve_resume_claude_bin`, and an account migration before
+//! its CLI hold (`terminal::account_migration`'s `spawn_next`, abortable by the
+//! hold's own `abort`). Fresh PTY panes do not wait yet, and
 //! neither does a secondary runner on the same box (the flag is in-process).
 //!
 //! # Scope

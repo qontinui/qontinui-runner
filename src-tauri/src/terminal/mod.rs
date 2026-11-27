@@ -16,6 +16,7 @@ pub mod auto_response;
 pub mod auto_response_fleet;
 pub mod child_path; // The base PATH every hosted-session child is composed from (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path)
 pub mod claude_resume_sniff;
+pub(crate) mod cli_availability; // An account migration holds for a stably launchable `claude` (plan 2026-11-10-migration-holds-for-missing-claude-cli, Phase 4)
 pub mod close_authority;
 pub mod commit_report;
 pub mod context_watcher;
@@ -43,6 +44,7 @@ pub mod pane_io;
 pub mod pane_output;
 pub mod phantom_turn;
 pub mod remote_pane_io;
+pub(crate) mod respawn_launch; // Did a respawn attempt ever launch the CLI? The cap-refund evidence (plan 2026-11-10-migration-holds-for-missing-claude-cli, Phase 5)
 pub mod respawn_liveness; // Is the resumed CLI alive? The proof + retry-then-rollback every `--resume` respawn passes (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 mod scan_gate;
 pub mod scan_interval;

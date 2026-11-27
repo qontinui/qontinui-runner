@@ -2315,17 +2315,20 @@ fn live_sessions_payload(
 ///
 /// **This call can take minutes to resolve, and it reports no progress
 /// meanwhile.** It resolves only once the resumed CLI is PROVEN alive or the
-/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case, per
-/// attempt: up to 45 s for a launchable `claude` to reappear on PATH
-/// (`claude_cli_spawn::RESUME_RESOLVE_DELAYS`), plus up to 180 s for the pane
-/// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
+/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case: the
+/// migration HOLDS for a stably launchable `claude` for up to 15 min in all
+/// (`cli_availability::MIGRATION_CLI_HOLD_CEILING`, one budget across every
+/// attempt — a CLI mid-reinstall), and each attempt then gets up to 180 s to
+/// paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`) plus, for a death that
+/// reads as a launch failure, a 3 s stamp grace
+/// (`respawn_liveness::LAUNCH_STAMP_GRACE`). With
 /// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
-/// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
-/// 679 s), plus the transcript carry before the first spawn. While a
+/// pauses between them, that comes to about 24 minutes (900 s + 3 × 183 s +
+/// 4 s = 1453 s), plus the transcript carry before the first spawn. While a
 /// runner-owned CLI install is running, each attempt first waits it out, for
-/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more. Only an install
-/// running at the start of each of the three attempts reaches the full
-/// 3 × 345 s + 4 s = 1039 s, about 17 minutes. A caller with a
+/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more: an install running
+/// at the start of each of the three attempts reaches 1453 s + 360 s = 1813 s,
+/// about 30 minutes. A caller with a
 /// UI should show the migration as pending for that long, and must not read a
 /// slow answer as a hang. Returning at the first spawn and reporting the
 /// verdict by event would take a new event contract with the webview. That is
