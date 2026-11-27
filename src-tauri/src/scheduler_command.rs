@@ -31,7 +31,12 @@
 //!   immediately before every spawn (the enforcing check, [`launch`]): a
 //!   policy tightened after a task was registered still stops it.
 //! - **`detach`** (D10): the child is launched outside the runner's
-//!   process-lifetime grouping and recorded as launched, never awaited.
+//!   process-lifetime grouping and recorded as launched, never awaited; its
+//!   `output` and `timeout_seconds` are ignored (nothing is read, nothing is
+//!   killed). It survives the runner's process group (Unix) or an enclosing
+//!   job (Windows) — NOT a Linux systemd service stop under the default
+//!   `KillMode=control-group`, which kills every process in the unit's cgroup,
+//!   `setsid` or not. See [`launch_detached`].
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -197,6 +202,10 @@ pub(crate) fn command_shape_error(task: &ScheduledTaskType) -> Option<CommandTas
 /// Create/update validation of a `Command` task: a non-blank `program`, a
 /// `Tail` of 1..=4096 bytes, and a command line the current policy allows.
 /// Any other task type passes untouched.
+///
+/// A `detach: true` task is NOT refused for carrying `output` or
+/// `timeout_seconds`: `Tail` is the schema default, so every detached task
+/// carries one. Both are simply ignored under detach (see [`launch_detached`]).
 pub(crate) fn validate_command_task(
     task: &ScheduledTaskType,
     policy: &SecurityPolicy,
@@ -410,21 +419,36 @@ pub(crate) fn classify_command_end(
 
 // ── Detach (D10) ────────────────────────────────────────────────────────────
 
+/// The execution record's message for a detached run: `success` means the
+/// spawn succeeded, and this says the exit was never observed, so a detached
+/// run is never mistaken for an awaited exit 0 in history.
+pub(crate) const DETACHED_LAUNCH_MESSAGE: &str = "launched (detached; exit not observed)";
+
 /// Spawn the child outside the runner's process-lifetime grouping and record
-/// the run as LAUNCHED: the completion resolves at once with `success`, so the
-/// task leaves `running_tasks` as soon as its row is written. Nothing awaits
-/// the child and nothing reads its output (all three streams are null).
+/// the run as LAUNCHED: the completion resolves at once with `success` and the
+/// message [`DETACHED_LAUNCH_MESSAGE`] (so history never shows it as an
+/// observed exit 0), and the task leaves `running_tasks` as soon as its row is
+/// written. Nothing awaits the child and nothing reads its output (all three
+/// streams are null), so the task's `output` and `timeout_seconds` are ignored.
 ///
 /// - Unix: `setsid()` between fork and exec — a new session AND process
 ///   group, so neither a kill of the runner's group nor its controlling
 ///   terminal's hangup reaches it. Deliberately NOT `PR_SET_PDEATHSIG`, which
 ///   other runner spawns use to die with the runner. The child is still our
-///   child until we exit; tokio reaps it when it exits first.
+///   child until we exit; tokio reaps it when it exits first. **Limit:** a
+///   runner run as a systemd unit with the default `KillMode=control-group`
+///   takes the child down on a service stop or restart — the child stays in
+///   the unit's cgroup whatever its session — so there it does NOT outlive
+///   the runner's service.
 /// - Windows: no `ChildTreeGuard` (whose kill-on-close job would reap it),
-///   and when this process sits in a job, `CREATE_BREAKAWAY_FROM_JOB` — legal
-///   only because every enclosing job permits breakaway (the runner-wide job
-///   sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; so does the supervisor's). A
-///   refused breakaway fails the launch loudly: silently spawning a child the
+///   and no enrolment in the runner-wide job either (the runner enrols
+///   children into that job one at a time and never sits in it itself, so a
+///   child it does not enrol is already outside it). What remains is an OUTER
+///   job the runner itself sits in — a supervisor's, a launcher's — which a
+///   child joins by inheritance. So when this process is in a job the spawn
+///   adds `CREATE_BREAKAWAY_FROM_JOB`, legal only when every enclosing job
+///   sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` (the supervisor's does). A refused
+///   breakaway fails the launch loudly: silently spawning a child the
 ///   enclosing job would reap is exactly what `detach` exists to prevent.
 fn launch_detached(
     spec: &CommandSpec,
@@ -450,7 +474,7 @@ fn launch_detached(
         completion: Box::pin(async {
             RemoteAgentOutcome {
                 success: true,
-                error: None,
+                error: Some(DETACHED_LAUNCH_MESSAGE.to_string()),
                 exit_code: None,
                 timed_out: false,
                 rate_limited: None,
@@ -930,7 +954,13 @@ mod tests {
         let launched = launch(s, &permissive()).await.expect("launch");
         assert!(launched.log_path.is_none());
         let out = launched.completion.await;
-        assert!(out.success && out.error.is_none(), "{out:?}");
+        assert!(out.success, "{out:?}");
+        assert_eq!(out.exit_code, None, "a detach observes no exit");
+        assert_eq!(
+            out.error.as_deref(),
+            Some(DETACHED_LAUNCH_MESSAGE),
+            "a detached run must not read as an awaited exit 0"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "a detach is not awaited"
@@ -1037,8 +1067,8 @@ mod tests {
 
     /// The "runner" half of [`a_detached_child_outlives_the_runners_group_or_job_and_one_left_in_it_does_not`]:
     /// run only as a re-exec'd copy of this test binary. Waits for `go`, then
-    /// launches one detached `Command` (the real launch path) and one plain
-    /// child, writes both pids, and sleeps until it is killed.
+    /// launches one detached child through the real detach spawn and one
+    /// contrast child, writes both pids, and waits until it is killed.
     #[tokio::test]
     #[ignore = "a child half: run only by a_detached_child_outlives_the_runners_group_or_job_and_one_left_in_it_does_not"]
     async fn detach_probe_child() {
@@ -1066,42 +1096,75 @@ mod tests {
                 return;
             }
         };
+
+        // The contrast child.
+        //
+        // Unix: a plain child, which stays in this "runner's" process group.
+        #[cfg(unix)]
         let plain = std::process::Command::new(program)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("plain spawn");
+        #[cfg(unix)]
+        let plain_pid = plain.id();
+        // Windows: a child ENROLLED the way the runner enrols its children —
+        // assigned, after the spawn, to a kill-on-close job this process
+        // owns (`ScopedKillOnCloseJob`, the shape of `assign_process_to_job`'s
+        // runner-wide job). It is spawned with the same breakaway as the
+        // detached one, so it leaves the OUTER job too; its death is then the
+        // runner-shaped job's doing alone, when this process dies and the job's
+        // last handle closes.
+        #[cfg(windows)]
+        let (plain_pid, _runner_job, _plain) = {
+            let child =
+                spawn_detached(base_command(&s, &workdir), program).expect("contrast spawn");
+            let job = qontinui_runner_win32::job_object::ScopedKillOnCloseJob::create(None)
+                .expect("a runner-shaped kill-on-close job");
+            let handle = child.raw_handle().expect("a live process handle");
+            // SAFETY: `child` is alive and owned here, so its handle is valid.
+            unsafe { job.assign(handle as _) };
+            (child.id().expect("pid"), job, child)
+        };
+
         // Written then renamed, so the parent never reads half a line.
-        std::fs::write(
-            dir.join("pids.tmp"),
-            format!("{detached_pid} {}", plain.id()),
-        )
-        .unwrap();
+        std::fs::write(dir.join("pids.tmp"), format!("{detached_pid} {plain_pid}")).unwrap();
         std::fs::rename(dir.join("pids.tmp"), dir.join("pids")).unwrap();
-        // Until the parent kills this probe; the plain child (a 120 s sleeper)
-        // is reaped here if the probe somehow outlives it.
-        let mut plain = plain;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(120),
-            tokio::task::spawn_blocking(move || plain.wait()),
-        )
-        .await;
+        // Until the parent kills this probe; on Unix the plain child (a 120 s
+        // sleeper) is reaped here if the probe somehow outlives it.
+        #[cfg(unix)]
+        {
+            let mut plain = plain;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(120),
+                tokio::task::spawn_blocking(move || plain.wait()),
+            )
+            .await;
+        }
+        #[cfg(windows)]
+        tokio::time::sleep(Duration::from_secs(120)).await;
     }
 
     /// D10: a detached child outlives the end of the runner's process-lifetime
-    /// grouping, and a child left inside that grouping does not. The grouping
-    /// is the runner-wide job on Windows (a job with its exact limit flags is
-    /// closed; the contrast child inherits it, as every runner child does), and
-    /// the runner's process group on Unix (killed with SIGKILL, how a
-    /// supervisor or a terminal takes a runner down; the contrast child stays
-    /// in that group).
+    /// grouping, and a child left inside that grouping does not.
     ///
-    /// On Unix this is NOT a contrast with an awaited `Command`: the awaited
-    /// path already leads its own process group (`spawn_tree`), so it also
-    /// survives a kill of the runner's group, exactly as `Script` does. What
-    /// detach adds there is its own SESSION (no controlling-terminal hangup),
-    /// which [`a_detached_launch_settles_at_once_in_its_own_session`] checks.
+    /// - Windows, in the production topology: the probe "runner" sits in an
+    ///   OUTER supervisor-shaped job (`KILL_ON_JOB_CLOSE | BREAKAWAY_OK`,
+    ///   `OuterKillOnCloseJob`), which is closed. The detached child broke away
+    ///   from it and survives. The contrast child is enrolled in a
+    ///   runner-shaped `KILL_ON_JOB_CLOSE` job the probe owns, which closes
+    ///   when the probe dies, and it dies.
+    /// - Unix: the probe leads its own process group, which is killed with
+    ///   SIGKILL (how a supervisor or a terminal takes a runner down). The
+    ///   contrast child stayed in that group and dies; the detached one, in
+    ///   its own session, survives. This is NOT a contrast with an awaited
+    ///   `Command`: the awaited path already leads its own process group
+    ///   (`spawn_tree`), so it also survives a kill of the runner's group,
+    ///   exactly as `Script` does. What detach adds there is its own SESSION,
+    ///   which [`a_detached_launch_settles_at_once_in_its_own_session`] checks.
+    ///   Neither survives a systemd service stop under
+    ///   `KillMode=control-group` (see [`launch_detached`]).
     #[tokio::test]
     async fn a_detached_child_outlives_the_runners_group_or_job_and_one_left_in_it_does_not() {
         let dir = tempfile::tempdir().unwrap();
@@ -1126,12 +1189,17 @@ mod tests {
         }
         let mut probe = cmd.spawn().expect("re-exec the test binary");
 
+        // The probe plays a runner a supervisor started: inside the
+        // supervisor's job shape. It waits for `go`, so it has spawned
+        // nothing before it is assigned.
         #[cfg(windows)]
-        let job = {
-            use std::os::windows::io::AsRawHandle;
-            let job = RunnerShapedJob::create();
-            job.assign(probe.as_raw_handle() as _);
-            job
+        let outer = {
+            let outer = qontinui_runner_win32::holder_spawn::OuterKillOnCloseJob::create(true)
+                .expect("a supervisor-shaped outer job");
+            outer
+                .assign(&probe)
+                .expect("assign the probe to the outer job");
+            outer
         };
         std::fs::write(dir.path().join("go"), "").unwrap();
 
@@ -1145,9 +1213,10 @@ mod tests {
                     && qontinui_runner_win32::holder_spawn::current_process_in_job()
                         .unwrap_or(false)
                 {
-                    // This test process itself sits in an outer job that
-                    // forbids breakaway (some CI hosts): nothing here can
-                    // break away, and the launch refused loudly as designed.
+                    // This test process itself sits in a job that forbids
+                    // breakaway (some CI hosts), so the probe inherits it and
+                    // nothing it starts can break away; the launch refused
+                    // loudly, as designed.
                     eprintln!("skipped: the test host's own job forbids breakaway: {e}");
                     return;
                 }
@@ -1171,7 +1240,7 @@ mod tests {
             libc::killpg(probe.id() as i32, libc::SIGKILL);
         }
         #[cfg(windows)]
-        drop(job);
+        drop(outer);
         let _ = probe.wait();
 
         let plain_gone = wait_gone(plain, Duration::from_secs(15));
@@ -1183,50 +1252,5 @@ mod tests {
             "the non-detached child survived its runner's end"
         );
         assert!(detached_alive, "the detached child died with its runner");
-    }
-
-    /// A kill-on-close job with the runner-wide job's exact limit flags.
-    #[cfg(windows)]
-    struct RunnerShapedJob(windows_sys::Win32::Foundation::HANDLE);
-
-    #[cfg(windows)]
-    impl RunnerShapedJob {
-        fn create() -> Self {
-            use windows_sys::Win32::System::JobObjects::{
-                CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            };
-            // SAFETY: plain Win32 calls with valid arguments.
-            unsafe {
-                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                assert!(!h.is_null(), "CreateJobObjectW");
-                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags =
-                    qontinui_runner_win32::job_object::RUNNER_JOB_LIMIT_FLAGS;
-                let ok = SetInformationJobObject(
-                    h,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::addr_of!(info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                assert!(ok != 0, "SetInformationJobObject");
-                Self(h)
-            }
-        }
-
-        fn assign(&self, process: windows_sys::Win32::Foundation::HANDLE) {
-            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-            // SAFETY: `process` is a live process handle owned by the caller.
-            assert!(unsafe { AssignProcessToJobObject(self.0, process) } != 0);
-        }
-    }
-
-    #[cfg(windows)]
-    impl Drop for RunnerShapedJob {
-        fn drop(&mut self) {
-            // SAFETY: the job handle is owned here; closing it kills every
-            // process still in the job (KILL_ON_JOB_CLOSE).
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-        }
     }
 }

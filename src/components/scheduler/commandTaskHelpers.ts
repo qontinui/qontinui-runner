@@ -62,6 +62,9 @@ export interface CommandFormFields {
 /** Why the form's `Command` fields cannot be saved, or `undefined` if they can. */
 export function commandFieldsError(f: CommandFormFields): string | undefined {
   if (f.program.trim() === "") return "A program is required.";
+  // Under detach the run is not awaited: the timeout and output controls are
+  // hidden and ignored, so they cannot block a save.
+  if (f.detach) return undefined;
   if (f.timeoutSeconds.trim() !== "") {
     const t = Number(f.timeoutSeconds);
     if (!Number.isInteger(t) || t < 1) return "Timeout must be a whole number of seconds.";
@@ -78,23 +81,41 @@ export function commandFieldsError(f: CommandFormFields): string | undefined {
 /**
  * The `Command` task the form submits: the edited fields laid over the task
  * it opened with, so a key this form has no control for survives a save.
+ *
+ * Two fields round-trip the stored value rather than the text:
+ * - `args`, when the argument text is unchanged: the one-per-line text cannot
+ *   spell every argv (a trailing empty argument, an argument containing a
+ *   line break), so an untouched stored argv is kept exactly.
+ * - `timeout_seconds` and `output` under detach: the form hides them (a
+ *   detached run is not awaited, so the runner ignores both), so the opened
+ *   task's values — or the defaults — are kept.
  */
 export function buildCommandTask(
   opened: CommandTask | undefined,
   f: CommandFormFields,
 ): CommandTask {
-  const timeout = f.timeoutSeconds.trim() === "" ? null : Number(f.timeoutSeconds);
+  const args =
+    opened?.args !== undefined && f.argsText === argsToLines(opened.args)
+      ? [...opened.args]
+      : linesToArgs(f.argsText);
+  const timeout = f.detach
+    ? (opened?.timeout_seconds ?? null)
+    : f.timeoutSeconds.trim() === ""
+      ? null
+      : Number(f.timeoutSeconds);
+  const output: CommandOutput = f.detach
+    ? (opened?.output ?? { type: "Tail", bytes: COMMAND_DEFAULT_TAIL_BYTES })
+    : f.outputMode === "Discard"
+      ? { type: "Discard" }
+      : { type: "Tail", bytes: Number(f.tailBytes) };
   return {
     ...opened,
     task_type: "Command",
     program: f.program.trim(),
-    args: linesToArgs(f.argsText),
+    args,
     working_directory: f.workingDirectory.trim() || null,
     timeout_seconds: timeout,
-    output:
-      f.outputMode === "Discard"
-        ? { type: "Discard" }
-        : { type: "Tail", bytes: Number(f.tailBytes) },
+    output,
     detach: f.detach,
   };
 }

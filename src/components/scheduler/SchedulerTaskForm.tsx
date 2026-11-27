@@ -1184,54 +1184,6 @@ export function SchedulerTaskForm({
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
               />
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label htmlFor="command-timeout" className="block text-sm font-medium mb-1">
-                  Timeout (seconds)
-                </label>
-                <input
-                  id="command-timeout"
-                  type="number"
-                  min={1}
-                  value={commandFields.timeoutSeconds}
-                  onChange={(e) => setCommandField("timeoutSeconds", e.target.value)}
-                  placeholder={String(COMMAND_DEFAULT_TIMEOUT_SECONDS)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
-                />
-              </div>
-              <div>
-                <label htmlFor="command-output" className="block text-sm font-medium mb-1">
-                  Output
-                </label>
-                <select
-                  id="command-output"
-                  value={commandFields.outputMode}
-                  onChange={(e) =>
-                    setCommandField("outputMode", e.target.value === "Discard" ? "Discard" : "Tail")
-                  }
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
-                >
-                  <option value="Tail">Keep the end of stderr (on failure)</option>
-                  <option value="Discard">Discard all output</option>
-                </select>
-              </div>
-            </div>
-            {commandFields.outputMode === "Tail" && (
-              <div>
-                <label htmlFor="command-tail-bytes" className="block text-sm font-medium mb-1">
-                  Stderr bytes to keep (1-{COMMAND_MAX_TAIL_BYTES})
-                </label>
-                <input
-                  id="command-tail-bytes"
-                  type="number"
-                  min={1}
-                  max={COMMAND_MAX_TAIL_BYTES}
-                  value={commandFields.tailBytes}
-                  onChange={(e) => setCommandField("tailBytes", e.target.value)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
-                />
-              </div>
-            )}
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
@@ -1240,10 +1192,71 @@ export function SchedulerTaskForm({
                 className="text-primary"
               />
               <span className="text-sm">
-                Detach: start it and record the run as launched; it keeps running after the runner
-                exits, and its exit is not awaited
+                Detach: start it and record the run as launched (its exit is not observed). It keeps
+                running after the runner exits — except where the runner is a Linux systemd service,
+                whose stop or restart ends it too
               </span>
             </label>
+            {commandFields.detach ? (
+              <p className="text-xs text-text-secondary" data-testid="command-detach-note">
+                A detached command is not awaited, so no timeout applies and none of its output is
+                kept.
+              </p>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="command-timeout" className="block text-sm font-medium mb-1">
+                      Timeout (seconds)
+                    </label>
+                    <input
+                      id="command-timeout"
+                      type="number"
+                      min={1}
+                      value={commandFields.timeoutSeconds}
+                      onChange={(e) => setCommandField("timeoutSeconds", e.target.value)}
+                      placeholder={String(COMMAND_DEFAULT_TIMEOUT_SECONDS)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="command-output" className="block text-sm font-medium mb-1">
+                      Output
+                    </label>
+                    <select
+                      id="command-output"
+                      value={commandFields.outputMode}
+                      onChange={(e) =>
+                        setCommandField(
+                          "outputMode",
+                          e.target.value === "Discard" ? "Discard" : "Tail",
+                        )
+                      }
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    >
+                      <option value="Tail">Keep the end of stderr (on failure)</option>
+                      <option value="Discard">Discard all output</option>
+                    </select>
+                  </div>
+                </div>
+                {commandFields.outputMode === "Tail" && (
+                  <div>
+                    <label htmlFor="command-tail-bytes" className="block text-sm font-medium mb-1">
+                      Stderr bytes to keep (1-{COMMAND_MAX_TAIL_BYTES})
+                    </label>
+                    <input
+                      id="command-tail-bytes"
+                      type="number"
+                      min={1}
+                      max={COMMAND_MAX_TAIL_BYTES}
+                      value={commandFields.tailBytes}
+                      onChange={(e) => setCommandField("tailBytes", e.target.value)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    />
+                  </div>
+                )}
+              </>
+            )}
             {commandFieldsError(commandFields) && (
               <p className="text-xs text-destructive" data-testid="command-task-error">
                 {commandFieldsError(commandFields)}

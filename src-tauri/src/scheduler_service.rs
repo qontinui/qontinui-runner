@@ -269,6 +269,29 @@ fn production_command_policy() -> CommandPolicySource {
     Arc::new(|| crate::scheduler_command::current_policy().0)
 }
 
+/// What [`SchedulerService::launch_and_await_command`] did with one fire.
+#[derive(Debug)]
+pub(crate) enum CommandDispatch {
+    /// Spawned; the detached settle task's handle (the scheduler drops it;
+    /// tests await it).
+    Settling(tokio::task::JoinHandle<Settlement>),
+    /// The fire-time policy denied it: nothing spawned; the row written.
+    PolicyDenied(TaskExecutionRecord),
+    /// The launch itself failed (recorded as `LaunchFailed`, backed off).
+    LaunchFailed,
+}
+
+impl CommandDispatch {
+    /// The settle handle, when the command was spawned.
+    #[cfg(test)]
+    pub(crate) fn settling(self) -> Option<tokio::task::JoinHandle<Settlement>> {
+        match self {
+            CommandDispatch::Settling(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
 /// What one settled slot did — every history row it wrote, in order, and the
 /// `next_run` it set when every account was exhausted. The detached settle
 /// task drops it; tests await it.
@@ -1419,11 +1442,11 @@ impl SchedulerService {
     /// `2026-09-13-move-fleet-scheduling-into-qontinui` Phase 2) and settle
     /// its row from the program's exit — or, for `detach`, as launched.
     ///
-    /// The fire-time policy check is inside [`crate::scheduler_command::launch`],
-    /// against [`Self::command_policy`] read NOW: a denial spawns nothing and
-    /// is a launch failure whose `error_message` reads `policy denied: …`.
-    /// Returns the settle task's handle (the scheduler drops it; tests await
-    /// it), `None` when nothing was launched.
+    /// The fire-time policy check runs HERE, against [`Self::command_policy`]
+    /// read NOW, before anything is spawned. A denial is
+    /// [`Self::record_policy_denial`]: no spawn, no auto-fix, no backoff.
+    /// ([`crate::scheduler_command::launch`] evaluates the same policy again,
+    /// so no caller of it can skip the check.)
     async fn launch_and_await_command(
         self: Arc<Self>,
         task_id: String,
@@ -1431,23 +1454,75 @@ impl SchedulerService {
         auto_fix_on_failure: bool,
         catch_up: Option<CatchUpContext>,
         spec: crate::scheduler_command::CommandSpec,
-    ) -> Option<tokio::task::JoinHandle<Settlement>> {
+    ) -> CommandDispatch {
         let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         if let Some(ref ctx) = catch_up {
             ctx.apply(&mut record);
         }
         let policy = (self.command_policy)();
+        if let Err(reason) =
+            crate::scheduler_command::evaluate_policy(&policy, &spec.program, &spec.args)
+        {
+            let row = self
+                .record_policy_denial(&task_id, &task_name, record, reason)
+                .await;
+            return CommandDispatch::PolicyDenied(row);
+        }
         let launched = crate::scheduler_command::launch(spec, &policy).await;
-        self.settle_launched_child(
-            "Command",
-            task_id,
-            task_name,
-            auto_fix_on_failure,
-            record,
-            launched,
-            None,
-        )
-        .await
+        match self
+            .settle_launched_child(
+                "Command",
+                task_id,
+                task_name,
+                auto_fix_on_failure,
+                record,
+                launched,
+                None,
+            )
+            .await
+        {
+            Some(handle) => CommandDispatch::Settling(handle),
+            None => CommandDispatch::LaunchFailed,
+        }
+    }
+
+    /// Record a `Command` fire the security policy denied: a `Failed` row
+    /// reading `policy denied: <reason>`, nothing spawned, and the slot
+    /// released. Deliberately NOT a launch failure's consequences:
+    ///
+    /// - **no auto-fix** — an AI session cannot fix a policy denial; only the
+    ///   operator's policy setting or the task can change the verdict;
+    /// - **no launch-failure backoff** — the next run stays on the task's own
+    ///   cadence, so a relaxed policy is picked up at the next slot, and the
+    ///   launch-failure streak is left as it was.
+    async fn record_policy_denial(
+        &self,
+        task_id: &str,
+        task_name: &str,
+        mut record: TaskExecutionRecord,
+        reason: String,
+    ) -> TaskExecutionRecord {
+        let message = format!("policy denied: {reason}");
+        warn!(
+            "Scheduler: Command task '{}' not run: {}",
+            task_name, message
+        );
+        record.complete(false, Some(message));
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.insert_execution_record(task_id, &record).await {
+                error!("Failed to record policy-denied execution: {}", e);
+            }
+            if let Err(e) = pg
+                .update_task_last_run(task_id, Some(&record.execution_id))
+                .await
+            {
+                error!("Failed to update task last_run: {}", e);
+            }
+        }
+        self.update_task_next_run_db(task_id).await;
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+        record
     }
 
     /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`,
@@ -5657,54 +5732,69 @@ mod command_task_tests {
         assert!(svc.is_task_running(&task.id).await);
     }
 
-    /// Catch-up under `run_once`: three missed 6-hourly slots collapse to ONE
-    /// late run, stamped as a catch-up for the latest slot.
+    /// Catch-up under `run_once`, through the REAL reconciler on a real
+    /// database (the test harness's bundled PostgreSQL): a 6-hourly Command
+    /// task created 20 h ago has three missed slots; `reconcile_missed_runs`
+    /// collapses them to ONE late run of the command, recorded as a catch-up
+    /// for the latest slot. A second pass finds nothing left to catch up.
     #[tokio::test]
-    async fn catch_up_run_once_fires_one_command_run_stamped_for_the_latest_slot() {
+    async fn reconcile_runs_a_missed_command_once_under_run_once() {
+        let pg = crate::database::pg::PgDb::new_for_test().await;
+        let mut settings = pg.get_scheduler_settings().await.unwrap();
+        settings.enabled = true;
+        pg.update_scheduler_settings(&settings).await.unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let counter = dir.path().join("runs");
-        let svc = service_with_policy(crate::security::SecurityPolicy::permissive());
         let mut task = counting_task("catch-up", &counter, 0);
         task.catch_up_policy = CatchUpPolicy::RunOnce;
-        let now = Utc::now();
-        let missed: Vec<DateTime<Utc>> = (1..=3)
-            .rev()
-            .map(|h| now - chrono::Duration::hours(6 * h))
-            .collect();
-        let actions = plan_catch_up_actions(&missed, task.catch_up_policy);
-        assert_eq!(actions.len(), 1);
+        task.catch_up_grace_seconds = 60;
+        let created = Utc::now() - chrono::Duration::hours(20);
+        task.created_at = created.to_rfc3339();
+        pg.insert_scheduled_task(&task).await.unwrap();
 
-        let mut settled = Vec::new();
-        for action in actions {
-            let CatchUpAction::Enqueue { scheduled_for } = action else {
-                panic!("run_once enqueues");
-            };
-            let spec =
-                crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
-            assert!(svc.try_mark_running(&task.id).await);
-            let handle = svc
-                .clone()
-                .launch_and_await_command(
-                    task.id.clone(),
-                    task.name.clone(),
-                    false,
-                    Some(CatchUpContext { scheduled_for }),
-                    spec,
-                )
-                .await
-                .expect("launched");
-            settled.push(handle.await.unwrap());
-        }
-        assert_eq!(runs(&counter), 1, "exactly one late run");
-        let row = &settled[0].rows[0];
+        let mut svc = SchedulerService::new(pg.clone());
+        svc.command_policy = Arc::new(crate::security::SecurityPolicy::permissive);
+        let svc = Arc::new(svc);
+        svc.clone().reconcile_missed_runs().await.unwrap();
+
+        let settled = |svc: Arc<SchedulerService>, id: String| async move {
+            for _ in 0..400 {
+                if !svc.is_task_running(&id).await {
+                    if let Ok(h) = svc.pg().unwrap().get_execution_history(&id, 10).await {
+                        if h.iter().all(|r| r.ended_at.is_some()) && !h.is_empty() {
+                            return h;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("the catch-up run never settled");
+        };
+        let history = settled(svc.clone(), task.id.clone()).await;
+        assert_eq!(runs(&counter), 1, "exactly one late run of the command");
+        assert_eq!(history.len(), 1, "{history:?}");
+        let row = &history[0];
         assert!(row.catch_up_run, "{row:?}");
-        assert_eq!(
-            row.scheduled_for.as_deref(),
-            Some(missed.last().unwrap().to_rfc3339().as_str())
-        );
         assert!(row.success, "{row:?}");
-        assert!(matches!(row.status, ScheduledTaskStatus::Completed));
-        assert!(!svc.is_task_running(&task.id).await);
+        assert!(
+            matches!(row.status, ScheduledTaskStatus::Completed),
+            "{row:?}"
+        );
+        let latest_slot = created + chrono::Duration::hours(18);
+        let stamped = DateTime::parse_from_rfc3339(row.scheduled_for.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(stamped.timestamp(), latest_slot.timestamp(), "{row:?}");
+
+        // The latest slot is now covered: a second pass runs nothing.
+        svc.clone().reconcile_missed_runs().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            runs(&counter),
+            1,
+            "a second reconcile re-ran a covered slot"
+        );
     }
 
     /// The service judges a Command against the policy as it stands at FIRE
@@ -5729,20 +5819,96 @@ mod command_task_tests {
         assert!(svc.try_mark_running(&task.id).await);
         let spec =
             crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
-        let handle = svc
+        let dispatch = svc
             .clone()
-            .launch_and_await_command(task.id.clone(), task.name.clone(), false, None, spec)
+            .launch_and_await_command(task.id.clone(), task.name.clone(), true, None, spec)
             .await;
-        assert!(
-            handle.is_none(),
-            "a denied command is a launch failure, not a run"
-        );
+        let CommandDispatch::PolicyDenied(row) = dispatch else {
+            panic!("a denied command must not run: {dispatch:?}");
+        };
+        let msg = row.error_message.as_deref().unwrap_or_default();
+        assert!(msg.starts_with("policy denied: "), "{row:?}");
+        assert!(matches!(row.status, ScheduledTaskStatus::Failed), "{row:?}");
+        assert!(!row.triggered_auto_fix, "{row:?}");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!marker.exists(), "the child was spawned despite the denial");
         assert!(
             !svc.is_task_running(&task.id).await,
             "the slot was not released"
         );
+    }
+
+    /// A fire-time policy denial, on a real database, with
+    /// `auto_fix_on_failure` set: the row is `Failed` with `policy denied: …`,
+    /// no auto-fix session is attempted (an AI session cannot fix a policy
+    /// denial), and no launch-failure backoff is applied — the streak counter
+    /// is untouched and `next_run` stays on the task's own cadence.
+    #[tokio::test]
+    async fn a_fire_time_policy_denial_triggers_no_auto_fix_and_no_backoff() {
+        let pg = crate::database::pg::PgDb::new_for_test().await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let mut task = command_task("denied", "touch", &[&marker.display().to_string()]);
+        task.auto_fix_on_failure = true;
+        pg.insert_scheduled_task(&task).await.unwrap();
+
+        let mut strict = crate::security::SecurityPolicy::permissive();
+        strict.actions.blocked_commands = vec![r"^touch\b".to_string()];
+        let mut svc = SchedulerService::new(pg.clone());
+        svc.command_policy = Arc::new(move || strict.clone());
+        let svc = Arc::new(svc);
+        assert!(svc.try_mark_running(&task.id).await);
+        let spec =
+            crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
+        let before = Utc::now();
+        let dispatch = svc
+            .clone()
+            .launch_and_await_command(task.id.clone(), task.name.clone(), true, None, spec)
+            .await;
+        assert!(
+            matches!(dispatch, CommandDispatch::PolicyDenied(_)),
+            "{dispatch:?}"
+        );
+        assert!(!marker.exists());
+
+        let history = pg.get_execution_history(&task.id, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "{history:?}");
+        let row = &history[0];
+        assert!(matches!(row.status, ScheduledTaskStatus::Failed), "{row:?}");
+        assert!(
+            row.error_message
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("policy denied: "),
+            "{row:?}"
+        );
+        assert!(
+            !row.triggered_auto_fix && row.auto_fix_session_id.is_none(),
+            "{row:?}"
+        );
+
+        let stored = pg.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.consecutive_launch_failures, 0,
+            "a denial is no launch-failure streak"
+        );
+        // The task's own 6-hourly cadence, not a backoff pushed past it.
+        let next = DateTime::parse_from_rfc3339(stored.next_run.as_deref().expect("next_run"))
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            next <= before + chrono::Duration::seconds(21600 + 60),
+            "next_run {next} is past the task's own interval"
+        );
+
+        // And by construction: the denial path never reaches either lever.
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("    async fn record_policy_denial(")
+            .expect("record_policy_denial");
+        let (body, _) = body.split_once("\n    }\n").expect("fn end");
+        assert!(!body.contains("launch_auto_fix"), "{body}");
+        assert!(!body.contains("apply_launch_failure_backoff"), "{body}");
     }
 
     /// A detached Command is settled as launched and leaves `running_tasks`
@@ -5773,10 +5939,16 @@ mod command_task_tests {
             .clone()
             .launch_and_await_command(task.id.clone(), task.name.clone(), false, None, spec)
             .await
+            .settling()
             .expect("launched")
             .await
             .unwrap();
         assert!(settled.rows[0].success, "{:?}", settled.rows[0]);
+        assert_eq!(
+            settled.rows[0].error_message.as_deref(),
+            Some(crate::scheduler_command::DETACHED_LAUNCH_MESSAGE),
+            "history must tell a detached launch from an observed exit 0"
+        );
         assert!(!svc.is_task_running(&task.id).await);
         assert!(wait_until(|| pidfile.exists(), Duration::from_secs(10)).await);
         let pid: i32 = std::fs::read_to_string(&pidfile)

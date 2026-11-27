@@ -12,7 +12,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
@@ -37,26 +37,6 @@ use windows_sys::Win32::System::JobObjects::{
 //
 // This crate declares `Win32_Security` in its OWN feature list, so the import
 // above links through `windows-sys` like every other entry point here.
-
-/// The runner-wide job's limit flags.
-///
-/// `KILL_ON_JOB_CLOSE`: every enrolled process dies when the runner exits,
-/// however it exits. `BREAKAWAY_OK` (plan
-/// `2026-09-13-move-fleet-scheduling-into-qontinui` D10): a process created
-/// INSIDE the job may leave it, but only when its creator asks with
-/// `CREATE_BREAKAWAY_FROM_JOB` explicitly — a scheduled `Command` with
-/// `detach: true`, which must outlive the runner (the WSL keepalive). Without
-/// `BREAKAWAY_OK` such a spawn fails with `ERROR_ACCESS_DENIED`.
-///
-/// The limit is job-wide, not per-caller: ANY process in the job (an enrolled
-/// child or one of its descendants) that passes that flag now leaves the job
-/// and is no longer reaped on close, and the PTY holder's
-/// `holder_spawn` Breakaway route succeeds here instead of needing WMI. A
-/// child that does not ask to break away is still reaped. The supervisor's
-/// job has set the same flag all along (qontinui-supervisor
-/// `src/process/job.rs`).
-pub const RUNNER_JOB_LIMIT_FLAGS: u32 =
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 
 /// RAII wrapper for a Windows Job Object handle.
 struct JobObjectHandle(HANDLE);
@@ -98,11 +78,9 @@ pub fn init_job_object() {
             }
 
             // Configure: kill all assigned processes when the Job Object handle is closed
-            // (which happens automatically when the runner process exits), and
-            // let an explicitly CREATE_BREAKAWAY_FROM_JOB child leave
-            // ([`RUNNER_JOB_LIMIT_FLAGS`]).
+            // (which happens automatically when the runner process exits).
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = RUNNER_JOB_LIMIT_FLAGS;
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
             let result = SetInformationJobObject(
                 handle,
@@ -120,7 +98,7 @@ pub fn init_job_object() {
                 return JobObjectHandle(std::ptr::null_mut());
             }
 
-            info!("Windows Job Object initialized (kill-on-close, explicit breakaway allowed)");
+            info!("Windows Job Object initialized (kill-on-close enabled)");
             JobObjectHandle(handle)
         }
     });

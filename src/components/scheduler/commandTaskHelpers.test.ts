@@ -66,6 +66,33 @@ describe("Command task helpers", () => {
     });
   });
 
+  it("keeps a stored argv the text cannot spell when the text is unchanged", () => {
+    const awkward: CommandTask = { ...stored, args: ["plan", ""] };
+    const fields = commandFormFields(awkward);
+    expect(buildCommandTask(awkward, fields).args).toEqual(["plan", ""]);
+    const multiLine: CommandTask = { ...stored, args: ["-c", "a\nb"] };
+    expect(buildCommandTask(multiLine, commandFormFields(multiLine)).args).toEqual(["-c", "a\nb"]);
+    // An edit takes the text's meaning.
+    expect(buildCommandTask(awkward, { ...fields, argsText: "apply" }).args).toEqual(["apply"]);
+  });
+
+  it("ignores the hidden timeout and output under detach", () => {
+    const f = { ...commandFormFields(stored), detach: true, tailBytes: "0", timeoutSeconds: "x" };
+    expect(commandFieldsError(f)).toBeUndefined();
+    const built = buildCommandTask(stored, f);
+    expect(built.detach).toBe(true);
+    expect(built.output).toEqual(stored.output);
+    expect(built.timeout_seconds).toBe(stored.timeout_seconds);
+    const fresh = buildCommandTask(undefined, {
+      ...commandFormFields(undefined),
+      program: "wsl",
+      detach: true,
+      outputMode: "Discard",
+    });
+    expect(fresh.output).toEqual({ type: "Tail", bytes: 2048 });
+    expect(fresh.timeout_seconds).toBeNull();
+  });
+
   it("refuses what the runner would refuse", () => {
     const ok = commandFormFields(stored);
     expect(commandFieldsError(ok)).toBeUndefined();
@@ -84,5 +111,6 @@ describe("Command task helpers", () => {
     expect(form).toContain(
       'case "command":\n        return commandFieldsError(commandFields) === undefined;',
     );
+    expect(form).toContain('data-testid="command-detach-note"');
   });
 });
