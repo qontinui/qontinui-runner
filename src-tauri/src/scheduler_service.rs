@@ -550,7 +550,7 @@ impl SchedulerService {
         // so it holds `pass_lock` longer when many tasks are waiting.
         let available_slots = (settings.max_concurrent - running_count) as usize;
         start_due_tasks(due_tasks, available_slots, |task| {
-            self.clone().try_start_due_task(pg, task)
+            SchedulerService::try_start_due_task(self.clone(), pg, task)
         })
         .await;
     }
