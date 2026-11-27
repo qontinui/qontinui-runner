@@ -80,6 +80,12 @@ pub enum ValidatorError {
         /// policy `Indeterminate` over empty in-scope assertions); the demote
         /// emit substitutes an empty string in that case.
         failing_assertion: Option<(String, String)>,
+        /// Assertions whose verdict is `Unknown` (they could not be
+        /// evaluated). `result_summary.severity_counts` counts decided
+        /// failures only, so a red caused by unknowns alone has every
+        /// severity bucket at zero; this count is what names that cause in
+        /// the detail strings.
+        unknown_count: usize,
     },
 }
 
@@ -116,16 +122,29 @@ pub fn validator_error_detail(e: &ValidatorError) -> String {
         ValidatorError::BExecutionRed {
             result_summary,
             policy_eval,
+            unknown_count,
             ..
         } => {
             let sc = &result_summary.severity_counts;
             let misses = sc.critical + sc.error + sc.warning + sc.info;
             format!(
-                "B-execution red: overall_status={:?}, miss_count={}",
-                policy_eval.overall_status, misses
+                "B-execution red: overall_status={:?}, miss_count={}, unknown_count={}",
+                policy_eval.overall_status, misses, unknown_count
             )
         }
     }
+}
+
+/// Detail recorded in `spec_proposals.last_error` when the sweep demotes a
+/// `_pending/` candidate on a gate-B red. The severity buckets count decided
+/// failures only, so `unknown` is what names a red that came from assertions
+/// that could not be evaluated.
+pub fn single_red_detail(result_summary: &SpecCheckSummary, unknown_count: usize) -> String {
+    let sc = &result_summary.severity_counts;
+    format!(
+        "single-red: critical={} error={} warning={} info={} unknown={}",
+        sc.critical, sc.error, sc.warning, sc.info, unknown_count
+    )
 }
 
 /// Run the four gates in order: distinctness → round-trip → coverage →
@@ -237,9 +256,21 @@ pub(crate) fn gate_b_execution_green_with_snapshot(
             policy_eval: eval,
             snapshot_id: result.snapshot_id.clone(),
             failing_assertion,
+            unknown_count: unknown_assertion_count(&result),
         });
     }
     Ok(result)
+}
+
+/// Number of assertions, across every state, whose verdict is `Unknown`.
+fn unknown_assertion_count(result: &SpecCheckResult) -> usize {
+    use qontinui_types::spec_check::SpecAssertionVerdict;
+    result
+        .state_results
+        .iter()
+        .flat_map(|state| &state.assertions)
+        .filter(|a| matches!(a.outcome, SpecAssertionVerdict::Unknown { .. }))
+        .count()
 }
 
 /// Locate the assertion that made gate B red, in result-iteration order:
@@ -804,6 +835,40 @@ mod tests {
             }
             other => panic!("expected BExecutionRed, got {:?}", other),
         }
+    }
+
+    /// A red from unknowns alone leaves every severity bucket at zero (they
+    /// count decided failures only), so both demote detail strings carry the
+    /// unknown count that names the cause. Mutation: dropping the count from
+    /// either string, or computing it as zero, reds this.
+    #[test]
+    fn red_from_unknowns_alone_names_the_unknown_count_in_its_detail() {
+        let mut ir = chain_ir("b-unknown-detail", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        let snapshot = body_snapshot();
+        let err = gate_b_execution_green_with_snapshot(&snapshot, &ir)
+            .expect_err("an unknown assertion makes gate B red");
+        match &err {
+            ValidatorError::BExecutionRed {
+                result_summary,
+                unknown_count,
+                ..
+            } => {
+                assert_eq!(*unknown_count, 1);
+                let sc = &result_summary.severity_counts;
+                assert_eq!(sc.critical + sc.error + sc.warning + sc.info, 0);
+                assert_eq!(
+                    single_red_detail(result_summary, *unknown_count),
+                    "single-red: critical=0 error=0 warning=0 info=0 unknown=1"
+                );
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
+        }
+        let detail = validator_error_detail(&err);
+        assert!(
+            detail.ends_with("miss_count=0, unknown_count=1"),
+            "{detail}"
+        );
     }
 
     // -------- All-gates-pass smoke --------------------------------------

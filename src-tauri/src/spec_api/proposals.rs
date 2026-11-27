@@ -897,15 +897,11 @@ pub async fn post_sweep_pending(
                 result_summary,
                 snapshot_id: red_snapshot_id,
                 failing_assertion,
+                unknown_count,
                 ..
             }) => {
-                let detail = format!(
-                    "single-red: critical={} error={} warning={} info={}",
-                    result_summary.severity_counts.critical,
-                    result_summary.severity_counts.error,
-                    result_summary.severity_counts.warning,
-                    result_summary.severity_counts.info,
-                );
+                let detail =
+                    crate::spec_api::validator::single_red_detail(&result_summary, unknown_count);
                 // Demote — rm -rf _pending/, reset greens, requeue.
                 if let Err(e) = storage::demote_pending(&root, &spec_id) {
                     warn!(
