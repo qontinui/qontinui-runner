@@ -4,7 +4,7 @@
 //! `sk-ant-oat*` token from `.credentials.json`) returns the exact numbers the
 //! Claude Code `/usage` screen shows: 5-hour session-window utilization +
 //! reset time, 7-day utilization + reset time, and per-model scoped weekly
-//! limits. Unlike the Haiku header probe (`commands::ai_settings::
+//! limits. Unlike the Haiku header probe (`usage_probe::
 //! probe_account_usage`'s fallback), this endpoint costs zero tokens and
 //! cannot itself consume the quota it measures — so it is the preferred
 //! stats source, with the header probe kept as fallback for when this

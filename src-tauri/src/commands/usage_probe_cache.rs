@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! [`crate::commands::ai_settings::probe_account_usage`] issues a live call
+//! [`crate::ai_provider::usage_probe::probe_account_usage`] issues a live call
 //! to Anthropic's API for one Claude account. It has four independent
 //! callers — the Settings/Terminal `check_accounts_usage` command, the
 //! `/analytics/account-usage` HTTP route, the 10-minute

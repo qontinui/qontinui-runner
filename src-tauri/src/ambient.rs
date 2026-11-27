@@ -2439,11 +2439,14 @@ mod tests {
         ),
         (
             "commands/ai_settings.rs",
-            3,
-            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login), \
-             plus the two `probe_account_usage` reads of the account identity in \
-             `~/.claude.json` (`account_hash_for`) — Claude Code's own file, reported, never \
-             runner state",
+            1,
+            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login)",
+        ),
+        (
+            "ai_provider/usage_probe.rs",
+            2,
+            "the two `probe_account_usage` reads of the account identity in `~/.claude.json` \
+             (`account_hash_for`) — Claude Code's own file, reported, never runner state",
         ),
         (
             "claude_session/workspace_trust.rs",

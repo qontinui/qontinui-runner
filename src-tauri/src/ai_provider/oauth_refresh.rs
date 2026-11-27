@@ -349,7 +349,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
     // dropping the client inside `tokio::task::spawn_blocking` panics with
     // "Cannot drop a runtime in a context where blocking is not allowed" —
     // still load-bearing for the two `spawn_blocking` callers that remain
-    // (`commands::ai_settings::probe_account_usage`, the warm API provider).
+    // (`ai_provider::usage_probe::probe_account_usage`, the warm API provider).
     let request_body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
