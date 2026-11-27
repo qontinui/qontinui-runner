@@ -59,10 +59,13 @@
 //! different variable.
 //!
 //! Provisioning children (tool installs, sibling git, service containers) do
-//! not pass through this module. Plan
-//! `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`
-//! owns their environment, which it builds from an allowlist (`child_env`)
-//! rather than from this scrub.
+//! not pass through this module, and they do not share one policy either.
+//! Tool installs run under the allowlist in `child_env` (plan
+//! `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`).
+//! Service containers run under `child_env::ChildEnv::ContainerRuntime`, which
+//! inherits the runner's environment on purpose, because the container CLI
+//! needs its own configuration. Sibling git never reaches `child_env`: it goes
+//! through `sibling_git_env`, which governs only the `GIT_*` variables.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

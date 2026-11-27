@@ -665,26 +665,228 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
 /// GitHub concludes `cancelled`, and the `if: failure()` expiry summariser
 /// never runs — the attribution the build/run split exists to provide is
 /// erased one level up. 150 failed this: 90 + 20 + 49 = 159.
+///
+/// Steps added AFTER that measurement window cannot be inside its 49 minutes,
+/// so their own bounds join the floor (plan
+/// `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`,
+/// 2.6 and 4.1), read from the workflow so that raising one moves the floor.
 #[test]
 fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
     const MEASURED_OVERHEAD_MAX_MINUTES: u64 = 50; // 49.0 measured, rounded up
+    const BOUNDED_AFTER_THE_MEASUREMENT: [&str; 4] = [
+        UNIX_EXTRACTOR_SENTINEL,
+        PROVISIONING_E2E_UNKNOWN,
+        PROVISIONING_E2E_SETUP,
+        PROVISIONING_E2E,
+    ];
     let doc = ci_workflow();
     let steps = job_steps(&doc, "test");
     let build_bound = timeout_minutes(find_step(&steps, BUILD), BUILD);
     let run_bound = timeout_minutes(find_step(&steps, RUN), RUN);
+    let added: u64 = BOUNDED_AFTER_THE_MEASUREMENT
+        .iter()
+        .map(|name| timeout_minutes(find_step(&steps, name), name))
+        .sum();
     let job_cap = doc
         .get("jobs")
         .and_then(|j| j.get("test"))
         .and_then(|j| j.get("timeout-minutes"))
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| panic!("job `test` must carry an integer job-level `timeout-minutes`"));
-    let floor = build_bound + run_bound + MEASURED_OVERHEAD_MAX_MINUTES;
+    let floor = build_bound + run_bound + MEASURED_OVERHEAD_MAX_MINUTES + added;
     assert!(
         job_cap >= floor,
         "job `test` timeout-minutes ({job_cap}) must be >= `{BUILD}` ({build_bound}) \
          + `{RUN}` ({run_bound}) + measured non-Rust overhead ({MEASURED_OVERHEAD_MAX_MINUTES}) \
-         = {floor}. A smaller cap turns a build-bound expiry into a job-level \
-         `cancelled`, which the `if: failure()` expiry summariser never explains."
+         + the bounds of {BOUNDED_AFTER_THE_MEASUREMENT:?} ({added}) = {floor}. A smaller \
+         cap turns a build-bound expiry into a job-level `cancelled`, which the \
+         `if: failure()` expiry summariser never explains."
+    );
+}
+
+const UNIX_EXTRACTOR_SENTINEL: &str = "Unix extractor tests ran (ubuntu)";
+const PROVISIONING_E2E_UNKNOWN: &str = "Provisioning env e2e UNKNOWN (self-hosted)";
+const PROVISIONING_E2E_SETUP: &str = "Setup Python (provisioning env e2e)";
+const PROVISIONING_E2E: &str = "Provisioning env e2e";
+
+/// Plan `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`,
+/// Phase 4: the ubuntu leg fails unless the three Unix-discriminating
+/// extractor tests printed `... ok` in the run half's log. Pinned here because
+/// every way this step can rot is silent: a lost name, a lost `if:`, or a
+/// `continue-on-error` all leave the job green.
+#[test]
+fn the_ubuntu_leg_proves_the_unix_extractor_tests_ran() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let sentinel = find_step(&steps, UNIX_EXTRACTOR_SENTINEL);
+    assert!(
+        position(&steps, RUN) < position(&steps, UNIX_EXTRACTOR_SENTINEL),
+        "`{UNIX_EXTRACTOR_SENTINEL}` must read the log `{RUN}` writes, so it runs after it"
+    );
+    assert_eq!(
+        sentinel.get("if").and_then(|v| v.as_str()),
+        Some("matrix.platform == 'ubuntu-22.04'"),
+        "`{UNIX_EXTRACTOR_SENTINEL}` belongs to the ubuntu leg, the one that runs the Unix arms"
+    );
+    assert!(
+        sentinel.get("continue-on-error").is_none(),
+        "`{UNIX_EXTRACTOR_SENTINEL}` is gating"
+    );
+    timeout_minutes(sentinel, UNIX_EXTRACTOR_SENTINEL);
+    let body = command_lines(sentinel, UNIX_EXTRACTOR_SENTINEL);
+    assert!(
+        body.contains("cargo-test-output.log"),
+        "`{UNIX_EXTRACTOR_SENTINEL}` must read the run half's log"
+    );
+    for name in [
+        "ci_node::tools::tests::two_link_chain_cannot_escape_the_extraction_root",
+        "ci_node::tools::tests::no_symlink_is_ever_created_under_the_destination",
+        "ci_node::tools::tests::a_contained_link_chain_materialises",
+    ] {
+        assert!(
+            body.contains(name),
+            "`{UNIX_EXTRACTOR_SENTINEL}` must name {name} as a literal"
+        );
+    }
+    assert!(
+        body.contains(r#""test $name ... ok""#),
+        "`{UNIX_EXTRACTOR_SENTINEL}` must require each name's `... ok` line"
+    );
+}
+
+/// Plan `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`,
+/// 2.6: the provisioning-env e2e runs on both hosted legs, after every step
+/// that runs Python (`setup-python` changes what later steps resolve), as a
+/// gating step that requires its one pass and carries its two canaries.
+#[test]
+fn the_provisioning_env_e2e_gates_both_hosted_legs() {
+    const TEST: &str =
+        "ci_node::child_env::tests::provisioning_children_see_only_allowlisted_names";
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let setup = find_step(&steps, PROVISIONING_E2E_SETUP);
+    let e2e = find_step(&steps, PROVISIONING_E2E);
+    let setup_at = position(&steps, PROVISIONING_E2E_SETUP);
+
+    assert_eq!(
+        position(&steps, PROVISIONING_E2E),
+        setup_at + 1,
+        "`{PROVISIONING_E2E_SETUP}` must come right before `{PROVISIONING_E2E}`"
+    );
+    assert!(
+        position(&steps, RUN) < setup_at,
+        "`{PROVISIONING_E2E}` runs the binary `{BUILD}` built, after `{RUN}`"
+    );
+    // Nothing after the setup step may run Python: it would get the
+    // setup-python interpreter, PATH and LD_LIBRARY_PATH instead of its own.
+    for (i, step) in steps.iter().enumerate().skip(setup_at + 1) {
+        let label = step_name(step)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<unnamed step #{i}>"));
+        if label == PROVISIONING_E2E || step.get("run").is_none() {
+            continue;
+        }
+        assert!(
+            !command_lines(step, &label).contains("python"),
+            "`{label}` runs Python after `{PROVISIONING_E2E_SETUP}`; move the setup \
+             step and the e2e below it"
+        );
+    }
+
+    assert!(
+        setup
+            .get("uses")
+            .and_then(|v| v.as_str())
+            .is_some_and(|uses| uses.starts_with("actions/setup-python@")),
+        "`{PROVISIONING_E2E_SETUP}` must use a pinned `actions/setup-python`"
+    );
+    for (name, step) in [(PROVISIONING_E2E_SETUP, setup), (PROVISIONING_E2E, e2e)] {
+        timeout_minutes(step, name);
+        assert!(
+            step.get("if")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cond| cond.contains("runner.environment == 'github-hosted'")),
+            "`{name}` must run on the hosted floor of BOTH legs (no platform gate)"
+        );
+        assert!(
+            step.get("continue-on-error").is_none(),
+            "`{name}` is gating, never continue-on-error"
+        );
+    }
+
+    let env = e2e
+        .get("env")
+        .unwrap_or_else(|| panic!("`{PROVISIONING_E2E}` must set the two canaries"));
+    for canary in ["HTTPS_PROXY", "QONTINUI_E2E_CANARY_PASSWORD"] {
+        assert!(
+            env.get(canary).is_some(),
+            "`{PROVISIONING_E2E}` must set the canary {canary}"
+        );
+    }
+    assert_eq!(
+        e2e.get("shell").and_then(|v| v.as_str()),
+        Some("bash"),
+        "`{PROVISIONING_E2E}` runs a bash body on windows-latest too"
+    );
+    let body = command_lines(e2e, PROVISIONING_E2E);
+    for needle in [
+        "cargo-test-build.log",
+        "cd src-tauri",
+        "--ignored --exact",
+        TEST,
+        r"test result: ok\. 1 passed",
+    ] {
+        assert!(
+            body.contains(needle),
+            "`{PROVISIONING_E2E}` must contain `{needle}`"
+        );
+    }
+}
+
+/// The e2e runs on hosted runners only, and the ubuntu leg routes a same-repo
+/// pull request to the self-hosted Linux pool when its lane says so — so on
+/// such a run the e2e is SKIPPED. That skip must be visible: a bounded step
+/// gated on exactly the complement of the e2e's `if:` prints a `::notice`
+/// naming it UNKNOWN. Pinned because a skip that says nothing reads as a pass.
+#[test]
+fn a_self_hosted_run_says_the_provisioning_env_e2e_did_not_run() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let notice = find_step(&steps, PROVISIONING_E2E_UNKNOWN);
+    assert_eq!(
+        notice.get("if").and_then(|v| v.as_str()),
+        Some("runner.environment != 'github-hosted'"),
+        "`{PROVISIONING_E2E_UNKNOWN}` must run exactly where `{PROVISIONING_E2E}` does not"
+    );
+    assert_eq!(
+        find_step(&steps, PROVISIONING_E2E)
+            .get("if")
+            .and_then(|v| v.as_str()),
+        Some("runner.environment == 'github-hosted'"),
+        "`{PROVISIONING_E2E_UNKNOWN}`'s `if:` is the complement of this one; \
+         change both together"
+    );
+    assert_eq!(
+        timeout_minutes(notice, PROVISIONING_E2E_UNKNOWN),
+        1,
+        "`{PROVISIONING_E2E_UNKNOWN}` only prints, so it is bounded at one minute"
+    );
+    assert!(
+        notice.get("continue-on-error").is_none(),
+        "`{PROVISIONING_E2E_UNKNOWN}` prints a notice and cannot fail"
+    );
+    // Before the setup step: nothing after it may name Python, and the
+    // notice names `setup-python`.
+    assert!(
+        position(&steps, RUN) < position(&steps, PROVISIONING_E2E_UNKNOWN)
+            && position(&steps, PROVISIONING_E2E_UNKNOWN)
+                < position(&steps, PROVISIONING_E2E_SETUP),
+        "`{PROVISIONING_E2E_UNKNOWN}` sits after `{RUN}` and before `{PROVISIONING_E2E_SETUP}`"
+    );
+    let body = command_lines(notice, PROVISIONING_E2E_UNKNOWN);
+    assert!(
+        body.contains("::notice title=Provisioning env e2e UNKNOWN::"),
+        "`{PROVISIONING_E2E_UNKNOWN}` must emit the UNKNOWN notice: {body}"
     );
 }
 
