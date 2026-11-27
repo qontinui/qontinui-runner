@@ -912,7 +912,10 @@ pub async fn ui_bridge_page_close_request_handler(
     if let Some(refusal) = handoff_label_refusal(close_mode, requested.as_deref(), main_label) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error_with_code(refusal, "HANDOFF_LABEL_NOT_MAIN")),
+            Json(ApiResponse::error_with_code(
+                refusal,
+                "HANDOFF_LABEL_NOT_MAIN",
+            )),
         ));
     }
 
