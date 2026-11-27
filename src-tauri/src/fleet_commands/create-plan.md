@@ -250,6 +250,15 @@ Policy is the authority on those; a plan is not the place to re-decide them.
    other document the index lists whose description matches the prompt's subject.
    Where the coord tools are not visible, use the `/policy` skill (`/policy list`,
    `/policy get policy <name>`) — it reads the same documents over the other doors.
+
+   **When a phase creates a page, screen or panel, or changes what one shows or in
+   which order, three more reads are mandatory (two are not kind `policy`):**
+   every authored `audience_profile` whose audience reaches that surface (a row
+   that reads `unedited_seed: true`, or that says it is an index, is not an
+   audience), the `domain_spec` that owns the surface, and `ux-priorities`, read
+   in full. Read them under the tenant proven to own the plan's repository (where the
+   device is bound to more than one tenant, prove it first). Step 4 derives the
+   surface from the first of these.
 2. **Apply, don't just read.** Step 4's design choices, phase sizing, gates and
    sequencing are decided by these clauses wherever a clause speaks. Note each one
    you apply as `[policy: <doc>/<clause>]`.
@@ -316,6 +325,39 @@ autonomy with checks, momentum through re-planning). Programming effort and
 backward compatibility are **not** factors — this project has no
 backward-compatibility constraint.
 
+**A surface is derived from what its audiences come to it to do — before any
+element is chosen** (served `ux-priorities`
+`a-surface-is-designed-from-what-its-audiences-come-to-do`; read the clause, this
+paragraph does not restate it). For a plan Step 2b's surface rule covers:
+
+- If no authored profile reaches the surface, write `UNKNOWN (no authored
+  profile)` as the section's `Who arrives`, make writing one the plan's first
+  phase, and mark the first-screen table and Acceptance `pending that phase`.
+- Run the `audience-task-analysis` skill on the profiles you read. Where this
+  session has no such skill, follow the clause's own steps and write `clause only
+  (skill not installed)` on the section's method line.
+- Where a profile has no section for this surface, write the questions you
+  derived into it first, each marked `proposed` (served `ux-priorities`
+  `what-an-agent-adds-to-an-audience-profile-is-a-marked-per-surface-section`),
+  then cite them by id. Do not keep the questions in the plan alone. Write them with the same
+  prompt-document write tool or skill the plan uses for any served document; where
+  no write door is visible, or the write is refused, keep them in the section marked `proposed — profile write
+  UNKNOWN (<reason>)`.
+- A top question the product cannot answer yet is the main finding. Choose the
+  smallest definition, field or read that makes it answerable, record it as an
+  assumption in the surface's spec and, as `proposed`, in the profile, and
+  design with it. The choice is yours. It is not a question for the operator,
+  and not the product/scope call the open-questions rule below lets you leave open; the
+  first clause above names the only two cases that are. Its "for the operator to confirm"
+  means open to later correction, not asked (served `ux-priorities`
+  `what-an-agent-adds-to-an-audience-profile-is-a-marked-per-surface-section`).
+- Fill the template's `## Audience and questions`, and answer its question
+  about what you left off.
+
+The four UX words above judge how a surface BEHAVES. This step decides what is
+ON it and in what order. Do not take a surface's job from its own heading, its
+module list or its permission table.
+
 Resolve open questions **now** wherever these priorities decide them —
 don't leave a question dangling just because it takes judgment; write the
 decision inline with one sentence naming the deciding priority (mirrors
@@ -376,6 +418,33 @@ the existing corpus in `plans/*.md`).
 ## Why
 <the motivating problem, pulled from the prompt + your own research —
 not a copy-paste of the prompt>
+
+## Audience and questions
+<!-- Delete this comment. REQUIRED when a phase creates a page, screen or panel, or changes what one shows or its order; omit the
+     section otherwise. Written BEFORE any element is chosen (served `ux-priorities`
+     `a-surface-is-designed-from-what-its-audiences-come-to-do`). Question ids come from the per-surface section
+     of the served audience_profile; a question that is not there yet is written there first, as `proposed`. -->
+**Surface:** <route or screen> — <one line: what a person arriving here wants settled>
+**Who arrives:** `audience_profile/<name>` v<n>: <role>, <role> (smallest and largest supported width: <WxH>, <WxH>, or UNKNOWN)
+**Audience method:** <skill | clause only (skill not installed)>
+
+| Question id | Role | When | The question, in their words |
+| --- | --- | --- | --- |
+| `<surface>.<role>.1` | <role> | every visit | <question> |
+
+**First screen, per role and width** — every element, in order, with the question it answers:
+
+| Role @ width | Element | Answers |
+| --- | --- | --- |
+| <role> @ <WxH> | <element> | `<question id>` |
+
+**What did you decide NOT to put on this surface, and why?**
+- <element> — <whose question it fails to answer, or how rarely it is needed; where it is reachable instead>
+
+**Questions the product cannot answer yet:**
+- `<question id>` — <the smallest definition, field or read that makes it answerable>. Recorded as an assumption in <the surface's spec> and as `proposed` in the profile. Phase <n> builds on it.
+
+**Acceptance:** per role and width above, the answer to each every-visit question is on the first screen. Phase <n>'s Gate observes it (a UI or visual check, where the repo's test command cannot), or states UNKNOWN with the reason.
 
 ## Design decision(s) — <name the tradeoff, omit section if none>
 <only for genuinely non-obvious choices; use a comparison table like
