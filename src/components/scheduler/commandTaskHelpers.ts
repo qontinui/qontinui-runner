@@ -88,7 +88,9 @@ export function commandFieldsError(f: CommandFormFields): string | undefined {
  *   line break), so an untouched stored argv is kept exactly.
  * - `timeout_seconds` and `output` under detach: the form hides them (a
  *   detached run is not awaited, so the runner ignores both), so the opened
- *   task's values — or the defaults — are kept.
+ *   task's values — or the defaults — are kept. One exception: an output the
+ *   select holds as `Discard` is stored as `Discard`, so a later untick of
+ *   detach never turns an explicit Discard into a persisted stderr tail.
  */
 export function buildCommandTask(
   opened: CommandTask | undefined,
@@ -103,8 +105,12 @@ export function buildCommandTask(
     : f.timeoutSeconds.trim() === ""
       ? null
       : Number(f.timeoutSeconds);
+  // Under detach a Discard the select holds is kept, never widened to a Tail:
+  // unticking detach later must not start persisting stderr to Postgres.
   const output: CommandOutput = f.detach
-    ? (opened?.output ?? { type: "Tail", bytes: COMMAND_DEFAULT_TAIL_BYTES })
+    ? f.outputMode === "Discard"
+      ? { type: "Discard" }
+      : (opened?.output ?? { type: "Tail", bytes: COMMAND_DEFAULT_TAIL_BYTES })
     : f.outputMode === "Discard"
       ? { type: "Discard" }
       : { type: "Tail", bytes: Number(f.tailBytes) };

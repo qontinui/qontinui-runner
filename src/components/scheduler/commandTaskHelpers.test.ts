@@ -89,8 +89,15 @@ describe("Command task helpers", () => {
       detach: true,
       outputMode: "Discard",
     });
-    expect(fresh.output).toEqual({ type: "Tail", bytes: 2048 });
+    // An explicit Discard survives detach, so unticking it later persists nothing.
+    expect(fresh.output).toEqual({ type: "Discard" });
     expect(fresh.timeout_seconds).toBeNull();
+    const freshTail = buildCommandTask(undefined, {
+      ...commandFormFields(undefined),
+      program: "wsl",
+      detach: true,
+    });
+    expect(freshTail.output).toEqual({ type: "Tail", bytes: 2048 });
   });
 
   it("refuses what the runner would refuse", () => {
