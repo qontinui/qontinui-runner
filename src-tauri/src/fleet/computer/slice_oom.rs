@@ -268,12 +268,7 @@ pub(crate) fn select_children(
         .collect();
     let (old, new): (Vec<&String>, Vec<&String>) =
         candidates.iter().partition(|n| tracked.contains(*n));
-    let kept: BTreeSet<String> = old
-        .into_iter()
-        .chain(new)
-        .take(cap)
-        .cloned()
-        .collect();
+    let kept: BTreeSet<String> = old.into_iter().chain(new).take(cap).cloned().collect();
     let truncated = candidates.len() > kept.len();
     (kept.into_iter().collect(), truncated)
 }
@@ -287,7 +282,11 @@ fn child_names(dir: &Path) -> Vec<String> {
     rd.flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| [".scope", ".service", ".slice"].iter().any(|s| n.ends_with(s)))
+        .filter(|n| {
+            [".scope", ".service", ".slice"]
+                .iter()
+                .any(|s| n.ends_with(s))
+        })
         .collect()
 }
 
@@ -636,7 +635,11 @@ fn plan_slice<'a>(
     let inside = |path: &str| -> u64 {
         kills
             .iter()
-            .filter(|k| k.control_group.as_deref().is_some_and(|cg| is_under(cg, path)))
+            .filter(|k| {
+                k.control_group
+                    .as_deref()
+                    .is_some_and(|cg| is_under(cg, path))
+            })
             .map(|k| k.count)
             .sum()
     };
@@ -689,7 +692,11 @@ fn plan_slice<'a>(
         listing: children_base,
         named_before: prev.map(|p| &p.named),
         // A reboot restarts the counter at 0: nothing is carried across it.
-        carried_before: if rebooted { 0 } else { prev.map_or(0, |p| p.carried) },
+        carried_before: if rebooted {
+            0
+        } else {
+            prev.map_or(0, |p| p.carried)
+        },
         next,
     }
 }
@@ -834,7 +841,9 @@ fn comm_for(
             records
                 .iter()
                 .find(|r| r.task_memcg == cgroup)
-                .map_or((None, "not_found"), |r| (Some(r.comm.clone()), "kernel_log")),
+                .map_or((None, "not_found"), |r| {
+                    (Some(r.comm.clone()), "kernel_log")
+                }),
         ),
     }
 }
@@ -956,9 +965,7 @@ impl SliceOutcome {
 /// B, C and the kernel records), the kills they carry and the next
 /// baselines. PURE.
 pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
-    let status = a
-        .read
-        .map_or(SLICES_NOT_SUPPORTED, |r| r.source.as_str());
+    let status = a.read.map_or(SLICES_NOT_SUPPORTED, |r| r.source.as_str());
     let read = a.read.filter(|r| r.source == SliceSource::Read);
     let cgroups = slice_cgroups(a.prev, read);
     let unchanged = |next: BTreeMap<String, SliceObs>| SliceOutcome {
@@ -975,7 +982,15 @@ pub(crate) fn attribute(a: &SliceInput<'_>) -> SliceOutcome {
     let mut plans: Vec<SlicePlan<'_>> = read
         .slices
         .iter()
-        .map(|s| plan_slice(a.prev.get(&s.name), s, a.unit_kills, a.rebooted, read.read_at))
+        .map(|s| {
+            plan_slice(
+                a.prev.get(&s.name),
+                s,
+                a.unit_kills,
+                a.rebooted,
+                read.read_at,
+            )
+        })
         .collect();
     let Some(budget) = a.budget else {
         // vmstat not computable: nothing is consumed, so every baseline is
@@ -1032,9 +1047,14 @@ fn draft_slice<'k>(a: &SliceInput<'k>, read: &SliceOomRead, p: &SlicePlan<'_>) -
     let need = p.unnamed();
     let d = door(p.read, read.euid, a.rebooted);
     let journal = match (d, a.journal) {
-        (Door::Own, Some(JournalRead::Read(entries))) if need > 0 => {
-            accept_journal(entries, p, window_end(read.read_at), a.boot, a.watched, need)
-        }
+        (Door::Own, Some(JournalRead::Read(entries))) if need > 0 => accept_journal(
+            entries,
+            p,
+            window_end(read.read_at),
+            a.boot,
+            a.watched,
+            need,
+        ),
         _ => Vec::new(),
     };
     // `journal` on the events C did not produce: whether Layer C could have
@@ -1212,7 +1232,13 @@ fn emit_slice_events(
             events.push(ComputerEvent {
                 client_event_id: event_id(
                     "oom_kill",
-                    &[a.boot, &s.cgroup, &e.unit, how, &e.realtime_usec.to_string()],
+                    &[
+                        a.boot,
+                        &s.cgroup,
+                        &e.unit,
+                        how,
+                        &e.realtime_usec.to_string(),
+                    ],
                 ),
                 kind: "oom_kill".into(),
                 observed_at: event_time(e.realtime_usec, a.now_s),
@@ -1386,7 +1412,10 @@ mod tests {
             &input(units, Some(before.0), Some(before.1)),
             t("2026-11-27T00:14:30Z"),
         );
-        assert!(ev0.is_empty(), "the first observation is a baseline: {ev0:?}");
+        assert!(
+            ev0.is_empty(),
+            "the first observation is a baseline: {ev0:?}"
+        );
         derive(
             Some(&obs0),
             &input(units, after.0, Some(after.1)),
@@ -1438,7 +1467,10 @@ ControlGroup=
                 "agent-builds.slice",
                 AGENT,
                 288,
-                &[("agent-build-a.scope", Some(0)), ("agent-build-b.scope", Some(2))],
+                &[
+                    ("agent-build-a.scope", Some(0)),
+                    ("agent-build-b.scope", Some(2)),
+                ],
             )],
         );
         let r1 = read(
@@ -1447,7 +1479,10 @@ ControlGroup=
                 "agent-builds.slice",
                 AGENT,
                 289,
-                &[("agent-build-a.scope", Some(1)), ("agent-build-b.scope", Some(2))],
+                &[
+                    ("agent-build-a.scope", Some(1)),
+                    ("agent-build-b.scope", Some(2)),
+                ],
             )],
         );
         let (ev, next) = two_ticks(&[], (34078, &r0), (Some(34079), &r1));
@@ -1487,9 +1522,12 @@ ControlGroup=
         assert_eq!(s.observed_at, t("2026-11-27T00:15:00Z"));
         assert_eq!(
             s.children,
-            [("agent-build-a.scope".to_string(), 1), ("agent-build-b.scope".to_string(), 2)]
-                .into_iter()
-                .collect()
+            [
+                ("agent-build-a.scope".to_string(), 1),
+                ("agent-build-b.scope".to_string(), 2)
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -1537,9 +1575,18 @@ ControlGroup=
     fn a_watched_unit_is_placed_by_its_persisted_cgroup_on_the_unit_result_arm() {
         let before = watched(CI_RUNNER_ACTIVE, Some(0));
         let after = watched(CI_RUNNER_OOM, None);
-        assert_eq!(after[0].control_group, None, "the dead unit's cgroup is gone");
-        let r0 = read("2026-11-27T00:14:30Z", vec![slice("ci-runners.slice", CI, 3, &[])]);
-        let r1 = read("2026-11-27T00:15:00Z", vec![slice("ci-runners.slice", CI, 4, &[])]);
+        assert_eq!(
+            after[0].control_group, None,
+            "the dead unit's cgroup is gone"
+        );
+        let r0 = read(
+            "2026-11-27T00:14:30Z",
+            vec![slice("ci-runners.slice", CI, 3, &[])],
+        );
+        let r1 = read(
+            "2026-11-27T00:15:00Z",
+            vec![slice("ci-runners.slice", CI, 4, &[])],
+        );
         let (_, o0) = derive(
             None,
             &input(&before, Some(20), Some(&r0)),
@@ -1594,14 +1641,24 @@ ControlGroup=
             "2026-11-27T00:14:30Z",
             vec![
                 slice("ci-runners.slice", CI, 3, &[]),
-                slice("agent-builds.slice", AGENT, 10, &[("agent-build-a.scope", Some(0))]),
+                slice(
+                    "agent-builds.slice",
+                    AGENT,
+                    10,
+                    &[("agent-build-a.scope", Some(0))],
+                ),
             ],
         );
         let r1 = read(
             "2026-11-27T00:15:00Z",
             vec![
                 slice("ci-runners.slice", CI, 5, &[]),
-                slice("agent-builds.slice", AGENT, 11, &[("agent-build-a.scope", Some(1))]),
+                slice(
+                    "agent-builds.slice",
+                    AGENT,
+                    11,
+                    &[("agent-build-a.scope", Some(1))],
+                ),
             ],
         );
         let (ev, _) = two_ticks(&[], (100, &r0), (Some(104), &r1));
@@ -1616,7 +1673,12 @@ ControlGroup=
             o[0].client_event_id,
             event_id(
                 "oom_kill",
-                &[BOOT, "/ci.slice/ci-runners.slice", "slice_memory_events", "3..5"]
+                &[
+                    BOOT,
+                    "/ci.slice/ci-runners.slice",
+                    "slice_memory_events",
+                    "3..5"
+                ]
             )
         );
         assert_eq!(o[1].detail["victim_unit"], "agent-build-a.scope");
@@ -1631,8 +1693,14 @@ ControlGroup=
     /// Plan test 8: slice delta 3, vmstat delta 2 → 2 in all, clamped.
     #[test]
     fn read_skew_is_clamped_to_the_vmstat_delta() {
-        let r0 = read("2026-11-27T00:14:30Z", vec![slice("agent-builds.slice", AGENT, 10, &[])]);
-        let r1 = read("2026-11-27T00:15:00Z", vec![slice("agent-builds.slice", AGENT, 13, &[])]);
+        let r0 = read(
+            "2026-11-27T00:14:30Z",
+            vec![slice("agent-builds.slice", AGENT, 10, &[])],
+        );
+        let r1 = read(
+            "2026-11-27T00:15:00Z",
+            vec![slice("agent-builds.slice", AGENT, 13, &[])],
+        );
         let (ev, _) = two_ticks(&[], (50, &r0), (Some(52), &r1));
         let o = ooms(&ev);
         assert_eq!(o.len(), 1, "no residual beside it: {ev:?}");
@@ -1650,7 +1718,10 @@ ControlGroup=
                 "agent-builds.slice",
                 AGENT,
                 10,
-                &[("agent-build-a.scope", Some(0)), ("agent-build-b.scope", Some(0))],
+                &[
+                    ("agent-build-a.scope", Some(0)),
+                    ("agent-build-b.scope", Some(0)),
+                ],
             )],
         );
         let r1 = read(
@@ -1659,7 +1730,10 @@ ControlGroup=
                 "agent-builds.slice",
                 AGENT,
                 11,
-                &[("agent-build-a.scope", Some(1)), ("agent-build-b.scope", Some(1))],
+                &[
+                    ("agent-build-a.scope", Some(1)),
+                    ("agent-build-b.scope", Some(1)),
+                ],
             )],
         );
         let (ev, _) = two_ticks(&[], (50, &r0), (Some(52), &r1));
@@ -1677,8 +1751,14 @@ ControlGroup=
     /// rebaselines; the kill is the vmstat residual's.
     #[test]
     fn a_slice_counter_that_went_down_rebaselines() {
-        let r0 = read("2026-11-27T00:14:30Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
-        let r1 = read("2026-11-27T00:15:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let r0 = read(
+            "2026-11-27T00:14:30Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
+        let r1 = read(
+            "2026-11-27T00:15:00Z",
+            vec![slice("agent-builds.slice", AGENT, 1, &[])],
+        );
         let (ev, next) = two_ticks(&[], (34078, &r0), (Some(34079), &r1));
         let o = ooms(&ev);
         assert_eq!(o.len(), 1, "{ev:?}");
@@ -1690,9 +1770,15 @@ ControlGroup=
     /// Plan test 10: the slice resolved at a different path rebaselines.
     #[test]
     fn a_moved_slice_path_rebaselines() {
-        let r0 = read("2026-11-27T00:14:30Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let r0 = read(
+            "2026-11-27T00:14:30Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
         let moved = "/user.slice/user-1001.slice/user@1001.service/agent.slice/agent-builds.slice";
-        let r1 = read("2026-11-27T00:15:00Z", vec![slice("agent-builds.slice", moved, 300, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:00Z",
+            vec![slice("agent-builds.slice", moved, 300, &[])],
+        );
         let (ev, next) = two_ticks(&[], (34078, &r0), (Some(34078), &r1));
         assert!(ooms(&ev).is_empty(), "{ev:?}");
         assert_eq!(next.slices["agent-builds.slice"].cgroup, moved);
@@ -1706,16 +1792,30 @@ ControlGroup=
     fn after_a_reboot_a_slice_counts_from_zero_and_first_sight_is_a_baseline() {
         let r0 = read(
             "2026-11-27T00:14:30Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(0))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(0))],
+            )],
         );
-        let (ev0, o0) = derive(None, &input(&[], Some(34078), Some(&r0)), t("2026-11-27T00:14:30Z"));
+        let (ev0, o0) = derive(
+            None,
+            &input(&[], Some(34078), Some(&r0)),
+            t("2026-11-27T00:14:30Z"),
+        );
         assert!(ev0.is_empty(), "first-ever sight: {ev0:?}");
         assert_eq!(o0.slices["agent-builds.slice"].oom_kill, 289);
 
         let new_boot = "11111111-2222-4333-8444-555555555555";
         let r1 = read(
             "2026-11-27T03:01:00Z",
-            vec![slice("agent-builds.slice", AGENT, 2, &[("agent-build-b.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                2,
+                &[("agent-build-b.scope", Some(1))],
+            )],
         );
         let inp = ObsInput {
             boot_id: Some(new_boot),
@@ -1744,7 +1844,9 @@ ControlGroup=
         );
         assert_eq!(
             o1.slices["agent-builds.slice"].children,
-            [("agent-build-b.scope".to_string(), 1)].into_iter().collect()
+            [("agent-build-b.scope".to_string(), 1)]
+                .into_iter()
+                .collect()
         );
 
         // A slice seen for the first time on a later tick: a baseline only,
@@ -1752,7 +1854,12 @@ ControlGroup=
         let r2 = read(
             "2026-11-27T03:01:30Z",
             vec![
-                slice("agent-builds.slice", AGENT, 2, &[("agent-build-b.scope", Some(1))]),
+                slice(
+                    "agent-builds.slice",
+                    AGENT,
+                    2,
+                    &[("agent-build-b.scope", Some(1))],
+                ),
                 slice("ci-runners.slice", CI, 40, &[]),
             ],
         );
@@ -1775,17 +1882,33 @@ ControlGroup=
     fn an_unreadable_vmstat_keeps_the_slice_baselines() {
         let r0 = read(
             "2026-11-27T00:14:30Z",
-            vec![slice("agent-builds.slice", AGENT, 10, &[("agent-build-a.scope", Some(0))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                10,
+                &[("agent-build-a.scope", Some(0))],
+            )],
         );
         let r1 = read(
             "2026-11-27T00:15:00Z",
-            vec![slice("agent-builds.slice", AGENT, 11, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                11,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
         let (ev, o1) = two_ticks(&[], (50, &r0), (None, &r1));
         assert!(ooms(&ev).is_empty(), "{ev:?}");
         assert_eq!(o1.slices["agent-builds.slice"].oom_kill, 10);
-        assert_eq!(o1.slices["agent-builds.slice"].observed_at, t("2026-11-27T00:14:30Z"));
-        assert_eq!(o1.slices["agent-builds.slice"].children["agent-build-a.scope"], 0);
+        assert_eq!(
+            o1.slices["agent-builds.slice"].observed_at,
+            t("2026-11-27T00:14:30Z")
+        );
+        assert_eq!(
+            o1.slices["agent-builds.slice"].children["agent-build-a.scope"],
+            0
+        );
         let (ev, _) = derive(
             Some(&o1),
             &input(&[], Some(51), Some(&r1)),
@@ -1807,13 +1930,27 @@ ControlGroup=
         let after = watched(RUNNER_SERVICE, Some(1));
         let r0 = read(
             "2026-11-27T00:14:30Z",
-            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 10, &[("build-x.scope", Some(0))])],
+            vec![slice(
+                "qontinui-runner.slice",
+                RUNNER_SLICE,
+                10,
+                &[("build-x.scope", Some(0))],
+            )],
         );
         let r1 = read(
             "2026-11-27T00:15:00Z",
-            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 14, &[("build-x.scope", Some(1))])],
+            vec![slice(
+                "qontinui-runner.slice",
+                RUNNER_SLICE,
+                14,
+                &[("build-x.scope", Some(1))],
+            )],
         );
-        let (_, o0) = derive(None, &input(&before, Some(100), Some(&r0)), t("2026-11-27T00:14:30Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&before, Some(100), Some(&r0)),
+            t("2026-11-27T00:14:30Z"),
+        );
         let run = |v: u64| {
             let (ev, _) = derive(
                 Some(&o0),
@@ -1860,8 +1997,14 @@ ControlGroup=
             ]
         );
         // V delta 1: only the watched unit's own event, never trimmed.
-        assert_eq!(run(101), vec![("cgroup_memory_events".to_string(), 1, None)]);
-        assert_eq!(run(100), vec![("cgroup_memory_events".to_string(), 1, None)]);
+        assert_eq!(
+            run(101),
+            vec![("cgroup_memory_events".to_string(), 1, None)]
+        );
+        assert_eq!(
+            run(100),
+            vec![("cgroup_memory_events".to_string(), 1, None)]
+        );
     }
 
     /// A nested slice child holding a watched unit: that unit's own kill is
@@ -1882,13 +2025,27 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let after = watched(NESTED, Some(1));
         let r0 = read(
             "2026-11-27T00:14:30Z",
-            vec![slice("ci-runners.slice", CI, 3, &[("ci-runners-gpu.slice", Some(0))])],
+            vec![slice(
+                "ci-runners.slice",
+                CI,
+                3,
+                &[("ci-runners-gpu.slice", Some(0))],
+            )],
         );
         let r1 = read(
             "2026-11-27T00:15:00Z",
-            vec![slice("ci-runners.slice", CI, 4, &[("ci-runners-gpu.slice", Some(1))])],
+            vec![slice(
+                "ci-runners.slice",
+                CI,
+                4,
+                &[("ci-runners-gpu.slice", Some(1))],
+            )],
         );
-        let (_, o0) = derive(None, &input(&before, Some(20), Some(&r0)), t("2026-11-27T00:14:30Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&before, Some(20), Some(&r0)),
+            t("2026-11-27T00:14:30Z"),
+        );
         let (ev, _) = derive(
             Some(&o0),
             &input(&after, Some(21), Some(&r1)),
@@ -1909,16 +2066,32 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     fn a_tick_derived_twice_mints_identical_ids() {
         let r0 = read(
             "2026-11-27T00:14:30Z",
-            vec![slice("agent-builds.slice", AGENT, 10, &[("agent-build-a.scope", Some(0))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                10,
+                &[("agent-build-a.scope", Some(0))],
+            )],
         );
         let r1 = read(
             "2026-11-27T00:15:00Z",
-            vec![slice("agent-builds.slice", AGENT, 13, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                13,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
-        let (_, o0) = derive(None, &input(&[], Some(50), Some(&r0)), t("2026-11-27T00:14:30Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&[], Some(50), Some(&r0)),
+            t("2026-11-27T00:14:30Z"),
+        );
         let ids = |at: &str| {
             let (ev, _) = derive(Some(&o0), &input(&[], Some(54), Some(&r1)), t(at));
-            ev.into_iter().map(|e| e.client_event_id).collect::<Vec<_>>()
+            ev.into_iter()
+                .map(|e| e.client_event_id)
+                .collect::<Vec<_>>()
         };
         let first = ids("2026-11-27T00:15:00Z");
         assert_eq!(first.len(), 3, "{first:?}");
@@ -1935,7 +2108,11 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "2026-11-27T00:14:30Z",
             vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])],
         );
-        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:30Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&units, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:30Z"),
+        );
         let unread = SliceOomRead {
             source: SliceSource::Unreadable,
             read_at: t("2026-11-27T00:15:00Z"),
@@ -1990,9 +2167,18 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let mut st = loaded.clone();
         let r = read(
             "2026-11-27T00:15:00.123456Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(0))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(0))],
+            )],
         );
-        let (_, next) = derive(Some(h), &input(&[], Some(34078), Some(&r)), t("2026-11-27T00:15:00Z"));
+        let (_, next) = derive(
+            Some(h),
+            &input(&[], Some(34078), Some(&r)),
+            t("2026-11-27T00:15:00Z"),
+        );
         st.computers.insert("h".into(), next);
         events::save(&path, &st).unwrap();
         assert_eq!(events::load(&path), st);
@@ -2034,7 +2220,12 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     /// a persisted child map of 64.
     #[test]
     fn the_child_listing_is_capped_at_64() {
-        for (n, kept, truncated) in [(0, 0, false), (1, 1, false), (64, 64, false), (65, 64, true)] {
+        for (n, kept, truncated) in [
+            (0, 0, false),
+            (1, 1, false),
+            (64, 64, false),
+            (65, 64, true),
+        ] {
             let d = tempfile::tempdir().unwrap();
             agent_tree(d.path(), 289, n);
             let r = read_from(
@@ -2055,15 +2246,31 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             assert_eq!(s.oom_kill, 289);
             assert_eq!(s.children.len(), kept, "{n}");
             assert_eq!(s.children_truncated, truncated, "{n}");
-            let (_, obs) = derive(None, &input(&[], Some(1), Some(&r)), t("2026-11-27T00:15:00Z"));
+            let (_, obs) = derive(
+                None,
+                &input(&[], Some(1), Some(&r)),
+                t("2026-11-27T00:15:00Z"),
+            );
             assert_eq!(obs.slices["agent-builds.slice"].children.len(), kept, "{n}");
         }
         // A truncated listing says so on the slice's events.
         let d = tempfile::tempdir().unwrap();
         agent_tree(d.path(), 289, 65);
-        let r0 = read_from(d.path(), &BTreeMap::new(), &BTreeSet::new(), Some(1000), t("2026-11-27T00:14:30Z"));
+        let r0 = read_from(
+            d.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(1000),
+            t("2026-11-27T00:14:30Z"),
+        );
         agent_tree(d.path(), 290, 65);
-        let r1 = read_from(d.path(), &BTreeMap::new(), &BTreeSet::new(), Some(1000), t("2026-11-27T00:15:00Z"));
+        let r1 = read_from(
+            d.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(1000),
+            t("2026-11-27T00:15:00Z"),
+        );
         let (ev, _) = two_ticks(&[], (5, &r0), (Some(6), &r1));
         let o = ooms(&ev);
         assert_eq!(o.len(), 1, "{ev:?}");
@@ -2075,7 +2282,13 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     #[test]
     fn a_tree_without_cgroup_v2_is_not_supported() {
         let d = tempfile::tempdir().unwrap();
-        let r = read_from(d.path(), &BTreeMap::new(), &BTreeSet::new(), Some(1000), t("2026-11-27T00:15:00Z"));
+        let r = read_from(
+            d.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(1000),
+            t("2026-11-27T00:15:00Z"),
+        );
         assert_eq!(r.source, SliceSource::NotSupported);
         assert_eq!(r.source.as_str(), "not_supported");
         assert!(r.slices.is_empty());
@@ -2125,7 +2338,11 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         write(root, "cgroup.controllers", "memory pids\n");
-        write(root, "ci.slice/ci-runners.slice/memory.events", "oom_kill 3\n");
+        write(
+            root,
+            "ci.slice/ci-runners.slice/memory.events",
+            "oom_kill 3\n",
+        );
         let mut watched_names = BTreeSet::new();
         for i in 0..70 {
             let unit = format!("actions.runner.example-org-r{i:02}.fleetbox.service");
@@ -2136,8 +2353,18 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             );
             watched_names.insert(unit);
         }
-        write(root, "ci.slice/ci-runners.slice/run-x.scope/memory.events", "oom_kill 0\n");
-        let r = read_from(root, &BTreeMap::new(), &watched_names, Some(1000), t("2026-11-27T00:15:00Z"));
+        write(
+            root,
+            "ci.slice/ci-runners.slice/run-x.scope/memory.events",
+            "oom_kill 0\n",
+        );
+        let r = read_from(
+            root,
+            &BTreeMap::new(),
+            &watched_names,
+            Some(1000),
+            t("2026-11-27T00:15:00Z"),
+        );
         let s = &r.slices[0];
         assert_eq!(s.name, "ci-runners.slice");
         assert_eq!(s.cgroup, "/ci.slice/ci-runners.slice");
@@ -2148,7 +2375,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
                 oom_kill: Some(0)
             }]
         );
-        assert!(!s.children_truncated, "watched units do not count toward the cap");
+        assert!(
+            !s.children_truncated,
+            "watched units do not count toward the cap"
+        );
     }
 
     #[test]
@@ -2188,7 +2418,12 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "2026-11-27T00:14:40Z",
             vec![slice("agent-builds.slice", AGENT, 288, children)],
         );
-        derive(None, &input(&[], Some(34078), Some(&r0)), t("2026-11-27T00:14:40Z")).1
+        derive(
+            None,
+            &input(&[], Some(34078), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        )
+        .1
     }
 
     /// Plan test 1 — the incident. Last tick listed the build scope under
@@ -2206,9 +2441,19 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             &format!("{dir}/{SCOPE}/memory.events"),
             "low 0\nhigh 900\nmax 40\noom 1\noom_kill 0\n",
         );
-        let r0 = read_from(d.path(), &BTreeMap::new(), &BTreeSet::new(), Some(1000), t("2026-11-27T00:14:40Z"));
+        let r0 = read_from(
+            d.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            Some(1000),
+            t("2026-11-27T00:14:40Z"),
+        );
         assert_eq!(r0.slices[0].children.len(), 1);
-        let (ev0, o0) = derive(None, &input(&[], Some(34078), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let (ev0, o0) = derive(
+            None,
+            &input(&[], Some(34078), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
         assert!(ev0.is_empty());
 
         std::fs::remove_dir_all(d.path().join(dir).join(SCOPE)).unwrap();
@@ -2218,7 +2463,13 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             .iter()
             .map(|(n, s)| (n.clone(), s.children.keys().cloned().collect()))
             .collect();
-        let r1 = read_from(d.path(), &tracked, &BTreeSet::new(), Some(1000), t("2026-11-27T00:15:10Z"));
+        let r1 = read_from(
+            d.path(),
+            &tracked,
+            &BTreeSet::new(),
+            Some(1000),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert!(r1.slices[0].children.is_empty(), "the scope is gone");
 
         // The window is decided before the derive, from the previous state.
@@ -2243,7 +2494,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         assert_eq!(ev.len(), 1, "{ev:?}");
         let e = &ev[0];
         assert_eq!(e.kind, "oom_kill");
-        assert_eq!(e.detail["victim_unit"], "agent-build-1795734446-543417-858931110.scope");
+        assert_eq!(
+            e.detail["victim_unit"],
+            "agent-build-1795734446-543417-858931110.scope"
+        );
         assert_eq!(e.detail["victim_slice"], "agent-builds.slice");
         assert_eq!(
             e.detail["victim_cgroup"],
@@ -2277,7 +2531,12 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
         let w = journal_window(Some(&o0), &input(&[], Some(34079), Some(&r1)), &r1).unwrap();
         assert!(!w.user, "no user-journal read: {w:?}");
@@ -2289,7 +2548,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     #[test]
     fn a_child_never_listed_is_not_placed_by_the_journal() {
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
         let j = journal(&[jline("agent-build-brief.scope", 1795738498277337, BOOT)]);
         let (ev, _) = derive(
             Some(&o0),
@@ -2310,7 +2572,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     #[test]
     fn an_unreadable_journal_keeps_the_remainder_and_its_count() {
         let o0 = baseline(&[(SCOPE, Some(0))]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 291, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 291, &[])],
+        );
         for j in [Some(JournalRead::Unreadable), None] {
             let inp = ObsInput {
                 journal: j.as_ref(),
@@ -2332,10 +2597,19 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "2026-11-27T00:14:40Z",
             vec![
                 slice("agent-builds.slice", AGENT, 288, &[]),
-                slice("qontinui-runner.slice", RUNNER_SLICE, 7, &[("other-x.scope", Some(0))]),
+                slice(
+                    "qontinui-runner.slice",
+                    RUNNER_SLICE,
+                    7,
+                    &[("other-x.scope", Some(0))],
+                ),
             ],
         );
-        let (_, o0) = derive(None, &input(&[], Some(34078), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&[], Some(34078), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
         let r1 = read(
             "2026-11-27T00:15:10Z",
             vec![
@@ -2364,7 +2638,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         );
         let j = journal_oom::parse_user_journal(&line);
         let o0 = baseline(&[(SCOPE, Some(0))]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
         let (ev, _) = derive(
             Some(&o0),
             &with_journal(input(&[], Some(34079), Some(&r1)), &j),
@@ -2376,7 +2653,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         assert!(!wire.contains(token), "{wire}");
         assert!(!wire.contains("killed by the OOM killer"), "{wire}");
         assert!(!wire.contains("systemd-run"), "{wire}");
-        assert!(!format!("{j:?}").contains(token), "the parser kept only the three fields");
+        assert!(
+            !format!("{j:?}").contains(token),
+            "the parser kept only the three fields"
+        );
     }
 
     /// Plan test 18 (Layer C part): a watched unit is never placed by the
@@ -2393,8 +2673,15 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
                 &[("qontinui-runner.service", Some(0))],
             )],
         );
-        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
+        let (_, o0) = derive(
+            None,
+            &input(&units, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])],
+        );
         let j = journal(&[jline("qontinui-runner.service", 1795738498277337, BOOT)]);
         let (ev, _) = derive(
             Some(&o0),
@@ -2416,11 +2703,18 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             ("agent-build-c.scope", Some(0)),
             ("agent-build-d.scope", Some(0)),
         ]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
         // 00:14:40Z is 1795738480 s.
         let j = journal(&[
             jline("agent-build-a.scope", 1795738479999999, BOOT),
-            jline("agent-build-b.scope", 1795738485000000, "0000000000000000000000000000beef"),
+            jline(
+                "agent-build-b.scope",
+                1795738485000000,
+                "0000000000000000000000000000beef",
+            ),
             jline("agent-build-c.scope", 1795738490000000, BOOT),
             jline("agent-build-d.scope", 1795738495000000, BOOT),
             jline("agent-build-a.scope", 1795738509000000, BOOT),
@@ -2433,8 +2727,15 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             &with_journal(input(&[], Some(34080), Some(&r1)), &j),
             t("2026-11-27T00:15:10Z"),
         );
-        let named: Vec<&str> = ev.iter().filter_map(|e| e.detail["victim_unit"].as_str()).collect();
-        assert_eq!(named, vec!["agent-build-c.scope", "agent-build-d.scope"], "{ev:?}");
+        let named: Vec<&str> = ev
+            .iter()
+            .filter_map(|e| e.detail["victim_unit"].as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["agent-build-c.scope", "agent-build-d.scope"],
+            "{ev:?}"
+        );
         assert_eq!(ev.len(), 2, "the delta of 2 is fully named: {ev:?}");
     }
 
@@ -2448,12 +2749,19 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         state.computers.insert("h".into(), o0.clone());
         // Two ticks returned early (no device file): the loop clock moved on.
         state.last_tick_at = Some("2026-11-27T00:15:40Z".into());
-        let r = read("2026-11-27T00:16:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let r = read(
+            "2026-11-27T00:16:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
         let prev = state.computers.get("h");
         let w = journal_window(prev, &input(&[], Some(34079), Some(&r)), &r).unwrap();
         assert_eq!(w.since, t("2026-11-27T00:14:40Z"));
         let j = journal(&[jline(SCOPE, 1795738520000000, BOOT)]); // 00:15:20Z
-        let (ev, _) = derive(prev, &with_journal(input(&[], Some(34079), Some(&r)), &j), t("2026-11-27T00:16:10Z"));
+        let (ev, _) = derive(
+            prev,
+            &with_journal(input(&[], Some(34079), Some(&r)), &j),
+            t("2026-11-27T00:16:10Z"),
+        );
         assert_eq!(ev.len(), 1, "{ev:?}");
         assert_eq!(ev[0].detail["victim_unit"], SCOPE);
     }
@@ -2467,13 +2775,32 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             CI,
             "/user.slice/user-1001.slice/user@1001.service/agent.slice/agent-builds.slice",
         ] {
-            let r0 = read("2026-11-27T00:14:40Z", vec![slice("agent-builds.slice", cgroup, 3, &[("x.scope", Some(0))])]);
-            let (_, o0) = derive(None, &input(&[], Some(20), Some(&r0)), t("2026-11-27T00:14:40Z"));
-            let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", cgroup, 4, &[])]);
+            let r0 = read(
+                "2026-11-27T00:14:40Z",
+                vec![slice(
+                    "agent-builds.slice",
+                    cgroup,
+                    3,
+                    &[("x.scope", Some(0))],
+                )],
+            );
+            let (_, o0) = derive(
+                None,
+                &input(&[], Some(20), Some(&r0)),
+                t("2026-11-27T00:14:40Z"),
+            );
+            let r1 = read(
+                "2026-11-27T00:15:10Z",
+                vec![slice("agent-builds.slice", cgroup, 4, &[])],
+            );
             let w = journal_window(Some(&o0), &input(&[], Some(21), Some(&r1)), &r1).unwrap();
             assert!(!w.user, "no user-journal fork for {cgroup}");
             let j = journal(&[jline("x.scope", 1795738500000000, BOOT)]);
-            let (ev, _) = derive(Some(&o0), &with_journal(input(&[], Some(21), Some(&r1)), &j), t("2026-11-27T00:15:10Z"));
+            let (ev, _) = derive(
+                Some(&o0),
+                &with_journal(input(&[], Some(21), Some(&r1)), &j),
+                t("2026-11-27T00:15:10Z"),
+            );
             assert_eq!(ev.len(), 1, "{ev:?}");
             assert_eq!(ev[0].detail["journal"], "unreadable", "{cgroup}");
             assert_eq!(ev[0].detail["victim_unit"], serde_json::Value::Null);
@@ -2488,7 +2815,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     fn after_a_reboot_the_journal_places_nothing() {
         let o0 = baseline(&[(SCOPE, Some(0))]);
         let new_boot = "11111111-2222-4333-8444-555555555555";
-        let r1 = read("2026-11-27T03:01:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let r1 = read(
+            "2026-11-27T03:01:00Z",
+            vec![slice("agent-builds.slice", AGENT, 1, &[])],
+        );
         let base = ObsInput {
             boot_id: Some(new_boot),
             booted_at: Some("2026-11-27T03:00:00Z"),
@@ -2496,8 +2826,16 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         };
         let w = journal_window(Some(&o0), &base, &r1).unwrap();
         assert!(!w.user, "no user-journal fork after a reboot");
-        let j = journal(&[jline(SCOPE, 1795748410000000, "11111111222243338444555555555555")]);
-        let (ev, _) = derive(Some(&o0), &with_journal(base, &j), t("2026-11-27T03:01:00Z"));
+        let j = journal(&[jline(
+            SCOPE,
+            1795748410000000,
+            "11111111222243338444555555555555",
+        )]);
+        let (ev, _) = derive(
+            Some(&o0),
+            &with_journal(base, &j),
+            t("2026-11-27T03:01:00Z"),
+        );
         let o = ooms(&ev);
         assert_eq!(o.len(), 1, "{ev:?}");
         assert_eq!(o[0].detail["attribution"], "slice_memory_events_since_boot");
@@ -2512,18 +2850,42 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let o0 = baseline(&[("agent-build-a.scope", Some(0)), (SCOPE, Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 291, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                291,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
         let j = journal(&[jline(SCOPE, 1795738498277337, BOOT)]);
         let run = |v: u64| {
-            let (ev, _) = derive(Some(&o0), &with_journal(input(&[], Some(v), Some(&r1)), &j), t("2026-11-27T00:15:10Z"));
+            let (ev, _) = derive(
+                Some(&o0),
+                &with_journal(input(&[], Some(v), Some(&r1)), &j),
+                t("2026-11-27T00:15:10Z"),
+            );
             ev.iter()
-                .map(|e| (e.detail["attribution"].as_str().unwrap().to_string(), e.detail["count"].as_u64().unwrap()))
+                .map(|e| {
+                    (
+                        e.detail["attribution"].as_str().unwrap().to_string(),
+                        e.detail["count"].as_u64().unwrap(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let s = |a: &str, n: u64| (a.to_string(), n);
-        assert_eq!(run(34081), vec![s("cgroup_memory_events", 1), s("user_journal_unit_oom", 1), s("slice_memory_events", 1)]);
-        assert_eq!(run(34080), vec![s("cgroup_memory_events", 1), s("user_journal_unit_oom", 1)]);
+        assert_eq!(
+            run(34081),
+            vec![
+                s("cgroup_memory_events", 1),
+                s("user_journal_unit_oom", 1),
+                s("slice_memory_events", 1)
+            ]
+        );
+        assert_eq!(
+            run(34080),
+            vec![s("cgroup_memory_events", 1), s("user_journal_unit_oom", 1)]
+        );
         assert_eq!(run(34079), vec![s("cgroup_memory_events", 1)]);
     }
 
@@ -2553,7 +2915,12 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
         let at = 1795738498277337; // 00:14:58Z
         let exact = KernelRead::Read(vec![krec(
@@ -2589,7 +2956,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         assert_eq!(d["victim_comm"], serde_json::Value::Null);
         assert_eq!(d["victim_comm_source"], "unreadable");
         let d = one(None);
-        assert!(d.get("victim_comm").is_none() && d.get("victim_comm_source").is_none(), "{d}");
+        assert!(
+            d.get("victim_comm").is_none() && d.get("victim_comm_source").is_none(),
+            "{d}"
+        );
     }
 
     /// Plan test 26: a readable record whose `task_memcg` is under the slice
@@ -2598,7 +2968,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     #[test]
     fn a_kernel_record_places_the_remainder() {
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
         let boot = "27cd98773ff347f083889880a31d5902";
         let k = KernelRead::Read(vec![
             krec(
@@ -2659,7 +3032,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     #[test]
     fn the_comm_states_stay_distinguishable() {
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
         for (k, want) in [
             (KernelRead::Read(vec![]), "not_found"),
             (KernelRead::Unreadable, "unreadable"),
@@ -2685,20 +3061,44 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let killed = watched(RUNNER_SERVICE, Some(1));
         let r0 = read(
             "2026-11-27T00:14:40Z",
-            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[("b.scope", Some(0)), ("c.scope", Some(0))])],
+            vec![slice(
+                "qontinui-runner.slice",
+                RUNNER_SLICE,
+                4,
+                &[("b.scope", Some(0)), ("c.scope", Some(0))],
+            )],
         );
-        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&units, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 8, &[("b.scope", Some(1))])],
+            vec![slice(
+                "qontinui-runner.slice",
+                RUNNER_SLICE,
+                8,
+                &[("b.scope", Some(1))],
+            )],
         );
         let boot = "27cd98773ff347f083889880a31d5902";
         let at = 1795738498000000;
         let k = KernelRead::Read(vec![
-            krec(&format!("{RUNNER_SLICE}/qontinui-runner.service"), "qontinui-runner", at, boot),
+            krec(
+                &format!("{RUNNER_SLICE}/qontinui-runner.service"),
+                "qontinui-runner",
+                at,
+                boot,
+            ),
             krec(&format!("{RUNNER_SLICE}/b.scope"), "rustc", at + 1, boot),
             krec(&format!("{RUNNER_SLICE}/c.scope"), "ld", at + 2, boot),
-            krec(&format!("{RUNNER_SLICE}/d.scope"), "cc", at + 3, "0000000000000000000000000000beef"),
+            krec(
+                &format!("{RUNNER_SLICE}/d.scope"),
+                "cc",
+                at + 3,
+                "0000000000000000000000000000beef",
+            ),
         ]);
         let j = journal(&[jline("c.scope", at + 2, boot)]);
         let inp = ObsInput {
@@ -2720,7 +3120,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         assert_eq!(
             got,
             vec![
-                ("cgroup_memory_events".to_string(), "qontinui-runner.service".to_string()),
+                (
+                    "cgroup_memory_events".to_string(),
+                    "qontinui-runner.service".to_string()
+                ),
                 ("cgroup_memory_events".to_string(), "b.scope".to_string()),
                 ("user_journal_unit_oom".to_string(), "c.scope".to_string()),
                 ("slice_memory_events".to_string(), "-".to_string()),
@@ -2739,7 +3142,10 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
     fn after_a_reboot_a_kernel_record_still_places() {
         let o0 = baseline(&[]);
         let new_boot = "11111111-2222-4333-8444-555555555555";
-        let r1 = read("2026-11-27T03:01:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let r1 = read(
+            "2026-11-27T03:01:00Z",
+            vec![slice("agent-builds.slice", AGENT, 1, &[])],
+        );
         let base = ObsInput {
             boot_id: Some(new_boot),
             booted_at: Some("2026-11-27T03:00:00Z"),
@@ -2771,13 +3177,27 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34079), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34079), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(ev1[0].detail["victim_unit"], "agent-build-a.scope");
         let r2 = read(
             "2026-11-27T00:15:40Z",
-            vec![slice("agent-builds.slice", AGENT, 290, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                290,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
         // 00:15:10.2Z: systemd logged the first kill a moment after the read.
         let j = journal(&[jline("agent-build-a.scope", 1795738510200000, BOOT)]);
@@ -2799,14 +3219,24 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "2026-11-27T00:14:40Z",
             vec![
                 slice("ci-runners.slice", CI, 3, &[("build-1.scope", Some(0))]),
-                slice("agent-builds.slice", AGENT, 10, &[("build-1.scope", Some(0))]),
+                slice(
+                    "agent-builds.slice",
+                    AGENT,
+                    10,
+                    &[("build-1.scope", Some(0))],
+                ),
             ],
         );
         let r1 = read(
             "2026-11-27T00:15:10Z",
             vec![
                 slice("ci-runners.slice", CI, 4, &[("build-1.scope", Some(1))]),
-                slice("agent-builds.slice", AGENT, 11, &[("build-1.scope", Some(1))]),
+                slice(
+                    "agent-builds.slice",
+                    AGENT,
+                    11,
+                    &[("build-1.scope", Some(1))],
+                ),
             ],
         );
         let (ev, _) = two_ticks(&[], (100, &r0), (Some(102), &r1));
@@ -2817,7 +3247,13 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             o[0].client_event_id,
             event_id(
                 "oom_kill",
-                &[BOOT, "/ci.slice/ci-runners.slice", "build-1.scope", "cgroup_memory_events", "0..1"]
+                &[
+                    BOOT,
+                    "/ci.slice/ci-runners.slice",
+                    "build-1.scope",
+                    "cgroup_memory_events",
+                    "0..1"
+                ]
             )
         );
         assert_eq!(
@@ -2843,21 +3279,45 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         // The kill landed between the slice read and the child read.
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 288, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                288,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34078), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34078), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert!(ooms(&ev1).is_empty(), "{ev1:?}");
-        assert_eq!(o1.slices["agent-builds.slice"].children["agent-build-a.scope"], 0);
+        assert_eq!(
+            o1.slices["agent-builds.slice"].children["agent-build-a.scope"],
+            0
+        );
         let r2 = read(
             "2026-11-27T00:15:40Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
-        let (ev2, o2) = derive(Some(&o1), &input(&[], Some(34079), Some(&r2)), t("2026-11-27T00:15:40Z"));
+        let (ev2, o2) = derive(
+            Some(&o1),
+            &input(&[], Some(34079), Some(&r2)),
+            t("2026-11-27T00:15:40Z"),
+        );
         let o = ooms(&ev2);
         assert_eq!(o.len(), 1, "{ev2:?}");
         assert_eq!(o[0].detail["victim_unit"], "agent-build-a.scope");
         assert_eq!(o[0].detail["attribution"], "cgroup_memory_events");
-        assert_eq!(o2.slices["agent-builds.slice"].children["agent-build-a.scope"], 1);
+        assert_eq!(
+            o2.slices["agent-builds.slice"].children["agent-build-a.scope"],
+            1
+        );
     }
 
     /// Review A5: a watched unit whose ControlGroup was never known says
@@ -2869,11 +3329,22 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             "ControlGroup=",
         ), Some(0));
         let after = watched(CI_RUNNER_OOM, None);
-        let (_, o0) = derive(None, &input(&before, Some(20), None), t("2026-11-27T00:14:40Z"));
-        let (ev, _) = derive(Some(&o0), &input(&after, Some(21), None), t("2026-11-27T00:15:10Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&before, Some(20), None),
+            t("2026-11-27T00:14:40Z"),
+        );
+        let (ev, _) = derive(
+            Some(&o0),
+            &input(&after, Some(21), None),
+            t("2026-11-27T00:15:10Z"),
+        );
         let o = ooms(&ev);
         assert_eq!(o[0].detail["attribution"], "unit_result");
-        assert_eq!(o[0].detail.get("victim_cgroup"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            o[0].detail.get("victim_cgroup"),
+            Some(&serde_json::Value::Null)
+        );
     }
 
     /// Review C2: `collect_from` end to end — a fixture cgroup tree, a fake
@@ -2897,7 +3368,11 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
             euid: Some(1000),
             journalctl: journal_oom::Journalctl {
                 program: "sh".into(),
-                leading: vec![fake.path().join("journalctl.sh").to_string_lossy().into_owned()],
+                leading: vec![fake
+                    .path()
+                    .join("journalctl.sh")
+                    .to_string_lossy()
+                    .into_owned()],
             },
             deadline: Duration::from_secs(5),
             lookahead: Duration::from_millis(1200),
@@ -2905,9 +3380,17 @@ ControlGroup=/ci.slice/ci-runners.slice/ci-runners-gpu.slice/actions.runner.exam
         // No previous state: no window, so no wait.
         let started = std::time::Instant::now();
         let r0 = collect_from(None, &input(&[], Some(34078), None), &src).await;
-        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(r0.journal, None, "no previous state, no window");
-        let (_, o0) = derive(None, &input(&[], Some(34078), r0.slices.as_ref()), t("2026-11-27T00:14:40Z"));
+        let (_, o0) = derive(
+            None,
+            &input(&[], Some(34078), r0.slices.as_ref()),
+            t("2026-11-27T00:14:40Z"),
+        );
 
         // The kill: after the baseline was read, before the next one.
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2935,7 +3418,10 @@ esac
         assert!(took >= Duration::from_millis(1200), "{took:?}");
         // Round-4 A5: and no longer than the lookahead plus the deadline.
         assert!(took < Duration::from_millis(1200 + 5000), "{took:?}");
-        assert!(matches!(r1.journal, Some(JournalRead::Read(ref e)) if e.len() == 1), "{r1:?}");
+        assert!(
+            matches!(r1.journal, Some(JournalRead::Read(ref e)) if e.len() == 1),
+            "{r1:?}"
+        );
         assert_eq!(r1.kernel, Some(KernelRead::Unreadable));
         let inp = ObsInput {
             slices: r1.slices.as_ref(),
@@ -2960,19 +3446,46 @@ esac
         let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(2))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(2))],
+            )],
         );
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34080), Some(&r1)), t("2026-11-27T00:15:10Z"));
-        let b1: Vec<_> = ooms(&ev1).into_iter().filter(|e| e.detail["attribution"] == "cgroup_memory_events").collect();
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34080), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
+        let b1: Vec<_> = ooms(&ev1)
+            .into_iter()
+            .filter(|e| e.detail["attribution"] == "cgroup_memory_events")
+            .collect();
         assert_eq!(b1.len(), 1, "{ev1:?}");
         assert_eq!(b1[0].detail["count"], 1);
-        assert_eq!(o1.slices["agent-builds.slice"].children["agent-build-a.scope"], 1);
+        assert_eq!(
+            o1.slices["agent-builds.slice"].children["agent-build-a.scope"],
+            1
+        );
         let r2 = read(
             "2026-11-27T00:15:40Z",
-            vec![slice("agent-builds.slice", AGENT, 290, &[("agent-build-a.scope", Some(2))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                290,
+                &[("agent-build-a.scope", Some(2))],
+            )],
         );
-        let (ev2, _) = derive(Some(&o1), &input(&[], Some(34081), Some(&r2)), t("2026-11-27T00:15:40Z"));
-        let b2: Vec<_> = ooms(&ev2).into_iter().filter(|e| e.detail["attribution"] == "cgroup_memory_events").collect();
+        let (ev2, _) = derive(
+            Some(&o1),
+            &input(&[], Some(34081), Some(&r2)),
+            t("2026-11-27T00:15:40Z"),
+        );
+        let b2: Vec<_> = ooms(&ev2)
+            .into_iter()
+            .filter(|e| e.detail["attribution"] == "cgroup_memory_events")
+            .collect();
         assert_eq!(b2.len(), 1, "{ev2:?}");
         assert_eq!(b2[0].detail["victim_unit"], "agent-build-a.scope");
         assert_ne!(b1[0].client_event_id, b2[0].client_event_id);
@@ -2998,11 +3511,22 @@ esac
     fn the_vmstat_clamp_carries_its_cut_into_the_next_baselines() {
         // A remainder cut: slice 288 -> 291, vmstat only +2.
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 291, &[])]);
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34080), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 291, &[])],
+        );
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34080), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(ooms(&ev1)[0].detail["count"], 2);
         assert_eq!(o1.slices["agent-builds.slice"].oom_kill, 290);
-        let (ev2, _) = derive(Some(&o1), &input(&[], Some(34081), Some(&r1)), t("2026-11-27T00:15:40Z"));
+        let (ev2, _) = derive(
+            Some(&o1),
+            &input(&[], Some(34081), Some(&r1)),
+            t("2026-11-27T00:15:40Z"),
+        );
         let o = ooms(&ev2);
         assert_eq!(o.len(), 1, "{ev2:?}");
         assert_eq!(o[0].detail["attribution"], "slice_memory_events");
@@ -3013,13 +3537,29 @@ esac
         let o0 = baseline(&[("agent-build-a.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-a.scope", Some(1))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-a.scope", Some(1))],
+            )],
         );
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34078), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34078), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert!(ooms(&ev1).is_empty(), "{ev1:?}");
         assert_eq!(o1.slices["agent-builds.slice"].oom_kill, 288);
-        assert_eq!(o1.slices["agent-builds.slice"].children["agent-build-a.scope"], 0);
-        let (ev2, _) = derive(Some(&o1), &input(&[], Some(34079), Some(&r1)), t("2026-11-27T00:15:40Z"));
+        assert_eq!(
+            o1.slices["agent-builds.slice"].children["agent-build-a.scope"],
+            0
+        );
+        let (ev2, _) = derive(
+            Some(&o1),
+            &input(&[], Some(34079), Some(&r1)),
+            t("2026-11-27T00:15:40Z"),
+        );
         let o = ooms(&ev2);
         assert_eq!(o.len(), 1, "{ev2:?}");
         assert_eq!(o[0].detail["victim_unit"], "agent-build-a.scope");
@@ -3033,7 +3573,12 @@ esac
         let o0 = baseline(&[(SCOPE, Some(0)), ("agent-build-b.scope", Some(0))]);
         let r1 = read(
             "2026-11-27T00:15:10Z",
-            vec![slice("agent-builds.slice", AGENT, 289, &[("agent-build-b.scope", Some(0))])],
+            vec![slice(
+                "agent-builds.slice",
+                AGENT,
+                289,
+                &[("agent-build-b.scope", Some(0))],
+            )],
         );
         // 00:15:10.5Z: half a second after the read.
         let j = journal(&[jline(SCOPE, 1795738510500000, BOOT)]);
@@ -3046,7 +3591,10 @@ esac
         );
         assert_eq!(ev1.len(), 1, "{ev1:?}");
         assert_eq!(ev1[0].detail["victim_unit"], SCOPE);
-        assert_eq!(o1.slices["agent-builds.slice"].named.get(SCOPE), Some(&1795738510500000));
+        assert_eq!(
+            o1.slices["agent-builds.slice"].named.get(SCOPE),
+            Some(&1795738510500000)
+        );
         // Next tick: another kill, and the same entry is still in its window
         // (it starts at the previous read). It must not name this one.
         let o1 = ComputerObs {
@@ -3061,7 +3609,10 @@ esac
                 .collect(),
             ..o1
         };
-        let r2 = read("2026-11-27T00:15:40Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let r2 = read(
+            "2026-11-27T00:15:40Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
         let (ev2, _) = derive(
             Some(&o1),
             &with_journal(input(&[], Some(34080), Some(&r2)), &j),
@@ -3079,11 +3630,24 @@ esac
     fn the_window_subtracts_watched_unit_kills() {
         let units = watched(RUNNER_SERVICE, Some(0));
         let killed = watched(RUNNER_SERVICE, Some(1));
-        let r0 = read("2026-11-27T00:14:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])]);
-        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
+        let r0 = read(
+            "2026-11-27T00:14:40Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])],
+        );
+        let (_, o0) = derive(
+            None,
+            &input(&units, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])],
+        );
         // vmstat +2: one kill elsewhere, so the budget is not what stops it.
-        assert_eq!(journal_window(Some(&o0), &input(&killed, Some(12), Some(&r1)), &r1), None);
+        assert_eq!(
+            journal_window(Some(&o0), &input(&killed, Some(12), Some(&r1)), &r1),
+            None
+        );
         // The same tick with the unit's counter unchanged: the slice kill is
         // unexplained, and both reads are asked for.
         let w = journal_window(Some(&o0), &input(&units, Some(12), Some(&r1)), &r1).unwrap();
@@ -3098,9 +3662,20 @@ esac
     #[test]
     fn a_carried_remainder_is_a_distinct_event_next_tick() {
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 291, &[])]);
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34080), Some(&r1)), t("2026-11-27T00:15:10Z"));
-        let (ev2, _) = derive(Some(&o1), &input(&[], Some(34081), Some(&r1)), t("2026-11-27T00:15:40Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 291, &[])],
+        );
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34080), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
+        let (ev2, _) = derive(
+            Some(&o1),
+            &input(&[], Some(34081), Some(&r1)),
+            t("2026-11-27T00:15:40Z"),
+        );
         let rem = |ev: &[ComputerEvent]| {
             ev.iter()
                 .find(|e| e.detail["attribution"] == "slice_memory_events")
@@ -3134,25 +3709,64 @@ esac
         );
         let before = watched(&no_cg, Some(0));
         let after = watched(&no_cg, Some(1));
-        let r0 = read("2026-11-27T00:14:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])]);
-        let (_, o0) = derive(None, &input(&before, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
-        let (_, o1) = derive(Some(&o0), &input(&after, Some(11), Some(&r1)), t("2026-11-27T00:15:10Z"));
-        assert_eq!(o1.slices["qontinui-runner.slice"].oom_kill, 4, "carried once");
+        let r0 = read(
+            "2026-11-27T00:14:40Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])],
+        );
+        let (_, o0) = derive(
+            None,
+            &input(&before, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])],
+        );
+        let (_, o1) = derive(
+            Some(&o0),
+            &input(&after, Some(11), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
+        assert_eq!(
+            o1.slices["qontinui-runner.slice"].oom_kill, 4,
+            "carried once"
+        );
         assert_eq!(o1.slices["qontinui-runner.slice"].carried, 1);
-        let (_, o2) = derive(Some(&o1), &input(&after, Some(11), Some(&r1)), t("2026-11-27T00:15:40Z"));
-        assert_eq!(o2.slices["qontinui-runner.slice"].oom_kill, 5, "not carried again");
+        let (_, o2) = derive(
+            Some(&o1),
+            &input(&after, Some(11), Some(&r1)),
+            t("2026-11-27T00:15:40Z"),
+        );
+        assert_eq!(
+            o2.slices["qontinui-runner.slice"].oom_kill, 5,
+            "not carried again"
+        );
         assert_eq!(o2.slices["qontinui-runner.slice"].carried, 0);
         // A later tick: one kill in the slice, one elsewhere.
-        let r3 = read("2026-11-27T00:16:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])]);
-        let (ev, _) = derive(Some(&o2), &input(&after, Some(13), Some(&r3)), t("2026-11-27T00:16:10Z"));
+        let r3 = read(
+            "2026-11-27T00:16:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])],
+        );
+        let (ev, _) = derive(
+            Some(&o2),
+            &input(&after, Some(13), Some(&r3)),
+            t("2026-11-27T00:16:10Z"),
+        );
         let got: Vec<(String, u64)> = ooms(&ev)
             .iter()
-            .map(|e| (e.detail["attribution"].as_str().unwrap().to_string(), e.detail["count"].as_u64().unwrap()))
+            .map(|e| {
+                (
+                    e.detail["attribution"].as_str().unwrap().to_string(),
+                    e.detail["count"].as_u64().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             got,
-            vec![("slice_memory_events".to_string(), 1), ("vmstat_delta".to_string(), 1)],
+            vec![
+                ("slice_memory_events".to_string(), 1),
+                ("vmstat_delta".to_string(), 1)
+            ],
             "{ev:?}"
         );
     }
@@ -3164,22 +3778,39 @@ esac
         let o0 = baseline(&[(SCOPE, Some(0))]);
         // The scope is still listed at the read, but its counter could not
         // be read (it was going away): B cannot name it; the kernel can.
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[(SCOPE, None)])]);
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[(SCOPE, None)])],
+        );
         let k = KernelRead::Read(vec![krec(
             &format!("{AGENT}/{SCOPE}"),
             "rustc",
             1795738509500000, // 00:15:09.5Z
             "27cd98773ff347f083889880a31d5902",
         )]);
-        let (ev1, o1) = derive(Some(&o0), &with_kernel(input(&[], Some(34079), Some(&r1)), &k), t("2026-11-27T00:15:10Z"));
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &with_kernel(input(&[], Some(34079), Some(&r1)), &k),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(ev1.len(), 1, "{ev1:?}");
         assert_eq!(ev1[0].detail["attribution"], "kernel_oom_record");
-        assert_eq!(o1.slices["agent-builds.slice"].named.get(SCOPE), Some(&1795738509500000));
+        assert_eq!(
+            o1.slices["agent-builds.slice"].named.get(SCOPE),
+            Some(&1795738509500000)
+        );
         // Next tick another, unplaced kill; systemd's line for the FIRST kill
         // lands in this window (00:15:13.5Z, past the last lookahead).
-        let r2 = read("2026-11-27T00:15:40Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let r2 = read(
+            "2026-11-27T00:15:40Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
         let j = journal(&[jline(SCOPE, 1795738513500000, BOOT)]);
-        let (ev2, _) = derive(Some(&o1), &with_journal(input(&[], Some(34080), Some(&r2)), &j), t("2026-11-27T00:15:40Z"));
+        let (ev2, _) = derive(
+            Some(&o1),
+            &with_journal(input(&[], Some(34080), Some(&r2)), &j),
+            t("2026-11-27T00:15:40Z"),
+        );
         assert_eq!(ev2.len(), 1, "{ev2:?}");
         assert_eq!(ev2[0].detail["attribution"], "slice_memory_events");
         assert_eq!(ev2[0].detail["victim_unit"], serde_json::Value::Null);
@@ -3196,8 +3827,10 @@ esac
         assert_eq!(old.oom_kill, 289);
         assert!(old.named.is_empty());
         assert_eq!(old.carried, 0);
-        let bare: SliceObs =
-            serde_json::from_str(r#"{"cgroup":"/a.slice","oom_kill":1,"observed_at":"2026-11-27T00:14:40Z"}"#).unwrap();
+        let bare: SliceObs = serde_json::from_str(
+            r#"{"cgroup":"/a.slice","oom_kill":1,"observed_at":"2026-11-27T00:14:40Z"}"#,
+        )
+        .unwrap();
         assert!(bare.children.is_empty() && bare.named.is_empty());
     }
 
@@ -3210,11 +3843,20 @@ esac
         let read = std::time::Instant::now();
         let three = Duration::from_secs(3);
         assert_eq!(lookahead_wait(read, read, three), three);
-        assert_eq!(lookahead_wait(read, read + Duration::from_secs(1), three), Duration::from_secs(2));
+        assert_eq!(
+            lookahead_wait(read, read + Duration::from_secs(1), three),
+            Duration::from_secs(2)
+        );
         // The read is long past: no wait.
-        assert_eq!(lookahead_wait(read, read + Duration::from_secs(50), three), Duration::ZERO);
+        assert_eq!(
+            lookahead_wait(read, read + Duration::from_secs(50), three),
+            Duration::ZERO
+        );
         // A read that looks later than now: still at most the lookahead.
-        assert_eq!(lookahead_wait(read + Duration::from_secs(3600), read, three), three);
+        assert_eq!(
+            lookahead_wait(read + Duration::from_secs(3600), read, three),
+            three
+        );
         assert_eq!(lookahead_wait(read, read, Duration::ZERO), Duration::ZERO);
     }
 
@@ -3225,20 +3867,44 @@ esac
     fn back_to_back_lagging_kills_are_both_counted_in_the_slice() {
         let o0 = baseline(&[]);
         // Tick 1: a kill in the slice, vmstat has not counted it yet.
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34078), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34078), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert!(ooms(&ev1).is_empty(), "{ev1:?}");
         assert_eq!(o1.slices["agent-builds.slice"].carried, 1);
         // Tick 2: vmstat counts kill 1; kill 2 lands in the slice, again
         // ahead of vmstat.
-        let r2 = read("2026-11-27T00:15:40Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
-        let (ev2, o2) = derive(Some(&o1), &input(&[], Some(34079), Some(&r2)), t("2026-11-27T00:15:40Z"));
+        let r2 = read(
+            "2026-11-27T00:15:40Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
+        let (ev2, o2) = derive(
+            Some(&o1),
+            &input(&[], Some(34079), Some(&r2)),
+            t("2026-11-27T00:15:40Z"),
+        );
         assert_eq!(ooms(&ev2).len(), 1, "{ev2:?}");
         assert_eq!(ooms(&ev2)[0].detail["attribution"], "slice_memory_events");
-        assert_eq!(o2.slices["agent-builds.slice"].oom_kill, 289, "the fresh cut is carried");
+        assert_eq!(
+            o2.slices["agent-builds.slice"].oom_kill, 289,
+            "the fresh cut is carried"
+        );
         // Tick 3: vmstat counts kill 2 — inside the slice, not the residual.
-        let (ev3, _) = derive(Some(&o2), &input(&[], Some(34080), Some(&r2)), t("2026-11-27T00:16:10Z"));
-        let kinds: Vec<&str> = ooms(&ev3).iter().map(|e| e.detail["attribution"].as_str().unwrap()).collect();
+        let (ev3, _) = derive(
+            Some(&o2),
+            &input(&[], Some(34080), Some(&r2)),
+            t("2026-11-27T00:16:10Z"),
+        );
+        let kinds: Vec<&str> = ooms(&ev3)
+            .iter()
+            .map(|e| e.detail["attribution"].as_str().unwrap())
+            .collect();
         assert_eq!(kinds, vec!["slice_memory_events"], "{ev3:?}");
     }
 
@@ -3247,15 +3913,32 @@ esac
     #[test]
     fn a_b_placed_unit_is_not_renamed_by_its_late_journal_line() {
         let o0 = baseline(&[(SCOPE, Some(0))]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[(SCOPE, Some(1))])]);
-        let (ev1, o1) = derive(Some(&o0), &input(&[], Some(34079), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[(SCOPE, Some(1))])],
+        );
+        let (ev1, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34079), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(ev1[0].detail["attribution"], "cgroup_memory_events");
-        assert_eq!(o1.slices["agent-builds.slice"].named.get(SCOPE), Some(&1795738510000000));
+        assert_eq!(
+            o1.slices["agent-builds.slice"].named.get(SCOPE),
+            Some(&1795738510000000)
+        );
         // The scope is gone; another, unplaced kill; systemd's line for the
         // first kill lands now (00:15:13.5Z).
-        let r2 = read("2026-11-27T00:15:40Z", vec![slice("agent-builds.slice", AGENT, 290, &[])]);
+        let r2 = read(
+            "2026-11-27T00:15:40Z",
+            vec![slice("agent-builds.slice", AGENT, 290, &[])],
+        );
         let j = journal(&[jline(SCOPE, 1795738513500000, BOOT)]);
-        let (ev2, _) = derive(Some(&o1), &with_journal(input(&[], Some(34080), Some(&r2)), &j), t("2026-11-27T00:15:40Z"));
+        let (ev2, _) = derive(
+            Some(&o1),
+            &with_journal(input(&[], Some(34080), Some(&r2)), &j),
+            t("2026-11-27T00:15:40Z"),
+        );
         assert_eq!(ev2.len(), 1, "{ev2:?}");
         assert_eq!(ev2[0].detail["attribution"], "slice_memory_events");
         assert_eq!(ev2[0].detail["victim_unit"], serde_json::Value::Null);
@@ -3270,20 +3953,44 @@ esac
     fn a_watched_unit_kill_does_not_keep_a_dead_carry_alive() {
         let units = watched(RUNNER_SERVICE, Some(0));
         let killed = watched(RUNNER_SERVICE, Some(1));
-        let r0 = read("2026-11-27T00:14:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])]);
-        let (_, o0) = derive(None, &input(&units, Some(10), Some(&r0)), t("2026-11-27T00:14:40Z"));
+        let r0 = read(
+            "2026-11-27T00:14:40Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 4, &[])],
+        );
+        let (_, o0) = derive(
+            None,
+            &input(&units, Some(10), Some(&r0)),
+            t("2026-11-27T00:14:40Z"),
+        );
         // Tick 1: a slice kill vmstat does not count — carried once.
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])]);
-        let (_, o1) = derive(Some(&o0), &input(&units, Some(10), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 5, &[])],
+        );
+        let (_, o1) = derive(
+            Some(&o0),
+            &input(&units, Some(10), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(o1.slices["qontinui-runner.slice"].carried, 1);
         // Tick 2: the runner service dies in the slice (vmstat +1 for it);
         // the carried excess is still uncovered.
-        let r2 = read("2026-11-27T00:15:40Z", vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])]);
-        let (ev2, o2) = derive(Some(&o1), &input(&killed, Some(11), Some(&r2)), t("2026-11-27T00:15:40Z"));
+        let r2 = read(
+            "2026-11-27T00:15:40Z",
+            vec![slice("qontinui-runner.slice", RUNNER_SLICE, 6, &[])],
+        );
+        let (ev2, o2) = derive(
+            Some(&o1),
+            &input(&killed, Some(11), Some(&r2)),
+            t("2026-11-27T00:15:40Z"),
+        );
         let o = ooms(&ev2);
         assert_eq!(o.len(), 1, "{ev2:?}");
         assert_eq!(o[0].detail["victim_unit"], "qontinui-runner.service");
-        assert_eq!(o2.slices["qontinui-runner.slice"].carried, 0, "dropped, not carried again");
+        assert_eq!(
+            o2.slices["qontinui-runner.slice"].carried, 0,
+            "dropped, not carried again"
+        );
         assert_eq!(o2.slices["qontinui-runner.slice"].oom_kill, 6);
     }
 
@@ -3292,19 +3999,32 @@ esac
     #[test]
     fn a_reboot_resets_the_carry() {
         let o0 = baseline(&[]);
-        let r1 = read("2026-11-27T00:15:10Z", vec![slice("agent-builds.slice", AGENT, 289, &[])]);
-        let (_, o1) = derive(Some(&o0), &input(&[], Some(34078), Some(&r1)), t("2026-11-27T00:15:10Z"));
+        let r1 = read(
+            "2026-11-27T00:15:10Z",
+            vec![slice("agent-builds.slice", AGENT, 289, &[])],
+        );
+        let (_, o1) = derive(
+            Some(&o0),
+            &input(&[], Some(34078), Some(&r1)),
+            t("2026-11-27T00:15:10Z"),
+        );
         assert_eq!(o1.slices["agent-builds.slice"].carried, 1);
         let new_boot = "11111111-2222-4333-8444-555555555555";
         // One kill since boot in the slice, not yet in vmstat.
-        let r2 = read("2026-11-27T03:01:00Z", vec![slice("agent-builds.slice", AGENT, 1, &[])]);
+        let r2 = read(
+            "2026-11-27T03:01:00Z",
+            vec![slice("agent-builds.slice", AGENT, 1, &[])],
+        );
         let inp = ObsInput {
             boot_id: Some(new_boot),
             booted_at: Some("2026-11-27T03:00:00Z"),
             ..input(&[], Some(0), Some(&r2))
         };
         let (_, o2) = derive(Some(&o1), &inp, t("2026-11-27T03:01:00Z"));
-        assert_eq!(o2.slices["agent-builds.slice"].carried, 1, "carried in the new boot");
+        assert_eq!(
+            o2.slices["agent-builds.slice"].carried, 1,
+            "carried in the new boot"
+        );
         assert_eq!(o2.slices["agent-builds.slice"].oom_kill, 0);
     }
 }

@@ -131,8 +131,9 @@ pub(crate) fn user_journal_args(since: DateTime<Utc>, until: DateTime<Utc>) -> V
 fn valid_unit_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 255
-        && n.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-' | b'@' | b'\\'))
+        && n.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-' | b'@' | b'\\')
+        })
 }
 
 /// One journal JSON field as text. journald writes a field that is not
@@ -168,7 +169,9 @@ pub(crate) fn json_lines(stdout: &str) -> Option<Vec<serde_json::Map<String, ser
 pub(crate) fn entry_time_and_boot(
     m: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<(u64, String)> {
-    let at = field_text(m.get("__REALTIME_TIMESTAMP"))?.parse::<u64>().ok()?;
+    let at = field_text(m.get("__REALTIME_TIMESTAMP"))?
+        .parse::<u64>()
+        .ok()?;
     let boot = field_text(m.get("_BOOT_ID"))?;
     Some((at, boot))
 }
@@ -554,7 +557,8 @@ pub(crate) async fn read_kernel(
     let window = if grep_supported(version.as_deref()) {
         grep_window_from(grepped)
     } else {
-        jc.run(kernel_journal_args(since, until, false), timeout).await
+        jc.run(kernel_journal_args(since, until, false), timeout)
+            .await
     };
     kernel_read_from(probe.as_deref(), window.as_deref())
 }
@@ -634,7 +638,10 @@ mod tests {
             boot_key("27cd9877-3ff3-47f0-8388-9880a31d5902"),
             boot_key("27CD98773FF347F083889880A31D5902")
         );
-        assert_eq!(boot_key("27cd9877-3ff3-47f0-8388-9880a31d5902"), "27cd98773ff347f083889880a31d5902");
+        assert_eq!(
+            boot_key("27cd9877-3ff3-47f0-8388-9880a31d5902"),
+            "27cd98773ff347f083889880a31d5902"
+        );
     }
 
     /// Plan test 4: the four ways a read fails — the binary is absent, it
@@ -645,21 +652,45 @@ mod tests {
     async fn every_failed_read_is_unreadable() {
         let none: Vec<String> = Vec::new();
         let probe = Some(r#"{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#);
-        let absent = run_journalctl("/nonexistent/qontinui-test/journalctl", &none, READ_TIMEOUT).await;
-        assert_eq!(user_read_from(probe, absent.as_deref()), JournalRead::Unreadable, "absent");
+        let absent =
+            run_journalctl("/nonexistent/qontinui-test/journalctl", &none, READ_TIMEOUT).await;
+        assert_eq!(
+            user_read_from(probe, absent.as_deref()),
+            JournalRead::Unreadable,
+            "absent"
+        );
         let nonzero = run_journalctl("false", &none, READ_TIMEOUT).await;
-        assert_eq!(user_read_from(probe, nonzero.as_deref()), JournalRead::Unreadable, "non-zero");
+        assert_eq!(
+            user_read_from(probe, nonzero.as_deref()),
+            JournalRead::Unreadable,
+            "non-zero"
+        );
         let started = std::time::Instant::now();
         let slow = run_journalctl("sleep", &["5".to_string()], Duration::from_millis(200)).await;
-        assert_eq!(user_read_from(probe, slow.as_deref()), JournalRead::Unreadable, "timed out");
-        assert!(started.elapsed() < Duration::from_secs(4), "the timeout bounds the fork");
         assert_eq!(
-            user_read_from(probe, Some("journalctl: hint: you are not in the systemd-journal group\n")),
+            user_read_from(probe, slow.as_deref()),
+            JournalRead::Unreadable,
+            "timed out"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the timeout bounds the fork"
+        );
+        assert_eq!(
+            user_read_from(
+                probe,
+                Some("journalctl: hint: you are not in the systemd-journal group\n")
+            ),
             JournalRead::Unreadable,
             "unparseable"
         );
         // And a clean exit with JSON is a read.
-        let ok = run_journalctl("echo", &[r#"{"USER_UNIT":"x.scope","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#.to_string()], READ_TIMEOUT).await;
+        let ok = run_journalctl(
+            "echo",
+            &[r#"{"USER_UNIT":"x.scope","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#.to_string()],
+            READ_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             user_read_from(probe, ok.as_deref()),
             JournalRead::Read(vec![UnitOomEntry {
@@ -686,16 +717,35 @@ mod tests {
                 .map(|x| x.1),
             Some("a,b".to_string())
         );
-        assert_eq!(parse_oom_kill_line("Memory cgroup out of memory: Killed process 4242 (rustc)"), None);
-        assert_eq!(parse_oom_kill_line("oom-kill:constraint=X,task_memcg=relative,task=x,pid=1,uid=0"), None);
-        assert_eq!(parse_oom_kill_line("oom-kill:constraint=X,task_memcg=/a.slice,task=,pid=1,uid=0"), None);
+        assert_eq!(
+            parse_oom_kill_line("Memory cgroup out of memory: Killed process 4242 (rustc)"),
+            None
+        );
+        assert_eq!(
+            parse_oom_kill_line("oom-kill:constraint=X,task_memcg=relative,task=x,pid=1,uid=0"),
+            None
+        );
+        assert_eq!(
+            parse_oom_kill_line("oom-kill:constraint=X,task_memcg=/a.slice,task=,pid=1,uid=0"),
+            None
+        );
     }
 
     #[test]
     fn the_kernel_argv_reads_only_kernel_messages_of_the_window() {
         assert_eq!(
             kernel_probe_args(),
-            vec!["-k", "-b", "-n", "1", "-o", "json", "--output-fields=_BOOT_ID", "--no-pager", "-q"]
+            vec![
+                "-k",
+                "-b",
+                "-n",
+                "1",
+                "-o",
+                "json",
+                "--output-fields=_BOOT_ID",
+                "--no-pager",
+                "-q"
+            ]
         );
         assert_eq!(
             kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), true),
@@ -716,7 +766,8 @@ mod tests {
                 "_TRANSPORT=kernel",
             ]
         );
-        let plain = kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), false);
+        let plain =
+            kernel_journal_args(t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), false);
         assert_eq!(&plain[10..], &["-n", "5000", "_TRANSPORT=kernel"]);
     }
 
@@ -731,11 +782,29 @@ mod tests {
             r#"{"__REALTIME_TIMESTAMP":"1795738498277000","_BOOT_ID":"27cd98773ff347f083889880a31d5902","MESSAGE":"Tasks state (memory values in pages):"}"#,
             "\n",
         );
-        assert_eq!(kernel_read_from(Some(""), Some(window)), KernelRead::Unreadable, "empty probe");
-        assert_eq!(kernel_read_from(None, Some(window)), KernelRead::Unreadable, "failed probe");
-        assert_eq!(kernel_read_from(Some(probe), None), KernelRead::Unreadable, "failed window");
-        assert_eq!(kernel_read_from(Some(probe), Some("not json")), KernelRead::Unreadable);
-        assert_eq!(kernel_read_from(Some(probe), Some("")), KernelRead::Read(vec![]));
+        assert_eq!(
+            kernel_read_from(Some(""), Some(window)),
+            KernelRead::Unreadable,
+            "empty probe"
+        );
+        assert_eq!(
+            kernel_read_from(None, Some(window)),
+            KernelRead::Unreadable,
+            "failed probe"
+        );
+        assert_eq!(
+            kernel_read_from(Some(probe), None),
+            KernelRead::Unreadable,
+            "failed window"
+        );
+        assert_eq!(
+            kernel_read_from(Some(probe), Some("not json")),
+            KernelRead::Unreadable
+        );
+        assert_eq!(
+            kernel_read_from(Some(probe), Some("")),
+            KernelRead::Read(vec![])
+        );
         assert_eq!(
             kernel_read_from(Some(probe), Some(window)),
             KernelRead::Read(vec![KernelOomRecord {
@@ -754,11 +823,23 @@ mod tests {
         let probe = r#"{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}"#;
         assert_eq!(user_read_from(Some(""), Some("")), JournalRead::Unreadable);
         assert_eq!(user_read_from(None, Some("")), JournalRead::Unreadable);
-        assert_eq!(user_read_from(Some(probe), Some("")), JournalRead::Read(vec![]));
+        assert_eq!(
+            user_read_from(Some(probe), Some("")),
+            JournalRead::Read(vec![])
+        );
         assert_eq!(user_read_from(Some(probe), None), JournalRead::Unreadable);
         assert_eq!(
             user_probe_args(),
-            vec!["--user", "-n", "1", "-o", "json", "--output-fields=_BOOT_ID", "--no-pager", "-q"]
+            vec![
+                "--user",
+                "-n",
+                "1",
+                "-o",
+                "json",
+                "--output-fields=_BOOT_ID",
+                "--no-pager",
+                "-q"
+            ]
         );
     }
 
@@ -792,7 +873,11 @@ mod tests {
             Duration::from_millis(300),
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(u, Some(JournalRead::Unreadable));
         assert_eq!(k, Some(KernelRead::Unreadable));
         // Not asked is None, never Unreadable.
@@ -822,7 +907,13 @@ mod tests {
 esac
 "#;
         let jc = fake_journalctl(d.path(), body);
-        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        let k = read_kernel(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            READ_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             k,
             KernelRead::Read(vec![KernelOomRecord {
@@ -854,9 +945,18 @@ esac
             plain_marker.display()
         );
         let jc = fake_journalctl(d.path(), &body);
-        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        let k = read_kernel(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            READ_TIMEOUT,
+        )
+        .await;
         assert_eq!(k, KernelRead::Read(vec![]));
-        assert!(!plain_marker.exists(), "no fallback read on a no-match exit");
+        assert!(
+            !plain_marker.exists(),
+            "no fallback read on a no-match exit"
+        );
     }
 
     #[test]
@@ -869,13 +969,26 @@ esac
             })
         };
         assert_eq!(grep_window_from(ran(Some(0), "x", true)), Some("x".into()));
-        assert_eq!(grep_window_from(ran(Some(1), "\n", true)), Some(String::new()));
-        assert_eq!(grep_window_from(ran(Some(1), "", false)), None, "exit 1 that says why");
+        assert_eq!(
+            grep_window_from(ran(Some(1), "\n", true)),
+            Some(String::new())
+        );
+        assert_eq!(
+            grep_window_from(ran(Some(1), "", false)),
+            None,
+            "exit 1 that says why"
+        );
         assert_eq!(grep_window_from(ran(Some(1), "partial", true)), None);
         assert_eq!(grep_window_from(ran(Some(2), "", true)), None);
-        assert_eq!(grep_window_from(ran(None, "", true)), None, "killed by a signal");
+        assert_eq!(
+            grep_window_from(ran(None, "", true)),
+            None,
+            "killed by a signal"
+        );
         assert_eq!(grep_window_from(None), None);
-        assert!(grep_supported(Some("systemd 257 (257.13)\n+PAM +AUDIT +PCRE2 +ZSTD\n")));
+        assert!(grep_supported(Some(
+            "systemd 257 (257.13)\n+PAM +AUDIT +PCRE2 +ZSTD\n"
+        )));
         assert!(!grep_supported(Some("systemd 247\n+PAM -PCRE2\n")));
         assert!(!grep_supported(None));
     }
@@ -906,7 +1019,11 @@ esac
             Duration::from_millis(1500),
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(
             u,
             Some(JournalRead::Read(vec![UnitOomEntry {
@@ -933,7 +1050,13 @@ esac
 esac
 "#;
         let jc = fake_journalctl(d.path(), body);
-        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        let k = read_kernel(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            READ_TIMEOUT,
+        )
+        .await;
         assert_eq!(k, KernelRead::Unreadable);
     }
 }
