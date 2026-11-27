@@ -39,6 +39,22 @@ pub enum IdentityCas {
     Unavailable,
 }
 
+/// What a re-key ([`SessionLifecycleStore::rekey_session`],
+/// [`SessionLifecycleStore::rekey_identity_if_unchanged`]) did.
+#[derive(Debug, Clone)]
+pub enum RekeyOutcome {
+    /// Re-keyed; carries the record as written under its new id.
+    Rekeyed(Box<TerminalSessionRecord>),
+    /// The new id already keys a record: refused rather than clobber it.
+    Occupied,
+    /// The record no longer matched the caller's expectation: nothing written.
+    Stale,
+    /// No record under the old id (or the two ids are equal).
+    Missing,
+    /// The store's lock was poisoned: nothing was written.
+    Unavailable,
+}
+
 impl SessionLifecycleStore {
     /// [`Self::update_identity`], applied ONLY when the record is still open on
     /// `expected_terminal_id` with exactly `expected_config_dir`.
@@ -89,6 +105,43 @@ impl SessionLifecycleStore {
             }],
         );
         IdentityCas::Written(Box::new(changed))
+    }
+
+    /// Re-key the record of `old_id` to `new_id` — the id the pane's own
+    /// provider row proves its claude runs — ONLY while the record is still
+    /// open on `expected_terminal_id` with exactly `expected_config_dir` (the
+    /// same expectation as [`Self::update_identity_if_unchanged`]).
+    ///
+    /// In the same persisted write it stamps the evidence grade the provider
+    /// row is (`origin = observed`, `confirmed_at = confirmed_at_ms`) and
+    /// applies `update` (the row's config dir and the account derived from it),
+    /// so the id and the account the pane runs under change together, never
+    /// two ticks apart. Refuses ([`RekeyOutcome::Occupied`]) when `new_id`
+    /// already keys a record.
+    pub fn rekey_identity_if_unchanged(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        expected_terminal_id: &str,
+        expected_config_dir: Option<&str>,
+        update: &SessionIdentityUpdate,
+        confirmed_at_ms: i64,
+    ) -> RekeyOutcome {
+        let update = update.clone().normalized();
+        self.rekey_where(
+            old_id,
+            new_id,
+            |rec| {
+                rec.state == "open"
+                    && rec.terminal_id == expected_terminal_id
+                    && rec.config_dir.as_deref() == expected_config_dir
+            },
+            |rec| {
+                update.apply(rec);
+                rec.origin = Some(ORIGIN_OBSERVED.to_string());
+                rec.confirmed_at = Some(confirmed_at_ms);
+            },
+        )
     }
 }
 
@@ -227,5 +280,61 @@ mod tests {
             Some(DIR_A)
         );
         assert!(!dir_update(DIR_B).normalized().is_empty());
+    }
+    /// The compare-and-set re-key: a stale expectation, or a new id that
+    /// already keys a record, writes nothing; a matching record moves to the
+    /// new id with the provider row's grade and dir in the same write.
+    #[test]
+    fn a_compare_and_set_rekey_moves_the_record_with_its_identity_in_one_write() {
+        let (_d, store) = open_store();
+        let mut pinned = rec("rk-old", "term-1", Some(DIR_A));
+        pinned.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        pinned.confirmed_at = None;
+        store.record_open(pinned);
+        store.record_open(rec("rk-taken", "term-2", Some(DIR_A)));
+
+        assert!(matches!(
+            store.rekey_identity_if_unchanged(
+                "rk-old",
+                "rk-new",
+                "term-0",
+                Some(DIR_A),
+                &dir_update(DIR_B),
+                5
+            ),
+            RekeyOutcome::Stale
+        ));
+        assert!(matches!(
+            store.rekey_identity_if_unchanged(
+                "rk-old",
+                "rk-taken",
+                "term-1",
+                Some(DIR_A),
+                &dir_update(DIR_B),
+                5
+            ),
+            RekeyOutcome::Occupied
+        ));
+        assert!(
+            store.get("rk-old").is_some(),
+            "a refused re-key writes nothing"
+        );
+
+        let out = store.rekey_identity_if_unchanged(
+            "rk-old",
+            "rk-new",
+            "term-1",
+            Some(DIR_A),
+            &dir_update(DIR_B),
+            5,
+        );
+        assert!(matches!(out, RekeyOutcome::Rekeyed(_)), "{out:?}");
+        assert!(store.get("rk-old").is_none());
+        let moved = store.get("rk-new").unwrap();
+        assert_eq!(moved.claude_session_id, "rk-new");
+        assert_eq!(moved.terminal_id, "term-1");
+        assert_eq!(moved.config_dir.as_deref(), Some(DIR_B));
+        assert_eq!(moved.origin.as_deref(), Some(ORIGIN_OBSERVED));
+        assert_eq!(moved.confirmed_at, Some(5));
     }
 }

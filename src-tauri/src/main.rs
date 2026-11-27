@@ -5575,7 +5575,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // it stood BEFORE this evidence was read, and writes only
                         // while a record still matches that read.
                         let pre_evidence =
-                            session::reconcile::config_dir_repair::PreEvidenceSnapshot::take(
+                            session::reconcile::identity_repair::PreEvidenceSnapshot::take(
                                 &poll_lifecycle_store,
                             );
                         let provider_rows =
@@ -5620,9 +5620,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &look,
                         );
 
-                        // Config-dir repair (plan 2026-11-16-boot-reconcile-
+                        // Identity repair (plan 2026-11-16-boot-reconcile-
                         // reverts-…, D2): write each open record's config_dir
-                        // from its own pane's valid provider row. Outside the
+                        // from its own pane's valid provider row, and re-key a
+                        // record whose pane's row names another session (plan
+                        // 2026-11-27-coord-message-to-cross-account-pane-…). Outside the
                         // `needs_reconcile` guard for the title pass's reason —
                         // a CONFIRMED row is exactly the one the bind pass leaves
                         // alone. Same `provider_rows` as the re-key. A record
@@ -5632,12 +5634,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // of the anchors (none when nothing is a candidate) lets
                         // it skip a session another live pane was resumed with.
                         let anchor_argv =
-                            session::reconcile::config_dir_repair::AnchorArgvIds::read(
+                            session::reconcile::identity_repair::AnchorArgvIds::read(
                                 &pre_evidence,
                                 &provider_rows,
                             )
                             .await;
-                        let repairs = session::reconcile::config_dir_repair::repair_config_dirs(
+                        let repairs = session::reconcile::identity_repair::repair_identities(
                             &poll_lifecycle_store,
                             &pre_evidence,
                             &provider_rows,
@@ -5645,7 +5647,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         emit_session_bound_payloads(
                             &poll_app_handle,
-                            session::reconcile::config_dir_repair::repair_bound_payloads(&repairs),
+                            session::reconcile::identity_repair::repair_bound_payloads(&repairs),
                         );
 
                         poll_lifecycle_store.prune(
@@ -5691,7 +5693,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Read before the provider evidence, for the config-dir
                     // repair's compare-and-set (see the periodic tick).
                     let pre_evidence =
-                        session::reconcile::config_dir_repair::PreEvidenceSnapshot::take(
+                        session::reconcile::identity_repair::PreEvidenceSnapshot::take(
                             &reconcile_lifecycle_store,
                         );
                     let boot_roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
@@ -5704,12 +5706,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Config-dir repair (D2), from the same provider rows. A
                     // record the boot bind (or a migration racing it) wrote is
                     // past `pre_evidence`, so it waits for the periodic tick.
-                    let anchor_argv = session::reconcile::config_dir_repair::AnchorArgvIds::read(
+                    let anchor_argv = session::reconcile::identity_repair::AnchorArgvIds::read(
                         &pre_evidence,
                         &provider_rows,
                     )
                     .await;
-                    let repairs = session::reconcile::config_dir_repair::repair_config_dirs(
+                    let repairs = session::reconcile::identity_repair::repair_identities(
                         &reconcile_lifecycle_store,
                         &pre_evidence,
                         &provider_rows,
@@ -5718,7 +5720,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     emit_session_bound(&reconcile_app_handle, &actions);
                     emit_session_bound_payloads(
                         &reconcile_app_handle,
-                        session::reconcile::config_dir_repair::repair_bound_payloads(&repairs),
+                        session::reconcile::identity_repair::repair_bound_payloads(&repairs),
                     );
                     session::coord_identity::apply_reconcile_tick_in_app(
                         &reconcile_app_handle,

@@ -80,7 +80,10 @@
 //!   session census sees live on this device with no runner — this one or any
 //!   other — as its host or process ancestor — plan
 //!   `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
-//!   Phase 4), past the repeat window for `pty_never_idle` (a busy
+//!   Phase 4) and `session_id_unbound` (a recipient live in one of THIS
+//!   runner's own panes whose record is keyed by another id — plan
+//!   `2026-11-27-coord-message-to-cross-account-pane-never-pushed`), past the
+//!   repeat window for `pty_never_idle` (a busy
 //!   live recipient) — evidence for the
 //!   stall-watchdog supervisor, never a change to delivery behavior. Gated
 //!   (default ON) by `RUNNER_DELIVERY_SURFACING_ENABLED`.
@@ -357,14 +360,24 @@ enum BlockReason {
     /// `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
     /// Phase 4.
     NoPusher,
+    /// The target IS live in one of THIS runner's own PTYs — the census's
+    /// pid-exact probe matched its claude to a pane here
+    /// ([`crate::session::census::LocalVerdict::LiveHereUnbound`]) — but the
+    /// pane's lifecycle record is keyed by another session id, so
+    /// [`resolve_target`] cannot reach it. The remedy is the reconcile's
+    /// re-key (`session::reconcile::identity_repair`), not a pull: calling it
+    /// `no_pusher` ("hosted by no runner") would be false. Plan
+    /// `2026-11-27-coord-message-to-cross-account-pane-never-pushed`, item 2.
+    SessionIdUnbound,
 }
 
 impl BlockReason {
     /// Every reason, for rendering the counter family with no series absent.
-    const ALL: [BlockReason; 3] = [
+    const ALL: [BlockReason; 4] = [
         BlockReason::TargetNotLive,
         BlockReason::PtyNeverIdle,
         BlockReason::NoPusher,
+        BlockReason::SessionIdUnbound,
     ];
 
     /// The wire value for the POST body's `reason` field.
@@ -373,6 +386,7 @@ impl BlockReason {
             BlockReason::TargetNotLive => "target_not_live",
             BlockReason::PtyNeverIdle => "pty_never_idle",
             BlockReason::NoPusher => "no_pusher",
+            BlockReason::SessionIdUnbound => "session_id_unbound",
         }
     }
 }
@@ -471,7 +485,8 @@ fn record_recipient_finished() {
 ///
 /// ```json
 /// { "push_ok": n,
-///   "push_miss": { "target_not_live": n, "pty_never_idle": n, "no_pusher": n },
+///   "push_miss": { "target_not_live": n, "pty_never_idle": n, "no_pusher": n,
+///                  "session_id_unbound": n },
 ///   "delivered_arm": { "sdk": n, "terminal": n },
 ///   "recipient_finished": n }
 /// ```
@@ -636,7 +651,9 @@ impl SurfacingTracker {
         let post_threshold = match reason {
             BlockReason::PtyNeverIdle => threshold.max(repeat),
             // Nothing on this device can push either — same short threshold.
-            BlockReason::TargetNotLive | BlockReason::NoPusher => threshold,
+            BlockReason::TargetNotLive | BlockReason::NoPusher | BlockReason::SessionIdUnbound => {
+                threshold
+            }
         };
         let surface_since = if should_surface(
             entry.first_seen,
@@ -659,6 +676,17 @@ impl SurfacingTracker {
             surface_since,
             next_log_in,
         }
+    }
+
+    /// When `message_id` was first seen blocked for `reason` (wall clock).
+    fn first_seen_wall(
+        &self,
+        message_id: &str,
+        reason: BlockReason,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.entries
+            .get(&(message_id.to_string(), reason))
+            .map(|e| e.first_seen_wall)
     }
 
     /// Has `message_id` been noted blocked for `reason`?
@@ -946,6 +974,16 @@ enum GateMiss {
 }
 
 impl GateMiss {
+    /// The coarse reason a miss counts as; `None` for the substrate fault
+    /// (`NoManager`), which is not a property of the target and is not counted.
+    fn block_reason(self) -> Option<BlockReason> {
+        match self {
+            GateMiss::NoManager => None,
+            GateMiss::Gone | GateMiss::ClaudeNotLive => Some(BlockReason::TargetNotLive),
+            GateMiss::NotIdle | GateMiss::PromptNotEmpty => Some(BlockReason::PtyNeverIdle),
+        }
+    }
+
     /// The specific behind the coarse `BlockReason`, for the log line.
     fn detail(self) -> &'static str {
         match self {
@@ -1229,59 +1267,251 @@ pub(crate) fn runner_hosts(
     resolve_target(session_manager, registrar, lifecycle_store, session_id).is_some()
 }
 
+/// The census-derived reasons: the two a census verdict, not a gate, decides.
+const CENSUS_REASONS: [BlockReason; 2] = [BlockReason::SessionIdUnbound, BlockReason::NoPusher];
+
+/// The census-derived reason already noted for `message_id`, if any — what an
+/// `Unknown` census keeps reporting ([`unhosted_reason`]).
+fn sticky_census_reason(tracker: &SurfacingTracker, message_id: &str) -> Option<BlockReason> {
+    CENSUS_REASONS
+        .into_iter()
+        .find(|reason| tracker.has(message_id, *reason))
+}
+
 /// The reason to report for a target [`resolve_target`] could not route,
 /// given what the runner's own session census says about it.
 ///
-/// Only [`LocalVerdict::LiveUnhosted`] — a live Claude process on this device
-/// with NO runner (this one or any other) as host or ancestor — yields
-/// `no_pusher`. A session under another runner is that runner's to push; an
-/// absent, stale or unreadable census is UNKNOWN; neither is upgraded to
-/// `no_pusher`, both keep the pre-census `target_not_live`.
+/// - [`LocalVerdict::LiveHereUnbound`] — live in one of THIS runner's PTYs (the
+///   census's pid-exact probe), but the pane's record is keyed by another id —
+///   yields `session_id_unbound`.
+/// - [`LocalVerdict::LiveUnhosted`] — a live Claude process on this device with
+///   NO runner (this one or any other) as host or ancestor — yields
+///   `no_pusher`.
+/// - A session under another runner is that runner's to push; an absent,
+///   stale or unreadable census is UNKNOWN; neither is upgraded, both keep the
+///   pre-census `target_not_live`.
 ///
-/// Sticky per message, but ONLY through an `Unknown` verdict: once
-/// `no_pusher` has been reported for a message (`already_no_pusher`), a census
-/// that later goes stale or unreadable keeps it `no_pusher` rather than
-/// flipping it to `target_not_live`. A FRESH `NotLive` (the session exited) or
-/// `LiveUnderARunner` (a runner now hosts it) is evidence, and wins.
+/// Sticky per message, but ONLY through an `Unknown` verdict: once a census
+/// reason has been reported for a message (`sticky`), a census that later goes
+/// stale or unreadable keeps it rather than flipping it to `target_not_live`.
+/// A FRESH verdict is evidence, and wins.
 ///
+/// [`LocalVerdict::LiveHereUnbound`]: crate::session::census::LocalVerdict::LiveHereUnbound
 /// [`LocalVerdict::LiveUnhosted`]: crate::session::census::LocalVerdict::LiveUnhosted
 fn unhosted_reason(
     verdict: crate::session::census::LocalVerdict,
-    already_no_pusher: bool,
+    sticky: Option<BlockReason>,
 ) -> (BlockReason, &'static str) {
     use crate::session::census::LocalVerdict;
-    let sticky = already_no_pusher && verdict == LocalVerdict::Unknown;
-    if sticky || verdict == LocalVerdict::LiveUnhosted {
-        (
-            BlockReason::NoPusher,
+    let reason = match (verdict, sticky) {
+        (LocalVerdict::LiveHereUnbound, _) => BlockReason::SessionIdUnbound,
+        (LocalVerdict::LiveUnhosted, _) => BlockReason::NoPusher,
+        (LocalVerdict::Unknown, Some(sticky)) => sticky,
+        (LocalVerdict::LiveUnderARunner, _) => {
+            return (
+                BlockReason::TargetNotLive,
+                "live under another runner on this device (session census); not hosted by this \
+                 runner",
+            );
+        }
+        _ => return (BlockReason::TargetNotLive, "no live session on this device"),
+    };
+    let detail = match reason {
+        BlockReason::SessionIdUnbound => {
+            "live in a terminal this runner hosts (session census: its pid is the pane's claude \
+             anchor), but the pane's lifecycle record is keyed by another session id, so the id \
+             does not route to it"
+        }
+        _ => {
             "live on this device (session census) and hosted by no runner — no push primitive \
-             reaches it; delivered only by the recipient's coord_inbox pull",
-        )
-    } else if verdict == LocalVerdict::LiveUnderARunner {
-        (
-            BlockReason::TargetNotLive,
-            "live under another runner on this device (session census); not hosted by this runner",
-        )
-    } else {
-        (BlockReason::TargetNotLive, "no live session on this device")
-    }
+             reaches it; delivered only by the recipient's coord_inbox pull"
+        }
+    };
+    (reason, detail)
 }
 
-/// FRESH evidence (`NotLive`: the session exited; `LiveUnderARunner`: a
-/// runner now hosts it) ends a message's sticky `no_pusher`, so a later
-/// `Unknown` census cannot re-assert it with the old entry's clock.
-fn forget_stale_no_pusher(
+/// A FRESH census verdict ends every census reason it does not itself give,
+/// so a later `Unknown` census cannot re-assert one with the old entry's
+/// clock, and a message never carries two census reasons at once.
+fn forget_stale_census_reasons(
     tracker: &mut SurfacingTracker,
     message_id: &str,
     verdict: crate::session::census::LocalVerdict,
 ) {
     use crate::session::census::LocalVerdict;
-    if matches!(
-        verdict,
-        LocalVerdict::NotLive | LocalVerdict::LiveUnderARunner
-    ) {
-        tracker.forget(message_id, BlockReason::NoPusher);
+    let keep = match verdict {
+        LocalVerdict::Unknown => return,
+        LocalVerdict::LiveHereUnbound => Some(BlockReason::SessionIdUnbound),
+        LocalVerdict::LiveUnhosted => Some(BlockReason::NoPusher),
+        LocalVerdict::NotLive | LocalVerdict::LiveUnderARunner => None,
+    };
+    for reason in CENSUS_REASONS {
+        if Some(reason) != keep {
+            tracker.forget(message_id, reason);
+        }
     }
+}
+
+// ===========================================================================
+// Pending view — the per-terminal badge feed
+// ===========================================================================
+
+/// The Tauri event each poll tick's [`PendingView`] is emitted on.
+pub(crate) const PENDING_VIEW_EVENT: &str = "session-messages-pending-view";
+
+/// The pseudo-reason for a message held because its recipient is finished
+/// ([`skip_finished_recipient`]): shown on the badge, never posted to coord.
+const RECIPIENT_FINISHED_REASON: &str = "recipient_finished";
+
+/// One pending message for a terminal this runner hosts, as the last tick saw
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingViewEntry {
+    message_id: String,
+    priority: String,
+    /// The block reason's wire value ([`BlockReason::as_str`]), or
+    /// `recipient_finished`.
+    reason: &'static str,
+    /// When this message was first seen blocked for `reason` (RFC 3339);
+    /// `None` for a held finished recipient, which has no blocked clock.
+    blocked_since: Option<String>,
+}
+
+/// What one tick learned for the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TickView {
+    /// The tick read coord's pending set: terminal id -> its pending messages.
+    /// A terminal with none is absent.
+    Read(std::collections::BTreeMap<String, Vec<PendingViewEntry>>),
+    /// The tick could not say what is pending, with why.
+    Unknown(&'static str),
+}
+
+/// The last tick's view and when it was taken.
+struct ViewRecord {
+    at: Instant,
+    at_wall: chrono::DateTime<chrono::Utc>,
+    view: TickView,
+}
+
+fn view_cell() -> &'static std::sync::Mutex<Option<ViewRecord>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<ViewRecord>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// A view older than this reads `unknown`, never "none pending".
+const PENDING_VIEW_STALE_AFTER: Duration = Duration::from_secs(3 * POLL_INTERVAL.as_secs());
+
+/// The view as JSON at `now`:
+///
+/// ```json
+/// { "state": "fresh" | "unknown", "unknownReason": "…" | null,
+///   "polledAt": "<rfc3339>" | null, "pollAgeSecs": n | null,
+///   "staleAfterSecs": 30,
+///   "byTerminal": { "<terminal id>": [ { "messageId", "priority", "reason",
+///                                        "blockedSince" } ] } }
+/// ```
+///
+/// `byTerminal` is empty whenever `state` is `unknown`: an unknown view must
+/// not read as "nothing pending".
+fn render_pending_view(record: Option<&ViewRecord>, now: Instant) -> serde_json::Value {
+    let Some(record) = record else {
+        return pending_view_json("unknown", Some("not polled yet"), None, None, None);
+    };
+    let age = now.saturating_duration_since(record.at);
+    let polled_at = Some(record.at_wall.to_rfc3339());
+    match &record.view {
+        _ if age > PENDING_VIEW_STALE_AFTER => pending_view_json(
+            "unknown",
+            Some("the last poll is stale"),
+            polled_at,
+            Some(age.as_secs()),
+            None,
+        ),
+        TickView::Unknown(why) => {
+            pending_view_json("unknown", Some(why), polled_at, Some(age.as_secs()), None)
+        }
+        TickView::Read(by_terminal) => pending_view_json(
+            "fresh",
+            None,
+            polled_at,
+            Some(age.as_secs()),
+            Some(by_terminal),
+        ),
+    }
+}
+
+fn pending_view_json(
+    state: &str,
+    unknown_reason: Option<&str>,
+    polled_at: Option<String>,
+    poll_age_secs: Option<u64>,
+    by_terminal: Option<&std::collections::BTreeMap<String, Vec<PendingViewEntry>>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "state": state,
+        "unknownReason": unknown_reason,
+        "polledAt": polled_at,
+        "pollAgeSecs": poll_age_secs,
+        "staleAfterSecs": PENDING_VIEW_STALE_AFTER.as_secs(),
+        "byTerminal": by_terminal.cloned().unwrap_or_default(),
+    })
+}
+
+/// Record this tick's view and emit it to the frontend.
+fn publish_pending_view(app: &tauri::AppHandle, view: TickView) {
+    use tauri::Emitter;
+    let now = Instant::now();
+    let payload = {
+        let Ok(mut cell) = view_cell().lock() else {
+            return;
+        };
+        *cell = Some(ViewRecord {
+            at: now,
+            at_wall: chrono::Utc::now(),
+            view,
+        });
+        render_pending_view(cell.as_ref(), now)
+    };
+    if let Err(e) = app.emit(PENDING_VIEW_EVENT, &payload) {
+        debug!("session_message_poller: emitting {PENDING_VIEW_EVENT} failed: {e}");
+    }
+}
+
+/// `GET /session-messages/pending-view` — the last tick's per-terminal view
+/// ([`render_pending_view`]).
+pub(crate) async fn pending_view_handler() -> axum::Json<serde_json::Value> {
+    let now = Instant::now();
+    let body = match view_cell().lock() {
+        Ok(cell) => render_pending_view(cell.as_ref(), now),
+        Err(_) => pending_view_json("unknown", Some("view unavailable"), None, None, None),
+    };
+    axum::Json(body)
+}
+
+/// Add `msg`, blocked for `reason` on `terminal_id`, to this tick's view.
+fn note_view(
+    view: &mut std::collections::BTreeMap<String, Vec<PendingViewEntry>>,
+    tracker: &SurfacingTracker,
+    terminal_id: &str,
+    msg: &PendingMessage,
+    reason: Option<BlockReason>,
+) {
+    let entry = PendingViewEntry {
+        message_id: msg.message_id.clone(),
+        priority: if msg.priority.is_empty() {
+            "normal".to_string()
+        } else {
+            msg.priority.clone()
+        },
+        reason: reason.map_or(RECIPIENT_FINISHED_REASON, BlockReason::as_str),
+        blocked_since: reason
+            .and_then(|r| tracker.first_seen_wall(&msg.message_id, r))
+            .map(|t| t.to_rfc3339()),
+    };
+    view.entry(terminal_id.to_string()).or_default().push(entry);
 }
 
 /// The envelope's tag name, matched case-insensitively by
@@ -1581,13 +1811,25 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
                 );
                 last_killed_logged = true;
             }
+            publish_pending_view(
+                &api_state.app_handle,
+                TickView::Unknown("message delivery is disabled"),
+            );
         } else {
             if last_killed_logged {
                 info!("session_message_poller: {KILL_SWITCH_ENV} cleared — resuming delivery");
                 last_killed_logged = false;
             }
             // Fail-open: a tick error NEVER panics the loop.
-            if let Err(e) = deliver_once(&api_state, &mut guard, &mut tracker).await {
+            let tick = deliver_once(&api_state, &mut guard, &mut tracker).await;
+            publish_pending_view(
+                &api_state.app_handle,
+                match &tick {
+                    Ok(view) => view.clone(),
+                    Err(_) => TickView::Unknown("the last poll of coord failed"),
+                },
+            );
+            if let Err(e) = tick {
                 // `{e:#}` — anyhow's ALTERNATE Display, which renders the whole
                 // context chain. A bare `{e}` prints only the outermost layer,
                 // so a `reqwest` transport fault reached this WARN as the
@@ -1653,21 +1895,18 @@ async fn report_gate_miss(
     now: Instant,
     no_manager_warned: &mut bool,
 ) {
-    let reason = match miss {
-        GateMiss::NoManager => {
-            if !*no_manager_warned {
-                warn!(
-                    "session_message_poller: TerminalManager unavailable this tick — every \
-                     PTY-targeted message stays pending (first: msg {} for session \
-                     {to_session})",
-                    msg.message_id
-                );
-                *no_manager_warned = true;
-            }
-            return;
+    let Some(reason) = miss.block_reason() else {
+        // `NoManager`: the substrate, not the target.
+        if !*no_manager_warned {
+            warn!(
+                "session_message_poller: TerminalManager unavailable this tick — every \
+                 PTY-targeted message stays pending (first: msg {} for session \
+                 {to_session})",
+                msg.message_id
+            );
+            *no_manager_warned = true;
         }
-        GateMiss::Gone | GateMiss::ClaudeNotLive => BlockReason::TargetNotLive,
-        GateMiss::NotIdle | GateMiss::PromptNotEmpty => BlockReason::PtyNeverIdle,
+        return;
     };
     debug!(
         "session_message_poller: terminal {terminal_id}: {} — msg {} stays pending",
@@ -1695,13 +1934,13 @@ async fn deliver_once(
     api_state: &Arc<ApiState>,
     guard: &mut DeliveryGuard,
     tracker: &mut SurfacingTracker,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TickView> {
     // Device JWT — unpaired ⇒ skip the tick quietly (no spam).
     let token = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => {
             debug!("session_message_poller: no device JWT yet (unpaired) — skipping tick");
-            return Ok(());
+            return Ok(TickView::Unknown("this runner is not paired with coord"));
         }
     };
 
@@ -1735,8 +1974,10 @@ async fn deliver_once(
     guard
         .finished_held
         .retain(|id| pending_ids.contains(id.as_str()));
+    let mut view: std::collections::BTreeMap<String, Vec<PendingViewEntry>> =
+        std::collections::BTreeMap::new();
     if pending.messages.is_empty() {
-        return Ok(());
+        return Ok(TickView::Read(view));
     }
 
     // 2. Resolution substrate (read once per tick).
@@ -1747,7 +1988,9 @@ async fn deliver_once(
         Some(sm) => sm.inner().clone(),
         None => {
             debug!("session_message_poller: SessionManager not available — skipping tick");
-            return Ok(());
+            return Ok(TickView::Unknown(
+                "the runner's session manager is not up yet",
+            ));
         }
     };
     let registrar = api_state
@@ -1800,9 +2043,18 @@ async fn deliver_once(
             // reason is the census's call: see `unhosted_reason`.
             let verdict = crate::session::census::local_verdict(to_session, now);
             let (reason, detail) =
-                unhosted_reason(verdict, tracker.has(&msg.message_id, BlockReason::NoPusher));
-            forget_stale_no_pusher(tracker, &msg.message_id, verdict);
+                unhosted_reason(verdict, sticky_census_reason(tracker, &msg.message_id));
+            forget_stale_census_reasons(tracker, &msg.message_id, verdict);
             surface_blocked_delivery(&ctx, tracker, msg, to_session, reason, detail, now).await;
+            // A pane this runner owns gets the badge even though the id does
+            // not route to it — that is exactly what the badge must show.
+            if reason == BlockReason::SessionIdUnbound {
+                if let Some(terminal_id) =
+                    crate::session::census::local_unbound_terminal(to_session, now)
+                {
+                    note_view(&mut view, tracker, &terminal_id, msg, Some(reason));
+                }
+            }
             continue;
         };
 
@@ -1815,6 +2067,9 @@ async fn deliver_once(
             &msg.message_id,
             to_session,
         ) {
+            if let ResolvedTarget::Terminal { terminal_id, .. } = &target {
+                note_view(&mut view, tracker, terminal_id, msg, None);
+            }
             continue;
         }
 
@@ -1840,6 +2095,9 @@ async fn deliver_once(
                             &mut no_manager_warned,
                         )
                         .await;
+                        if let Some(reason) = miss.block_reason() {
+                            note_view(&mut view, tracker, terminal_id, msg, Some(reason));
+                        }
                         continue;
                     }
                 }
@@ -1894,6 +2152,15 @@ async fn deliver_once(
                     now,
                 )
                 .await;
+                if let ResolvedTarget::Terminal { terminal_id, .. } = &target {
+                    note_view(
+                        &mut view,
+                        tracker,
+                        terminal_id,
+                        msg,
+                        Some(BlockReason::TargetNotLive),
+                    );
+                }
                 continue;
             }
         };
@@ -1935,7 +2202,7 @@ async fn deliver_once(
     if delivered > 0 {
         debug!("session_message_poller: delivered {delivered} message(s) this tick");
     }
-    Ok(())
+    Ok(TickView::Read(view))
 }
 
 // ===========================================================================
@@ -2671,25 +2938,130 @@ mod tests {
         assert_eq!(SURFACE_REPEAT_SECS_ENV, "RUNNER_MSG_SURFACE_REPEAT_SECS");
     }
 
+    /// Item 2 of plan `2026-11-27-coord-message-to-cross-account-pane-never-pushed`:
+    /// a pane this runner owns whose id does not route is `session_id_unbound`,
+    /// never `no_pusher`; an unmatched live row (Windows: no ancestry) is still
+    /// `no_pusher`.
+    #[test]
+    fn a_pane_this_runner_owns_but_cannot_route_reports_session_id_unbound() {
+        use crate::session::census::LocalVerdict;
+        let (reason, detail) = unhosted_reason(LocalVerdict::LiveHereUnbound, None);
+        assert_eq!(reason, BlockReason::SessionIdUnbound);
+        assert_eq!(reason.as_str(), "session_id_unbound");
+        assert!(!detail.contains("hosted by no runner"), "{detail}");
+        // A fresh pid-matched verdict beats a sticky no_pusher.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveHereUnbound, Some(BlockReason::NoPusher)).0,
+            BlockReason::SessionIdUnbound
+        );
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnhosted, None).0,
+            BlockReason::NoPusher
+        );
+        // Sticky through an Unknown census, like no_pusher.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::Unknown, Some(BlockReason::SessionIdUnbound)).0,
+            BlockReason::SessionIdUnbound
+        );
+        // Fresh evidence keeps one census reason, never both.
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
+        t.note_blocked("m", BlockReason::NoPusher, t0, thresh, repeat, true);
+        forget_stale_census_reasons(&mut t, "m", LocalVerdict::LiveHereUnbound);
+        assert_eq!(sticky_census_reason(&t, "m"), None);
+        t.note_blocked("m", BlockReason::SessionIdUnbound, t0, thresh, repeat, true);
+        forget_stale_census_reasons(&mut t, "m", LocalVerdict::LiveHereUnbound);
+        assert_eq!(
+            sticky_census_reason(&t, "m"),
+            Some(BlockReason::SessionIdUnbound)
+        );
+        assert!(health_snapshot()["push_miss"]
+            .get("session_id_unbound")
+            .is_some());
+    }
+
+    /// Item 6: the badge feed. A fresh read lists each terminal's messages
+    /// with their reason and first-blocked time; an unknown tick, a stale
+    /// read and no read at all are `unknown` with an EMPTY `byTerminal`, never
+    /// "none pending".
+    #[test]
+    fn the_pending_view_is_fresh_only_while_the_last_tick_read_coord() {
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        t.note_blocked(
+            "d5efb40e",
+            BlockReason::SessionIdUnbound,
+            t0,
+            Duration::from_secs(60),
+            Duration::from_secs(1800),
+            true,
+        );
+        let msg = PendingMessage {
+            message_id: "d5efb40e".to_string(),
+            to_session: Some("88ea9404".to_string()),
+            from_session: None,
+            kind: String::new(),
+            priority: String::new(),
+            body: String::new(),
+            created_at: None,
+            action: None,
+        };
+        let mut by_terminal = std::collections::BTreeMap::new();
+        note_view(
+            &mut by_terminal,
+            &t,
+            "term-1",
+            &msg,
+            Some(BlockReason::SessionIdUnbound),
+        );
+        let fresh = ViewRecord {
+            at: t0,
+            at_wall: chrono::Utc::now(),
+            view: TickView::Read(by_terminal),
+        };
+        let v = render_pending_view(Some(&fresh), t0);
+        assert_eq!(v["state"], "fresh");
+        let entry = &v["byTerminal"]["term-1"][0];
+        assert_eq!(entry["messageId"], "d5efb40e");
+        assert_eq!(entry["priority"], "normal");
+        assert_eq!(entry["reason"], "session_id_unbound");
+        assert!(entry["blockedSince"].is_string());
+
+        let stale = render_pending_view(Some(&fresh), t0 + PENDING_VIEW_STALE_AFTER * 2);
+        assert_eq!(stale["state"], "unknown");
+        assert!(stale["byTerminal"].as_object().unwrap().is_empty());
+
+        let unpaired = ViewRecord {
+            at: t0,
+            at_wall: chrono::Utc::now(),
+            view: TickView::Unknown("this runner is not paired with coord"),
+        };
+        let u = render_pending_view(Some(&unpaired), t0);
+        assert_eq!(u["state"], "unknown");
+        assert!(u["byTerminal"].as_object().unwrap().is_empty());
+        assert_eq!(render_pending_view(None, t0)["state"], "unknown");
+    }
+
     #[test]
     fn only_a_live_session_with_no_runner_reports_no_pusher() {
         use crate::session::census::LocalVerdict;
         assert_eq!(
-            unhosted_reason(LocalVerdict::LiveUnhosted, false).0,
+            unhosted_reason(LocalVerdict::LiveUnhosted, None).0,
             BlockReason::NoPusher
         );
         // Live under ANOTHER runner on the device: that runner pushes it.
         assert_eq!(
-            unhosted_reason(LocalVerdict::LiveUnderARunner, false).0,
+            unhosted_reason(LocalVerdict::LiveUnderARunner, None).0,
             BlockReason::TargetNotLive
         );
         assert_eq!(
-            unhosted_reason(LocalVerdict::NotLive, false).0,
+            unhosted_reason(LocalVerdict::NotLive, None).0,
             BlockReason::TargetNotLive
         );
         // No fresh census is UNKNOWN — never upgraded to no_pusher.
         assert_eq!(
-            unhosted_reason(LocalVerdict::Unknown, false).0,
+            unhosted_reason(LocalVerdict::Unknown, None).0,
             BlockReason::TargetNotLive
         );
     }
@@ -2699,7 +3071,7 @@ mod tests {
         use crate::session::census::LocalVerdict;
         // already_no_pusher = true, but the session has since exited.
         assert_eq!(
-            unhosted_reason(LocalVerdict::NotLive, true).0,
+            unhosted_reason(LocalVerdict::NotLive, Some(BlockReason::NoPusher)).0,
             BlockReason::TargetNotLive
         );
     }
@@ -2709,7 +3081,7 @@ mod tests {
         use crate::session::census::LocalVerdict;
         // already_no_pusher = true, but a runner now hosts the session.
         assert_eq!(
-            unhosted_reason(LocalVerdict::LiveUnderARunner, true).0,
+            unhosted_reason(LocalVerdict::LiveUnderARunner, Some(BlockReason::NoPusher)).0,
             BlockReason::TargetNotLive
         );
     }
@@ -2721,19 +3093,16 @@ mod tests {
         let t0 = Instant::now();
         let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
         // LiveUnhosted -> no_pusher, noted.
-        let (r1, _) = unhosted_reason(
-            LocalVerdict::LiveUnhosted,
-            t.has("m", BlockReason::NoPusher),
-        );
+        let (r1, _) = unhosted_reason(LocalVerdict::LiveUnhosted, sticky_census_reason(&t, "m"));
         assert_eq!(r1, BlockReason::NoPusher);
         t.note_blocked("m", r1, t0, thresh, repeat, true);
         // The session exits: a fresh NotLive wins and clears the sticky entry.
         let v = LocalVerdict::NotLive;
-        let (r2, _) = unhosted_reason(v, t.has("m", BlockReason::NoPusher));
-        forget_stale_no_pusher(&mut t, "m", v);
+        let (r2, _) = unhosted_reason(v, sticky_census_reason(&t, "m"));
+        forget_stale_census_reasons(&mut t, "m", v);
         assert_eq!(r2, BlockReason::TargetNotLive);
         // A later stale census (Unknown) must NOT re-assert no_pusher.
-        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, t.has("m", BlockReason::NoPusher));
+        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, sticky_census_reason(&t, "m"));
         assert_eq!(r3, BlockReason::TargetNotLive);
     }
 
@@ -2743,17 +3112,14 @@ mod tests {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
         let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
-        let (r1, _) = unhosted_reason(
-            LocalVerdict::LiveUnhosted,
-            t.has("m", BlockReason::NoPusher),
-        );
+        let (r1, _) = unhosted_reason(LocalVerdict::LiveUnhosted, sticky_census_reason(&t, "m"));
         assert_eq!(r1, BlockReason::NoPusher);
         t.note_blocked("m", r1, t0, thresh, repeat, true);
         // The census later goes stale (Unknown): still no_pusher for "m".
-        let (r2, _) = unhosted_reason(LocalVerdict::Unknown, t.has("m", BlockReason::NoPusher));
+        let (r2, _) = unhosted_reason(LocalVerdict::Unknown, sticky_census_reason(&t, "m"));
         assert_eq!(r2, BlockReason::NoPusher);
         // A different message is unaffected.
-        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, t.has("n", BlockReason::NoPusher));
+        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, sticky_census_reason(&t, "n"));
         assert_eq!(r3, BlockReason::TargetNotLive);
     }
 
@@ -3300,7 +3666,12 @@ mod tests {
         );
         assert_eq!(
             keys(&snap["push_miss"]),
-            ["no_pusher", "pty_never_idle", "target_not_live"]
+            [
+                "no_pusher",
+                "pty_never_idle",
+                "session_id_unbound",
+                "target_not_live"
+            ]
         );
         assert_eq!(keys(&snap["delivered_arm"]), ["sdk", "terminal"]);
 

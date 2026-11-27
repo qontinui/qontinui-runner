@@ -423,6 +423,7 @@ GET /screenshots/list list_screenshots_endpoint
 GET /security/audit/events get_audit_events
 GET /security/audit/summary get_audit_summary
 GET /session-briefing session_briefing_handler
+GET /session-messages/pending-view pending_view_handler
 GET /session-repository list_handler
 GET /session-repository/unfinished unfinished_handler
 GET /session-repository/{id} detail_handler

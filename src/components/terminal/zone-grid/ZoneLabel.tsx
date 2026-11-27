@@ -6,6 +6,7 @@ import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS, ZONE_HEADER_HEIGHT_PX } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { PendingMessagesBadge } from "../PendingMessagesBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
@@ -230,6 +231,10 @@ export function ZoneLabel({
         claudeSessionId={tab.claudeSessionId}
         zoneIndex={zoneIndex}
       />
+
+      {/* Pending coord messages the runner's poller could not push into this
+          pane, with why; a muted "?" when that is unknown. Local tabs only. */}
+      {!tab.remote && <PendingMessagesBadge terminalId={tab.id} zoneIndex={zoneIndex} />}
 
       {/* Remote tab (Phase 4/5): device badge, earlier-output and reattach.
           Renders nothing for a local tab. */}

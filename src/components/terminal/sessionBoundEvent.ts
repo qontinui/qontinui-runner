@@ -75,7 +75,7 @@ export interface SessionBoundUpdate {
  *
  * A payload for the SAME id with a non-empty config dir that differs from the
  * tab's re-stamps ONLY the config dir (the session id is returned unchanged).
- * That is the runner's config-dir repair (`reconcile/config_dir_repair.rs`):
+ * That is the runner's config-dir repair (`reconcile/identity_repair.rs`):
  * the record's account was corrected from the pane's own provider row, and the
  * tab must follow it, or the next restore types the wrong account's wrapper.
  * It is runner-inferred, so it is not gated on `providerReported`; it moves no
@@ -99,8 +99,9 @@ export interface SessionBoundUpdate {
  * its id is lifted from the anchor process's typed `--session-id` — the
  * runner's own prediction. Gating on grade would let that bind overwrite a true
  * id with the guess, reinstating this defect in the opposite direction. Only
- * the provider's SessionStart hook reports an id about itself, and only it
- * corrects.
+ * an id the provider reported about itself corrects: its SessionStart hook, or
+ * the identity repair's re-key, which reads the id from Claude Code's own
+ * registry row for the pane's claude pid (`reconcile/identity_repair.rs`).
  *
  * Pure + exported for unit tests.
  */

@@ -63,7 +63,7 @@ use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
 mod identity_cas;
-pub use identity_cas::IdentityCas;
+pub use identity_cas::{IdentityCas, RekeyOutcome};
 
 /// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
 /// "." fallback for a home-less environment. Base for the instance-scoped
@@ -551,7 +551,7 @@ pub struct SessionIdentityUpdate {
     /// Whether this session runs with provider permissions bypassed.
     pub bypass_permissions: Option<bool>,
     /// The account root the live process runs under, from pid-exact evidence
-    /// (the pane's own provider row — `session::reconcile::config_dir_repair`).
+    /// (the pane's own provider row — `session::reconcile::identity_repair`).
     pub config_dir: Option<String>,
 }
 
@@ -4239,42 +4239,56 @@ impl SessionLifecycleStore {
     /// `claude_session_id` is the MAP KEY ([`record_open`] does
     /// `m.entry(rec.claude_session_id.clone())`, and the in-place refresh block
     /// only touches non-key fields). An adapter that reports a CORRECTED id can
-    /// therefore not change the key by re-recording — it must re-key. This helper
-    /// is the defensive primitive for that.
+    /// therefore not change the key by re-recording — it must re-key.
     ///
     /// No-op (no write) when: `old_id == new_id`; `old_id` is absent; or `new_id`
     /// is ALREADY present (re-keying onto a live row would clobber it — refuse
-    /// rather than lose data). NOTE: no shipped adapter triggers this today (the
-    /// audit refuted Claude id-rotation); it exists so a future adapter that does
-    /// report a corrected id has a correct primitive and never leaves a
-    /// permanently-stale row. Launch-failure liveness is NOT carried: it lives in
-    /// `terminal::launch_failure::registry()`, keyed by the old id, until the
-    /// poll's next KeepAlive notes the new one — a caller that wires this up
-    /// should re-note it there.
-    pub fn rekey_session(&self, old_id: &str, new_id: &str) {
+    /// rather than lose data). The production caller is the reconcile's
+    /// identity repair, through [`Self::rekey_identity_if_unchanged`], which
+    /// re-keys a pane whose claude runs another id than its spawn pin (an
+    /// account shortcut typed into the pane). Launch-failure liveness is NOT
+    /// carried: it lives in `terminal::launch_failure::registry()`, keyed by
+    /// the old id — a caller re-notes the new one there.
+    pub fn rekey_session(&self, old_id: &str, new_id: &str) -> RekeyOutcome {
+        self.rekey_where(old_id, new_id, |_| true, |_| {})
+    }
+
+    /// The one re-key primitive: under the store's lock, re-key `old_id` to
+    /// `new_id` only when `admit` accepts the record as it stands, applying
+    /// `mutate` to it in the same persisted write (one `Remove` + one `Upsert`
+    /// delta, so a reader never sees the id change without the rest).
+    pub(crate) fn rekey_where(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        admit: impl FnOnce(&TerminalSessionRecord) -> bool,
+        mutate: impl FnOnce(&mut TerminalSessionRecord),
+    ) -> RekeyOutcome {
         if old_id == new_id {
-            return;
+            return RekeyOutcome::Missing;
         }
         let rekeyed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on rekey_session");
-                    return;
+                    return RekeyOutcome::Unavailable;
                 }
             };
+            let Some(current) = m.get(old_id) else {
+                return RekeyOutcome::Missing; // old id absent — nothing to re-key
+            };
+            if !admit(current) {
+                return RekeyOutcome::Stale;
+            }
             if m.contains_key(new_id) {
-                warn!(
-                    old_id,
-                    new_id,
-                    "session_lifecycle_store: rekey target already present — refusing to clobber"
-                );
-                return;
+                return RekeyOutcome::Occupied;
             }
             let Some(mut rec) = m.remove(old_id) else {
-                return; // old id absent — nothing to re-key
+                return RekeyOutcome::Missing;
             };
             rec.claude_session_id = new_id.to_string();
+            mutate(&mut rec);
             m.insert(new_id.to_string(), rec.clone());
             self.persist(
                 m,
@@ -4289,7 +4303,8 @@ impl SessionLifecycleStore {
             );
             rec
         };
-        self.snapshot_change(std::iter::once(rekeyed));
+        self.snapshot_change(std::iter::once(rekeyed.clone()));
+        RekeyOutcome::Rekeyed(Box::new(rekeyed))
     }
 
     /// Remove a record outright (session-restore-redesign Phase 4 reconcile
