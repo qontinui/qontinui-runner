@@ -85,7 +85,7 @@ pub mod session_env;
 pub(crate) mod shared_branch_restore;
 pub(crate) mod sibling_store;
 #[cfg(test)]
-mod test_coord;
+pub(crate) mod test_coord;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**
 /// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.
@@ -1227,8 +1227,10 @@ pub const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
 /// The leading token of a gate continuation's `spawn_failed` detail when it
 /// asked for isolation and coord's `/agents/allocate` kept failing transiently
 /// until the acquire's retry budget ran out ([`AllocateError::Unavailable`]).
-/// Such a continuation is refused rather than run in the shared workspace
-/// root, and coord re-offers the gate on its bounded spawn-retry schedule
+/// Gate continuations only: such a continuation is refused rather than run in
+/// the shared workspace root, and coord re-offers the gate on its bounded
+/// spawn-retry schedule; a work-unit continuation keeps the fallback and its
+/// note, since it posts no outcome to be re-offered from
 /// (plan
 /// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
 /// D2). Stable, because coord must match it: the re-offer REQUIRES coord's
