@@ -892,10 +892,10 @@ const EVENT_LOOP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_
 /// is a normal close. The mode reaches `run_teardown` through the one-shot
 /// `AppState::pending_close_mode` slot, staged immediately before
 /// `window.close()` and cleared if that close fails, and taken by the
-/// `CloseRequested` worker. It only makes sense for the main window (`400`
-/// with any other `label`), and a runner with no main window refuses it with
-/// `409` / `HANDOFF_REQUIRES_MAIN_WINDOW` (use force-close, which accepts the
-/// same field).
+/// `CloseRequested` worker. It only makes sense for the main window (`400` /
+/// `HANDOFF_LABEL_NOT_MAIN` with any other `label`), and a runner with no main
+/// window refuses it with `409` / `HANDOFF_REQUIRES_MAIN_WINDOW` (use
+/// force-close, which accepts the same field).
 pub async fn ui_bridge_page_close_request_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -910,7 +910,10 @@ pub async fn ui_bridge_page_close_request_handler(
         .map(str::to_string);
     let close_mode = crate::terminal::CloseMode::from_request_body(body.as_ref().map(|Json(v)| v));
     if let Some(refusal) = handoff_label_refusal(close_mode, requested.as_deref(), main_label) {
-        return Err((StatusCode::BAD_REQUEST, Json(api_error(refusal))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error_with_code(refusal, "HANDOFF_LABEL_NOT_MAIN")),
+        ));
     }
 
     // Route only labels that actually name something other than the main
