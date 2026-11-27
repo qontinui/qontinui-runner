@@ -173,7 +173,7 @@ pub fn refetch_unified_workflow_steps(
     );
 
     // Fetch workflow from database (async call from sync context)
-    let workflow_result = tokio::task::block_in_place(|| {
+    let workflow_result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(db.get_unified_workflow(&workflow_id))
     });
     match workflow_result {
@@ -217,10 +217,11 @@ pub fn refetch_unified_workflow_steps(
 
             // Update the task_run with the correct execution_steps_json
             if let Ok(new_json) = serde_json::to_string(&all_steps) {
-                let update_result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(db.update_task_run_execution_steps(task_id, &new_json))
-                });
+                let update_result =
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(db.update_task_run_execution_steps(task_id, &new_json))
+                    });
                 if let Err(e) = update_result {
                     warn!(
                         "Failed to update execution_steps_json for task {}: {}",

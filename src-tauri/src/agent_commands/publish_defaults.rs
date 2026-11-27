@@ -558,7 +558,7 @@ pub(crate) fn claim_publish_slot() -> bool {
 /// fetch makes (`AuthManager::get_access_token`, a secure-storage read with no
 /// tier gate); moved to a blocking thread because it may touch the keychain.
 async fn resolve_token() -> Option<String> {
-    let read = tokio::task::spawn_blocking(|| {
+    let read = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
         crate::auth::AuthManager::new()
             .get_access_token()
             .ok()

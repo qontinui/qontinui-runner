@@ -4019,7 +4019,7 @@ pub(crate) fn spawn_log_proxy_upstream_rejected(
 ) {
     let nonce = nonce.map(str::to_owned);
     let cause = cause.into();
-    tokio::task::spawn_blocking(move || {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         log_proxy_upstream_rejected(nonce.as_deref(), status, &cause)
     });
 }
@@ -4033,7 +4033,7 @@ pub(crate) fn spawn_log_proxy_runner_credential_rejected(
 ) {
     let nonce = nonce.map(str::to_owned);
     let cause = cause.into();
-    tokio::task::spawn_blocking(move || {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         log_proxy_runner_credential_rejected(nonce.as_deref(), &cause)
     });
 }
@@ -4156,7 +4156,7 @@ pub(crate) fn spawn_log_proxy_upstream_unreachable(
     let nonce = nonce.map(str::to_owned);
     let url = upstream_url.to_string();
     let cause = cause.into();
-    tokio::task::spawn_blocking(move || {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         log_proxy_upstream_unreachable(nonce.as_deref(), class, &url, &cause)
     });
 }
@@ -14776,7 +14776,10 @@ pub(crate) fn start_stale_breadcrumb_sweep(fallback_port: u16) {
             if port == 0 {
                 continue;
             }
-            let reprobed = tokio::task::spawn_blocking(move || sweep_stale_breadcrumbs_once(port))
+            let reprobed =
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    sweep_stale_breadcrumbs_once(port)
+                })
                 .await
                 .unwrap_or(0);
             if reprobed > 0 {

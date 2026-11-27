@@ -85,7 +85,7 @@ pub fn create_version_sync(
     content: &str,
     metadata: Option<&str>,
 ) -> Result<i64, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(create_version(
             pg_db,
             resource_type,
