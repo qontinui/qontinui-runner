@@ -3475,6 +3475,12 @@ fn run_cred_refresh_cycle(
 /// [`CRED_REGIONAL_PROBES_MARKER`] would attest one tenant's catalogue to all of
 /// them. It is withheld there (coord then reads every regional zero as UNKNOWN);
 /// the regional tokens themselves fold exactly as before.
+///
+/// A cycle that does not reach its final fold (a panic anywhere in it, the
+/// regional half above all, which runs after the built-in half has already
+/// refreshed `ran_at`) withdraws [`CRED_REGIONAL_PROBES_MARKER`] on unwind:
+/// otherwise the PREVIOUS cycle's marker would stay advertised beside a fresh
+/// `ran_at`, attesting a measurement this cycle never made.
 fn run_cred_refresh_cycle_scoped(
     cache: &Mutex<CredFamilyState>,
     env: &CredProbeEnv,
@@ -3483,6 +3489,29 @@ fn run_cred_refresh_cycle_scoped(
     ttl: Duration,
     single_tenant: bool,
 ) {
+    /// Clears `regional_measured` when dropped while still armed.
+    struct WithdrawRegionalMarkerUnlessCompleted<'a> {
+        cache: &'a Mutex<CredFamilyState>,
+        armed: bool,
+    }
+    impl Drop for WithdrawRegionalMarkerUnlessCompleted<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // A poisoned lock (the panic hit inside a fold) is still ours to
+                // correct: the marker must not outlive an unfinished cycle.
+                self.cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .regional_measured = false;
+                warn!(
+                    "host_capabilities: cred refresh cycle did not complete; \
+                     {CRED_REGIONAL_PROBES_MARKER} withdrawn"
+                );
+            }
+        }
+    }
+    let mut withdraw = WithdrawRegionalMarkerUnlessCompleted { cache, armed: true };
+
     let verdicts = probe_cred_family(env);
     cache
         .lock()
@@ -3493,6 +3522,8 @@ fn run_cred_refresh_cycle_scoped(
     state.apply_regional(&regional, started, ttl);
     // Under the same lock, so no heartbeat reads the marker in between.
     state.regional_measured &= single_tenant;
+    // The cycle completed; `state` (declared after the guard) unlocks first.
+    withdraw.armed = false;
 }
 
 /// Whether this device is bound to exactly ONE tenant, by BOTH reads: the local
