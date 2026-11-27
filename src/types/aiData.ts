@@ -181,6 +181,12 @@ export interface LoopResult {
   critical_failure: boolean;
   /** Whether the loop was manually stopped */
   was_stopped: boolean;
+  /**
+   * Whether the loop ended because no required verification step ran.
+   * Nothing was checked, so the outcome is unknown, not passed and not
+   * failed. Absent on results written before the runner emitted it.
+   */
+  no_verification_steps?: boolean;
   /** Per-iteration results */
   iteration_results: IterationResult[];
   /** Human-readable summary of the loop execution */
