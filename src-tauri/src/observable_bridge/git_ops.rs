@@ -449,8 +449,13 @@ fn hook_body(push_file: &Path) -> String {
 # `{backup}` next to this file and is sourced below so it still runs.
 __qontinui_remote="$1"
 __qontinui_url="$2"
-__qontinui_stdin="$(cat)"
 printf 'QONTINUI_GIT_PUSH %s %s %s\n' "$__qontinui_remote" "$__qontinui_url" "$(date +%s)" >> "{push_file}" 2>/dev/null || true
+# Bounded read, never an unbounded command substitution: git closes our stdin after the last ref line,
+# but on Windows the pipe's write end can leak into another process and EOF
+# never arrives -- `cat` then blocks forever at 0 CPU with no child (finding
+# fd2abedf). `read -t 5` returns what it has after 5s of silence.
+__qontinui_stdin=""
+IFS= read -r -d '' -t 5 __qontinui_stdin || true
 __qontinui_dir="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 __qontinui_backup="$__qontinui_dir/{backup}"
 if [ -x "$__qontinui_backup" ] || [ -f "$__qontinui_backup" ]; then
@@ -1234,6 +1239,11 @@ mod tests {
         assert!(body.contains("QONTINUI_GIT_PUSH"));
         assert!(body.contains("/tmp/qontinui-gitop-abc.push"));
         assert!(body.contains(HOOK_BACKUP_NAME));
+        assert!(
+            !body.contains("$(cat)"),
+            "unbounded stdin read stalls forever when EOF never arrives"
+        );
+        assert!(body.contains("read -r -d '' -t"));
     }
 
     #[test]
