@@ -252,7 +252,9 @@ mod tests {
     }
 
     /// A process that ignores SIGTERM outlives the grace, takes SIGKILL, and
-    /// `terminate` confirms that death before returning `Ok`.
+    /// `terminate` confirms that death before returning `Ok`. Linux only: the
+    /// wait for the `exec` reads `/proc`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminate_escalates_to_sigkill_and_confirms_the_death() {
         // `trap "" TERM` sets SIGTERM to ignored, which `exec` keeps.
