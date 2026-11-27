@@ -7956,6 +7956,12 @@ async fn run_gate_continuation_inner(
         ConsumeTarget::Dispatch(dispatch_id) => {
             if dispatch_consume_ack(&result, outcome_withheld) {
                 post_unit_dispatch_consumed(dispatch_id, device_id).await;
+            } else if outcome_withheld {
+                info!(
+                    "agent_runtime: unit-dispatch dispatch_id={dispatch_id} start unobserved — \
+                     NOT acking consume yet; the unobserved hold settles it (consumed if its \
+                     transcript appears, its claim released if not)"
+                );
             } else {
                 warn!(
                     "agent_runtime: unit-dispatch dispatch_id={dispatch_id} spawn failed — \
@@ -8001,19 +8007,26 @@ async fn run_gate_continuation_inner(
                                 .flatten();
                             post_spawn_outcome(gate_id, device_id, outcome, detail, sid).await;
                         }
-                        (HoldEffect::GateWorkUnreported(detail), Some(gate_id), _) => {
-                            post_work_unreported_fallback(
-                                gate_id,
-                                device_id,
-                                "(unobserved hold)",
+                        (
+                            HoldEffect::GateWorkUnreported {
                                 detail,
-                            )
-                            .await;
+                                terminal_id,
+                            },
+                            Some(gate_id),
+                            _,
+                        ) => {
+                            post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail)
+                                .await;
                         }
                         (HoldEffect::ConsumeDispatch, _, Some(dispatch_id)) => {
                             post_unit_dispatch_consumed(dispatch_id, device_id).await;
                         }
                         (HoldEffect::ReleaseDispatch, _, Some(dispatch_id)) => {
+                            info!(
+                                "agent_runtime: unobserved unit-dispatch dispatch_id={dispatch_id} \
+                                 never started; its in-process claim is released so coord's \
+                                 re-list dispatches it again"
+                            );
                             release_dispatch_dispatch(dispatch_id);
                         }
                         _ => {}
@@ -9205,8 +9218,9 @@ enum HoldEffect {
     /// Post this outcome to the gate (`spawned` carries the session id).
     Gate(ContinuationOutcome, Option<String>),
     /// Post the gate's `work_unreported` exit fallback with this detail
-    /// ([`work_unreported_detail`]'s `exit=<class> …` grammar).
-    GateWorkUnreported(String),
+    /// ([`work_unreported_detail`]'s `exit=<class> …` grammar), for the pane
+    /// `terminal_id`.
+    GateWorkUnreported { detail: String, terminal_id: String },
     /// The session started: ack the work-unit dispatch consumed and KEEP its
     /// in-process claim, so the unit is not dispatched a second time.
     ConsumeDispatch,
@@ -9229,13 +9243,17 @@ fn unobserved_hold_effects(
     gate: bool,
     dispatch: bool,
     unreported_detail: &str,
+    terminal_id: &str,
 ) -> Vec<HoldEffect> {
     let mut effects = Vec::new();
     if gate {
         match (end, started) {
             (UnobservedHoldEnd::ChildExited, true) => {
                 effects.push(HoldEffect::Gate(ContinuationOutcome::Spawned, None));
-                effects.push(HoldEffect::GateWorkUnreported(unreported_detail.to_string()));
+                effects.push(HoldEffect::GateWorkUnreported {
+                    detail: unreported_detail.to_string(),
+                    terminal_id: terminal_id.to_string(),
+                });
             }
             (UnobservedHoldEnd::ChildExited, false) => effects.push(HoldEffect::Gate(
                 ContinuationOutcome::SpawnFailed,
@@ -9285,22 +9303,34 @@ async fn run_unobserved_hold(
             terminal_manager,
             terminal_id,
         } => {
-            // No bound: the pane is live and visible, and the registry holds
-            // its anchor; it ends when the pane does.
-            let end = hold_unobserved_start(Duration::MAX, poll, || {
+            // Phase 1, unbounded: the pane is live and visible and the
+            // registry holds its anchor, so nothing is settled under it.
+            hold_unobserved_start(Duration::MAX, poll, || {
                 if terminal_manager
                     .get(&terminal_id)
                     .is_some_and(|s| s.is_alive())
                 {
-                    return ChildReading::Alive;
+                    ChildReading::Alive
+                } else {
+                    ChildReading::Dead
                 }
+            })
+            .await;
+            // Phase 2, bounded exactly like `Held`: the pane is gone, and a
+            // child that lingers (or a pid read on liveness alone) must not pin
+            // the dispatch claim forever.
+            let end = hold_unobserved_start(bound, poll, || {
                 child.map_or(ChildReading::Dead, &read_child)
             })
             .await;
             let started = transcripts.read() == TranscriptRead::Present;
+            info!(
+                "agent_runtime: unobserved registered continuation terminal_id={terminal_id} \
+                 settled ({end:?}, transcript present: {started}) after its pane ended"
+            );
             (
                 end,
-                unobserved_hold_effects(end, started, false, dispatch, ""),
+                unobserved_hold_effects(end, started, false, dispatch, "", &terminal_id),
             )
         }
         UnobservedStart::Held {
@@ -9333,7 +9363,7 @@ async fn run_unobserved_hold(
             let detail = work_unreported_detail(None, begun.elapsed(), &terminal_id);
             (
                 end,
-                unobserved_hold_effects(end, started, gate, dispatch, &detail),
+                unobserved_hold_effects(end, started, gate, dispatch, &detail, &terminal_id),
             )
         }
     }
@@ -10026,29 +10056,38 @@ async fn stalled_child_identity(
     pid: u32,
     terminal_id: &str,
 ) -> crate::process_capture::process_tree::PidWithSpawnedAt {
-    let no_time = crate::process_capture::process_tree::PidWithSpawnedAt {
-        pid,
-        spawned_at_unix: 0,
-        spawned_at_ft: None,
-    };
-    match spawn_blocking_tracked(crate::process_capture::process_table::snapshot_blocking).await {
-        Ok(snapshot) if !snapshot.stale => {
-            crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(pid, &snapshot)
+    let snapshot =
+        spawn_blocking_tracked(crate::process_capture::process_table::snapshot_blocking).await;
+    match &snapshot {
+        Ok(s) if s.stale => debug!(
+            "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot is \
+             stale; pid {pid} recorded with no creation time"
+        ),
+        Err(e) => warn!(
+            "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot task \
+             failed: {e}; pid {pid} recorded with no creation time"
+        ),
+        Ok(_) => {}
+    }
+    identity_from(pid, snapshot)
+}
+
+/// [`stalled_child_identity`]'s pure half: a FRESH snapshot gives the pid its
+/// creation time (none when the snapshot misses it); a stale snapshot or a
+/// failed snapshot task gives none — never a possibly reused pid's time.
+fn identity_from<E>(
+    pid: u32,
+    snapshot: Result<crate::process_capture::process_tree::ProcessSnapshot, E>,
+) -> crate::process_capture::process_tree::PidWithSpawnedAt {
+    match snapshot {
+        Ok(s) if !s.stale => {
+            crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(pid, &s)
         }
-        Ok(_) => {
-            debug!(
-                "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot \
-                 is stale; pid {pid} recorded with no creation time"
-            );
-            no_time
-        }
-        Err(e) => {
-            warn!(
-                "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot \
-                 task failed: {e}; pid {pid} recorded with no creation time"
-            );
-            no_time
-        }
+        _ => crate::process_capture::process_tree::PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: 0,
+            spawned_at_ft: None,
+        },
     }
 }
 
@@ -25774,6 +25813,63 @@ mod tests {
         assert_eq!(effects, vec![HoldEffect::ConsumeDispatch]);
     }
 
+    /// W1 (round 6): once a registered pane is GONE, the hold on its child is
+    /// BOUNDED exactly like `Held`: a child that keeps reading alive (or a pid
+    /// read on liveness alone) cannot pin the dispatch claim forever. At the
+    /// bound the transcript rule decides — absent, the claim is released.
+    #[tokio::test]
+    async fn a_registered_hold_is_bounded_once_its_pane_is_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "gone-pane");
+        pane.set_alive_for_test(false);
+        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-161616161616");
+        let hold = UnobservedStart::Registered {
+            child: some_child(),
+            transcripts,
+            terminal_manager: std::sync::Arc::clone(&tm),
+            terminal_id: "gone-pane".to_string(),
+        };
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_unobserved_hold(
+                hold,
+                false,
+                true,
+                std::time::Duration::from_millis(30),
+                std::time::Duration::from_millis(5),
+                |_| ChildReading::Alive,
+            ),
+        )
+        .await
+        .expect("a registered hold whose pane is gone is bounded");
+        assert_eq!(settled.0, UnobservedHoldEnd::BoundReached);
+        assert_eq!(settled.1, vec![HoldEffect::ReleaseDispatch]);
+    }
+
+    /// S2 (round 6): a child's identity takes its creation time only from a
+    /// FRESH snapshot; a stale one, or a failed snapshot task, records none.
+    #[test]
+    fn a_stale_or_failed_snapshot_records_no_creation_time() {
+        let snapshot = |stale: bool| crate::process_capture::process_tree::ProcessSnapshot {
+            stale,
+            observed_at_ms: 0,
+            parent_map: Default::default(),
+            creation_times: [(77u32, 1_700_000_000i64)].into_iter().collect(),
+            names: Default::default(),
+            exe_paths: Default::default(),
+            creation_filetimes: [(77u32, 42u64)].into_iter().collect(),
+            start_ticks: Default::default(),
+        };
+        let fresh = identity_from::<String>(77, Ok(snapshot(false)));
+        assert_eq!(fresh.spawned_at_unix, 1_700_000_000);
+        assert_eq!(fresh.spawned_at_ft, Some(42));
+        let stale = identity_from::<String>(77, Ok(snapshot(true)));
+        assert_eq!((stale.pid, stale.spawned_at_unix, stale.spawned_at_ft), (77, 0, None));
+        let failed = identity_from(77, Err("task panicked".to_string()));
+        assert_eq!((failed.pid, failed.spawned_at_unix, failed.spawned_at_ft), (77, 0, None));
+    }
+
     /// A2 / S3: when a held gate's child exits, the transcript is RE-READ:
     /// present, it started (`spawned`, then the `work_unreported` fallback in
     /// the `exit=<class>` grammar) and is never `spawn_failed`; absent, it never
@@ -25798,9 +25894,13 @@ mod tests {
         assert_eq!(effects.len(), 2, "{effects:?}");
         assert_eq!(effects[0], HoldEffect::Gate(ContinuationOutcome::Spawned, None));
         match &effects[1] {
-            HoldEffect::GateWorkUnreported(detail) => {
+            HoldEffect::GateWorkUnreported {
+                detail,
+                terminal_id,
+            } => {
                 assert!(detail.starts_with("exit=unknown code=none after="), "{detail}");
                 assert!(detail.ends_with("terminal=held-pane"), "{detail}");
+                assert_eq!(terminal_id, "held-pane", "the real terminal id, not a placeholder");
             }
             other => panic!("expected the work_unreported fallback, got {other:?}"),
         }
@@ -25818,11 +25918,11 @@ mod tests {
         }
 
         assert_eq!(
-            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, true, true, false, "x"),
+            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, true, true, false, "x", "t"),
             vec![HoldEffect::Gate(ContinuationOutcome::Spawned, None)]
         );
         assert!(
-            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, false, true, false, "x")
+            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, false, true, false, "x", "t")
                 .is_empty()
         );
     }
