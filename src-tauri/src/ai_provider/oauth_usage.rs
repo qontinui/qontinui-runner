@@ -13,11 +13,90 @@
 //! Utilizations arrive as percentages (`8.0` = 8%) and are normalized to the
 //! 0.0–1.0 fractions the rest of the account-selection code uses.
 //! `resets_at` arrives as RFC3339 and is normalized to unix seconds.
+//!
+//! The endpoint reads only with a token granted the [`PROFILE_SCOPE`]. A
+//! long-lived `claude setup-token` token is inference-only and is refused
+//! with a 403 naming that scope, which [`UsageFetchError::scope_refused`]
+//! reports. WHICH token asks, and how often a refused or rate-limited one is
+//! asked again, is `super::oauth_usage_gate`'s decision, not this module's.
 
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::debug;
 
 const OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// The OAuth scope the usage endpoint requires of the token that asks it.
+pub(crate) const PROFILE_SCOPE: &str = "user:profile";
+
+/// Why one ask of the usage endpoint produced no snapshot. Carries no token,
+/// so it is safe to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageFetchError {
+    /// The HTTP status, or `None` when no response arrived (a transport
+    /// failure, or a request that was never sent).
+    pub status: Option<u16>,
+    /// The response's `Retry-After`, when it sent one.
+    pub retry_after: Option<Duration>,
+    /// A 403 whose `error.type` is `permission_error` and whose body names
+    /// [`PROFILE_SCOPE`]: this token can never read the endpoint, however
+    /// often it is asked.
+    pub scope_refused: bool,
+    /// What went wrong, for a log line.
+    pub detail: String,
+}
+
+impl std::fmt::Display for UsageFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl UsageFetchError {
+    /// A failure with no HTTP response behind it.
+    fn transport(detail: String) -> Self {
+        Self {
+            status: None,
+            retry_after: None,
+            scope_refused: false,
+            detail,
+        }
+    }
+}
+
+/// Whether a 403 body is the endpoint refusing this token's scope: its
+/// `error.type` is `permission_error` and its text names [`PROFILE_SCOPE`]
+/// (measured body: `OAuth token does not meet scope requirement
+/// user:profile`). Any other 403 is not a scope verdict.
+fn is_scope_refusal(status: u16, body: &str) -> bool {
+    if status != 403 || !body.contains(PROFILE_SCOPE) {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")?
+                .get("type")?
+                .as_str()
+                .map(|t| t == "permission_error")
+        })
+        .unwrap_or(false)
+}
+
+/// The typed error for a non-2xx answer. `retry_after_secs` is the
+/// response's `Retry-After`, parsed as the Messages API path parses it
+/// (`super::claude_api::retry_after_secs`).
+fn error_from_response(status: u16, retry_after_secs: Option<u64>, body: &str) -> UsageFetchError {
+    UsageFetchError {
+        status: Some(status),
+        retry_after: retry_after_secs.map(Duration::from_secs),
+        scope_refused: is_scope_refusal(status, body),
+        detail: format!(
+            "usage endpoint returned {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ),
+    }
+}
 
 /// One usage window (the 5-hour session window or the 7-day week).
 #[derive(Debug, Clone, PartialEq)]
@@ -136,42 +215,49 @@ fn snapshot_from_wire(wire: WireUsage) -> OauthUsageSnapshot {
 }
 
 /// Fetch the usage snapshot for one account's OAuth token. `Err` on any
-/// transport / auth / rate-limit / parse failure — the caller falls back to
-/// the header probe. Only meaningful for subscription OAuth tokens
-/// (`sk-ant-oat*`); API keys have no usage windows, so callers should skip
-/// straight to the probe for those.
-pub async fn fetch(token: &str) -> Result<OauthUsageSnapshot, String> {
+/// transport / auth / rate-limit / parse failure, typed so the caller can
+/// tell a scope refusal from a rate limit from a dead network — the caller
+/// then falls back to the header probe. Only meaningful for subscription
+/// OAuth tokens (`sk-ant-oat*`); API keys have no usage windows, so callers
+/// should skip straight to the probe for those.
+pub async fn fetch(token: &str) -> Result<OauthUsageSnapshot, UsageFetchError> {
     // A subscription-only endpoint: never called while a model gateway is
     // declared (subscription accounts are off, `crate::model_gateway`), and
     // never routed to the gateway, which would hand it a subscription token.
     if crate::model_gateway::gateway_declared() {
-        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
+        return Err(UsageFetchError::transport(
+            crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string(),
+        ));
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| format!("client build failed: {e}"))?;
+        .map_err(|e| UsageFetchError::transport(format!("client build failed: {e}")))?;
     let resp = client
         .get(OAUTH_USAGE_URL)
         .bearer_auth(token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| UsageFetchError::transport(format!("request failed: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
+        let retry_after = super::claude_api::retry_after_secs(resp.headers());
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "usage endpoint returned {status}: {}",
-            body.chars().take(200).collect::<String>()
-        ));
+        return Err(error_from_response(status.as_u16(), retry_after, &body));
     }
+    let answered = |detail: String| UsageFetchError {
+        status: Some(status.as_u16()),
+        retry_after: None,
+        scope_refused: false,
+        detail,
+    };
     let body = resp
         .text()
         .await
-        .map_err(|e| format!("body read failed: {e}"))?;
-    let wire: WireUsage =
-        serde_json::from_str(&body).map_err(|e| format!("unexpected response shape: {e}"))?;
+        .map_err(|e| answered(format!("body read failed: {e}")))?;
+    let wire: WireUsage = serde_json::from_str(&body)
+        .map_err(|e| answered(format!("unexpected response shape: {e}")))?;
     let snap = snapshot_from_wire(wire);
     debug!(
         five_hour = ?snap.five_hour,
@@ -244,6 +330,42 @@ mod tests {
         assert!(snap.five_hour.is_none());
         assert!(snap.seven_day.is_none());
         assert!(snap.model_limits.is_empty());
+    }
+
+    /// The measured refusal of an inference-only token, verbatim in shape.
+    const SCOPE_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement user:profile"},"request_id":"req_test"}"#;
+
+    #[test]
+    fn a_403_permission_error_naming_the_profile_scope_is_a_scope_refusal() {
+        let e = error_from_response(403, None, SCOPE_403);
+        assert_eq!(e.status, Some(403));
+        assert!(e.scope_refused);
+        assert_eq!(e.retry_after, None);
+    }
+
+    /// Only that exact shape latches a token as unable to read the endpoint:
+    /// a 403 of another type, a permission error naming another scope, and a
+    /// non-403 naming the scope all stay ordinary failures.
+    #[test]
+    fn any_other_refusal_is_not_a_scope_refusal() {
+        let other_type = SCOPE_403.replace("permission_error", "forbidden");
+        assert!(!error_from_response(403, None, &other_type).scope_refused);
+        let other_scope = SCOPE_403.replace("user:profile", "user:inference");
+        assert!(!error_from_response(403, None, &other_scope).scope_refused);
+        assert!(!error_from_response(401, None, SCOPE_403).scope_refused);
+        assert!(!error_from_response(403, None, "user:profile").scope_refused);
+    }
+
+    #[test]
+    fn a_429_carries_its_retry_after_and_none_when_absent() {
+        let body =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
+        let with = error_from_response(429, Some(1800), body);
+        assert_eq!(with.status, Some(429));
+        assert_eq!(with.retry_after, Some(Duration::from_secs(1800)));
+        assert!(!with.scope_refused);
+        let without = error_from_response(429, None, body);
+        assert_eq!(without.retry_after, None);
     }
 
     #[test]

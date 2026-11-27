@@ -12,6 +12,10 @@
 //!   failures trip it, it stays Open for a fixed 60 s, and then the next caller
 //!   is admitted as the probe; two consecutive successes close it
 //!   ([`ProbeMode::CallerPermit`]).
+//! * **The OAuth usage endpoint** (`ai_provider::oauth_usage_gate`, bin): one
+//!   circuit per token, opened by one failure, backing off 5, 10, 20, 40 then
+//!   60 minutes, and honouring the server's `Retry-After` through
+//!   [`Circuit::record_with_hint`] when that is longer.
 //!
 //! # States
 //!
@@ -409,6 +413,15 @@ impl Circuit {
     /// * Open: outcomes are ignored (they come from calls admitted before the
     ///   trip), except that non-trip failures are still counted.
     pub fn record(&self, outcome: Outcome) {
+        self.record_with_hint(outcome, None);
+    }
+
+    /// [`Circuit::record`] with the server's own retry hint (an HTTP
+    /// `Retry-After`) for a trip failure: when it opens or re-opens the
+    /// breaker, the next trial waits `max(backoff.delay(n), hint)`. The hint
+    /// can only lengthen the wait, never shorten the schedule, and it is
+    /// ignored for every outcome that does not open the breaker.
+    pub fn record_with_hint(&self, outcome: Outcome, retry_hint: Option<Duration>) {
         let mut g = self.lock();
         let now = self.clock.now();
         if let Outcome::NonTripFailure(kind) = &outcome {
@@ -426,7 +439,7 @@ impl Circuit {
             (CircuitState::Closed, Outcome::TripFailure(err)) => {
                 g.consecutive_failures += 1;
                 if g.consecutive_failures >= self.config.failure_threshold.max(1) {
-                    self.open_locked(&mut g, now, "runtime", err);
+                    self.open_locked(&mut g, now, "runtime", err, retry_hint);
                 } else {
                     g.last_error = Some(err);
                 }
@@ -440,7 +453,7 @@ impl Circuit {
             }
             (CircuitState::HalfOpen, Outcome::TripFailure(err)) => {
                 g.active_probes = g.active_probes.saturating_sub(1);
-                self.reopen_locked(&mut g, now, err);
+                self.reopen_locked(&mut g, now, err, retry_hint);
             }
             (CircuitState::HalfOpen, Outcome::NonTripFailure(_)) => {
                 g.active_probes = g.active_probes.saturating_sub(1);
@@ -467,7 +480,7 @@ impl Circuit {
         let mut g = self.lock();
         let now = self.clock.now();
         if g.state == CircuitState::Closed {
-            self.open_locked(&mut g, now, cause, last_error.into());
+            self.open_locked(&mut g, now, cause, last_error.into(), None);
         } else {
             g.last_error = Some(last_error.into());
         }
@@ -479,25 +492,45 @@ impl Circuit {
         self.close_locked(&mut g);
     }
 
-    fn open_locked(&self, g: &mut Inner, now: Instant, cause: &str, err: String) {
+    /// The wait before trial `failed_trials`: the backoff, or the server's
+    /// hint when that is longer.
+    fn trial_delay(&self, failed_trials: u32, retry_hint: Option<Duration>) -> Duration {
+        let backoff = self.config.backoff.delay(failed_trials);
+        retry_hint.map_or(backoff, |hint| backoff.max(hint))
+    }
+
+    fn open_locked(
+        &self,
+        g: &mut Inner,
+        now: Instant,
+        cause: &str,
+        err: String,
+        retry_hint: Option<Duration>,
+    ) {
         self.set_state(g, CircuitState::Open);
         g.since = Some(now);
         g.since_wall = Some(self.clock.wall_now());
         g.cause = Some(cause.to_string());
         g.last_error = Some(err);
         g.failed_trials = 0;
-        g.retry_at = Some(now + self.config.backoff.delay(0));
+        g.retry_at = Some(now + self.trial_delay(0, retry_hint));
         g.consecutive_successes = 0;
         g.active_probes = 0;
         g.trips += 1;
         self.opened.notify_waiters();
     }
 
-    fn reopen_locked(&self, g: &mut Inner, now: Instant, err: String) {
+    fn reopen_locked(
+        &self,
+        g: &mut Inner,
+        now: Instant,
+        err: String,
+        retry_hint: Option<Duration>,
+    ) {
         self.set_state(g, CircuitState::Open);
         g.failed_trials = g.failed_trials.saturating_add(1);
         g.last_error = Some(err);
-        g.retry_at = Some(now + self.config.backoff.delay(g.failed_trials));
+        g.retry_at = Some(now + self.trial_delay(g.failed_trials, retry_hint));
         g.consecutive_successes = 0;
         g.active_probes = 0;
         g.trial_in_flight = false;
@@ -571,7 +604,7 @@ impl Circuit {
                     self.close_locked(&mut g);
                 }
             }
-            Err(e) => self.reopen_locked(&mut g, now, e),
+            Err(e) => self.reopen_locked(&mut g, now, e, None),
         }
     }
 
@@ -848,5 +881,91 @@ mod tests {
         // Outcomes recorded while Open are ignored.
         c.record(Outcome::Success);
         assert_eq!(c.state(), CircuitState::Open);
+    }
+
+    fn usage_endpoint_config() -> CircuitConfig {
+        CircuitConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            backoff: Backoff {
+                initial: Duration::from_secs(300),
+                factor: 2,
+                cap: Duration::from_secs(3600),
+            },
+            half_open_max_probes: 1,
+            probe_mode: ProbeMode::CallerPermit,
+        }
+    }
+
+    /// A server hint longer than the backoff sets the next trial: a 429 that
+    /// says `Retry-After: 1800` is not re-asked after the 5-minute backoff.
+    #[test]
+    fn a_longer_server_hint_sets_the_first_trial() {
+        let (c, clock) = manual(usage_endpoint_config());
+        c.record_with_hint(
+            Outcome::TripFailure("429".into()),
+            Some(Duration::from_secs(1800)),
+        );
+        assert_eq!(c.state(), CircuitState::Open);
+        assert_eq!(c.retry_after(), Some(Duration::from_secs(1800)));
+        clock.advance(Duration::from_secs(300));
+        assert!(
+            matches!(c.allow(), Admission::Reject(_)),
+            "the 5-minute backoff must not admit a trial the server said to hold for 30"
+        );
+        clock.advance(Duration::from_secs(1500));
+        assert_eq!(c.allow(), Admission::ProbePermit);
+    }
+
+    /// A hint shorter than the backoff changes nothing: the schedule is the
+    /// floor, the hint can only lengthen it.
+    #[test]
+    fn a_shorter_server_hint_keeps_the_backoff() {
+        let (c, _) = manual(usage_endpoint_config());
+        c.record_with_hint(
+            Outcome::TripFailure("429".into()),
+            Some(Duration::from_secs(10)),
+        );
+        assert_eq!(c.retry_after(), Some(Duration::from_secs(300)));
+    }
+
+    /// A failed trial re-opens at `max(backoff.delay(n), hint)`, with `n` the
+    /// failed-trial count, so the doubling continues under a hint.
+    #[test]
+    fn a_failed_trial_reopens_at_the_longer_of_the_next_backoff_and_the_hint() {
+        let (c, clock) = manual(usage_endpoint_config());
+        c.record(Outcome::TripFailure("503".into()));
+        assert_eq!(c.retry_after(), Some(Duration::from_secs(300)));
+        clock.advance(Duration::from_secs(300));
+        assert_eq!(c.allow(), Admission::ProbePermit);
+        // delay(1) is 600 s; a 120 s hint is shorter and loses.
+        c.record_with_hint(
+            Outcome::TripFailure("429".into()),
+            Some(Duration::from_secs(120)),
+        );
+        assert_eq!(c.retry_after(), Some(Duration::from_secs(600)));
+        clock.advance(Duration::from_secs(600));
+        assert_eq!(c.allow(), Admission::ProbePermit);
+        // delay(2) is 1200 s; a 2400 s hint is longer and wins.
+        c.record_with_hint(
+            Outcome::TripFailure("429".into()),
+            Some(Duration::from_secs(2400)),
+        );
+        assert_eq!(c.retry_after(), Some(Duration::from_secs(2400)));
+        assert_eq!(c.snapshot().failed_trials, 2);
+    }
+
+    /// The hint rides on a trip only: a success or a non-trip failure that
+    /// carries one opens nothing.
+    #[test]
+    fn a_hint_on_a_non_tripping_outcome_opens_nothing() {
+        let (c, _) = manual(usage_endpoint_config());
+        c.record_with_hint(Outcome::Success, Some(Duration::from_secs(900)));
+        c.record_with_hint(
+            Outcome::NonTripFailure(NonTripKind::Ambiguous),
+            Some(Duration::from_secs(900)),
+        );
+        assert_eq!(c.state(), CircuitState::Closed);
+        assert_eq!(c.retry_after(), None);
     }
 }

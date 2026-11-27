@@ -23,6 +23,7 @@ use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
+use crate::ai_provider::oauth_usage_gate::{UsageEndpointInfo, UsageEndpointState};
 
 // ============================================================================
 // Keychain Operations for API Keys
@@ -1119,6 +1120,14 @@ pub struct AccountUsageInfo {
     /// was readable, which is UNKNOWN and never equal to another `None`.
     #[serde(default)]
     pub account_hash: Option<String>,
+    /// What the OAuth usage endpoint did for this probe: which token asked,
+    /// whether it answered, was refused its scope, or is cooling and until
+    /// when (`ai_provider::oauth_usage_gate`). Its own field, never `error`:
+    /// [`probe_result_exhausted`] reads `error` as "this account will not
+    /// serve a request", and an endpoint refusal says nothing of the kind.
+    /// `None` only on a row built outside the probe.
+    #[serde(default)]
+    pub usage_endpoint: Option<crate::ai_provider::oauth_usage_gate::UsageEndpointInfo>,
 }
 
 /// One per-model scoped weekly limit, mirrored to the frontend.
@@ -1338,6 +1347,7 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
             label,
             error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
             account_hash,
+            usage_endpoint: Some(UsageEndpointInfo::bare(UsageEndpointState::Gateway)),
             ..Default::default()
         };
     }
@@ -1356,10 +1366,12 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
         .await
 }
 
-/// The live probe. Makes a minimal API call (1 token, cheapest model) and
-/// reads the `anthropic-ratelimit-unified-7d-utilization` response header,
-/// which always contains the exact weekly usage fraction regardless of
-/// threshold.
+/// The live probe. Asks the OAuth usage endpoint first, through its gate
+/// (`ai_provider::oauth_usage_gate`: the token that can read it, and a
+/// cooldown for a token it refused). When that gives no answer, makes a
+/// minimal API call (1 token, cheapest model) and reads the
+/// `anthropic-ratelimit-unified-7d-utilization` response header, which always
+/// contains the exact weekly usage fraction regardless of threshold.
 ///
 /// Call [`probe_account_usage`] instead — going straight to this bypasses the
 /// coalescing that keeps the runner off Anthropic's rate limiter.
@@ -1373,9 +1385,11 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // error rather than a swallowed "couldn't refresh."
     //
     // Skipped when the dir holds a long-lived `claude setup-token` token: that
-    // is the token `read_oauth_token` returns and the probe sends, so
-    // refreshing a stale `.credentials.json` beside it would be a token-endpoint
-    // round-trip (and a refresh-token rotation) for a credential nothing uses.
+    // is the token `read_oauth_token` returns and the header probe sends. The
+    // `.credentials.json` grant beside it is the usage endpoint's token, which
+    // the endpoint's gate refreshes in the BACKGROUND, gated on the grant
+    // still being refreshable (`oauth_usage_gate::candidates_for_dir`), so a
+    // dead grant is not POSTed once per probe.
     let creds_path = std::path::PathBuf::from(&config_dir).join(".credentials.json");
     let has_long_lived_token =
         qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(&config_dir))
@@ -1393,6 +1407,16 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
         .await;
     }
 
+    // Preferred source: the OAuth usage endpoint — zero token cost, exact
+    // session-window (5h) + weekly utilization and reset times (the same
+    // numbers `/usage` shows), and the per-model caps no header carries. The
+    // gate picks the token that can read it and holds back one it refused.
+    let endpoint =
+        crate::ai_provider::oauth_usage_gate::ask_usage_endpoint(&config_dir, &label).await;
+    if let Some(snap) = endpoint.snapshot {
+        return oauth_usage_row(config_dir, label, snap, endpoint.info);
+    }
+
     let token = match read_oauth_token(&config_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -1401,69 +1425,11 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
                 label,
                 utilization: 1.0,
                 error: Some(e),
+                usage_endpoint: Some(endpoint.info),
                 ..Default::default()
             };
         }
     };
-
-    // Preferred source: the OAuth usage endpoint — zero token cost, exact
-    // session-window (5h) + weekly utilization and reset times (the same
-    // numbers `/usage` shows). Subscription OAuth tokens only; API keys have
-    // no usage windows, so they skip straight to the header probe below.
-    if token.starts_with("sk-ant-oat") {
-        match crate::ai_provider::oauth_usage::fetch(&token).await {
-            Ok(snap) => {
-                let weekly = snap.seven_day.clone();
-                let session = snap.five_hour.clone();
-                let utilization_7d = weekly.as_ref().map(|w| w.utilization).unwrap_or(0.0);
-                let resets_at_7d = weekly.as_ref().and_then(|w| w.resets_at);
-                let (expected, delta, elapsed_frac, remaining_days) =
-                    compute_expected_usage(utilization_7d, resets_at_7d);
-                info!(
-                    "Account '{}' (oauth_usage): 7d={:.0}% 5h={:.0}%",
-                    label,
-                    utilization_7d * 100.0,
-                    session
-                        .as_ref()
-                        .map(|s| s.utilization * 100.0)
-                        .unwrap_or(0.0),
-                );
-                return AccountUsageInfo {
-                    config_dir,
-                    label,
-                    utilization: utilization_7d,
-                    rate_limit_type: Some("seven_day".to_string()),
-                    resets_at: resets_at_7d,
-                    status: snap.blocking_severity.then(|| "blocked".to_string()),
-                    error: None,
-                    expected_utilization: expected,
-                    usage_delta: delta,
-                    period_elapsed_fraction: elapsed_frac,
-                    period_remaining_days: remaining_days,
-                    session_utilization: session.as_ref().map(|s| s.utilization),
-                    session_resets_at: session.as_ref().and_then(|s| s.resets_at),
-                    model_limits: snap
-                        .model_limits
-                        .into_iter()
-                        .map(|m| ModelLimitInfo {
-                            model: m.model,
-                            utilization: m.utilization,
-                            resets_at: m.resets_at,
-                        })
-                        .collect(),
-                    source: Some("oauth_usage".to_string()),
-                    // Filled by `probe_account_usage`'s cached closure.
-                    account_hash: None,
-                };
-            }
-            Err(e) => {
-                info!(
-                    "Account '{}': oauth usage endpoint unavailable ({e}) — falling back to header probe",
-                    label
-                );
-            }
-        }
-    }
 
     // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible.
     // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
@@ -1489,39 +1455,7 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
 
     match response {
         Ok(resp) => {
-            let headers = resp.headers();
-
-            // Parse weekly (7-day) utilization from response headers
-            let utilization_7d = headers
-                .get("anthropic-ratelimit-unified-7d-utilization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-
-            let status_7d = headers
-                .get("anthropic-ratelimit-unified-7d-status")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let resets_at_7d = headers
-                .get("anthropic-ratelimit-unified-7d-reset")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-
-            // Also grab 5-hour utilization for context
-            let utilization_5h = headers
-                .get("anthropic-ratelimit-unified-5h-utilization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<f64>().ok());
-
-            info!(
-                "Account '{}': 7d={:.0}% 5h={:.0}% status={:?}",
-                label,
-                utilization_7d * 100.0,
-                utilization_5h.unwrap_or(0.0) * 100.0,
-                status_7d
-            );
-
+            let headers = resp.headers().clone();
             let error = if resp.status().is_success() {
                 None
             } else {
@@ -1529,26 +1463,15 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
                 let body = resp.text().await.unwrap_or_default();
                 Some(format!("API error ({}): {}", status_code, body))
             };
-
-            let (expected, delta, elapsed_frac, remaining_days) =
-                compute_expected_usage(utilization_7d, resets_at_7d);
-
-            AccountUsageInfo {
-                config_dir,
-                label,
-                utilization: utilization_7d,
-                rate_limit_type: Some("seven_day".to_string()),
-                resets_at: resets_at_7d,
-                status: status_7d,
-                error,
-                expected_utilization: expected,
-                usage_delta: delta,
-                period_elapsed_fraction: elapsed_frac,
-                period_remaining_days: remaining_days,
-                session_utilization: utilization_5h,
-                source: Some("probe".to_string()),
-                ..Default::default()
-            }
+            let row = header_probe_row(config_dir, label, &headers, error, endpoint.info);
+            info!(
+                "Account '{}': 7d={:.0}% 5h={:.0}% status={:?}",
+                row.label,
+                row.utilization * 100.0,
+                row.session_utilization.unwrap_or(0.0) * 100.0,
+                row.status
+            );
+            row
         }
         Err(e) => AccountUsageInfo {
             config_dir,
@@ -1556,8 +1479,108 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
             utilization: 1.0,
             error: Some(format!("Network error: {}", e)),
             source: Some("probe".to_string()),
+            usage_endpoint: Some(endpoint.info),
             ..Default::default()
         },
+    }
+}
+
+/// The usage row the OAuth usage endpoint's answer makes.
+fn oauth_usage_row(
+    config_dir: String,
+    label: String,
+    snap: crate::ai_provider::oauth_usage::OauthUsageSnapshot,
+    endpoint: UsageEndpointInfo,
+) -> AccountUsageInfo {
+    let weekly = snap.seven_day.clone();
+    let session = snap.five_hour.clone();
+    let utilization_7d = weekly.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+    let resets_at_7d = weekly.as_ref().and_then(|w| w.resets_at);
+    let (expected, delta, elapsed_frac, remaining_days) =
+        compute_expected_usage(utilization_7d, resets_at_7d);
+    // `5h=null` when the endpoint reported no five-hour window: that is an
+    // observation, distinct from a 0 % window.
+    info!(
+        "Account '{}' (oauth_usage): 7d={:.0}% 5h={}",
+        label,
+        utilization_7d * 100.0,
+        session
+            .as_ref()
+            .map(|s| format!("{:.0}%", s.utilization * 100.0))
+            .unwrap_or_else(|| "null".to_string()),
+    );
+    AccountUsageInfo {
+        config_dir,
+        label,
+        utilization: utilization_7d,
+        rate_limit_type: Some("seven_day".to_string()),
+        resets_at: resets_at_7d,
+        status: snap.blocking_severity.then(|| "blocked".to_string()),
+        error: None,
+        expected_utilization: expected,
+        usage_delta: delta,
+        period_elapsed_fraction: elapsed_frac,
+        period_remaining_days: remaining_days,
+        session_utilization: session.as_ref().map(|s| s.utilization),
+        session_resets_at: session.as_ref().and_then(|s| s.resets_at),
+        model_limits: snap
+            .model_limits
+            .into_iter()
+            .map(|m| ModelLimitInfo {
+                model: m.model,
+                utilization: m.utilization,
+                resets_at: m.resets_at,
+            })
+            .collect(),
+        source: Some("oauth_usage".to_string()),
+        // Filled by `probe_account_usage`'s cached closure.
+        account_hash: None,
+        usage_endpoint: Some(endpoint),
+    }
+}
+
+/// The usage row a header-probe response makes. `error` is `Some` exactly
+/// when the probe call itself failed (a non-2xx); the endpoint's state rides
+/// in `usage_endpoint` and NEVER becomes an `error`, whatever it is.
+fn header_probe_row(
+    config_dir: String,
+    label: String,
+    headers: &reqwest::header::HeaderMap,
+    error: Option<String>,
+    endpoint: UsageEndpointInfo,
+) -> AccountUsageInfo {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    // Parse weekly (7-day) utilization from response headers
+    let utilization_7d = header("anthropic-ratelimit-unified-7d-utilization")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let status_7d = header("anthropic-ratelimit-unified-7d-status").map(|s| s.to_string());
+    let resets_at_7d =
+        header("anthropic-ratelimit-unified-7d-reset").and_then(|v| v.parse::<u64>().ok());
+    // Also grab 5-hour utilization for context
+    let utilization_5h =
+        header("anthropic-ratelimit-unified-5h-utilization").and_then(|v| v.parse::<f64>().ok());
+
+    let (expected, delta, elapsed_frac, remaining_days) =
+        compute_expected_usage(utilization_7d, resets_at_7d);
+
+    AccountUsageInfo {
+        config_dir,
+        label,
+        utilization: utilization_7d,
+        rate_limit_type: Some("seven_day".to_string()),
+        resets_at: resets_at_7d,
+        status: status_7d,
+        error,
+        expected_utilization: expected,
+        usage_delta: delta,
+        period_elapsed_fraction: elapsed_frac,
+        period_remaining_days: remaining_days,
+        session_utilization: utilization_5h,
+        source: Some("probe".to_string()),
+        usage_endpoint: Some(endpoint),
+        ..Default::default()
     }
 }
 
@@ -4020,6 +4043,67 @@ mod exhaustion_tests {
     fn rejected_status_is_exhausted() {
         assert!(probe_result_exhausted(&usage(0.50, Some("rejected"), None)));
         assert!(probe_result_exhausted(&usage(0.50, Some("BLOCKED"), None)));
+    }
+
+    /// The header-probe answer of a healthy account, as literal headers.
+    fn healthy_probe_headers() -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.25"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-reset", "1800000000"),
+        ] {
+            h.insert(name, value.parse().unwrap());
+        }
+        h
+    }
+
+    /// D8: the usage endpoint refusing an account's token is not the account
+    /// refusing work. A healthy header probe beside a scope refusal reads
+    /// NOT exhausted, with the refusal in its own field and `error` empty.
+    /// Folding the refusal into `error` would mark every account on a
+    /// setup-token box exhausted.
+    #[test]
+    fn a_scope_refused_endpoint_leaves_the_account_unexhausted() {
+        use crate::ai_provider::oauth_usage_gate::UsageTokenKind;
+        let refused = UsageEndpointInfo {
+            state: UsageEndpointState::ScopeRefused,
+            token_kind: Some(UsageTokenKind::LongLived),
+            retry_at: None,
+        };
+        let row = header_probe_row(
+            "/test/acct".to_string(),
+            "acct".to_string(),
+            &healthy_probe_headers(),
+            None,
+            refused.clone(),
+        );
+        assert_eq!(row.error, None);
+        assert_eq!(row.usage_endpoint, Some(refused));
+        assert!(!probe_result_exhausted(&row));
+        assert_eq!(row.source.as_deref(), Some("probe"));
+        assert!((row.utilization - 0.25).abs() < 1e-9);
+    }
+
+    /// Cooling is the same: an endpoint holding back a 429'd token says
+    /// nothing about the account's own quota.
+    #[test]
+    fn a_cooling_endpoint_leaves_the_account_unexhausted() {
+        let cooling = UsageEndpointInfo {
+            state: UsageEndpointState::Cooling,
+            token_kind: None,
+            retry_at: Some(1_800_000_300),
+        };
+        let row = header_probe_row(
+            "/test/acct".to_string(),
+            "acct".to_string(),
+            &healthy_probe_headers(),
+            None,
+            cooling,
+        );
+        assert_eq!(row.error, None);
+        assert!(!probe_result_exhausted(&row));
     }
 }
 
