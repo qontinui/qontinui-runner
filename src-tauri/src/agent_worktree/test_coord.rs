@@ -18,6 +18,8 @@ struct State {
     hits: HashMap<&'static str, usize>,
     bodies: HashMap<&'static str, Vec<serde_json::Value>>,
     paths: HashMap<&'static str, Vec<String>>,
+    /// How long a route waits before it answers (a slow but alive coord).
+    delays: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// The ambient fixture every test against this double holds: the env lock, a
@@ -38,10 +40,20 @@ pub(crate) struct ScriptedCoord {
 
 impl ScriptedCoord {
     pub(crate) async fn start(script: Script) -> Self {
+        Self::start_with_delays(script, Vec::new()).await
+    }
+
+    /// [`Self::start`], with each listed route prefix answering only after its
+    /// delay.
+    pub(crate) async fn start_with_delays(
+        script: Script,
+        delays: Vec<(&'static str, std::time::Duration)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(Mutex::new(State {
             queues: script,
+            delays,
             ..State::default()
         }));
         let st = state.clone();
@@ -55,6 +67,16 @@ impl ScriptedCoord {
                     let Some((path, body)) = read_request(&mut sock).await else {
                         return;
                     };
+                    let delay = {
+                        let st = st.lock().unwrap();
+                        st.delays
+                            .iter()
+                            .find(|(p, _)| path.starts_with(p))
+                            .map(|(_, d)| *d)
+                    };
+                    if let Some(d) = delay {
+                        tokio::time::sleep(d).await;
+                    }
                     let (status, text) = respond(&st, &path, &body);
                     let resp = format!(
                         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\

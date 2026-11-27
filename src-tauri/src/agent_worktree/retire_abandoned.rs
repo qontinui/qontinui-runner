@@ -411,6 +411,123 @@ pub(crate) fn spawn_retire_abandoned(
     });
 }
 
+/// The request body that hands back every row ONE allocation run committed,
+/// by the run's own `client_allocation_id` (coord's `WorktreeDoneRequest`
+/// third match arm, scoped to this device). Sent alone: no `worktree_path` or
+/// `branch`, which would widen the match (a union) to rows of other runs.
+pub(crate) fn retire_client_allocation_body(client_allocation_id: uuid::Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "client_allocation_id": client_allocation_id,
+        "abandoned": true,
+    })
+}
+
+/// How long a first `404` for a run's id waits before it is asked once more.
+/// The attempt the runner gave up on may still be running on coord, which
+/// would commit its rows AFTER an immediate ask answered "no row". This is a
+/// HEURISTIC, not a bound: it exceeds the runner's own 80 s allocate bound
+/// plus coord's 20 s mirror-refresh cap, but coord's allocate handler has no
+/// overall server-side timeout (intent derivation, the advisory lock and DB
+/// latency are unbounded), so an attempt slower than this can still commit
+/// after the re-ask. Such a row is not lost: it ages out through coord's
+/// worktree reclaim.
+#[cfg(not(test))]
+const ID_HANDBACK_RECHECK_DELAY: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const ID_HANDBACK_RECHECK_DELAY: Duration = Duration::from_millis(200);
+
+/// Hand back whatever an allocation run whose every attempt failed may have
+/// committed (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D4). An attempt that timed out on the runner's side can still have
+/// committed rows on coord's; no response named them, so only the run's
+/// `client_allocation_id` can.
+///
+/// A FIRST `404` ([`RetireOutcome::NoRow`]) is "not yet", not "none": the
+/// timed-out attempt may still be running on coord. It is asked once more
+/// after [`ID_HANDBACK_RECHECK_DELAY`], and only a second `404` is logged as
+/// "committed no row".
+pub(crate) async fn retire_client_allocation(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    client_allocation_id: uuid::Uuid,
+    deadline: RetryDeadline,
+) -> Result<RetireOutcome, String> {
+    let url = retire_url(coord_http_base, device_id);
+    let body = retire_client_allocation_body(client_allocation_id);
+    let ask = || {
+        acquire_retry::retry_transient(
+            "worktree-done abandon (client_allocation_id)",
+            deadline,
+            |_| retire_once(&url, &body),
+            |e| e,
+        )
+    };
+    let mut r = ask().await;
+    if matches!(r, Ok(RetireOutcome::NoRow)) {
+        info!(
+            %client_allocation_id,
+            recheck_after_ms = ID_HANDBACK_RECHECK_DELAY.as_millis() as u64,
+            "failed allocation run has no row on coord YET (its timed-out attempt may still \
+             be running there); asking once more"
+        );
+        tokio::time::sleep(ID_HANDBACK_RECHECK_DELAY).await;
+        r = ask().await;
+    }
+    match &r {
+        Ok(RetireOutcome::NoRow) => info!(
+            %client_allocation_id,
+            "failed allocation run committed no row on coord (404 twice): nothing to hand back"
+        ),
+        Ok(RetireOutcome::Retired { abandoned, note }) => info!(
+            %client_allocation_id,
+            abandoned = abandoned,
+            note = ?note,
+            "failed allocation run had committed rows coord never answered with; retired"
+        ),
+        Ok(RetireOutcome::AlreadyRetired) => info!(
+            %client_allocation_id,
+            "failed allocation run's rows already read abandoned on coord's ledger"
+        ),
+        Ok(other) => warn!(
+            %client_allocation_id,
+            outcome = ?other,
+            "failed allocation run's rows NOT retired by coord; they age out through reclaim"
+        ),
+        Err(e) => warn!(
+            %client_allocation_id,
+            "failed allocation run's hand-back gave up (budget spent): {e}; any committed row \
+             ages out through reclaim"
+        ),
+    }
+    r
+}
+
+/// [`retire_client_allocation`] in a detached task on the retire's own
+/// budget. Never blocks, never changes `cause`.
+pub(crate) fn spawn_retire_client_allocation(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    client_allocation_id: uuid::Uuid,
+    cause: &AllocateError,
+) {
+    info!(
+        %client_allocation_id,
+        "allocation run failed ({cause}); handing back anything it committed"
+    );
+    let base = coord_http_base.to_string();
+    tokio::spawn(async move {
+        let deadline = RetryDeadline::with_delays(
+            RETIRE_BUDGET,
+            tokio::time::Instant::now(),
+            RETIRE_BASE_DELAY_SECS,
+            RETIRE_CAP_DELAY_SECS,
+        );
+        // Logged inside; the detached task has no one to return it to.
+        let _ = retire_client_allocation(&base, device_id, client_allocation_id, deadline).await;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +809,45 @@ mod tests {
                 "first answer: {first}"
             );
         }
+    }
+
+    /// A2: a first 404 for a run's id is "not yet" — the timed-out attempt
+    /// may still be committing on coord — so it is asked once more after the
+    /// recheck delay, and that answer is the one reported.
+    #[tokio::test]
+    async fn a_first_404_for_an_id_is_rechecked_once() {
+        let _amb = super::super::test_coord::isolate();
+        let coord = super::super::test_coord::ScriptedCoord::start(vec![(
+            "/coord/worktree-done/",
+            vec![(404, "{}".to_string()), (200, coord_answer(1, None))],
+        )])
+        .await;
+        let id = uuid::Uuid::now_v7();
+        let deadline =
+            RetryDeadline::with_delays(Duration::from_secs(30), tokio::time::Instant::now(), 0, 0);
+        let started = tokio::time::Instant::now();
+        let out = retire_client_allocation(&coord.base, uuid::Uuid::nil(), id, deadline).await;
+        assert_eq!(
+            shown(&out),
+            "Ok(Retired { abandoned: 1, note: None })",
+            "the re-ask's answer is reported"
+        );
+        assert!(started.elapsed() >= ID_HANDBACK_RECHECK_DELAY);
+        let want = serde_json::json!({"client_allocation_id": id, "abandoned": true});
+        assert_eq!(
+            coord.bodies("/coord/worktree-done/"),
+            vec![want.clone(), want]
+        );
+
+        // Two 404s: reported as no row, after exactly two asks.
+        let coord = super::super::test_coord::ScriptedCoord::start(vec![(
+            "/coord/worktree-done/",
+            vec![(404, "{}".to_string())],
+        )])
+        .await;
+        let out = retire_client_allocation(&coord.base, uuid::Uuid::nil(), id, deadline).await;
+        assert!(matches!(out, Ok(RetireOutcome::NoRow)), "{out:?}");
+        assert_eq!(coord.hits("/coord/worktree-done/"), 2);
     }
 
     #[tokio::test]
