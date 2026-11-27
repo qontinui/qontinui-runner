@@ -848,7 +848,51 @@ pub struct SpawnPreconditionSnapshot {
     /// cwd is not a linked worktree, so such a spawn's body is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explicit_trust: Option<ExplicitTrustPrecondition>,
+    /// See [`AddDirTrustPrecondition`]. Absent from the wire when the launch
+    /// carries no `--add-dir` sibling, so a single-repo spawn's body is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub add_dir_trust: Vec<AddDirTrustPrecondition>,
     pub credential: CredentialProbe,
+}
+
+/// The trust readings for ONE `--add-dir` sibling of a launch, in the account
+/// the spawn resolved.
+///
+/// Claude Code raises its "Adding new directory … Is this a directory you
+/// created or one you trust?" prompt for a sibling whose PRIMARY checkout the
+/// account does not trust (plan
+/// `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`,
+/// Phase 0), so `explicit_trust` — the primary-checkout reading the cwd also
+/// gets — is the one that explains such a stall. `trust` is the sibling's own
+/// key, kept beside it so a report shows both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AddDirTrustPrecondition {
+    /// The sibling directory exactly as the launch's `--add-dir=` named it.
+    pub dir: String,
+    /// The sibling's own `projects` key, `None` when underivable.
+    pub project_key: Option<String>,
+    pub trust: TrustVerdict,
+    /// The sibling's primary-checkout reading, `None` when the sibling is not a
+    /// linked worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_trust: Option<ExplicitTrustPrecondition>,
+}
+
+/// [`AddDirTrustPrecondition`] for `dir`, read from the config dir the spawn
+/// resolved. The same two derivations the cwd gets, so the reading keys the
+/// entries the CLI consults.
+pub fn add_dir_trust_precondition(dir: &str, config_dir: Option<&str>) -> AddDirTrustPrecondition {
+    let plain = trust_precondition(dir, config_dir);
+    let explicit_trust = plain.project_key.as_ref().and_then(|_| {
+        explicit_trust_for(Path::new(dir), plain.config_file.as_deref().map(Path::new))
+    });
+    AddDirTrustPrecondition {
+        dir: dir.to_string(),
+        project_key: plain.project_key,
+        trust: plain.verdict,
+        explicit_trust,
+    }
 }
 
 /// The live per-spawn handle: a settled trust verdict plus a credential ladder
@@ -869,6 +913,7 @@ pub struct SpawnPreconditions {
     config_dir_source: String,
     trust: TrustVerdict,
     explicit_trust: Option<ExplicitTrustPrecondition>,
+    add_dir_trust: Vec<AddDirTrustPrecondition>,
     credential: watch::Receiver<CredentialProbe>,
 }
 
@@ -925,10 +970,27 @@ impl SpawnPreconditions {
             config_dir_source: config_dir_source.to_string(),
             trust: trust.verdict,
             explicit_trust,
+            add_dir_trust: Vec::new(),
             credential,
         };
         me.log_trust();
         me
+    }
+
+    /// Attach the trust readings for the launch's `--add-dir` siblings, read in
+    /// this spawn's resolved account (see [`AddDirTrustPrecondition`]). Report
+    /// only, like everything here: it changes no spawn.
+    pub fn with_add_dirs<S: AsRef<str>>(mut self, dirs: &[S]) -> Self {
+        self.add_dir_trust = dirs
+            .iter()
+            .map(|d| add_dir_trust_precondition(d.as_ref(), self.account_config_dir.as_deref()))
+            .collect();
+        self
+    }
+
+    /// The `--add-dir` sibling readings attached by [`Self::with_add_dirs`].
+    pub fn add_dir_trust(&self) -> &[AddDirTrustPrecondition] {
+        &self.add_dir_trust
     }
 
     /// Emit the trust verdict WITH its full derivation. `untrusted` and
@@ -1021,6 +1083,7 @@ impl SpawnPreconditions {
             config_dir_source: self.config_dir_source.clone(),
             trust: self.trust.clone(),
             explicit_trust: self.explicit_trust.clone(),
+            add_dir_trust: self.add_dir_trust.clone(),
             credential: self.credential(),
         }
     }
@@ -1384,6 +1447,55 @@ mod tests {
             workspace_trust::project_key(&primary).as_deref()
         );
         assert!(body(&primary).get("explicit_trust").is_none());
+    }
+
+    /// An `--add-dir` sibling whose primary checkout the account does not
+    /// trust is named in the stall body with that primary-checkout reading —
+    /// the shape that parks a launch on "Adding new directory …" — and a
+    /// launch with no sibling carries no `add_dir_trust` key at all.
+    #[tokio::test]
+    async fn the_stalled_body_names_each_add_dir_siblings_primary_checkout_reading() {
+        let (_tmp, primary, wt, acct) = linked_worktree();
+        // The cwd (the primary) is trusted; the sibling worktree's primary is
+        // the same checkout here, so trust only the worktree's own key and the
+        // primary-checkout reading of the sibling is what reads untrusted.
+        trust_keys(&acct, &[&workspace_trust::project_key(&wt).unwrap()]);
+        let acct_s = acct.to_string_lossy().into_owned();
+        let sibling = wt.to_string_lossy().into_owned();
+        let pre = SpawnPreconditions::evaluate(
+            primary.to_str().unwrap(),
+            None,
+            Some(acct_s.as_str()),
+            "manual",
+        );
+        let bare = serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None))
+            .unwrap();
+        assert!(bare.get("add_dir_trust").is_none(), "{bare}");
+
+        let pre = pre.with_add_dirs(&[sibling.as_str()]);
+        assert_eq!(pre.add_dir_trust().len(), 1);
+        let body =
+            serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None)).unwrap();
+        let row = &body["add_dir_trust"][0];
+        assert_eq!(row["dir"], sibling.as_str());
+        assert_eq!(row["trust"]["verdict"], "trusted");
+        assert_eq!(row["explicit_trust"]["verdict"]["verdict"], "untrusted");
+        assert_eq!(
+            row["explicit_trust"]["primary_key"].as_str(),
+            workspace_trust::project_key(&primary).as_deref()
+        );
+    }
+
+    /// A sibling that is not a linked worktree has no primary-checkout reading
+    /// to report; its own key's reading still is.
+    #[test]
+    fn an_add_dir_sibling_that_is_a_primary_checkout_carries_only_its_own_reading() {
+        let (_tmp, primary, _wt, acct) = linked_worktree();
+        trust_keys(&acct, &[]);
+        let row = add_dir_trust_precondition(primary.to_str().unwrap(), acct.to_str());
+        assert_eq!(row.explicit_trust, None);
+        assert_eq!(row.project_key, workspace_trust::project_key(&primary));
+        assert!(matches!(row.trust, TrustVerdict::Untrusted { .. }), "{:?}", row.trust);
     }
 
     // ------------------------------------------------------------ exp decode

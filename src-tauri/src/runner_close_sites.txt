@@ -118,6 +118,7 @@ session/transport/pty.rs | close | helper | transport.close(
 session/transport/claude_cli.rs | close | helper | transport.close(
 session/mod.rs | close_by_id | helper | close_by_id(
 agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
+agent_runtime.rs | close_stalled_continuation_pane | exempt | a runner-spawned continuation pane (gate continuation or condition check) whose claude recorded no turn: the start verdict saw the PTY alive with the pinned session's transcript KNOWN absent from the pinned account's projects dir at the end of the start window (`TranscriptRead::Absent` — never on an UNKNOWN location), re-read just before the close; it ends no session's work, and a transcript appearing across the close is reported as a started session, not retried
 agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
 commands/terminal/coord_wiring.rs | bind_registered_coord_session | exempt | the on-exit hook every terminal create door installs (Tauri command, invoke proxy, POST /terminals, steward start, backend spawn) closes the pane's coord registry row once the PTY has exited; External row — reaches no terminal
 
