@@ -3291,4 +3291,68 @@ mod device_token_door_tests {
         );
         assert_eq!(websocket_token_from(&am, None, Some(a)).unwrap(), opaque);
     }
+
+    /// ARMING — enters the seed-retry budget through the UI's own pull command.
+    ///
+    /// `get_binding_gap_asks` is the production caller of
+    /// `open_binding_gap_asks`. A record in which the unanswered-seed budget is
+    /// SPENT is written by the refresher's own planner, then read back through
+    /// the command (secure storage, bound-tenant sidecar and paired account all
+    /// resolved from the isolated ambient, as on a runner). The ask must name
+    /// the attempts, and must withdraw once the tenant holds a slot.
+    #[tokio::test]
+    async fn get_binding_gap_asks_names_the_attempts_once_the_seed_budget_is_spent() {
+        use crate::mcp::device_jwt_refresher as r;
+        let amb = crate::test_env::isolated_ambient();
+        let (held_t, t) = (tenant(0xA1), tenant(0xC3));
+        let am = hermetic_auth_manager();
+        // Signed in through a tenant slot for ANOTHER tenant; `t` has none.
+        am.store_tenant_device_jwt(&held_t, &jwt_for(held_t))
+            .unwrap();
+        let acct = "acct-a";
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({ "user_id": acct }).to_string(),
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        std::fs::write(
+            amb.dir().join("coord_bound_tenants.json"),
+            serde_json::json!({
+                "tenant_ids": [held_t.to_string(), t.to_string()],
+                "observed_at": now,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let path = r::binding_gap_ask_path().expect("ask path resolves in the ambient");
+        assert_eq!(path.parent(), Some(amb.dir()));
+
+        let report = r::BindingGapReport::Gaps(vec![t.to_string()]);
+        let mut at = now - 100_000;
+        for _ in 0..=r::BINDING_GAP_SEED_MAX_UNANSWERED {
+            r::plan_gap_actions_at(&path, &report, Some(&[held_t]), Some(acct), at, true);
+            r::record_seed_outcome_at(&path, &t, &r::SeedOutcome::Transport("refused".into()), at);
+            at += 10_000;
+        }
+        let opened = r::plan_gap_actions_at(&path, &report, Some(&[held_t]), Some(acct), at, true);
+        assert!(
+            opened
+                .iter()
+                .any(|a| matches!(a, r::GapAction::Notified { .. })),
+            "the spent budget opens the ask: {opened:?}"
+        );
+
+        let asks = get_binding_gap_asks().await.expect("a resolvable path");
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        let reason = asks[0]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("6 attempts, coord never answered"),
+            "the command must serve the stored count: {reason}"
+        );
+
+        // A human pairs the tenant: the ask is withdrawn on the next read.
+        am.store_tenant_device_jwt(&t, &jwt_for(t)).unwrap();
+        assert_eq!(get_binding_gap_asks().await, Some(Vec::new()));
+    }
 }
