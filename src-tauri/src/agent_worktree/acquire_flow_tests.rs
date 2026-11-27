@@ -201,6 +201,8 @@ async fn an_exhausted_budget_still_releases_the_claims_already_held() {
         (CLAIMS, vec![claimed()]),
         (ALLOCATE, vec![(502, "bad gateway".to_string())]),
         (RELEASE, vec![(200, "{}".to_string())]),
+        // coord's answer when no attempt committed a row for the id.
+        (DONE, vec![(404, "{}".to_string())]),
     ])
     .await;
     let o = overlap();
@@ -210,17 +212,202 @@ async fn an_exhausted_budget_still_releases_the_claims_already_held() {
         .go(&coord, Some(&o), SharedBranchPolicy::Honor, deadline)
         .await;
     match out {
-        Err(AllocateError::Other(msg)) => {
+        Err(AllocateError::Unavailable(msg)) => {
             assert!(msg.contains("returned 502"), "{msg}");
             assert!(msg.contains("attempts"), "{msg}");
         }
-        other => panic!("expected Other, got {other:?}"),
+        other => panic!("expected Unavailable, got {other:?}"),
     }
     assert!(coord.hits(ALLOCATE) >= 2);
     assert_eq!(coord.hits(RELEASE), 1);
-    // No allocate succeeded: no row id is known, nothing to retire.
+    // No allocate answered, so no row path is known; the run's own id is the
+    // only handle, and it is handed back by that id alone (plan 2026-11-26 D4).
+    assert_eq!(wait_for_hits(&coord, DONE, 1).await, 1);
+    let id = coord.bodies(ALLOCATE)[0]["client_allocation_id"].clone();
+    assert_eq!(
+        coord.bodies(DONE),
+        vec![serde_json::json!({"client_allocation_id": id, "abandoned": true})]
+    );
+}
+
+// ── plan 2026-11-26-allocate-under-a-continuation-burst-sends-isolated-
+//    continuations-to-the-shared-workspace-root, Phase 2 ──
+
+/// D3: the allocate's attempt is bounded by `ALLOCATE_REQUEST_TIMEOUT`, not by
+/// the claims' `PER_ATTEMPT_TIMEOUT`. Under test those are 3 s and 1 s; the
+/// stand-in answers after 2 s, in the gap between them. Before D3 the budgeted
+/// path used `PER_ATTEMPT_TIMEOUT`, so this answer timed out on every attempt
+/// and the continuation took the fallback cwd.
+#[tokio::test]
+async fn a_slow_but_alive_allocate_inside_its_own_bound_counts() {
+    use super::acquire_retry::PER_ATTEMPT_TIMEOUT;
+    let delay = Duration::from_secs(2);
+    assert!(delay > PER_ATTEMPT_TIMEOUT && delay < super::ALLOCATE_REQUEST_TIMEOUT);
+    let _amb = super::test_coord::isolate();
+    let coord = ScriptedCoord::start_with_delays(
+        vec![(ALLOCATE, vec![wait_answer()])],
+        vec![(ALLOCATE, delay)],
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let out = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
+        .await;
+    assert!(matches!(out, Ok(MaterializeOutcome::Wait(_))), "{out:?}");
+    assert!(started.elapsed() >= delay, "{:?}", started.elapsed());
+    assert_eq!(coord.hits(ALLOCATE), 1, "answered on the first attempt");
+}
+
+/// D4: one id per allocation run, the same on every retry of it, a UUIDv7 as
+/// coord requires; a second run mints its own.
+#[tokio::test]
+async fn every_retry_of_one_allocation_run_carries_the_same_client_allocation_id() {
+    let _amb = super::test_coord::isolate();
+    let coord = ScriptedCoord::start(vec![(
+        ALLOCATE,
+        vec![
+            (503, "{}".to_string()),
+            (500, r#"{"error":"db_error"}"#.to_string()),
+            wait_answer(),
+        ],
+    )])
+    .await;
+    let out = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
+        .await;
+    assert!(matches!(out, Ok(MaterializeOutcome::Wait(_))), "{out:?}");
+    let ids: Vec<serde_json::Value> = coord
+        .bodies(ALLOCATE)
+        .iter()
+        .map(|b| b["client_allocation_id"].clone())
+        .collect();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert!(ids.iter().all(|i| *i == ids[0]), "{ids:?}");
+    let id: uuid::Uuid = serde_json::from_value(ids[0].clone()).expect("a uuid");
+    assert_eq!(id.get_version_num(), 7);
+
+    let _ = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
+        .await;
+    let next = coord.bodies(ALLOCATE)[3]["client_allocation_id"].clone();
+    assert_ne!(next, ids[0], "a new run mints a new id");
+}
+
+/// D4: a coord that cannot store the id (or refuses it) is re-sent WITHOUT
+/// it, inside the same attempt, instead of failing every allocate on it.
+#[tokio::test]
+async fn a_coord_that_cannot_store_the_id_is_retried_without_it() {
+    let _amb = super::test_coord::isolate();
+    for refusal in [
+        (
+            503,
+            r#"{"error":"schema_migration_pending","column":"coord.agent_worktrees.client_allocation_id","cause":"undefined_column"}"#,
+        ),
+        (
+            400,
+            r#"{"error":"client_allocation_id_invalid","reason":"skewed"}"#,
+        ),
+    ] {
+        let coord = ScriptedCoord::start(vec![(
+            ALLOCATE,
+            vec![(refusal.0, refusal.1.to_string()), wait_answer()],
+        )])
+        .await;
+        // A zero budget too: the re-send happens inside the one attempt.
+        let out = Run::new()
+            .go(
+                &coord,
+                None,
+                SharedBranchPolicy::Honor,
+                RetryDeadline::none(),
+            )
+            .await;
+        assert!(matches!(out, Ok(MaterializeOutcome::Wait(_))), "{out:?}");
+        let bodies = coord.bodies(ALLOCATE);
+        assert_eq!(bodies.len(), 2, "{refusal:?}");
+        assert!(bodies[0].get("client_allocation_id").is_some());
+        assert!(
+            bodies[1].get("client_allocation_id").is_none(),
+            "{refusal:?}"
+        );
+    }
+}
+
+/// D4: a retry answered `client_allocation_id_duplicate` means an earlier
+/// attempt committed and its answer was lost. Nothing new was allocated and no
+/// token came back, so the run ends Unavailable and hands the rows back by id.
+#[tokio::test]
+async fn a_duplicate_id_answer_ends_the_run_and_hands_its_rows_back() {
+    let _amb = super::test_coord::isolate();
+    let coord = ScriptedCoord::start(vec![
+        (
+            ALLOCATE,
+            vec![
+                (503, "{}".to_string()),
+                (
+                    409,
+                    r#"{"error":"client_allocation_id_duplicate","client_allocation_id":"x"}"#
+                        .to_string(),
+                ),
+            ],
+        ),
+        (
+            DONE,
+            vec![(200, r#"{"matched":1,"trigger_signal":"agent_done","statuses":["allocated"],"abandoned":1,"abandon_refused":null,"note":"retired"}"#.to_string())],
+        ),
+    ])
+    .await;
+    let out = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
+        .await;
+    assert!(
+        matches!(&out, Err(AllocateError::Unavailable(m)) if m.contains("client_allocation_id_duplicate")),
+        "{out:?}"
+    );
+    assert_eq!(coord.hits(ALLOCATE), 2, "a duplicate is final");
+    assert_eq!(wait_for_hits(&coord, DONE, 1).await, 1);
+    let id = coord.bodies(ALLOCATE)[0]["client_allocation_id"].clone();
+    assert_eq!(coord.bodies(DONE)[0]["client_allocation_id"], id);
+}
+
+/// D2's input: only a BUDGETED run that exhausts on transient failures is
+/// Unavailable. A zero-budget caller's single transient failure stays Other
+/// (and hands nothing back), and a `repo_not_registered` stays typed.
+#[tokio::test]
+async fn only_a_budgeted_exhaustion_is_unavailable() {
+    let _amb = super::test_coord::isolate();
+    let coord = ScriptedCoord::start(vec![(ALLOCATE, vec![(503, "{}".to_string())])]).await;
+    let out = Run::new()
+        .go(
+            &coord,
+            None,
+            SharedBranchPolicy::Honor,
+            RetryDeadline::none(),
+        )
+        .await;
+    assert!(
+        matches!(&out, Err(AllocateError::Other(m)) if m.contains("returned 503")),
+        "{out:?}"
+    );
+    assert_eq!(coord.hits(ALLOCATE), 1);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(coord.hits(DONE), 0);
+
+    let coord = ScriptedCoord::start(vec![(
+        ALLOCATE,
+        vec![(
+            409,
+            format!(r#"{{"error":"repo_not_registered","repo":"{REPO}"}}"#),
+        )],
+    )])
+    .await;
+    let out = Run::new()
+        .go(&coord, None, SharedBranchPolicy::Honor, quick_budget())
+        .await;
+    assert!(
+        matches!(out, Err(AllocateError::RepoNotRegistered(_))),
+        "{out:?}"
+    );
 }
 
 #[tokio::test]

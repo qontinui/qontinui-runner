@@ -411,6 +411,93 @@ pub(crate) fn spawn_retire_abandoned(
     });
 }
 
+/// The request body that hands back every row ONE allocation run committed,
+/// by the run's own `client_allocation_id` (coord's `WorktreeDoneRequest`
+/// third match arm, scoped to this device). Sent alone: no `worktree_path` or
+/// `branch`, which would widen the match (a union) to rows of other runs.
+pub(crate) fn retire_client_allocation_body(client_allocation_id: uuid::Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "client_allocation_id": client_allocation_id,
+        "abandoned": true,
+    })
+}
+
+/// Hand back whatever an allocation run whose every attempt failed may have
+/// committed (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D4). An attempt that timed out on the runner's side can still have
+/// committed rows on coord's; no response named them, so only the run's
+/// `client_allocation_id` can. A `404` ([`RetireOutcome::NoRow`]) is the
+/// expected answer — no attempt committed — and is logged as such.
+pub(crate) async fn retire_client_allocation(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    client_allocation_id: uuid::Uuid,
+    deadline: RetryDeadline,
+) -> Result<RetireOutcome, String> {
+    let url = retire_url(coord_http_base, device_id);
+    let body = retire_client_allocation_body(client_allocation_id);
+    let r = acquire_retry::retry_transient(
+        "worktree-done abandon (client_allocation_id)",
+        deadline,
+        |_| retire_once(&url, &body),
+        |e| e,
+    )
+    .await;
+    match &r {
+        Ok(RetireOutcome::NoRow) => info!(
+            %client_allocation_id,
+            "failed allocation run committed no row on coord: nothing to hand back"
+        ),
+        Ok(RetireOutcome::Retired { abandoned, note }) => info!(
+            %client_allocation_id,
+            abandoned = abandoned,
+            note = ?note,
+            "failed allocation run had committed rows coord never answered with; retired"
+        ),
+        Ok(RetireOutcome::AlreadyRetired) => info!(
+            %client_allocation_id,
+            "failed allocation run's rows already read abandoned on coord's ledger"
+        ),
+        Ok(other) => warn!(
+            %client_allocation_id,
+            outcome = ?other,
+            "failed allocation run's rows NOT retired by coord; they age out through reclaim"
+        ),
+        Err(e) => warn!(
+            %client_allocation_id,
+            "failed allocation run's hand-back gave up (budget spent): {e}; any committed row \
+             ages out through reclaim"
+        ),
+    }
+    r
+}
+
+/// [`retire_client_allocation`] in a detached task on the retire's own
+/// budget. Never blocks, never changes `cause`.
+pub(crate) fn spawn_retire_client_allocation(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    client_allocation_id: uuid::Uuid,
+    cause: &AllocateError,
+) {
+    info!(
+        %client_allocation_id,
+        "allocation run failed ({cause}); handing back anything it committed"
+    );
+    let base = coord_http_base.to_string();
+    tokio::spawn(async move {
+        let deadline = RetryDeadline::with_delays(
+            RETIRE_BUDGET,
+            tokio::time::Instant::now(),
+            RETIRE_BASE_DELAY_SECS,
+            RETIRE_CAP_DELAY_SECS,
+        );
+        // Logged inside; the detached task has no one to return it to.
+        let _ = retire_client_allocation(&base, device_id, client_allocation_id, deadline).await;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

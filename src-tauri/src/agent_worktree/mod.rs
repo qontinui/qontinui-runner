@@ -1224,6 +1224,16 @@ pub struct SharedBranchRepo {
 /// like [`canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
 pub const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
 
+/// The leading token of a gate continuation's `spawn_failed` detail when it
+/// asked for isolation and coord's `/agents/allocate` kept failing transiently
+/// until the acquire's retry budget ran out ([`AllocateError::Unavailable`]).
+/// Such a continuation is refused rather than run in the shared workspace
+/// root, and coord re-offers the gate on its bounded spawn-retry schedule
+/// (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D2). Stable: coord's `classify_spawn_failure` matches it.
+pub const WORKTREE_ALLOCATE_UNAVAILABLE: &str = "worktree_allocate_unavailable";
+
 /// Whether an allocate may honor coord's `shared_branch` directive, which
 /// checks the agent's branch out IN the canonical checkout instead of cutting
 /// a worktree.
@@ -1394,6 +1404,18 @@ pub enum AllocateError {
     /// treats it as "not yet" and stays queued (plan
     /// `2026-09-23-conductor-e2e-phase1-defects` Phase 1).
     Wait(WaitOutcome),
+    /// `/agents/allocate` failed transiently (transport error, timeout, 5xx)
+    /// on every attempt until a NON-ZERO retry budget ran out, or a retry was
+    /// answered `client_allocation_id_duplicate` (an earlier attempt committed
+    /// and only its answer was lost). Coord was there but could not answer in
+    /// time; nothing was materialized and the claims are released. Only a
+    /// budgeted (unattended) acquire produces it — a zero-budget caller's
+    /// single transient failure stays [`AllocateError::Other`], as before. A
+    /// gate continuation that asked for isolation refuses its fallback cwd on
+    /// it (plan
+    /// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+    /// D2).
+    Unavailable(String),
     /// Anything else — config errors, transport failures, coord 5xx,
     /// `git worktree add` failures, etc.
     Other(String),
@@ -1417,7 +1439,7 @@ impl std::fmt::Display for AllocateError {
                  retry_when={:?}",
                 w.agent_id, w.reason, w.blocking, w.retry_when
             ),
-            AllocateError::Other(s) => f.write_str(s),
+            AllocateError::Unavailable(s) | AllocateError::Other(s) => f.write_str(s),
         }
     }
 }
@@ -1685,9 +1707,11 @@ fn allocate_tenant_scope(
 
 /// How long `POST /agents/allocate` may take, from connect to the end of the
 /// response body, before the allocate fails. This route runs git on coord's
-/// side, and an allocate that fails here sends the session to its fallback cwd
-/// with no isolation, so a bound a busy coord can exceed would trade a hang for
-/// unisolated work. 80 s leaves room for that work. It also ends under the 90 s
+/// side, and an allocate that fails here sends an interactive session to its
+/// fallback cwd with no isolation (an isolated gate continuation is refused
+/// instead, `worktree_allocate_unavailable`), so a bound a busy coord can
+/// exceed would trade a hang for unisolated or refused work. A budgeted
+/// caller's attempts use it too, capped by the remaining budget. 80 s leaves room for that work. It also ends under the 90 s
 /// TTL of a `file_glob` claim taken before this POST, though the materialisation
 /// that follows can still outlast that TTL. Short under test, where the bound's
 /// effect is what is pinned.
@@ -1758,7 +1782,10 @@ const ALLOCATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// edit sibling is a requested repo, so its canonical checkout gets the lease
 /// and the branch switch like any requested repo (a declared sibling would not).
 ///
-/// On success returns `AllocateResult`. On any non-claim error,
+/// On success returns `AllocateResult`. When a non-zero `deadline` runs out on
+/// transient allocate failures, returns `Err(AllocateError::Unavailable)` and
+/// hands back, by the run's `client_allocation_id`, anything an unanswered
+/// attempt committed. On any other non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
 /// handled at the boundary: if anything fails after coord has minted rows (a
 /// claim, a refused placement, a `git worktree add`), the materialization
@@ -1841,12 +1868,28 @@ pub async fn allocate_and_materialize_with_claim(
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
+    // One id for this allocation run, sent unchanged on every retry, so a
+    // timed-out attempt coord DID commit can be found and handed back (plan
+    // 2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root
+    // D4). coord requires a UUIDv7.
+    let client_allocation_id = uuid::Uuid::now_v7();
     // Claims already held are released only once the allocate is FINAL: a
     // retried attempt keeps them (plan 2026-10-31 Phase 1).
-    let coord_resp = match post_allocate(&url, &body, scope, deadline).await {
+    let coord_resp = match post_allocate(&url, &body, scope, deadline, client_allocation_id).await {
         Ok(r) => r,
         Err(e) => {
             release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            if matches!(e, AllocateError::Unavailable(_)) {
+                // An attempt that timed out may still have committed rows that
+                // no response named: hand back whatever this run's id holds. A
+                // 404 there means none was committed.
+                retire_abandoned::spawn_retire_client_allocation(
+                    coord_http_base,
+                    *machine_id,
+                    client_allocation_id,
+                    &e,
+                );
+            }
             return Err(e);
         }
     };
@@ -2334,23 +2377,120 @@ async fn materialize_allocation(
 /// `deadline` has room (plan 2026-10-31 Phase 1). Releases nothing: the
 /// caller unwinds its claims only on the final answer.
 ///
-/// A retry after a transport error may mint a second allocation when the
-/// first one committed and only its response was lost. That row names the
-/// session that goes on to run, so it lives as long as today's stranded row;
-/// the allocate has no idempotency key to prevent it (plan D3, accepted).
+/// Each attempt is bounded by `min(ALLOCATE_REQUEST_TIMEOUT, remaining
+/// budget)`, never by the claims' 10 s `PER_ATTEMPT_TIMEOUT`: under a burst
+/// coord's allocate legitimately waits up to its 20 s mirror-refresh cap, and a
+/// slow but alive answer must count (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D3). With no budget the single attempt keeps the same 80 s bound.
+///
+/// Every attempt carries the same `client_allocation_id` (D4), coord's
+/// idempotency key for one allocation run. A retry after an attempt that
+/// committed but whose answer was lost is therefore answered 409
+/// `client_allocation_id_duplicate` instead of minting a second allocation;
+/// that answer carries no token, so it ends this acquire as
+/// [`AllocateError::Unavailable`] and the caller hands the committed rows back
+/// by the id. A coord that cannot store the id (503 `schema_migration_pending`
+/// naming it) or refuses it as invalid (400 `client_allocation_id_invalid`, a
+/// skewed clock) is re-sent at once WITHOUT the id, and the rest of this run
+/// goes without it, rather than failing every allocate on it.
+///
+/// Exhausting a NON-ZERO budget on transient failures is
+/// [`AllocateError::Unavailable`]; a zero budget's single failure stays
+/// [`AllocateError::Other`].
 async fn post_allocate(
     url: &str,
     body: &serde_json::Value,
     scope: crate::auth::TenantScope,
     deadline: acquire_retry::RetryDeadline,
+    client_allocation_id: uuid::Uuid,
 ) -> Result<CoordAllocateResponse, AllocateError> {
-    acquire_retry::retry_transient(
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut with_id = body.clone();
+    with_id["client_allocation_id"] = serde_json::json!(client_allocation_id);
+    let send_id = AtomicBool::new(true);
+    let budgeted = deadline.is_active();
+    acquire_retry::retry_transient_within(
         "agents/allocate",
         deadline,
-        |timeout| post_allocate_once(url, body, scope, timeout),
-        AllocateError::Other,
+        ALLOCATE_REQUEST_TIMEOUT,
+        |timeout| {
+            let (with_id, send_id) = (&with_id, &send_id);
+            async move {
+                let sending_id = send_id.load(Ordering::Relaxed);
+                let b = if sending_id { with_id } else { body };
+                match post_allocate_once(url, b, scope, timeout).await {
+                    AllocateAttempt::Answer(a) => a,
+                    AllocateAttempt::IdRefused(msg) => {
+                        // Nothing was allocated. Re-send at once without the
+                        // id, inside this same attempt, so a zero-budget caller
+                        // is not failed by a coord that predates the column.
+                        warn!(
+                            %client_allocation_id,
+                            "agents/allocate: coord refused client_allocation_id; \
+                             re-sending this run without it: {msg}"
+                        );
+                        send_id.store(false, Ordering::Relaxed);
+                        match post_allocate_once(url, body, scope, timeout).await {
+                            AllocateAttempt::Answer(a) => a,
+                            AllocateAttempt::IdRefused(m) | AllocateAttempt::IdDuplicate(m) => {
+                                acquire_retry::Attempt::Done(Err(AllocateError::Other(m)))
+                            }
+                        }
+                    }
+                    AllocateAttempt::IdDuplicate(msg) => {
+                        acquire_retry::Attempt::Done(Err(AllocateError::Unavailable(format!(
+                            "{msg} (an earlier attempt of this run committed and its answer \
+                             was lost)"
+                        ))))
+                    }
+                }
+            }
+        },
+        |msg| {
+            if budgeted {
+                AllocateError::Unavailable(msg)
+            } else {
+                AllocateError::Other(msg)
+            }
+        },
     )
     .await
+}
+
+/// One allocate attempt's result, with the two `client_allocation_id`
+/// refusals [`post_allocate`] handles itself split out.
+enum AllocateAttempt {
+    Answer(acquire_retry::Attempt<CoordAllocateResponse, AllocateError>),
+    /// Coord cannot store the id (503 `schema_migration_pending`) or refused it
+    /// (400 `client_allocation_id_invalid`); nothing was allocated.
+    IdRefused(String),
+    /// 409 `client_allocation_id_duplicate`: this device already holds rows
+    /// made with this id; nothing new was allocated and no token came back.
+    IdDuplicate(String),
+}
+
+/// Which `client_allocation_id` refusal, if any, a non-2xx allocate answer is.
+/// Read from coord's typed `error` code (and, for the schema arm, the `column`
+/// it names), never from free text.
+fn client_allocation_id_refusal(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<fn(String) -> AllocateAttempt> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = v.get("error").and_then(|e| e.as_str())?;
+    match (status.as_u16(), code) {
+        (409, "client_allocation_id_duplicate") => Some(AllocateAttempt::IdDuplicate),
+        (400, "client_allocation_id_invalid") => Some(AllocateAttempt::IdRefused),
+        (503, "schema_migration_pending")
+            if v.get("column")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.ends_with("client_allocation_id")) =>
+        {
+            Some(AllocateAttempt::IdRefused)
+        }
+        _ => None,
+    }
 }
 
 /// Apply `timeout` to a request when one is given; leave it unbounded when not.
@@ -2367,7 +2507,8 @@ fn with_optional_timeout(
 /// One allocate attempt. Transient: a transport error, a body that could not
 /// be READ (distinct from one read in full that does not parse, which is
 /// final), and a 5xx. Final: a `repo_not_registered` 409, any other non-2xx,
-/// and an unparseable body.
+/// and an unparseable body. The two `client_allocation_id` refusals come back
+/// split out ([`AllocateAttempt`]) for [`post_allocate`] to handle.
 ///
 /// Every attempt goes through the shared coord client and is bounded: with a
 /// budget, by the attempt's timeout, because a hung send never returns and
@@ -2382,8 +2523,9 @@ async fn post_allocate_once(
     body: &serde_json::Value,
     scope: crate::auth::TenantScope,
     timeout: Option<Duration>,
-) -> acquire_retry::Attempt<CoordAllocateResponse, AllocateError> {
+) -> AllocateAttempt {
     use acquire_retry::Attempt;
+    use AllocateAttempt::Answer;
     // The client is chosen first so the `.post(` stays inside the
     // `attach_device_auth_for(` statement (the coord-auth pin test reads it
     // there).
@@ -2405,10 +2547,10 @@ async fn post_allocate_once(
             } else {
                 String::new()
             };
-            return Attempt::Transient(format!(
+            return Answer(Attempt::Transient(format!(
                 "POST {url}: {timed_out}{}",
                 acquire_retry::describe_reqwest_error(&e)
-            ));
+            )));
         }
     };
     let status = resp.status();
@@ -2418,11 +2560,11 @@ async fn post_allocate_once(
         // failure. Any other status is already a final answer; its body is
         // only detail, as before.
         Err(e) if status.is_success() || acquire_retry::status_is_transient(status) => {
-            return Attempt::Transient(format!(
+            return Answer(Attempt::Transient(format!(
                 "read /agents/allocate body ({}): {}",
                 status.as_u16(),
                 acquire_retry::describe_reqwest_error(&e)
-            ))
+            )))
         }
         Err(_) => Vec::new(),
     };
@@ -2433,8 +2575,14 @@ async fn post_allocate_once(
             status.as_u16(),
             body_text
         );
+        // The id's own refusals first: a 503 `schema_migration_pending` naming
+        // it must not be retried WITH the id, and a 409 duplicate is not a
+        // `repo_not_registered`.
+        if let Some(refusal) = client_allocation_id_refusal(status, &body_text) {
+            return refusal(msg);
+        }
         if acquire_retry::status_is_transient(status) {
-            return Attempt::Transient(msg);
+            return Answer(Attempt::Transient(msg));
         }
         // Coord's `decide_parent_sha` → RepoNotRegistered surfaces as a
         // 409 with body `{"error":"repo_not_registered","repo":<repo>}`.
@@ -2450,17 +2598,19 @@ async fn post_allocate_once(
                         .map(|s| s.to_string())
                 })
             {
-                return Attempt::Done(Err(AllocateError::RepoNotRegistered(repo)));
+                return Answer(Attempt::Done(Err(AllocateError::RepoNotRegistered(repo))));
             }
         }
-        return Attempt::Done(Err(AllocateError::Other(msg)));
+        return Answer(Attempt::Done(Err(AllocateError::Other(msg))));
     }
-    match serde_json::from_slice::<CoordAllocateResponse>(&bytes) {
-        Ok(r) => Attempt::Done(Ok(r)),
-        Err(e) => Attempt::Done(Err(AllocateError::Other(format!(
-            "decode coord response: {e}"
-        )))),
-    }
+    Answer(
+        match serde_json::from_slice::<CoordAllocateResponse>(&bytes) {
+            Ok(r) => Attempt::Done(Ok(r)),
+            Err(e) => Attempt::Done(Err(AllocateError::Other(format!(
+                "decode coord response: {e}"
+            )))),
+        },
+    )
 }
 
 /// One row of a `worktree` allocation, resolved before anything touches disk.
@@ -4607,8 +4757,11 @@ mod tests {
     ///
     /// Driven with NO retry budget, the arm that used to send with no timeout
     /// (interactive and worker allocates). A budgeted caller — the gate
-    /// continuation — is bounded per attempt by `acquire_retry`'s
-    /// `PER_ATTEMPT_TIMEOUT` instead, which this bound does not change.
+    /// continuation — is bounded per attempt by the SAME bound, capped by its
+    /// remaining budget (`min(ALLOCATE_REQUEST_TIMEOUT, remaining)`, plan
+    /// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+    /// D3), and no longer by `acquire_retry`'s `PER_ATTEMPT_TIMEOUT`, which
+    /// stays the bound of the claims alone.
     ///
     /// Mutation check: in `post_allocate_once`, pass `timeout` (not
     /// `Some(bound)`) to `with_optional_timeout`. Then the allocate is still

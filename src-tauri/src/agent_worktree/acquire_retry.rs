@@ -31,8 +31,18 @@ use tracing::info;
 pub const CONTINUATION_TRANSPORT_RETRY: Duration = Duration::from_secs(120);
 
 /// No single coord request may outlive this, whatever budget remains: a hung
-/// send never returns and would otherwise escape the deadline.
+/// send never returns and would otherwise escape the deadline. The default
+/// per-call bound of [`retry_transient`] (claims, retires); the allocate has its
+/// own, longer one (`ALLOCATE_REQUEST_TIMEOUT`, passed through
+/// [`retry_transient_within`]) because coord's allocate does git and mirror
+/// work a 10 s bound cannot cover under a burst (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D3). Shorter under test, below the allocate's 3 s test bound, so the gap
+/// between the two bounds is testable in seconds.
+#[cfg(not(test))]
 pub(crate) const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Floor for an attempt's timeout once the remaining budget is nearly spent,
 /// so a last attempt is not sent with a timeout too short to answer.
@@ -91,12 +101,18 @@ impl RetryDeadline {
         self.at.map(|at| at.saturating_duration_since(now))
     }
 
-    /// The timeout one attempt may use at `now`: `min(10 s, remaining)`,
-    /// floored at 1 s. `None` when no budget is set — the caller keeps its own
-    /// bound, so a zero budget changes nothing.
+    /// The timeout one attempt may use at `now`: `min(PER_ATTEMPT_TIMEOUT,
+    /// remaining)`, floored at 1 s. `None` when no budget is set — the caller
+    /// keeps its own bound, so a zero budget changes nothing.
     pub fn attempt_timeout(&self, now: Instant) -> Option<Duration> {
+        self.attempt_timeout_within(PER_ATTEMPT_TIMEOUT, now)
+    }
+
+    /// [`Self::attempt_timeout`] under a caller-chosen per-attempt `bound`:
+    /// `min(bound, remaining)`, floored at 1 s; `None` when no budget is set.
+    pub fn attempt_timeout_within(&self, bound: Duration, now: Instant) -> Option<Duration> {
         self.remaining(now)
-            .map(|r| r.min(PER_ATTEMPT_TIMEOUT).max(MIN_ATTEMPT_TIMEOUT))
+            .map(|r| r.min(bound).max(MIN_ATTEMPT_TIMEOUT))
     }
 
     /// The sleep before the next attempt after `failures` consecutive transient
@@ -139,6 +155,27 @@ pub(crate) enum Attempt<T, E> {
 pub(crate) async fn retry_transient<T, E, F, Fut>(
     what: &str,
     deadline: RetryDeadline,
+    op: F,
+    exhausted: impl FnOnce(String) -> E,
+) -> Result<T, E>
+where
+    F: FnMut(Option<Duration>) -> Fut,
+    Fut: Future<Output = Attempt<T, E>>,
+{
+    retry_transient_within(what, deadline, PER_ATTEMPT_TIMEOUT, op, exhausted).await
+}
+
+/// [`retry_transient`] with this call's own per-attempt bound in place of
+/// [`PER_ATTEMPT_TIMEOUT`]: each attempt's timeout is `min(attempt_bound,
+/// remaining budget)` (floored at 1 s), and the first attempt gets the whole
+/// `attempt_bound`. The allocate passes its 80 s bound here; every other call
+/// keeps the 10 s one (plan
+/// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+/// D3).
+pub(crate) async fn retry_transient_within<T, E, F, Fut>(
+    what: &str,
+    deadline: RetryDeadline,
+    attempt_bound: Duration,
     mut op: F,
     exhausted: impl FnOnce(String) -> E,
 ) -> Result<T, E>
@@ -152,9 +189,9 @@ where
         // claim taken after a late allocate is never worse off than with no
         // budget at all; the deadline bounds only the retries.
         let timeout = if failures == 0 && deadline.is_active() {
-            Some(PER_ATTEMPT_TIMEOUT)
+            Some(attempt_bound)
         } else {
-            deadline.attempt_timeout(Instant::now())
+            deadline.attempt_timeout_within(attempt_bound, Instant::now())
         };
         match op(timeout).await {
             Attempt::Done(r) => return r,
@@ -294,14 +331,55 @@ mod tests {
     }
 
     #[test]
-    fn attempt_timeout_is_min_of_ten_seconds_and_remaining() {
+    fn attempt_timeout_is_min_of_the_bound_and_remaining() {
         let start = Instant::now();
         let d = RetryDeadline::from_budget(Duration::from_secs(120), start);
         assert_eq!(d.attempt_timeout(start), Some(PER_ATTEMPT_TIMEOUT));
+        let ten = Duration::from_secs(10);
+        assert_eq!(d.attempt_timeout_within(ten, start), Some(ten));
         let near = start + Duration::from_secs(116);
-        assert_eq!(d.attempt_timeout(near), Some(Duration::from_secs(4)));
+        assert_eq!(
+            d.attempt_timeout_within(ten, near),
+            Some(Duration::from_secs(4))
+        );
         let spent = start + Duration::from_secs(130);
         assert_eq!(d.attempt_timeout(spent), Some(MIN_ATTEMPT_TIMEOUT));
+        // A longer per-call bound (the allocate's 80 s) is capped by the
+        // budget, never by PER_ATTEMPT_TIMEOUT.
+        let eighty = Duration::from_secs(80);
+        assert_eq!(d.attempt_timeout_within(eighty, start), Some(eighty));
+        let later = start + Duration::from_secs(70);
+        assert_eq!(
+            d.attempt_timeout_within(eighty, later),
+            Some(Duration::from_secs(50))
+        );
+        assert_eq!(
+            RetryDeadline::none().attempt_timeout_within(eighty, start),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_per_call_bound_replaces_the_default_one() {
+        let bound = Duration::from_secs(80);
+        let mut seen = Vec::new();
+        let _: Result<(), String> = retry_transient_within(
+            "test",
+            RetryDeadline::from_budget(Duration::from_secs(120), Instant::now()),
+            bound,
+            |timeout| {
+                seen.push(timeout);
+                async { Attempt::Transient("down".to_string()) }
+            },
+            |m| m,
+        )
+        .await;
+        assert_eq!(seen.first(), Some(&Some(bound)), "{seen:?}");
+        assert!(seen.len() > 1, "{seen:?}");
+        assert!(
+            seen.iter().all(|t| t.is_some_and(|t| t <= bound)),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

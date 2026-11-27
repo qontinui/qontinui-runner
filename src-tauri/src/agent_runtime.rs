@@ -9838,6 +9838,22 @@ async fn acquire_continuation_workdir(
         })
         .await;
         let settled = settle_continuation_acquire(acquired);
+        // An isolated continuation whose allocate stayed unavailable for the
+        // whole retry budget is REFUSED, never run unisolated in the shared
+        // workspace root: the `Err` posts `spawn_failed`, whose typed head coord
+        // re-offers on its bounded schedule (plan
+        // `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`
+        // D2). Reaching here at all means it asked for isolation: `repos` is
+        // non-empty, and with worktree mode off the acquire answers `Ok(None)`.
+        if let Some(refusal) = settled.refusal() {
+            warn!(
+                intent = %intent,
+                agent_session_id = ?agent_session_id,
+                "agent_runtime: gate-continuation acquire refused ({refusal}); \
+                 NOT taking the fallback cwd"
+            );
+            return Err(anyhow::anyhow!(refusal));
+        }
         if let ContinuationAcquire::Failed(cause) = &settled {
             // Names the continuation (its anchor rides on `intent`) and the
             // pinned session id the allocate carried, so a session can join its
@@ -9965,6 +9981,10 @@ enum ContinuationAcquire<C> {
     WorktreeModeOff,
     /// The acquire failed; the error's text.
     Failed(String),
+    /// The allocate stayed unavailable through the acquire's whole retry
+    /// budget ([`crate::agent_worktree::AllocateError::Unavailable`]); the
+    /// error's text. Refused, never the fallback.
+    Unavailable(String),
 }
 
 impl<C> ContinuationAcquire<C> {
@@ -9975,7 +9995,24 @@ impl<C> ContinuationAcquire<C> {
             ContinuationAcquire::WorktreeModeOff => {
                 "worktree mode is off or the acquire was declined".to_string()
             }
-            ContinuationAcquire::Failed(e) => format!("worktree acquire failed: {e}"),
+            ContinuationAcquire::Failed(e) | ContinuationAcquire::Unavailable(e) => {
+                format!("worktree acquire failed: {e}")
+            }
+        }
+    }
+
+    /// The refusal an isolated continuation posts instead of taking the
+    /// fallback cwd: `worktree_allocate_unavailable: <cause>`, or `None` for
+    /// every arm that keeps today's fallback (a held claim, a
+    /// `repo_not_registered` that its own retry could not clear, any other
+    /// failure, mode off).
+    fn refusal(&self) -> Option<String> {
+        match self {
+            ContinuationAcquire::Unavailable(cause) => Some(format!(
+                "{}: {cause}",
+                crate::agent_worktree::WORKTREE_ALLOCATE_UNAVAILABLE
+            )),
+            _ => None,
         }
     }
 
@@ -9988,13 +10025,14 @@ impl<C> ContinuationAcquire<C> {
 }
 
 /// The `spawn_failed` detail posted for a continuation whose cwd could not be
-/// acquired. A typed refusal (`workdir_not_a_checkout`, `no_isolated_worktree`)
-/// is posted verbatim so its token
+/// acquired. A typed refusal (`workdir_not_a_checkout`, `no_isolated_worktree`,
+/// `worktree_allocate_unavailable`) is posted verbatim so its token
 /// LEADS the line coord stores (coord keeps the first line, truncated); every
 /// other failure keeps its historical prefix.
 fn continuation_acquire_failure_detail(err: &str) -> String {
     if err.starts_with(crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT)
         || err.starts_with(NO_ISOLATED_WORKTREE)
+        || err.starts_with(crate::agent_worktree::WORKTREE_ALLOCATE_UNAVAILABLE)
     {
         err.to_string()
     } else {
@@ -10025,6 +10063,9 @@ fn settle_continuation_acquire<C>(
         Ok(None) => {
             debug!("agent_runtime: gate-continuation worktree mode off — using the fallback cwd");
             ContinuationAcquire::WorktreeModeOff
+        }
+        Err(crate::agent_worktree::AllocateError::Unavailable(cause)) => {
+            ContinuationAcquire::Unavailable(cause)
         }
         Err(e) => ContinuationAcquire::Failed(e.to_string()),
     }
@@ -14126,6 +14167,63 @@ mod tests {
             super::append_no_worktree_note("B".to_string(), "D:/r", None),
             "B"
         );
+    }
+
+    /// D2 of plan
+    /// `2026-11-26-allocate-under-a-continuation-burst-sends-isolated-continuations-to-the-shared-workspace-root`:
+    /// an isolated continuation whose allocate stayed unavailable through the
+    /// whole retry budget is REFUSED with the typed head, and the posted
+    /// `spawn_failed` detail BEGINS with it (coord's retriable class matches
+    /// it there). It takes no fallback cwd: `acquire_continuation_workdir`
+    /// returns on `refusal()` before `continuation_fallback_workdir` runs.
+    #[test]
+    fn an_unavailable_allocate_refuses_the_fallback_with_a_typed_head() {
+        use crate::agent_worktree::AllocateError;
+        let cause = "POST http://c/agents/allocate: timed out after 80s: x (after 3 attempts)";
+        let settled =
+            super::settle_continuation_acquire::<u8>(Err(AllocateError::Unavailable(cause.into())));
+        let refusal = settled
+            .refusal()
+            .expect("an unavailable allocate is refused");
+        assert_eq!(refusal, format!("worktree_allocate_unavailable: {cause}"));
+        let detail = super::continuation_acquire_failure_detail(&refusal);
+        assert!(
+            detail.starts_with("worktree_allocate_unavailable: "),
+            "{detail}"
+        );
+        assert_eq!(detail, refusal, "posted verbatim, no historical prefix");
+        assert!(settled.into_context().is_none());
+    }
+
+    /// D2's other half: every failure that is NOT an exhausted allocate keeps
+    /// today's fallback plus the session note — a held claim, a
+    /// `repo_not_registered` its own retry could not clear, any other failure
+    /// (including a zero-budget caller's single transient one, which is
+    /// `Other`), and worktree mode off (no isolation asked).
+    #[test]
+    fn every_other_acquire_outcome_keeps_the_fallback() {
+        use crate::agent_worktree::{AllocateError, ClaimConflict};
+        let held = AllocateError::ClaimConflict(ClaimConflict {
+            kind: "worktree".into(),
+            resource_key: "repo:qontinui-web".into(),
+            current_holder: "peer".into(),
+            intent: None,
+        });
+        for e in [
+            held,
+            AllocateError::RepoNotRegistered("qontinui-web".into()),
+            AllocateError::Other("POST x returned 503 — body: {}".into()),
+        ] {
+            let settled = super::settle_continuation_acquire::<u8>(Err(e.clone()));
+            assert_eq!(settled.refusal(), None, "{e:?}");
+            assert!(
+                matches!(settled, super::ContinuationAcquire::Failed(_)),
+                "{e:?}"
+            );
+        }
+        let off = super::settle_continuation_acquire::<u8>(Ok(None));
+        assert_eq!(off, super::ContinuationAcquire::WorktreeModeOff);
+        assert_eq!(off.refusal(), None);
     }
 
     /// Only a FAILED acquire yields a cause; mode-off and acquired do not.
