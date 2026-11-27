@@ -136,6 +136,69 @@ export function hasCargoTestOutput(lines) {
 }
 
 /**
+ * Did the LAST binary in this output print its `test result:` summary line?
+ *
+ * libtest prints that line last, on green and red alike (`test result: ok.`
+ * / `test result: FAILED.`), and only a process that DIED mid-run — an
+ * abort, a segfault, a kill — ends without it. `hasCargoTestOutput` cannot
+ * tell those apart: a run that printed three `... FAILED` lines and then
+ * aborted "has cargo test output" and still judged nothing after the abort.
+ * A consumer folding one executable's output (the interleave census) reads
+ * this to fail closed on that shape rather than count the partial run.
+ *
+ * Scoped to the last announced binary (`Running `…``/`Doc-tests …`), so a
+ * multi-binary log answers for the binary that was executing at the end;
+ * output with no announcement at all answers for the whole text.
+ *
+ * @param {string[]} lines normalised lines (see `normalizeLogLine`)
+ * @returns {boolean}
+ */
+export function lastBinaryHasSummary(lines) {
+  let sawSummary = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (binaryIdFromAnnouncementLine(t) !== undefined) {
+      sawSummary = false;
+      continue;
+    }
+    if (t.startsWith("test result:")) sawSummary = true;
+  }
+  return sawSummary;
+}
+
+/**
+ * Redact the secret-shaped substrings a captured test panic could carry
+ * before it lands anywhere public — a GitHub issue body or comment, a Checks
+ * annotation. The shapes are the ones a panic message is likely to carry:
+ * a JWT (`eyJ…` base64url header, a dot, more); a `Bearer <token>` header;
+ * a GitHub token (`ghp_…`/`gho_…`/`ghu_…`/`ghs_…`/`ghr_…`, `github_pat_…`);
+ * and any key whose name contains `token`, `secret`, `password`, `jwt` or
+ * `api_key` followed by `=` or `:` — which covers an env pair
+ * (`GITHUB_TOKEN=ghp_…`), a Rust Debug field (`runner_token: "qr_…"`), a
+ * JSON member (`"token": "abc"`) and a query pair (`?token=…`) alike; the
+ * key is kept, the value is not. Shared by `test-interleave-census.mjs`
+ * (annotations, the json's `sample_panic`) and `ci-flake-escalate.mjs`
+ * (issue bodies, comments), so the two consumers cannot drift. Idempotent.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function redactSecrets(text) {
+  return String(text ?? "")
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_.-]*/g, "[redacted]")
+    .replace(/Bearer \S+/g, "Bearer [redacted]")
+    .replace(/gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\S+/g, "[redacted]")
+    .replace(
+      // `:(?!:)` keeps a Rust path separator (`TokenKind::Secret`) from
+      // reading as key/value; a quoted value is consumed to its closing
+      // quote (skipping `\"` escapes, never past a newline) so
+      // `"token": "a b c"` and `"token": "a \"b\" c"` cannot leak a tail.
+      /("?)([A-Za-z0-9_]*(?:token|secret|password|jwt|api_key)[A-Za-z0-9_]*)("?)\s*(?:=|:(?!:))\s*(?:"(?:[^"\\\n]|\\.)*"?|[^\s",}]+)/gi,
+      "$1$2$3=[redacted]",
+    );
+}
+
+/**
  * Extract failing test names from a cargo job log.
  *
  * Handles BOTH shapes cargo emits, because a log routinely contains only one:
@@ -216,6 +279,33 @@ const DOCTEST_HEADER_RE = /^Doc-tests\s+(\S+)$/;
 const HASH_SUFFIX_RE = /-[0-9a-f]{6,}$/i;
 
 /**
+ * The `<binary>` id of a built test executable's PATH: its basename, `.exe`
+ * stripped, cargo's `-<hash>` metadata suffix stripped. Returns `undefined`
+ * when the basename carries no hash — that is how a toolchain INVOCATION
+ * (`.../bin/rustc`) is told apart from a test binary being launched, and it is
+ * also what makes a hand-copied, un-hashed executable unresolvable rather than
+ * silently mis-attributed.
+ *
+ * This is the ONE normaliser for the `<binary>::<test path>` id grammar.
+ * `binaryIdFromAnnouncementLine` below applies it to a `Running` line, and
+ * `scripts/test-interleave-census.mjs` applies it to the `executable` field of
+ * `cargo test --no-run --message-format=json` so an id parsed from a log maps
+ * back to the executable that produced it by the same rule — a second
+ * normaliser there would be a second place for the two to drift apart (plan
+ * `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 0).
+ *
+ * @param {string} executablePath a Linux path or a Windows `.exe` path
+ * @returns {string|undefined}
+ */
+export function binaryIdFromExecutablePath(executablePath) {
+  const path = String(executablePath ?? "");
+  const base = path.split(/[\\/]/).pop() ?? path;
+  const noExt = base.replace(/\.exe$/i, "");
+  if (!HASH_SUFFIX_RE.test(noExt)) return undefined;
+  return noExt.replace(HASH_SUFFIX_RE, "");
+}
+
+/**
  * Does this (already-trimmed) line announce which binary subsequent `test ...`
  * lines belong to? Returns the binary/crate id, or `undefined` if the line is
  * either not an announcement at all, or is a `Running` line for a toolchain
@@ -226,15 +316,12 @@ const HASH_SUFFIX_RE = /-[0-9a-f]{6,}$/i;
  * @param {string} trimmedLine
  * @returns {string|undefined}
  */
-function binaryIdFromAnnouncementLine(trimmedLine) {
+export function binaryIdFromAnnouncementLine(trimmedLine) {
   const doc = DOCTEST_HEADER_RE.exec(trimmedLine);
   if (doc) return doc[1];
   const running = RUNNING_BINARY_RE.exec(trimmedLine);
   if (!running) return undefined;
-  const base = running[1].split(/[\\/]/).pop() ?? running[1];
-  const noExt = base.replace(/\.exe$/i, "");
-  if (!HASH_SUFFIX_RE.test(noExt)) return undefined;
-  return noExt.replace(HASH_SUFFIX_RE, "");
+  return binaryIdFromExecutablePath(running[1]);
 }
 
 /**

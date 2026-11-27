@@ -4603,6 +4603,34 @@ mod tests {
     /// [`config_report_never_reaches_the_settings_writer`] — this test's
     /// fingerprints match on a dev box whether or not the writer ran, because
     /// boot has already consumed the one-shot migration.
+    ///
+    /// # The config dir is a DEDICATED subdir, and the dir watch names entries
+    ///
+    /// Measured 2026-09-21 under two concurrent full-suite loops of one test
+    /// binary (red on run 11): this test panicked on the config DIR row with
+    /// `(true, Some(4096), mtime T)` before and `mtime T+4ms` after — size
+    /// unchanged, `settings.json` unchanged, so not the settings persist (which
+    /// Phase 3's canary in `settings::persist_target_for_this_thread` now
+    /// deflects anyway). The dir was the fixture's ROOT tempdir, because
+    /// `isolated_ambient()` points FIVE process-global keys at that one
+    /// directory — `QONTINUI_HOME`, `QONTINUI_CONFIG_DIR`,
+    /// `QONTINUI_SECURE_STORAGE_DIR`, `HOME`, `USERPROFILE` — and the ambient
+    /// READ canary's soft arm 3 lets an unguarded sibling proceed while a
+    /// fixture is live. Any sibling touching `$HOME/.something` bumps that
+    /// root's mtime, and a directory mtime cannot say whether the report
+    /// materialised something or a sibling wrote to its `HOME`.
+    ///
+    /// Two remedies, both in this test only. First, `QONTINUI_CONFIG_DIR` is
+    /// re-pointed (under the fixture's own `env_lock()`, restored on drop) at
+    /// `<fixture root>/config-under-test`, a subdir no other key aliases, and
+    /// the watched paths are derived AFTER that override so they point into
+    /// it; a write there is reachable only through `QONTINUI_CONFIG_DIR`, which
+    /// is exactly where the persist canary stands. Second, a directory's
+    /// fingerprint is its sorted entry list with each entry's `(len, mtime)`
+    /// rather than the dir's own mtime, and a mismatch prints the entries that
+    /// appeared, vanished or changed — so the next red names the FILE a
+    /// sibling wrote instead of a directory timestamp. Plan
+    /// `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 3.
     #[test]
     fn config_report_live_command_writes_nothing_it_reports_on() {
         // The report reaches `get_effective_config_dir` (the fleet term and
