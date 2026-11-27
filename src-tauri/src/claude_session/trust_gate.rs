@@ -2086,11 +2086,13 @@ fn sibling_trust_not_landed(
 /// Claude Code raises a per-session "Adding a new directory … Yes, add it"
 /// dialog at startup for every `--add-dir` directory whose PRIMARY checkout
 /// (`.git` → `gitdir` → `commondir`, the same derivation as explicit trust,
-/// [`mints_primary_checkout_trust`]) the account has not trusted; a key at the
-/// sibling worktree's own path does not clear it. Measured on CLI 2.1.332
-/// (plan `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`
+/// [`mints_primary_checkout_trust`]) the account has not trusted. Measured on
+/// CLI 2.1.332 (plan
+/// `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`
 /// Phase 0): the dialog appears iff the pinned account lacks the first
-/// untrusted sibling's primary key, and an unattended PTY parks on it forever.
+/// untrusted sibling's primary key — so a key at the sibling worktree's own
+/// path is not NEEDED to clear it (whether such a key alone would clear it was
+/// not measured) — and an unattended PTY parks on it forever.
 ///
 /// So the key gated here is the one the CLI consults, and only that key is
 /// written — never the sibling worktree's own:
@@ -2105,7 +2107,12 @@ fn sibling_trust_not_landed(
 ///   [`promote_for_surface`] → [`annotate_unread_dial`]) at the tenant's dial,
 ///   and the write itself is the cwd arm's primary-checkout mint, under the
 ///   same guards ([`mints_primary_checkout_trust`]) and the same
-///   runner-minted stamp;
+///   runner-minted stamp. The guards apply to the consulted KEY however it was
+///   reached: a sibling that is itself a primary checkout (named directly, not
+///   through a linked worktree) is put through them too, so its key is minted
+///   on no weaker terms than when a linked worktree leads to it — and since it
+///   is not an allocated worktree, conjunct 1 does not hold for it and nothing
+///   is minted;
 /// - a grant that does not LAND (the mint's guards fail, or the write fails)
 ///   is a refusal on [`SpawnSurface::InteractivePty`], rendered by
 ///   [`TrustGateDecision::refusal`] so [`is_spawn_blocked_refusal`] classifies
@@ -2231,12 +2238,14 @@ fn finish_add_dir_sibling(
         return report(Some(consulted_key), decision, None, conjuncts);
     }
 
+    // `true` for EITHER shape: the consulted key is a primary checkout's
+    // whether a linked worktree led to it or the sibling names the checkout
+    // directly, and the same key must not be minted on weaker terms because
+    // of how the launch spelled it.
     let mut write_outcome = None;
     let decision = if !decision.writes_trust() {
         decision
-    } else if is_linked_worktree
-        && !mints_primary_checkout_trust(&decision, &conjuncts, posture, true)
-    {
+    } else if !mints_primary_checkout_trust(&decision, &conjuncts, posture, true) {
         let mut failed: Vec<String> = conjuncts
             .failing()
             .into_iter()
@@ -3203,6 +3212,153 @@ THE AUTONOMY DIAL. One of:
             tier: AutonomyTier::DraftRequired,
         });
         assert!(!refusal_rests_on_unread_dial(&read), "{read}");
+    }
+
+    /// Drive the add-dir sibling core for the fixture worktree, which sits
+    /// OUTSIDE every agent-worktree root (conjunct 1 is UNKNOWN for it).
+    fn run_sibling(
+        wt: &Path,
+        acct: &str,
+        tier: AutonomyTier,
+        surface: SpawnSurface,
+    ) -> SiblingTrustReport {
+        finish_add_dir_sibling(
+            &wt.to_string_lossy(),
+            Some(acct),
+            DialResolution::Override { tier },
+            surface,
+        )
+    }
+
+    /// The permissive dial alone does not mint a sibling's primary key: the
+    /// primary-checkout mint's guards must hold too. A hand-rolled linked
+    /// worktree outside every agent-worktree root fails conjunct 1, so on a
+    /// PTY the sibling is refused under its own rule and nothing is written.
+    #[test]
+    fn a_sibling_whose_mint_guards_fail_is_refused_on_a_pty_and_nothing_written() {
+        let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::InteractivePty,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::SpawnBlocked {
+                    rule: RULE_SIBLING_MINT_NOT_PERMITTED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert_eq!(
+            r.consulted_key.as_deref(),
+            Some(workspace_trust::project_key(&primary).unwrap().as_str())
+        );
+        assert!(is_spawn_blocked_refusal(&r.decision.refusal().unwrap()));
+        assert!(r.write_outcome.is_none());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// On a `--print` child the same not-landed grant WITHHOLDS rather than
+    /// blocks: that child degrades instead of hanging on the dialog.
+    #[test]
+    fn a_sibling_whose_mint_guards_fail_withholds_on_a_print_child() {
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::Withhold {
+                    rule: RULE_SIBLING_MINT_NOT_PERMITTED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert!(r.decision.allows_spawn());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// The withholding dial: a block on a PTY, a withhold on a `--print`
+    /// child — the cwd matrix's surface mapping, applied to the sibling.
+    #[test]
+    fn a_sibling_under_a_withholding_dial_blocks_a_pty_and_withholds_a_print_child() {
+        let (_tmp, _primary, wt, _cfg, acct) = finish_fixture(serde_json::json!({}));
+        let pty = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::DraftRequired,
+            SpawnSurface::InteractivePty,
+        );
+        assert!(
+            matches!(pty.decision, TrustGateDecision::SpawnBlocked { .. }),
+            "{:?}",
+            pty.decision
+        );
+        let print = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::DraftRequired,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                print.decision,
+                TrustGateDecision::Withhold {
+                    rule: "dial-withholds-underived-mint",
+                    ..
+                }
+            ),
+            "{:?}",
+            print.decision
+        );
+    }
+
+    /// A forged sibling link withholds on a `--print` child (and names the
+    /// unverified rule) — it still never mints.
+    #[test]
+    fn a_forged_sibling_withholds_on_a_print_child_and_never_mints() {
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let (_tmp2, victim, _vwt) = linked_worktree_fixture(&[]);
+        let admin = std::fs::read_dir(victim.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::Withhold {
+                    rule: RULE_SIBLING_PRIMARY_UNVERIFIED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert!(r.consulted_key.is_none());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
     }
 
     /// A human-trusted primary IS a derivation source: the worktree grant is

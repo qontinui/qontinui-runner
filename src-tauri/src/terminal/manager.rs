@@ -236,10 +236,10 @@ fn apply_trust_arm(
 ) -> Result<(), String> {
     match trust {
         TrustArm::Pinned(account) => {
-            pinned_account_agrees(child_pin, account.as_deref())?;
+            let account = pinned_derivation_account(child_pin, account.as_deref())?;
             let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
                 working_dir,
-                account.as_deref(),
+                account,
                 crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
             );
             match gate.decision.refusal() {
@@ -257,20 +257,31 @@ fn apply_trust_arm(
     }
 }
 
-/// Refuse a pinned arm whose stated account disagrees with the PTY's actual
-/// pin (see [`apply_trust_arm`]). Shared by the cwd and the `--add-dir` arms so
-/// neither can derive trust for an account the child will not read.
-fn pinned_account_agrees(child_pin: Option<&str>, account: Option<&str>) -> Result<(), String> {
-    if let (Some(pinned), Some(stated)) = (child_pin, account) {
-        if pinned != stated {
-            return Err(format!(
-                "terminal trust arm names account {stated} but the PTY is pinned to \
-                 {pinned}; refusing rather than deriving trust for an account the \
-                 child will not read"
-            ));
-        }
+/// The account a pinned arm derives trust IN: the account the child will
+/// actually read. Shared by the cwd and the `--add-dir` arms so neither can
+/// derive trust for an account the child will not read.
+///
+/// - The stated account and the PTY's pin disagree → refused outright (see
+///   [`apply_trust_arm`]): the runner's own drift, not a trust verdict.
+/// - The arm states `None` (the ambient default) but the PTY env pins
+///   `CLAUDE_CONFIG_DIR` → the PIN, because that is the config the child reads;
+///   deriving in the ambient default would write trust the child never sees
+///   and leave it facing the dialog.
+/// - Otherwise the stated account (`None` = the ambient default, with no pin
+///   on the PTY either, so the child reads the default too).
+fn pinned_derivation_account<'a>(
+    child_pin: Option<&'a str>,
+    account: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    match (child_pin, account) {
+        (Some(pinned), Some(stated)) if pinned != stated => Err(format!(
+            "terminal trust arm names account {stated} but the PTY is pinned to \
+             {pinned}; refusing rather than deriving trust for an account the \
+             child will not read"
+        )),
+        (pin, None) => Ok(pin),
+        (_, stated) => Ok(stated),
     }
-    Ok(())
 }
 
 /// Apply one [`TrustArm`] to an `--add-dir` sibling of the spawn, BEFORE the PTY
@@ -296,10 +307,10 @@ fn apply_sibling_trust_arm(
 ) -> Result<(), String> {
     match trust {
         TrustArm::Pinned(account) => {
-            pinned_account_agrees(child_pin, account.as_deref())?;
+            let account = pinned_derivation_account(child_pin, account.as_deref())?;
             let gate = crate::claude_session::trust_gate::pre_accept_add_dir_sibling_sync(
                 sibling,
-                account.as_deref(),
+                account,
                 crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
             );
             match gate.decision.refusal() {
@@ -1599,8 +1610,8 @@ mod tests {
     }
 
     use super::{
-        add_dir_siblings, apply_trust_arm, command_implies_bypass_permissions,
-        establish_spawn_trust, TerminalManager, TrustArm,
+        add_dir_siblings, apply_sibling_trust_arm, apply_trust_arm,
+        command_implies_bypass_permissions, establish_spawn_trust, TerminalManager, TrustArm,
     };
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
@@ -2340,6 +2351,186 @@ mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// [`launch`] with the sibling, the arm and the PTY pin chosen by the test.
+    fn launch_with(
+        fx: &MultiWorktree,
+        sibling: &std::path::Path,
+        arm: TrustArm,
+        child_pin: Option<&str>,
+    ) -> Result<(), String> {
+        let command = argv(&[
+            "claude",
+            &format!("--add-dir={}", sibling.display()),
+            "--",
+            "run /implement-plan",
+        ]);
+        establish_spawn_trust(&fx.cwd, Some(&command), &arm, child_pin, |_| {
+            Some("test-scope")
+        })
+    }
+
+    /// The cwd and its primary already trusted, so only the sibling arm can
+    /// write or refuse.
+    fn cwd_trusted(fx: &MultiWorktree) -> serde_json::Value {
+        serde_json::json!({
+            key(std::path::Path::new(&fx.cwd)): { "hasTrustDialogAccepted": true },
+            key(&fx.cwd_primary): { "hasTrustDialogAccepted": true },
+        })
+    }
+
+    /// A4: a pinned arm that states no account (`None`, the ambient default)
+    /// while the PTY env pins `CLAUDE_CONFIG_DIR` derives in the PIN — the
+    /// config the child reads — not in the ambient default.
+    #[test]
+    fn a_pinned_arm_with_no_stated_account_derives_in_the_ptys_pin() {
+        use crate::claude_session::spawn_preconditions::{trust_verdict_in, TrustVerdict};
+        let fx = multi_worktree("proceed", cwd_trusted);
+        assert_eq!(
+            launch_with(&fx, &fx.sibling, TrustArm::Pinned(None), Some(&fx.account)),
+            Ok(())
+        );
+        assert_eq!(
+            trust_verdict_in(&fx.config_file, &key(&fx.sibling_primary)),
+            TrustVerdict::Trusted,
+            "the sibling's key must land in the account the child reads"
+        );
+    }
+
+    /// A2: a sibling that IS a primary checkout, named directly, goes through
+    /// the same mint guards as one reached through a linked worktree. It is
+    /// not an allocated worktree, so conjunct 1 fails and — even at the most
+    /// permissive dial — nothing is minted and the PTY spawn is refused.
+    #[test]
+    fn a_primary_checkout_named_directly_as_a_sibling_is_not_minted_on_weaker_terms() {
+        let fx = multi_worktree("proceed", cwd_trusted);
+        let before = std::fs::read(&fx.config_file).unwrap();
+        let err = launch_with(
+            &fx,
+            &fx.sibling_primary,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        )
+        .expect_err("an unallocated primary checkout as a sibling is refused");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-primary-checkout-mint-not-permitted"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// A primary checkout named directly whose own key is already trusted
+    /// passes at the strictest dial with no write: its OWN key is the one read.
+    #[test]
+    fn a_trusted_primary_checkout_named_directly_as_a_sibling_produces_no_write() {
+        let fx = multi_worktree("ask-first", |fx| {
+            let mut p = cwd_trusted(fx);
+            p[key(&fx.sibling_primary)] = serde_json::json!({ "hasTrustDialogAccepted": true });
+            p
+        });
+        let before = std::fs::read(&fx.config_file).unwrap();
+        assert_eq!(
+            launch_with(
+                &fx,
+                &fx.sibling_primary,
+                TrustArm::Pinned(Some(fx.account.clone())),
+                Some(&fx.account),
+            ),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// `TrustOutcome::Skipped`: the account has no config file yet (the CLI
+    /// creates it at first launch, and the trust module will not half-create
+    /// it), so the permitted mint does not land and the PTY spawn is refused.
+    #[test]
+    fn a_sibling_mint_the_trust_module_skips_blocks_the_spawn() {
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        std::fs::remove_file(&fx.config_file).unwrap();
+        let err = launch_with(
+            &fx,
+            &fx.sibling,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        )
+        .expect_err("a skipped write did not land");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-trust-write-did-not-land") && err.contains("skipped"),
+            "{err}"
+        );
+    }
+
+    /// `TrustOutcome::Failed`: the account dir and file are read-only, so the
+    /// atomic rewrite fails and the PTY spawn is refused. Unix-only (mode
+    /// bits), and skipped where the process can write through them (root).
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_mint_whose_write_fails_blocks_the_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = multi_worktree("proceed", cwd_trusted);
+        let dir = std::path::Path::new(&fx.account).to_path_buf();
+        let set = |mode: u32| {
+            std::fs::set_permissions(
+                &fx.config_file,
+                std::fs::Permissions::from_mode(mode & 0o666),
+            )
+            .unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set(0o555);
+        if std::fs::write(dir.join("probe"), b"x").is_ok() {
+            set(0o755);
+            eprintln!("skipped: this process writes through read-only mode bits");
+            return;
+        }
+        let result = launch_with(
+            &fx,
+            &fx.sibling,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        );
+        set(0o755);
+        let err = result.expect_err("a failed write did not land");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-trust-write-did-not-land") && err.contains("FAILED"),
+            "{err}"
+        );
+    }
+
+    /// The sibling arm refuses a PTY pin that disagrees with the stated
+    /// account itself — runner drift, not a trust verdict — rather than
+    /// deriving trust for an account the child will not read.
+    #[test]
+    fn the_sibling_arm_refuses_a_pin_that_disagrees_with_the_stated_account() {
+        let target = tempfile::tempdir().unwrap();
+        let err = apply_sibling_trust_arm(
+            &target.path().to_string_lossy(),
+            &TrustArm::Pinned(Some("C:/claude/.claude-a".into())),
+            Some("C:/claude/.claude-b"),
+        )
+        .expect_err("a disagreeing pin is refused");
+        assert!(
+            err.contains(".claude-a") && err.contains(".claude-b"),
+            "{err}"
+        );
+        assert!(
+            !crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "runner drift is not a trust verdict: {err}"
+        );
     }
 
     #[test]
