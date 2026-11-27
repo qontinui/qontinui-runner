@@ -128,10 +128,12 @@ jobs:
           restore-keys: |
             poetry-${{ matrix.platform }}-
 
+      # `poetry sync`, not `install`: a venv restored from the cache above
+      # then cannot carry a distribution the lock does not list.
       - name: Install Python dependencies
         working-directory: qontinui-runner/python-bridge
         run: |
-          poetry install --no-interaction
+          poetry sync --no-interaction
 
       # pip into the venv, NOT `poetry add`: `poetry add` rewrites
       # pyproject.toml and poetry.lock on every run, so the executor was built
@@ -148,6 +150,18 @@ jobs:
       - name: Enforce owners of contested packages (Xlib, cv2)
         working-directory: qontinui-runner/python-bridge
         run: poetry run python ../../qontinui/scripts/enforce_package_owners.py --lock poetry.lock
+
+      # LOCK CONFORMANCE. The one property nothing else observes: that the
+      # venv PyInstaller freezes is the venv poetry.lock records (Pillow,
+      # aiohttp, yarl and every other locked package at the locked version,
+      # nothing unlisted beyond PyInstaller). Runs after the last install step.
+      # Plan 2026-11-05-dependency-advisory-followups-after-the-pillow-13-lift,
+      # Phase 3.
+      - name: Assert the venv matches poetry.lock
+        working-directory: qontinui-runner/python-bridge
+        run: |
+          poetry check --lock
+          poetry run python ../scripts/ci/assert-venv-matches-lock.py poetry.lock
 
       - name: Build Python executor
         working-directory: qontinui-runner/python-bridge

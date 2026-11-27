@@ -347,6 +347,8 @@ observes = [
   "src-tauri/src/**",
   # pytest runs from python-bridge/ (working-directory), so its tests are
   # python-bridge/tests/*, already under python-bridge/**.
+  "scripts/ci/assert-venv-matches-lock.py",
+  "scripts/ci/test_assert_venv_matches_lock.py",
   ".github/workflows/python-executor-command-table.yml",
 ]
 
