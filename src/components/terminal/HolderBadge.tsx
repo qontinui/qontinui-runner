@@ -23,15 +23,18 @@ export const FIRST_READ_RETRY_MS = 2_000;
 export const FIRST_READ_RETRIES = 15;
 
 export function HolderBadge({ terminalId }: { terminalId: string }) {
-  const [state, setState] = useState<HolderState | null | undefined>(undefined);
+  // Keyed by the pane it was read for, so a new `terminalId` renders nothing
+  // from its first paint rather than the last pane's state for one frame.
+  const [read, setRead] = useState<{ id: string; state: HolderState | null } | undefined>(
+    undefined,
+  );
+  const state = read?.id === terminalId ? read.state : undefined;
   useEffect(() => {
-    // A new pane starts from nothing: the last one's state is not its own.
-    setState(undefined);
     let everRead = false;
     let cancelled = false;
     let retries = 0;
     let retry: ReturnType<typeof setTimeout> | undefined;
-    const read = async () => {
+    const readStates = async () => {
       try {
         const r = await invoke<CommandResponse>("terminal_holder_states");
         if (cancelled || !r.success || !r.data || typeof r.data !== "object") return;
@@ -44,20 +47,20 @@ export function HolderBadge({ terminalId }: { terminalId: string }) {
             retries += 1;
             retry = setTimeout(() => {
               retry = undefined;
-              void read();
+              void readStates();
             }, FIRST_READ_RETRY_MS);
           }
           return;
         }
         everRead = true;
-        setState(states[terminalId]);
+        setRead({ id: terminalId, state: states[terminalId] });
       } catch {
         // Unreadable is not "safe": keep whatever was last read, and show
         // nothing only when nothing ever was.
       }
     };
-    void read();
-    const timer = setInterval(() => void read(), POLL_MS);
+    void readStates();
+    const timer = setInterval(() => void readStates(), POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);

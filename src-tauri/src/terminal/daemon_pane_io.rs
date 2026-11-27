@@ -1406,9 +1406,18 @@ impl DaemonPaneIo {
         // stops, exactly as a fresh plain spawn would.
         match holder_shares_runner_unit_cgroup(io.holder_pid()) {
             Some(true) => {
-                io.unprotected = Some(Unprotected::Cgroup {
+                let why = Unprotected::Cgroup {
                     fallback_reason: None,
-                })
+                };
+                // The same visible notice `attach` gives every other
+                // unprotected pane: in-band, and in the log.
+                warn!(
+                    pane = %pane_id,
+                    holder_pid = io.holder_pid(),
+                    "pty holder: {why} — this pane will NOT survive the runner's systemd unit stopping"
+                );
+                io.out.push_local(&unprotected_notice(&why));
+                io.unprotected = Some(why);
             }
             Some(false) => {}
             None => {
@@ -3863,11 +3872,19 @@ sleep 30
                 offset,
                 "resumes where the first left off"
             );
+            // The adoption measured the holder's cgroup itself, and what it
+            // recorded agrees with a fresh read of the same holder.
+            let shares = holder_shares_runner_unit_cgroup(second.holder_pid());
+            assert!(shares.is_some(), "a live holder's cgroup reads");
+            assert!(second.cgroup_measured());
+            assert_eq!(second.unprotected().is_some(), shares == Some(true));
             let (c2, t2) = drain(&second);
             second.writer().unwrap().write_all(b"two\r").unwrap();
             until(&c2, Duration::from_secs(10), |c| contains(c, b"two"));
+            // cat's echoed line, as above: an unprotected notice pushed on
+            // adoption may itself contain the bare word.
             assert!(
-                !contains(&c2.lock().unwrap(), b"one"),
+                !contains(&c2.lock().unwrap(), b"one\r\n"),
                 "no duplicate replay"
             );
             second.release(Duration::from_secs(2)).unwrap();
