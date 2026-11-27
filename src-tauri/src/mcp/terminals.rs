@@ -328,7 +328,9 @@ pub async fn list_terminals_handler(
                     crate::mcp::ui_bridge::UiBridgeError {
                         code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::InternalError,
                         message: e,
-                        recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+                        recovery: Some(crate::mcp::ui_bridge::next_action_for(
+                            &crate::mcp::ui_bridge::types::UiBridgeErrorCode::InternalError,
+                        )),
                         context: Some(serde_json::json!({
                             "reason": "terminal_registry_unreadable",
                         })),
