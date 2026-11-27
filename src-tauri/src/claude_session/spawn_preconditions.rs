@@ -1136,18 +1136,82 @@ pub struct SpawnStalledBody {
     /// the report-only arm that never closes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_location_known: Option<bool>,
+    /// For a terminal continuation's stall only: how long the runner watched
+    /// for a transcript. Distinct from `silent_secs`, which is how long the
+    /// PTY has been output-QUIET — a pane still chattering at the ceiling has
+    /// waited long and been silent briefly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_secs: Option<u64>,
+    /// For a terminal continuation's stall only: which stall it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_kind: Option<TerminalStallKind>,
+    /// For a terminal continuation's stall only: what the runner's close of
+    /// the pane did, so a report-only stall, a failed close on a pane still
+    /// held, and a close whose task never returned read differently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_outcome: Option<StallCloseOutcome>,
     #[serde(flatten)]
     pub preconditions: SpawnPreconditionSnapshot,
+}
+
+/// Which stall a terminal continuation's watch ended on: a PTY alive past the
+/// start window with no transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStallKind {
+    /// Transcript known-absent and the PTY output-quiet: closeable.
+    Quiet,
+    /// The transcript's location is UNKNOWN: reported only.
+    Unlocated,
+    /// Still producing output at the ceiling: reported only.
+    Active,
+}
+
+/// What the runner's close of a stalled terminal continuation's pane did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallCloseOutcome {
+    /// No close was attempted (an unlocated or active stall: report only).
+    NotAttempted,
+    /// The runner closed the pane and the transcript was still absent.
+    Closed,
+    /// The runner closed the pane and a transcript appeared across the close:
+    /// the session started and the close ended it.
+    ClosedStartedAcross,
+    /// The close erred and the pane is still held: left running.
+    FailedPaneHeld,
+    /// The close erred and the pane is gone (the operator closed it).
+    FailedPaneGone,
+    /// The close task did not return (it panicked): the outcome is UNKNOWN.
+    Unknown,
+}
+
+impl StallCloseOutcome {
+    /// The runner's own close succeeded.
+    pub fn closed_by_runner(self) -> bool {
+        matches!(self, Self::Closed | Self::ClosedStartedAcross)
+    }
 }
 
 /// What a terminal continuation's stall adds to [`SpawnStalledBody`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalStallFacts {
-    pub pane_closed: bool,
     pub transcript_location_known: bool,
+    /// How long the runner watched for a transcript.
+    pub waited: Duration,
+    pub stall_kind: TerminalStallKind,
+    pub close_outcome: StallCloseOutcome,
+}
+
+impl TerminalStallFacts {
+    /// Whether the runner closed the pane.
+    pub fn pane_closed(&self) -> bool {
+        self.close_outcome.closed_by_runner()
+    }
 }
 
 impl SpawnStalledBody {
+    /// `silent` is how long the child produced no output at all.
     pub fn new(pre: &SpawnPreconditions, silent: Duration, pid: Option<i64>) -> Self {
         Self {
             phase: "spawn_stalled",
@@ -1155,6 +1219,9 @@ impl SpawnStalledBody {
             pid,
             pane_closed: None,
             transcript_location_known: None,
+            waited_secs: None,
+            stall_kind: None,
+            close_outcome: None,
             preconditions: pre.snapshot(),
         }
     }
@@ -1163,8 +1230,11 @@ impl SpawnStalledBody {
     /// body without them serializes exactly as before.
     pub fn with_terminal_facts(mut self, facts: Option<TerminalStallFacts>) -> Self {
         if let Some(f) = facts {
-            self.pane_closed = Some(f.pane_closed);
+            self.pane_closed = Some(f.pane_closed());
             self.transcript_location_known = Some(f.transcript_location_known);
+            self.waited_secs = Some(f.waited.as_secs());
+            self.stall_kind = Some(f.stall_kind);
+            self.close_outcome = Some(f.close_outcome);
         }
         self
     }
@@ -1527,19 +1597,47 @@ mod tests {
             SpawnStalledBody::new(&pre, Duration::from_secs(1), None).with_terminal_facts(None),
         )
         .unwrap();
-        assert!(bare.get("pane_closed").is_none(), "{bare}");
+        for key in ["pane_closed", "waited_secs", "stall_kind", "close_outcome"] {
+            assert!(bare.get(key).is_none(), "{key}: {bare}");
+        }
         let body = serde_json::to_value(
             SpawnStalledBody::new(&pre, Duration::from_secs(1), None).with_terminal_facts(Some(
                 TerminalStallFacts {
-                    pane_closed: true,
                     transcript_location_known: false,
+                    waited: Duration::from_secs(300),
+                    stall_kind: TerminalStallKind::Unlocated,
+                    close_outcome: StallCloseOutcome::NotAttempted,
                 },
             )),
         )
         .unwrap();
-        assert_eq!(body["pane_closed"], true);
+        assert_eq!(body["pane_closed"], false);
         assert_eq!(body["transcript_location_known"], false);
+        assert_eq!(body["silent_secs"], 1);
+        assert_eq!(body["waited_secs"], 300);
+        assert_eq!(body["stall_kind"], "unlocated");
+        assert_eq!(body["close_outcome"], "not_attempted");
         assert_eq!(body["phase"], "spawn_stalled");
+    }
+
+    /// The close outcomes stay distinguishable on the wire, and only the two
+    /// successful closes read as `pane_closed`.
+    #[test]
+    fn every_stall_close_outcome_has_its_own_token_and_only_closes_read_closed() {
+        let all = [
+            (StallCloseOutcome::NotAttempted, "not_attempted", false),
+            (StallCloseOutcome::Closed, "closed", true),
+            (StallCloseOutcome::ClosedStartedAcross, "closed_started_across", true),
+            (StallCloseOutcome::FailedPaneHeld, "failed_pane_held", false),
+            (StallCloseOutcome::FailedPaneGone, "failed_pane_gone", false),
+            (StallCloseOutcome::Unknown, "unknown", false),
+        ];
+        for (outcome, token, closed) in all {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), token);
+            assert_eq!(outcome.closed_by_runner(), closed, "{token}");
+        }
+        assert_eq!(serde_json::to_value(TerminalStallKind::Active).unwrap(), "active");
+        assert_eq!(serde_json::to_value(TerminalStallKind::Quiet).unwrap(), "quiet");
     }
 
     /// A sibling that is not a linked worktree has no primary-checkout reading
