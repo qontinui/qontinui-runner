@@ -1722,7 +1722,7 @@ impl PgDb {
                       effectiveness, effectiveness_evidence,
                       applied_at::TEXT, evaluated_at::TEXT, created_at::TEXT,
                       content_hash, source_agent, reflection_scope,
-                      project_path, target_component, reuse_count,
+                      project_path, reuse_count,
                       reasoning, alternatives_considered,
                       applicability_context
                FROM reflection_fixes WHERE 1=1"#,
@@ -1768,11 +1768,10 @@ impl PgDb {
                     "source_agent": r.get::<_, Option<String>>(18),
                     "reflection_scope": r.get::<_, Option<String>>(19),
                     "project_path": r.get::<_, Option<String>>(20),
-                    "target_component": r.get::<_, Option<String>>(21),
-                    "reuse_count": r.get::<_, Option<i32>>(22),
-                    "reasoning": r.get::<_, Option<String>>(23),
-                    "alternatives_considered": r.get::<_, Option<String>>(24),
-                    "applicability_context": r.get::<_, Option<String>>(25),
+                    "reuse_count": r.get::<_, Option<i32>>(21),
+                    "reasoning": r.get::<_, Option<String>>(22),
+                    "alternatives_considered": r.get::<_, Option<String>>(23),
+                    "applicability_context": r.get::<_, Option<String>>(24),
                 })
             })
             .collect())
@@ -4711,10 +4710,7 @@ impl PgDb {
 #[cfg(test)]
 mod tests {
     use super::BRIDGE_COMPARISON_SELECT;
-
-    /// The vendored pg_dump of the alembic-managed schema. `schema-pg-sql-fresh`
-    /// CI keeps it honest, which is what makes it usable as an oracle here.
-    const GENERATED_SCHEMA: &str = include_str!("../../../schema.pg.sql.generated");
+    use crate::database::pg::schema_oracle::{aliased_identifiers, declared_columns};
 
     /// The five columns the bridge referenced for months and `project.comparison_runs`
     /// never had. Named explicitly so the regression cannot come back under the
@@ -4726,61 +4722,6 @@ mod tests {
         "recommendation_id",
         "source",
     ];
-
-    /// Column names declared by a `CREATE TABLE <table> (...)` block.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
-    fn declared_columns(table: &str) -> Vec<String> {
-        let header = format!("CREATE TABLE {} (\n", table);
-        let start = GENERATED_SCHEMA
-            .find(&header)
-            .unwrap_or_else(|| panic!("{} not found in schema.pg.sql.generated", table))
-            + header.len();
-        let len = GENERATED_SCHEMA[start..]
-            .find("\n);")
-            .unwrap_or_else(|| panic!("unterminated CREATE TABLE for {}", table));
-        GENERATED_SCHEMA[start..start + len]
-            .lines()
-            .filter_map(|line| line.trim().split_whitespace().next())
-            .map(|tok| tok.trim_end_matches(',').to_string())
-            .filter(|tok| {
-                !tok.is_empty()
-                    && !matches!(
-                        tok.as_str(),
-                        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
-                    )
-            })
-            .collect()
-    }
-
-    /// Every identifier written as `<alias>.<ident>` in `sql`.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
-    fn aliased_identifiers(sql: &str, alias: &str) -> Vec<String> {
-        let needle = format!("{}.", alias);
-        let bytes = sql.as_bytes();
-        let mut found = Vec::new();
-        let mut cursor = 0usize;
-        while let Some(offset) = sql[cursor..].find(&needle) {
-            let at = cursor + offset;
-            // Reject a match inside a longer word (e.g. `abc.` in `xabc.`).
-            let standalone =
-                at == 0 || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
-            let ident: String = sql[at + needle.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if standalone && !ident.is_empty() {
-                found.push(ident);
-            }
-            cursor = at + needle.len();
-        }
-        found
-    }
 
     /// The gate the inline bridge query never had.
     ///

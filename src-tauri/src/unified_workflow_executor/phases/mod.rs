@@ -563,6 +563,13 @@ async fn build_compressed_iteration_history(
                 pg_db.score_knowledge_relevance(&wf_c, 10).await
             };
 
+            let scored_knowledge = scored_knowledge.map_err(|e| {
+                tracing::warn!(
+                    workflow = %wf_name,
+                    error = %e,
+                    "knowledge ranker failed; falling back to chronological knowledge"
+                );
+            });
             if let Ok(scored) = scored_knowledge {
                 if !scored.is_empty() {
                     let mut lines = vec!["### Historical Knowledge (relevance-ranked)".to_string()];
@@ -589,7 +596,8 @@ async fn build_compressed_iteration_history(
                     }
                 }
             } else {
-                // Fallback: chronological ordering (pre-v99 databases)
+                // Fallback when the ranker could not run (its error is logged
+                // above): chronological ordering, titled as such below.
                 if let Ok(historical) = pg_db
                     .list_workflow_knowledge(
                         wf_name,
