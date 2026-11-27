@@ -283,6 +283,7 @@ fn record_sdk_result_held(
             },
             action,
             hint: failure_hint(failed),
+            timeline: None,
             hold,
             at: Instant::now(),
         },
