@@ -1451,7 +1451,12 @@ jobs:
           # `Executable` lines the run half executes and reach the test-results
           # ingest. Its fixtures are embedded at compile time, so the run half's
           # `src-tauri` cwd does not matter to it. Pinned by the shape test.
-          cargo test --no-run --verbose -p qontinui-runner -p session-lifecycle 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
+          # `-p qontinui-spec-check`: the spec-check crate (plan
+          # 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass,
+          # Phase 1c) is a separate workspace member too, so its verdict and
+          # D4 policy tests ran in no CI job until it was named here. Its
+          # fixtures are `include_str!`ed, so the `src-tauri` cwd is fine.
+          cargo test --no-run --verbose -p qontinui-runner -p session-lifecycle -p qontinui-spec-check 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:

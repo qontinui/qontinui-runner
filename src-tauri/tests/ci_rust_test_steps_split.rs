@@ -246,7 +246,14 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
     // workspace member: a bare `cargo test --no-run` from `src-tauri` builds
     // only `qontinui-runner`'s tests, so the kernel's would never run in the
     // required job nor reach the ingest. Both packages are named.
-    for package in ["-p qontinui-runner", "-p session-lifecycle"] {
+    // The spec-check crate is one more (plan
+    // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass,
+    // Phase 1c): its verdict tests ran in no CI job before it was named.
+    for package in [
+        "-p qontinui-runner",
+        "-p session-lifecycle",
+        "-p qontinui-spec-check",
+    ] {
         assert!(
             build_run.contains(package),
             "`{BUILD}` must build `{package}`'s tests: the required job runs \
