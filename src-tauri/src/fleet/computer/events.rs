@@ -157,6 +157,9 @@ pub(crate) struct ObsInput<'a> {
     /// reads slices (a non-Linux host, a WSL guest): every `oom_kill` event
     /// says `slices: "not_supported"` and the slice baselines are kept.
     pub(crate) slices: Option<&'a slice_oom::SliceOomRead>,
+    /// Layer C's user-journal read (`journal_oom`), taken before the derive
+    /// when `slice_oom::journal_window` asked for one.
+    pub(crate) journal: Option<&'a super::journal_oom::JournalRead>,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -250,6 +253,32 @@ pub(crate) fn unit_oom_victim(
     } else {
         None
     }
+}
+
+/// The watched units' OOM kills this tick, as `slice_oom` subtracts them from
+/// the slice that contains them — the same decision [`derive`] makes, for
+/// the pre-derive journal window. A unit is placed by this tick's
+/// `ControlGroup=`, else the last non-empty one persisted for it. PURE.
+pub(crate) fn unit_kills(
+    prev: &ComputerObs,
+    input: &ObsInput<'_>,
+    rebooted: bool,
+) -> Vec<slice_oom::UnitKill> {
+    let Some(current) = input.services else {
+        return Vec::new();
+    };
+    current
+        .iter()
+        .filter_map(|w| {
+            let p = prev.units.get(&w.row.unit)?;
+            let (count, _) = unit_oom_victim(p, w, rebooted)?;
+            Some(slice_oom::UnitKill {
+                unit: w.row.unit.clone(),
+                count,
+                control_group: w.control_group.clone().or_else(|| p.control_group.clone()),
+            })
+        })
+        .collect()
 }
 
 /// Derive this tick's events and the next observation.
@@ -467,6 +496,7 @@ pub(crate) fn derive(
     let sliced = slice_oom::attribute(&slice_oom::SliceInput {
         prev: &prev.slices,
         read: input.slices,
+        journal: input.journal,
         unit_kills: &unit_kills,
         watched: &watched,
         rebooted,
@@ -911,6 +941,7 @@ mod tests {
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
             slices: None,
+            journal: None,
         }
     }
 
@@ -1058,6 +1089,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
             slices: None,
+            journal: None,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -1086,6 +1118,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
             slices: None,
+            journal: None,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -1107,6 +1140,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             complete_kinds: &[],
             carry_oom_baseline: true,
             slices: None,
+            journal: None,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(

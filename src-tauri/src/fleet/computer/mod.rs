@@ -45,6 +45,7 @@
 pub(crate) mod access;
 pub(crate) mod events;
 pub(crate) mod identity;
+pub(crate) mod journal_oom;
 pub(crate) mod services;
 pub(crate) mod services_bound;
 pub(crate) mod slice_oom;
@@ -131,6 +132,7 @@ pub(crate) fn obs_input(o: &Observed) -> ObsInput<'_> {
         // owner this tick must not keep a baseline it no longer tracks.
         carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
         slices: o.oom.slices.as_ref(),
+        journal: o.oom.journal.as_ref(),
     }
 }
 
@@ -1428,6 +1430,7 @@ mod tests {
                 complete_kinds: &o.scan.complete_kinds,
                 carry_oom_baseline: true,
                 slices: None,
+                journal: None,
             }
         }
         let (_, obs0) = events::derive(None, &inp(&before, 5), t("2026-09-30T01:40:00Z"));
@@ -2427,6 +2430,7 @@ mod tests {
         ("access.rs", include_str!("access.rs")),
         ("identity.rs", include_str!("identity.rs")),
         ("slice_oom.rs", include_str!("slice_oom.rs")),
+        ("journal_oom.rs", include_str!("journal_oom.rs")),
     ];
 
     /// Plan `2026-11-27-devops-oom-kills-inside-agent-build-slices-carry-no-victim`
@@ -2436,6 +2440,7 @@ mod tests {
     fn the_oom_placement_modules_are_reporter_sources() {
         let names: Vec<&str> = REPORTER_SOURCES.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"slice_oom.rs"), "{names:?}");
+        assert!(names.contains(&"journal_oom.rs"), "{names:?}");
     }
 
     /// The production part of a source file: its test module split off.
