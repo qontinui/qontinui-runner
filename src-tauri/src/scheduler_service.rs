@@ -5616,7 +5616,7 @@ mod stale_snapshot_tests {
         snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
 
         let svc = Arc::new(SchedulerService::new(pg.clone()));
-        let started = svc.clone().try_start_due_task(&pg, snapshot).await;
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
 
         assert!(
             !started,
@@ -5669,7 +5669,7 @@ mod stale_snapshot_tests {
         snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
 
         let svc = Arc::new(SchedulerService::new(pg.clone()));
-        let started = svc.clone().try_start_due_task(&pg, snapshot).await;
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
 
         let probed = marker.exists();
         let _ = std::fs::remove_file(&marker);
