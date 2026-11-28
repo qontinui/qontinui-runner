@@ -6595,6 +6595,7 @@ pub(crate) mod tests {
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
             children,
         );
@@ -6734,6 +6735,7 @@ pub(crate) mod tests {
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: alive.to_vec(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }

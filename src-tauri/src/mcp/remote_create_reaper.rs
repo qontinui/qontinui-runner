@@ -1227,6 +1227,7 @@ mod tests {
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }
@@ -1241,6 +1242,7 @@ mod tests {
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }

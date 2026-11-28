@@ -57,6 +57,13 @@ export interface RingResyncHost {
   noteResynced(replayedThrough: number): boolean;
   /** `PaneVisibilityService.noteResyncFailed`. */
   noteResyncFailed(): void;
+  /**
+   * Bytes of this pane's output were lost unparsed — a ring overrun, or the
+   * spliced exit. The pane's shell-integration marks are no longer known to be
+   * current (`ShellMarksSink.outputLost`). Called at the point in the write
+   * stream where the loss sits.
+   */
+  outputLost(): void;
   /** Flush the acked write queue now. */
   flushStaged(): void;
   /** `terminal_flow_reset`, logged on failure. */
@@ -123,6 +130,9 @@ export class RingResync {
             `scrollback ring overran the missed window; ${lost} bytes of output are unrecoverable`,
           );
           b.write(formatLostOutputMarker(lost));
+          // The lost bytes are OLDER than the slice below, so report the loss
+          // here, in front of it: the slice's own marks, if any, are current.
+          host.outputLost();
         }
         const from = resyncSliceStart(ringWindow, stream.writtenThrough);
         const slice = ring.bytes.subarray(from);
@@ -167,6 +177,10 @@ export class RingResync {
         // the spliced output it describes, not in front of it.
         host.flushStaged();
         host.backend()?.write(RESYNC_INCOMPLETE_MARKER);
+        // A hole precedes the leftovers just written, and it may have held a
+        // command start: the marks after it prove nothing. Reported behind
+        // everything written, so no earlier mark outlives it.
+        host.outputLost();
       }
       if (!ringRead && !disposed && !retryQueued) {
         // No ring read reset the counters. If the gate is paused, no chunk
