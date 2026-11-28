@@ -1126,6 +1126,9 @@ pub(crate) async fn restart_after_drain(
         //   put it back in the stopped-by-drain set. The caller must keep it
         //   owed. `code` is exactly what says so — `api_refusal` stamps
         //   `DeferClass`'s `device_drained` / `drain_unreadable`.
+        // * A LOADED MACHINE — the unattended spawn gate's `machine_loaded`.
+        //   Nothing started; the kind stays owed and the wind-down executor's
+        //   next tick retries it, exactly like a drain deferral.
         // * ANYTHING ELSE — already running (an operator restarted it by hand
         //   during the drain), or a start already in flight. Benign; nothing is
         //   owed, and the caller settles the kind out of its set.
@@ -1143,6 +1146,7 @@ pub(crate) async fn restart_after_drain(
                 code == crate::coord_drain_state::DeferClass::Drained.code()
                     || code == crate::coord_drain_state::DeferClass::Unknown.code()
                     || code == crate::coord_drain_state::DeferClass::RoleClosed.code()
+                    || code == crate::unattended_spawn_gate::MACHINE_LOADED_CODE
             });
             let reason = err
                 .error
@@ -1192,7 +1196,10 @@ async fn start_steward_detached(
 
 /// The shared start path behind the HTTP route and the Tauri command. `origin`
 /// decides how the coord device drain applies: `Steward` (autonomous) is
-/// deferred while the drain holds, `OperatorTerminal` is not.
+/// deferred while the drain holds, `OperatorTerminal` is not. An autonomous
+/// start also passes the unattended spawn gate, decided once: a loaded or busy
+/// machine is a 409 `machine_loaded`, which the HTTP caller retries and
+/// [`restart_after_drain`] keeps owed for the wind-down executor's next tick.
 async fn start_steward(
     app_handle: tauri::AppHandle,
     kind: String,
@@ -1226,8 +1233,10 @@ async fn start_steward(
     }
 
     // Coord device drain (D3). After validation, so a malformed body is still a
-    // clean 400; before the start claim, so a deferral occupies nothing. The
-    // deferral is counted on the draining banner, keyed by steward kind.
+    // clean 400; before the start claim, so a deferral occupies nothing; and
+    // before the unattended spawn gate below, so a drained device answers
+    // `device_drained` rather than `machine_loaded`. The deferral is counted on
+    // the draining banner, keyed by steward kind.
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(origin, &format!("steward:{}", spec.kind))
     {
@@ -1237,6 +1246,27 @@ async fn start_steward(
             Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1). Decided ONCE — neither caller is held: the HTTP route answers 409
+    // `machine_loaded`, and `restart_after_drain` keeps the kind owed for the
+    // wind-down executor's next tick. After the drain read above (the gate decides
+    // once and never holds, so it adds no wait for a drain to arm in), and before
+    // the start claim, so a loaded machine never makes the operator's
+    // own `steward_start` answer "already starting". The slot is committed
+    // immediately before the PTY create; any refusal in between drops it, which
+    // refunds it. An operator origin passes untouched.
+    let unattended_slot = match crate::unattended_spawn_gate::check_request(
+        origin,
+        "steward terminal",
+        &format!("steward:{}", spec.kind),
+    ) {
+        Ok(slot) => slot,
+        Err(loaded) => {
+            warn!("HTTP: Not starting {} now — {}", spec.skill, loaded.reason);
+            return Err((StatusCode::CONFLICT, Json(loaded.api_refusal())));
+        }
+    };
 
     // Claim the start slot BEFORE the running-check, and hold it for the rest
     // of this handler (released on drop). Checking first and claiming later
@@ -1292,6 +1322,9 @@ async fn start_steward(
     }
 
     let launch_command = build_launch_command(spec, &mode, &interval);
+
+    // The PTY opens next: keep the unattended gate's slot (paced to this moment).
+    unattended_slot.commit().await;
 
     info!(
         "HTTP: Starting {} (mode={}, interval={})",
