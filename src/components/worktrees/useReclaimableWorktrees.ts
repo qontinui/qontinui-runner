@@ -111,7 +111,13 @@ export interface WorktreeSurvey {
   coord_pull_source: CoordPullSource | null;
   /** RFC3339 time coord answered that pull; `null` when there is none. */
   coord_pull_taken_at: string | null;
-  /** Age of that pull in seconds (`0` for a live pull); `null` when there is none. */
+  /**
+   * Age of that pull in whole seconds at the moment the survey SELECTED it
+   * (`0` for a live pull), never above 600; `null` when there is none.
+   * Computing `now - coord_pull_taken_at` can read higher than this by the
+   * survey's own duration (its census wait and ownership walk run after the
+   * selection), so trust this field for the age bound, not that subtraction.
+   */
   coord_pull_age_secs: number | null;
   remove_armed: boolean;
   canonical_excluded: number;

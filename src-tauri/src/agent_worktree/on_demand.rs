@@ -182,8 +182,9 @@ enum PullChoice {
 /// `(device_id, coord_base)` this runner would pull from right now; `None`
 /// (unconfigured) never matches a snapshot. A snapshot is used only under
 /// [`PullPolicy::SnapshotFirst`], when its key matches `current`, and when
-/// its age is in `0..=COORD_PULL_STALE_AFTER_SECS` — a `taken_at` in the
-/// future (a wall clock that stepped back) is not trusted either.
+/// its age is in `0..=COORD_PULL_STALE_AFTER_SECS * 1000` milliseconds — a
+/// `taken_at` in the future (a wall clock that stepped back), by any amount,
+/// is not trusted either.
 fn choose_pull(
     policy: PullPolicy,
     snapshot: Option<reclaim::LastGoodPull>,
@@ -199,13 +200,21 @@ fn choose_pull(
     if snap.device_id != device_id || snap.coord_base != base {
         return PullChoice::Live;
     }
-    let age = (now - snap.taken_at).num_seconds();
-    if age < 0 || age as u64 > COORD_PULL_STALE_AFTER_SECS {
+    // Any future `taken_at` is refused outright, before the age is truncated
+    // to whole milliseconds (a sub-millisecond step back would truncate to 0).
+    if snap.taken_at > now {
         return PullChoice::Live;
     }
+    // The bound is compared in MILLISECONDS: `num_seconds()` truncates, so a
+    // seconds comparison admitted anything up to 600.999 s old.
+    let age_ms = (now - snap.taken_at).num_milliseconds();
+    if age_ms < 0 || age_ms as u64 > COORD_PULL_STALE_AFTER_SECS * 1000 {
+        return PullChoice::Live;
+    }
+    // Reported in whole seconds; `age_ms <= 600_000` keeps it `<= 600`.
     PullChoice::Snapshot {
         snap,
-        age_secs: age as u64,
+        age_secs: age_ms as u64 / 1000,
     }
 }
 
@@ -4695,5 +4704,260 @@ mod tests {
         let clause = coord_pull_clause(None, None);
         assert_eq!(clause, "Coord decision: none, so nothing is reclaimable.");
         assert!(!clause.contains("not reached"));
+    }
+
+    // -----------------------------------------------------------------
+    // Millisecond-precision age bound.
+    // -----------------------------------------------------------------
+
+    /// A last-good pull taken exactly `age_ms` milliseconds before `now`
+    /// (negative = in the future).
+    fn last_good_ms(now: chrono::DateTime<chrono::Utc>, age_ms: i64) -> reclaim::LastGoodPull {
+        reclaim::LastGoodPull {
+            taken_at: now - chrono::Duration::milliseconds(age_ms),
+            ..last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 0)
+        }
+    }
+
+    fn choose_ms(now: chrono::DateTime<chrono::Utc>, age_ms: i64) -> PullChoice {
+        choose_pull(
+            PullPolicy::SnapshotFirst,
+            Some(last_good_ms(now, age_ms)),
+            Some((device(), SNAP_BASE)),
+            now,
+        )
+    }
+
+    /// Exactly 600 000 ms is in bound and reported as 600 s.
+    #[test]
+    fn a_snapshot_aged_exactly_600_000_ms_is_admitted_at_600_s() {
+        let now = chrono::Utc::now();
+        let PullChoice::Snapshot { age_secs, .. } = choose_ms(now, 600_000) else {
+            panic!("600 000 ms is the bound itself and must be admitted");
+        };
+        assert_eq!(age_secs, 600);
+    }
+
+    /// 600 001 ms is past the bound. A whole-seconds comparison truncated it
+    /// to 600 and admitted it.
+    #[test]
+    fn a_snapshot_aged_600_001_ms_is_refused() {
+        let now = chrono::Utc::now();
+        assert!(matches!(choose_ms(now, 600_001), PullChoice::Live));
+        assert!(matches!(choose_ms(now, 600_999), PullChoice::Live));
+    }
+
+    /// A `taken_at` 1 ms in the future is refused. A whole-seconds comparison
+    /// truncated it to 0 and admitted it.
+    #[test]
+    fn a_snapshot_1_ms_in_the_future_is_refused() {
+        let now = chrono::Utc::now();
+        assert!(matches!(choose_ms(now, -1), PullChoice::Live));
+        assert!(matches!(choose_ms(now, -999), PullChoice::Live));
+        // Sub-millisecond too: the future check precedes the ms truncation.
+        let snap = reclaim::LastGoodPull {
+            taken_at: now + chrono::Duration::microseconds(1),
+            ..last_good_ms(now, 0)
+        };
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+        // …and a 0 ms snapshot is admitted, so the refusals are not vacuous.
+        assert!(matches!(
+            choose_ms(now, 0),
+            PullChoice::Snapshot { age_secs: 0, .. }
+        ));
+    }
+
+    /// The reported age is whole seconds, truncated: 599 999 ms reads 599.
+    #[test]
+    fn the_reported_age_is_whole_seconds_truncated() {
+        let now = chrono::Utc::now();
+        let PullChoice::Snapshot { age_secs, .. } = choose_ms(now, 599_999) else {
+            panic!("599 999 ms is in bound");
+        };
+        assert_eq!(age_secs, 599);
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end: `survey()` against a recording loopback coord.
+    // -----------------------------------------------------------------
+
+    /// A loopback "coord" that records the path of every request it receives
+    /// and answers each one `503`, so a test can see which coord routes a
+    /// survey dialled — and a live reclaim pull against it always fails.
+    async fn recording_coord() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(path) = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                    {
+                        recorder
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(path.to_string());
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\
+                              connection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn reclaim_pulls_seen(seen: &std::sync::Mutex<Vec<String>>) -> usize {
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.starts_with("/coord/worktree-reclaim/"))
+            .count()
+    }
+
+    /// Point the isolated ambient at `base` as coord and at `device()` as
+    /// this machine, and prove `survey()` would resolve exactly that key —
+    /// otherwise the seeded snapshot could never match and the tests below
+    /// would pass for the wrong reason.
+    fn point_ambient_at(amb: &crate::test_env::IsolatedAmbient, base: &str) {
+        std::env::set_var("COORD_HTTP_URL", base);
+        amb.write_machine_json(&format!("{{\"device_id\":\"{}\"}}", device()));
+        assert_eq!(census::load_device_id_pub(), Some(device()));
+        assert_eq!(
+            qontinui_runner_lib::profiles::connected_coord_base().as_deref(),
+            Some(base),
+            "connected_coord_base() must resolve the COORD_HTTP_URL arm under the fixture"
+        );
+    }
+
+    /// SnapshotFirst, end to end: with an in-bound last-good pull seeded for
+    /// the `(device_id, coord_base)` the survey resolves, the answer's coord
+    /// half comes from that snapshot and NO reclaim pull reaches coord. The
+    /// coord here fails every request, so a live pull would read unreachable.
+    #[tokio::test]
+    async fn snapshot_first_survey_serves_the_seeded_pull_and_makes_no_live_pull() {
+        let amb = crate::test_env::isolated_ambient();
+        let _pull_lock = reclaim::LAST_GOOD_PULL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reclaim::reset_last_good_pull_for_test();
+        let (base, seen) = recording_coord().await;
+        point_ambient_at(&amb, &base);
+        let wt = "D:/qontinui-root/qontinui-runner-wt-snapshot-e2e";
+        census::publish_census_for_test(census_req(vec![census_row(wt, false, Some(false))]));
+
+        let taken_at = chrono::Utc::now() - chrono::Duration::seconds(42);
+        reclaim::seed_last_good_pull_for_test(reclaim::LastGoodPull {
+            device_id: device(),
+            coord_base: base.clone(),
+            pull: std::sync::Arc::new(pull_with(vec![instruction(wt)])),
+            taken_at,
+            taker: reclaim::PullTaker::Poller,
+        });
+
+        let reads_before = reclaim::last_good_pull_reads_on_this_thread();
+        let s = survey(SurveyQuery::default(), PullPolicy::SnapshotFirst)
+            .await
+            .expect("survey must always answer");
+
+        assert!(
+            reclaim::last_good_pull_reads_on_this_thread() > reads_before,
+            "SnapshotFirst must consult the store (keeps the LiveOnly test non-vacuous)"
+        );
+        assert_eq!(
+            reclaim_pulls_seen(&seen),
+            0,
+            "an in-bound snapshot must be served with NO live reclaim pull; coord saw {:?}",
+            seen.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        assert!(s.coord_reachable, "the snapshot is an answered decision");
+        assert_eq!(s.coord_pull_source, Some(PullSource::PollerSnapshot));
+        assert_eq!(s.coord_pull_taken_at, Some(taken_at.to_rfc3339()));
+        let age = s.coord_pull_age_secs.expect("a snapshot carries its age");
+        assert!(
+            (42..=45).contains(&age),
+            "age at selection should be ~42 s, got {age}"
+        );
+        // The store was not overwritten by a live pull.
+        let after = reclaim::last_good_pull().expect("the seeded pull is still there");
+        assert_eq!(after.taken_at, taken_at);
+        assert_eq!(after.taker, reclaim::PullTaker::Poller);
+        reclaim::reset_last_good_pull_for_test();
+    }
+
+    /// LiveOnly (`reclaim_now`, the removal path) never READS the last-good
+    /// store — not merely "does not use it". Seeded with a fresh, matching
+    /// snapshot that SnapshotFirst would serve, a LiveOnly survey against a
+    /// failing coord must make a live pull and read unreachable. Removing the
+    /// short-circuit in `survey` turns the read-count assertion red; removing
+    /// `choose_pull`'s early return as well turns the answer assertions red.
+    #[tokio::test]
+    async fn live_only_survey_never_reads_the_last_good_store() {
+        let amb = crate::test_env::isolated_ambient();
+        let _pull_lock = reclaim::LAST_GOOD_PULL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reclaim::reset_last_good_pull_for_test();
+        let (base, seen) = recording_coord().await;
+        point_ambient_at(&amb, &base);
+        let wt = "D:/qontinui-root/qontinui-runner-wt-live-only-e2e";
+        census::publish_census_for_test(census_req(vec![census_row(wt, false, Some(false))]));
+
+        let taken_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        reclaim::seed_last_good_pull_for_test(reclaim::LastGoodPull {
+            device_id: device(),
+            coord_base: base.clone(),
+            pull: std::sync::Arc::new(pull_with(vec![instruction(wt)])),
+            taken_at,
+            taker: reclaim::PullTaker::Poller,
+        });
+
+        let reads_before = reclaim::last_good_pull_reads_on_this_thread();
+        let s = survey(SurveyQuery::default(), PullPolicy::LiveOnly)
+            .await
+            .expect("survey must always answer");
+
+        assert_eq!(
+            reclaim::last_good_pull_reads_on_this_thread(),
+            reads_before,
+            "LiveOnly must never read the last-good store"
+        );
+        assert_eq!(
+            reclaim_pulls_seen(&seen),
+            1,
+            "LiveOnly must make exactly one live reclaim pull; coord saw {:?}",
+            seen.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        assert!(
+            !s.coord_reachable,
+            "the live pull failed, so the answer must not rest on the seeded snapshot"
+        );
+        assert_eq!(s.coord_pull_source, None);
+        assert_eq!(s.coord_pull_taken_at, None);
+        assert_eq!(s.coord_pull_age_secs, None);
+        reclaim::reset_last_good_pull_for_test();
     }
 }

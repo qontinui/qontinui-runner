@@ -235,7 +235,31 @@ static LAST_GOOD_PULL: std::sync::RwLock<Option<LastGoodPull>> = std::sync::RwLo
 
 /// The last-good pull, whatever its age. The reader bounds the age.
 pub(super) fn last_good_pull() -> Option<LastGoodPull> {
+    #[cfg(test)]
+    LAST_GOOD_PULL_READS.with(|c| c.set(c.get() + 1));
     LAST_GOOD_PULL.read().ok().and_then(|g| g.clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times THIS thread has read [`LAST_GOOD_PULL`], so a test can
+    /// pin that a caller never reads the store at all. Per-thread so a
+    /// concurrent test elsewhere in the process cannot move it.
+    static LAST_GOOD_PULL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's [`last_good_pull`] read count. See [`LAST_GOOD_PULL_READS`].
+#[cfg(test)]
+pub(super) fn last_good_pull_reads_on_this_thread() -> usize {
+    LAST_GOOD_PULL_READS.with(|c| c.get())
+}
+
+/// Seed the process-wide last-good pull, as a 2xx would have.
+#[cfg(test)]
+pub(super) fn seed_last_good_pull_for_test(pull: LastGoodPull) {
+    if let Ok(mut g) = LAST_GOOD_PULL.write() {
+        *g = Some(pull);
+    }
 }
 
 /// Serializes the tests that touch [`LAST_GOOD_PULL`], which is process-wide.
@@ -251,8 +275,8 @@ pub(super) fn reset_last_good_pull_for_test() {
     }
 }
 
-/// Record a pull coord answered and hand it back, with the time recorded. Every 2xx [`fetch_pull`]
-/// gets goes through here, from both takers.
+/// Record a pull coord answered and hand it back, with the time recorded.
+/// Every 2xx that [`fetch_pull`] receives goes through here, from both takers.
 fn accept_pull(
     device_id: Uuid,
     coord_base: &str,
