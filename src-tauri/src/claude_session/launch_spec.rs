@@ -235,6 +235,9 @@ pub struct LaunchSpec {
     /// Caller-provided model ⇒ `--model <m>`; subsumes model overrides and any
     /// failover sniff. When set, drops any `--model` from the template.
     pub model: Option<String>,
+    /// Caller-provided reasoning effort ⇒ `--effort <e>`. When set, drops any
+    /// `--effort` / `--effort=<e>` from the template; unset keeps the template's.
+    pub effort: Option<String>,
     /// Display name ⇒ `--name <v>` (shown in the prompt box, `/resume` picker and
     /// terminal title). Passed through [`sanitize_session_name`]; a name that
     /// sanitises to nothing is omitted. When set, drops any `--name` / `-n` (and
@@ -525,6 +528,10 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                         .filter(|m| !m.is_empty())
                         .map(str::to_string)
                 }
+                // Effort is spec-owned when the caller supplies one, in either
+                // spelling, so two never ship (the CLI takes the last).
+                "--effort" if spec.effort.is_some() => {}
+                n if spec.effort.is_some() && n.starts_with("--effort=") => {}
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
@@ -651,6 +658,10 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     } else if let Some(model) = template_model {
         out.push("--model".to_string());
         out.push(model);
+    }
+    if let Some(effort) = &spec.effort {
+        out.push("--effort".to_string());
+        out.push(effort.clone());
     }
 
     // 3. Session — appended only when the template did not position it via
@@ -1699,9 +1710,31 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
     }
 
+    /// A spec effort renders exactly one `--effort`, dropping a template's in
+    /// either spelling; with no spec effort the template's stands.
+    #[test]
+    fn spec_effort_beats_a_template_effort_in_either_spelling() {
+        for template in ["claude --effort low", "claude --effort=low"] {
+            let s = LaunchSpec {
+                effort: Some("high".to_string()),
+                ..Default::default()
+            };
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(value_after(&argv, "--effort"), Some("high"));
+            assert_eq!(argv.iter().filter(|a| a.starts_with("--effort")).count(), 1);
+        }
+        let argv = render_argv(
+            &LaunchSpec::default(),
+            &tmpl("claude --effort low"),
+            "claude",
+        );
+        assert_eq!(value_after(&argv, "--effort"), Some("low"));
+    }
+
     /// The attached spelling is the template's model too: dropped under a spec
     /// model (never a second, last-wins `--model=`), kept as the model when
     /// the spec names none.
+
     #[test]
     fn spec_model_beats_an_attached_template_model() {
         let mut s = spec();
