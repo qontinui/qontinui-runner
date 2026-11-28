@@ -344,7 +344,13 @@ mod tests {
         );
         assert_eq!(
             refusal_log_reason(r#"{"error":"transcript_sync_disabled","column_missing":true}"#),
-            "transcript_sync_disabled (coord column not provisioned yet)"
+            "transcript_sync_disabled",
+            "column_missing is not read"
+        );
+        assert_eq!(
+            refusal_log_reason(crate::session::coord_sync::COORD_EGRESS_REFUSAL_429),
+            "transcript_sync_disabled (egress_off)",
+            "coord's egress refusal names its reason"
         );
     }
 

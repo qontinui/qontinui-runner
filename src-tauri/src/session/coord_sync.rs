@@ -101,9 +101,7 @@
 //! counts — coord pacing this runner is not coord refusing the row). The kinds
 //! that retry a 429 are `output_chunk` (any 429 whose body `error` is not
 //! `warm_quota_exceeded` or `transcript_sync_disabled` — those two are standing
-//! tenant answers and ACK-drop the chunk, except a `transcript_sync_disabled`
-//! carrying `column_missing: true`, coord's deploy-window stand-in, which is
-//! retried) and the session LIFECYCLE kinds
+//! tenant answers and ACK-drop the chunk) and the session LIFECYCLE kinds
 //! `started` / `state_change` / `closed` / `finished` ([`is_lifecycle_kind`]),
 //! whose loss would leave coord's row wrong for good;
 //! every other kind treats a 429 as coord refusing the row and ACK-drops it:
@@ -1376,65 +1374,69 @@ pub(crate) fn is_lifecycle_kind(kind: &str) -> bool {
 /// indefinitely — so both ACK-drop the chunk. Any other 429 (an edge or proxy
 /// rate limit, or a body that is not coord's JSON) stays retryable.
 ///
-/// One exception, read from the body rather than the code: coord sends the
-/// SAME `transcript_sync_disabled` code with `"column_missing": true` during
-/// the deploy window in which `coord.tenant_policies.transcript_sync_enabled`
-/// is not provisioned yet (`transcript_sync_refusal` in qontinui-coord
-/// `crates/coord/src/sessions.rs` fails closed there). That is not an admin
-/// decision and clears on its own when the migration lands, so it stays a
-/// retried `Transport` — only `column_missing` false or absent ACK-drops.
+/// coord's ingest-side egress refusal also arrives as `transcript_sync_disabled`,
+/// with `"reason": "egress_off"` (qontinui-coord `crates/coord/src/sessions.rs`
+/// `session_output_refusal`: the wire `error` stays `transcript_sync_disabled`
+/// for both streams so a parsing runner ACK-drops it).
+/// [`output_chunk_429_is_egress_off`] takes that body first, to name it; a
+/// `transcript_sync_disabled` with any other `reason`, or none (an older coord),
+/// ACK-drops here. Any other key coord sends — `column_missing` included, which
+/// coord's egress refusal always sends `false` — is not read.
 const OUTPUT_CHUNK_TERMINAL_429_REASONS: [&str; 2] =
     ["warm_quota_exceeded", "transcript_sync_disabled"];
 
 /// coord's JSON answer to a 429 on `POST /sessions/:id/output`, parsed from
-/// its `error` field (never a substring of the raw body).
+/// its `error` and `reason` fields (never a substring of the raw body).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputChunk429 {
     /// coord's `error` code, verbatim.
     pub error: String,
-    /// `true` only when the body carries `"column_missing": true` — the
-    /// deploy-window stand-in for `transcript_sync_disabled`.
-    pub column_missing: bool,
+    /// coord's `reason`, when it sends one as a string: `egress_off` names the
+    /// tenant switch that refused (see [`output_chunk_429_is_egress_off`]).
+    pub reason: Option<String>,
 }
 
 impl OutputChunk429 {
     /// The reason this refusal ACK-drops the chunk, or `None` when it is
     /// retryable (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]).
     fn terminal_reason(&self) -> Option<&'static str> {
-        if self.error == "transcript_sync_disabled" && self.column_missing {
-            return None;
-        }
         OUTPUT_CHUNK_TERMINAL_429_REASONS
             .iter()
             .copied()
             .find(|r| *r == self.error)
     }
 
-    /// Human-readable reason for a log line.
+    /// Human-readable reason for a log line: the `error` code, with coord's
+    /// `reason` beside it when it sent one (`transcript_sync_disabled
+    /// (egress_off)`).
     fn label(&self) -> String {
-        if self.column_missing {
-            format!("{} (coord column not provisioned yet)", self.error)
-        } else {
-            self.error.clone()
+        match &self.reason {
+            Some(reason) => format!("{} ({reason})", self.error),
+            None => self.error.clone(),
         }
     }
 }
 
-/// Parse an `output_chunk` 429 response body into coord's `error` code (and
-/// its `column_missing` flag). `None` when the body is not JSON or carries no
-/// string `error` — an intermediary's page, or a bare edge rate limit.
+/// Parse an `output_chunk` 429 response body into coord's `error` code and
+/// its `reason`. `None` when the body is not JSON or carries no string
+/// `error` — an intermediary's page, or a bare edge rate limit.
 pub(crate) fn parse_output_chunk_429(body: &str) -> Option<OutputChunk429> {
     let parsed: JsonValue = serde_json::from_str(body).ok()?;
     let error = parsed.get("error")?.as_str()?.to_string();
-    let column_missing = parsed
-        .get("column_missing")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    Some(OutputChunk429 {
-        error,
-        column_missing,
-    })
+    let reason = parsed
+        .get("reason")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+    Some(OutputChunk429 { error, reason })
 }
+
+/// coord's ingest-side egress refusal of a transcript-stream `output_chunk`,
+/// verbatim in shape (qontinui-coord `crates/coord/src/sessions.rs`
+/// `session_output_refusal`): the contract fixture the 429 tests read, here
+/// and in `output_pipe`. coord's pty-stream body differs only in `stream`,
+/// `domain` and `detail`, none of which the parser reads.
+#[cfg(test)]
+pub(crate) const COORD_EGRESS_REFUSAL_429: &str = r#"{"error":"transcript_sync_disabled","reason":"egress_off","stream":"transcript","domain":"egress_transcript_sync","column_missing":false,"resolved_scope":"tenant","default_source":null,"detail":"this tenant's egress_transcript_sync switch is off"}"#;
 
 /// Return the parsed `error` field of an `output_chunk` 429 body when it is
 /// a terminal refusal (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]). Reads the
@@ -1445,17 +1447,21 @@ fn output_chunk_terminal_429_reason(body: &str) -> Option<&'static str> {
     parse_output_chunk_429(body)?.terminal_reason()
 }
 
-/// Whether an `output_chunk` 429 is coord's ingest-side egress refusal. Reads
-/// the parsed `error` field, never a substring: a proxy page or a
-/// `{"error":"rate_limited","detail":"…egress_off…"}` body that merely
-/// mentions the reason stays retryable rather than losing the chunk.
+/// Whether an `output_chunk` 429 is coord's ingest-side egress refusal:
+/// `transcript_sync_disabled` with `reason: "egress_off"`, the shape coord's
+/// `session_output_refusal` sends for both streams. Reads parsed fields, never
+/// a substring: a proxy page, or a `rate_limited` body whose `reason` or
+/// `detail` merely mentions egress_off, stays retryable rather than losing
+/// the chunk.
 fn output_chunk_429_is_egress_off(body: &str) -> bool {
-    parse_output_chunk_429(body).is_some_and(|p| p.error == "egress_off")
+    parse_output_chunk_429(body).is_some_and(|p| {
+        p.error == "transcript_sync_disabled" && p.reason.as_deref() == Some("egress_off")
+    })
 }
 
 /// The reason to NAME in a log line for an `output_chunk` 429: coord's parsed
-/// `error` code (annotated when it is the deploy-window `column_missing`
-/// stand-in), or a generic "rate limited" when the body carries none.
+/// `error` code (with its `reason` when coord sent one), or a generic "rate
+/// limited" when the body carries none.
 pub(crate) fn output_chunk_429_log_reason(body: &str) -> String {
     parse_output_chunk_429(body)
         .map(|p| p.label())
@@ -2908,9 +2914,8 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     );
                     return PushOutcome::Acked;
                 }
-                // Any other 429 (proxy / edge rate limit, or the
-                // deploy-window `transcript_sync_disabled` with
-                // `column_missing: true`) is transient — keep the row and
+                // Any other 429 (a proxy or edge rate limit, or a body that
+                // is not coord's JSON) is transient — keep the row and
                 // retry, same as a 5xx.
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
@@ -6723,6 +6728,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
+        // The pre-egress shape (no `reason`), which an older coord sends: it
+        // ACK-drops through the terminal-reason arm. The drain-only twin below
+        // feeds coord's current egress body instead.
         rec.lock().await.output_429_body = Some(
             json!({
                 "error": "transcript_sync_disabled",
@@ -6784,9 +6792,10 @@ mod tests {
     /// 2026-10-10-remote-create-residuals-followups, Phase 2 review): enters
     /// ONLY through `start_drain_task`, never a row-level helper, so it proves
     /// the production path end to end. coord answers every chunk 429
-    /// `transcript_sync_disabled` (an admin decision, `column_missing: false`);
-    /// the chunk must be ACK-dropped and the `closed` row queued behind it in
-    /// the same session delivered. Before the fix the chunk was a retried
+    /// `transcript_sync_disabled` with `reason: egress_off` (coord's literal
+    /// egress refusal, [`COORD_EGRESS_REFUSAL_429`]); the chunk must be
+    /// ACK-dropped and the `closed` row queued behind it in the same session
+    /// delivered. Before the fix the chunk was a retried
     /// `Transport` forever and the close never left the outbox.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transcript_sync_disabled_chunk_does_not_hold_the_close_behind_it_in_the_drain() {
@@ -6794,15 +6803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
-        rec.lock().await.output_429_body = Some(
-            json!({
-                "error": "transcript_sync_disabled",
-                "stream": "transcript",
-                "column_missing": false,
-                "detail": "this tenant has transcript sync turned off",
-            })
-            .to_string(),
-        );
+        rec.lock().await.output_429_body = Some(COORD_EGRESS_REFUSAL_429.to_string());
         let coord = CoordSync::new_for_test(
             outbox.clone(),
             base,
@@ -7022,11 +7023,14 @@ mod tests {
             "warm_quota_exceeded ACK-drops the chunk"
         );
 
-        // `transcript_sync_disabled` with `column_missing: false` (an admin
-        // turned it off) ACK-drops; so does one with the flag absent.
+        // A `transcript_sync_disabled` with no `reason` (an older coord)
+        // ACK-drops through the terminal arm, and so does one still carrying
+        // `column_missing`: coord now always sends it `false`, and the runner
+        // no longer reads it, so `true` is not a retryable deploy window.
         for body in [
-            json!({ "error": "transcript_sync_disabled", "column_missing": false }),
             json!({ "error": "transcript_sync_disabled" }),
+            json!({ "error": "transcript_sync_disabled", "column_missing": false }),
+            json!({ "error": "transcript_sync_disabled", "column_missing": true }),
         ] {
             rec.lock().await.output_429_body = Some(body.to_string());
             assert!(
@@ -7036,15 +7040,6 @@ mod tests {
         }
 
         for body in [
-            // coord's deploy-window stand-in: the column is not provisioned
-            // yet, so the refusal clears by itself — retried, not dropped.
-            json!({
-                "error": "transcript_sync_disabled",
-                "stream": "transcript",
-                "column_missing": true,
-                "detail": "transcript sync is treated as off (fail closed)",
-            })
-            .to_string(),
             json!({ "error": "rate_limited" }).to_string(),
             "upstream says transcript_sync_disabled and warm_quota_exceeded".to_string(),
             json!({ "detail": "transcript_sync_disabled" }).to_string(),
@@ -7061,12 +7056,15 @@ mod tests {
         }
     }
 
-    /// Coord's ingest-side egress refusal is recognised by its parsed `error`
-    /// field only: `{"error":"egress_off"}` is ACK-dropped and counted, while a
-    /// body that merely MENTIONS egress_off (in `detail`, or a proxy page)
-    /// stays retryable, so the chunk is not lost.
+    /// Coord's ingest-side egress refusal is recognised by its parsed fields
+    /// only — `error: transcript_sync_disabled` with `reason: egress_off`
+    /// ([`COORD_EGRESS_REFUSAL_429`]) is ACK-dropped and counted, while a body
+    /// that merely MENTIONS egress_off (in `detail`, or a proxy page) stays
+    /// retryable, so the chunk is not lost. `{"error":"egress_off"}` is the
+    /// runner's own local-route shape, which coord never sends on this route:
+    /// it is retried like any other unrecognised 429.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn output_chunk_egress_off_429_drops_only_on_the_parsed_error() {
+    async fn output_chunk_egress_off_429_drops_only_on_the_parsed_error_and_reason() {
         let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -7088,6 +7086,7 @@ mod tests {
 
         for body in [
             json!({ "error": "rate_limited", "detail": "egress_off for another flow" }).to_string(),
+            json!({ "error": "rate_limited", "reason": "egress_off" }).to_string(),
             json!({ "detail": "egress_off" }).to_string(),
             "<html>proxy says egress_off</html>".to_string(),
         ] {
@@ -7104,11 +7103,24 @@ mod tests {
 
         rec.lock().await.output_429_body =
             Some(json!({ "error": "egress_off", "flow": "transcript_sync" }).to_string());
+        match push_record(&coord.inner, &chunk).await {
+            PushOutcome::Transport(msg) => assert_eq!(
+                classify_push_failure(&msg, false).0,
+                "rate_limited",
+                "the runner's local-route `error: egress_off` shape is not coord's - retried"
+            ),
+            other => panic!("`error: egress_off` must be retried, got {other:?}"),
+        }
+
+        rec.lock().await.output_429_body = Some(COORD_EGRESS_REFUSAL_429.to_string());
         let before = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed);
         assert!(
             matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
-            "a parsed egress_off 429 ACK-drops the chunk"
+            "coord's egress refusal ACK-drops the chunk"
         );
+        // Secondary: the counter is process-global and the egress source-gate
+        // tests bump it concurrently, so this can only pass spuriously, never
+        // fail spuriously. The pure predicate test below is the proof.
         assert!(
             OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed) > before,
             "the egress_off drop is counted"
@@ -7116,8 +7128,24 @@ mod tests {
     }
 
     #[test]
-    fn output_chunk_429_is_egress_off_reads_the_error_field() {
-        assert!(output_chunk_429_is_egress_off(r#"{"error":"egress_off"}"#));
+    fn output_chunk_429_is_egress_off_reads_the_reason_field() {
+        assert!(
+            output_chunk_429_is_egress_off(COORD_EGRESS_REFUSAL_429),
+            "coord's literal egress refusal"
+        );
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"error":"transcript_sync_disabled"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"error":"rate_limited","reason":"egress_off"}"#
+        ));
+        assert!(!output_chunk_429_is_egress_off(
+            r#"{"error":"transcript_sync_disabled","reason":"legacy_column"}"#
+        ));
+        assert!(
+            !output_chunk_429_is_egress_off(r#"{"error":"egress_off"}"#),
+            "the runner's own local-route shape is not coord's"
+        );
         assert!(!output_chunk_429_is_egress_off(
             r#"{"error":"rate_limited","detail":"egress_off"}"#
         ));
@@ -7143,18 +7171,16 @@ mod tests {
             None
         );
         assert_eq!(
-            output_chunk_terminal_429_reason(
-                r#"{"error":"transcript_sync_disabled","column_missing":false}"#
-            ),
+            output_chunk_terminal_429_reason(COORD_EGRESS_REFUSAL_429),
             Some("transcript_sync_disabled"),
-            "column_missing false is an admin decision — terminal"
+            "coord's egress refusal is a standing answer"
         );
         assert_eq!(
             output_chunk_terminal_429_reason(
                 r#"{"error":"transcript_sync_disabled","column_missing":true}"#
             ),
-            None,
-            "column_missing true is the deploy window — retryable"
+            Some("transcript_sync_disabled"),
+            "column_missing is not read: coord no longer sends it true"
         );
         assert_eq!(output_chunk_terminal_429_reason(r#"{"error":42}"#), None);
         assert_eq!(
