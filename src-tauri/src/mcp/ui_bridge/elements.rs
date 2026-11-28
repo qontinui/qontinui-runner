@@ -4073,102 +4073,55 @@ pub async fn ui_bridge_find_handler(
     wrap_ipc_result(result)
 }
 
-// =========================================================================
-// Convenience endpoints — app-agnostic DOM interaction helpers
-// =========================================================================
-
-/// The script `page/find-by-text` evaluates: the visible `tag` elements whose
-/// trimmed text equals `text` case-sensitively (`exact`), or else contains it
-/// case-insensitively, as a JSON array. Both caller values enter the script
-/// only as single-quoted string data, `\` and `'` escaped, so neither can close
-/// its literal and splice code. That is the invariant the unguarded fallback
-/// of `evaluate_js_expression` (helpers.rs) relies on.
-fn find_by_text_js(text: &str, tag: &str, exact: bool) -> String {
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    format!(
-        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
-            .filter(el => el.offsetParent !== null && {match_expr})
-            .map((el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                id: el.id || null,
-                disabled: el.disabled || false,
-                visible: el.offsetParent !== null,
-                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
-            }})))"#,
-        tag = escaped_tag,
-        match_expr = match_expr
-    )
-}
-
-#[cfg(test)]
-mod find_by_text_js_tests {
-    use super::find_by_text_js;
-
-    /// A caller's `tag` enters the script as escaped string data, exactly as
-    /// `text` does. A tag that tries to close its `querySelectorAll('...')`
-    /// literal and call `fetch` stays inside the literal. So does one that
-    /// puts a backslash before that quote, which only the backslash doubling
-    /// catches: without it, `\'` becomes `\\'`, an escaped backslash and then
-    /// a quote that closes the literal. And so does a trailing backslash that
-    /// would otherwise escape the closing quote.
-    #[test]
-    fn a_hostile_tag_stays_inside_its_string_literal() {
-        for exact in [true, false] {
-            let js = find_by_text_js(
-                "Submit",
-                "*'),fetch('/x'),document.querySelectorAll('*",
-                exact,
-            );
-            assert!(
-                js.contains(
-                    r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
-                ),
-                "the tag must sit escaped inside its literal, got: {js}"
-            );
-            assert!(
-                !js.contains("'),fetch('"),
-                "the tag must not close its literal and splice a call, got: {js}"
-            );
-
-            // The absence check is anchored at the literal's opening quote:
-            // the bare `\\'),fetch(` also occurs inside the correctly escaped
-            // `*\\\'),fetch(`.
-            let js = find_by_text_js(
-                "Submit",
-                r"*\'),fetch('/x'),document.querySelectorAll('*",
-                exact,
-            );
-            assert!(
-                js.contains(
-                    r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
-                ),
-                "a backslash before the quote must be escaped too, got: {js}"
-            );
-            assert!(
-                !js.contains(r"querySelectorAll('*\\'),fetch("),
-                "a backslash before the quote must not let the quote close its literal, got: {js}"
-            );
-
-            let js = find_by_text_js("Submit", r"button\", exact);
-            assert!(
-                js.contains(r"querySelectorAll('button\\')"),
-                "a trailing backslash in the tag must be escaped, got: {js}"
-            );
+/// Build an IPC payload carrying only `keys` from `body`. `windowLabel` rides
+/// at the TOP level (`ui_bridge_request_sync` strips it there to pick the
+/// window); the frontend reads `payload.params`.
+pub(crate) fn text_action_ipc_payload(
+    body: &serde_json::Value,
+    keys: &[&str],
+) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for key in keys {
+        if let Some(v) = body.get(*key) {
+            params.insert((*key).to_string(), v.clone());
         }
     }
+    serde_json::json!({
+        "windowLabel": read_window_label(body),
+        "params": params,
+    })
 }
+
+/// Reject an `index` that is not a non-negative integer with a 400 naming it.
+/// `null` and absent both mean "no index".
+pub(crate) fn validate_index_param(
+    body: &serde_json::Value,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    match body.get("index") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(v) if v.as_u64().is_some() => Ok(()),
+        Some(v) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "'index' must be a non-negative integer, got {v}"
+            ))),
+        )),
+    }
+}
+
+// =========================================================================
+// Convenience endpoints — app-agnostic DOM interaction helpers
+//
+// find-by-text, click-by-text and click-by-selector dispatch the same IPC
+// request the relay fallback (`/ui-bridge/sdk/page/*`) serves, so every door
+// shares ONE implementation: the SDK's `findByTextPrimitive` /
+// `clickByTextPrimitive` / `clickBySelectorPrimitive`, which own the §4.6
+// redaction verdict (a content-redacted element is never matched or echoed).
+// These handlers used to inject private JS that matched and echoed raw
+// `textContent`. A miss is now an error (400, `ELEMENT_NOT_FOUND`), not HTTP
+// 200 `clicked:false`; `index` on click-by-text is gone (the primitive clicks
+// the first match).
+// =========================================================================
 
 /// Find elements by visible text content.
 /// POST /ui-bridge/control/page/find-by-text
@@ -4178,33 +4131,25 @@ pub async fn ui_bridge_find_by_text_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
-    let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
-
     if text.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error("'text' field is required")),
         ));
     }
+    let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
+    let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let js = find_by_text_js(text, tag, exact);
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::Value::Array(vec![]));
-            Ok(Json(ApiResponse::success(serde_json::json!({
-                "matches": parsed,
-                "count": parsed.as_array().map(|a| a.len()).unwrap_or(0),
-                "query": { "text": text, "tag": tag, "exact": exact }
-            }))))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    let payload = text_action_ipc_payload(&body, &["text", "tag", "exact"]);
+    let Json(resp) =
+        wrap_ipc_result(ui_bridge_request_sync(&state, "find_by_text", payload).await)?;
+    let matches = resp.data.unwrap_or(serde_json::Value::Array(vec![]));
+    let count = matches.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "matches": matches,
+        "count": count,
+        "query": { "text": text, "tag": tag, "exact": exact }
+    }))))
 }
 
 /// Journey ledger choke point (plan
@@ -4223,16 +4168,12 @@ pub async fn ui_bridge_click_by_text_handler(
 
 /// Click an element by its visible text content.
 /// POST /ui-bridge/control/page/click-by-text
-/// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
+/// Body: { "text": "Submit", "tag": "button", "exact": true }
 async fn ui_bridge_click_by_text_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
-    let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
-    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-
     if text.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -4240,53 +4181,22 @@ async fn ui_bridge_click_by_text_handler_dispatch(
         ));
     }
 
+    // The primitive clicks the first match; a caller-supplied `index` would be
+    // silently ignored (a wrong-element click), so refuse it.
+    if body.get("index").is_some_and(|v| !v.is_null()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "'index' is not supported on click-by-text (the first match is clicked); use click-by-selector with 'index'",
+            )),
+        ));
+    }
+
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{tag}'))
-                .filter(el => el.offsetParent !== null && {match_expr});
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No matching elements found' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        tag = tag,
-        match_expr = match_expr,
-        index = index
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-text",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    let payload = text_action_ipc_payload(&body, &["text", "tag", "exact"]);
+    wrap_ipc_result(ui_bridge_request_sync(&state, "click_by_text", payload).await)
 }
 
 /// Journey ledger choke point (plan
@@ -4311,53 +4221,19 @@ async fn ui_bridge_click_by_selector_handler_dispatch(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-
     if selector.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error("'selector' field is required")),
         ));
     }
+    validate_index_param(&body)?;
 
     // Bust the vision cache: a click can change rendered pixels.
     crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
-
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{selector}'))
-                .filter(el => el.offsetParent !== null);
-            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No elements match selector' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.click();
-            return JSON.stringify({{
-                clicked: true,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        selector = escaped_selector,
-        index = index
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "click-by-selector",
-            "click result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    let payload = text_action_ipc_payload(&body, &["selector", "index"]);
+    wrap_ipc_result(ui_bridge_request_sync(&state, "click_by_selector", payload).await)
 }
 
 /// Build the `read_value` IPC payload. `windowLabel` must ride at the TOP
@@ -4406,6 +4282,8 @@ pub async fn ui_bridge_read_value_handler(
             Json(api_error("'selector' field is required")),
         ));
     }
+
+    validate_index_param(&body)?;
 
     let payload = read_value_ipc_payload(&body);
     wrap_ipc_result(ui_bridge_request_sync(&state, "read_value", payload).await)
@@ -4588,7 +4466,7 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else if let Some(lbl) = label {
         let escaped = lbl.replace('\\', "\\\\").replace('\'', "\\'");
         format!(
-            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
+            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact=\"true\"]') && !l.querySelector('[data-bridge-redact=\"true\"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
             escaped.to_lowercase()
         )
     } else {
@@ -7807,5 +7685,37 @@ mod read_value_payload_tests {
         let p = read_value_ipc_payload(&json!({"selector":"#a"}));
         assert_eq!(p["windowLabel"], "");
         assert_eq!(p["params"], json!({"selector":"#a"}));
+    }
+}
+
+#[cfg(test)]
+mod text_action_helper_tests {
+    use super::{text_action_ipc_payload, validate_index_param};
+    use serde_json::json;
+
+    #[test]
+    fn payload_hoists_window_label_and_forwards_only_named_keys() {
+        let p = text_action_ipc_payload(
+            &json!({"text": "x", "tag": "b", "exact": true, "index": 3, "windowLabel": "pop"}),
+            &["text", "tag", "exact"],
+        );
+        assert_eq!(p["windowLabel"], "pop");
+        assert_eq!(p["params"], json!({"text": "x", "tag": "b", "exact": true}));
+    }
+
+    #[test]
+    fn index_must_be_a_non_negative_integer() {
+        assert!(validate_index_param(&json!({})).is_ok());
+        assert!(validate_index_param(&json!({"index": null})).is_ok());
+        assert!(validate_index_param(&json!({"index": 0})).is_ok());
+        for bad in [json!(-1), json!(1.5), json!("0"), json!(true)] {
+            let (status, body) =
+                validate_index_param(&json!({ "index": bad })).expect_err("must reject");
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                body.0.error.as_deref().unwrap_or("").contains("index"),
+                "the 400 must name index"
+            );
+        }
     }
 }
