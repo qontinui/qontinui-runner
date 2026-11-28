@@ -165,6 +165,152 @@ static POLLER_LAST_SUCCESS_UNIX: std::sync::atomic::AtomicU64 =
 /// The most recent failure message (already carries its source chain).
 static POLLER_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+// ---------------------------------------------------------------------------
+// Last-good coord pull — what the survey answers from when coord is slow.
+// ---------------------------------------------------------------------------
+
+/// Timeout of an ON-DEMAND pull (the survey's live arm, and `reclaim_now`).
+/// Someone is waiting on that request, so it stays short.
+pub(super) const ON_DEMAND_PULL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default timeout of the BACKGROUND poller's pull. Nobody waits on the
+/// poller, so it can ride out a coord that answers in 20-50 s, which the 15 s
+/// on-demand bound could not (plan
+/// `2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull`).
+/// Override via `QONTINUI_WORKTREE_RECLAIM_PULL_TIMEOUT_SECS`, clamped to
+/// [`POLLER_PULL_TIMEOUT_FLOOR_SECS`]..=[`POLLER_PULL_TIMEOUT_CEILING_SECS`].
+const DEFAULT_POLLER_PULL_TIMEOUT_SECS: u64 = 60;
+/// Never shorter than the on-demand bound.
+const POLLER_PULL_TIMEOUT_FLOOR_SECS: u64 = 15;
+/// Always under the 300 s default cadence, so one pull never outlives its tick.
+const POLLER_PULL_TIMEOUT_CEILING_SECS: u64 = 240;
+
+/// The poller's pull timeout, from the env override when it parses.
+fn poller_pull_timeout() -> Duration {
+    poller_pull_timeout_from(
+        std::env::var("QONTINUI_WORKTREE_RECLAIM_PULL_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`poller_pull_timeout`].
+fn poller_pull_timeout_from(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_POLLER_PULL_TIMEOUT_SECS)
+        .clamp(
+            POLLER_PULL_TIMEOUT_FLOOR_SECS,
+            POLLER_PULL_TIMEOUT_CEILING_SECS,
+        );
+    Duration::from_secs(secs)
+}
+
+/// Which caller took a pull. Stored with the last-good pull so a reused pull
+/// is labelled by who actually made it — an on-demand pull reused by a later
+/// survey must never read as the poller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullTaker {
+    /// The background reclaim poller ([`tick_once`]).
+    Poller,
+    /// A survey's live arm ([`super::on_demand::survey`]) or `reclaim_now`.
+    OnDemand,
+}
+
+/// The most recent pull coord ANSWERED (2xx, body parsed), from either caller.
+///
+/// Keyed on `(device_id, coord_base)`: the base comes from
+/// `profiles::connected_coord_base()`, so after a profile switch a
+/// device-only key would serve the previous coord's decision.
+#[derive(Debug, Clone)]
+pub struct LastGoodPull {
+    pub device_id: Uuid,
+    pub coord_base: String,
+    pub pull: std::sync::Arc<ReclaimPull>,
+    pub taken_at: chrono::DateTime<chrono::Utc>,
+    pub taker: PullTaker,
+}
+
+static LAST_GOOD_PULL: std::sync::RwLock<Option<LastGoodPull>> = std::sync::RwLock::new(None);
+
+/// The last-good pull, whatever its age. The reader bounds the age.
+pub(super) fn last_good_pull() -> Option<LastGoodPull> {
+    #[cfg(test)]
+    LAST_GOOD_PULL_READS.with(|c| c.set(c.get() + 1));
+    LAST_GOOD_PULL.read().ok().and_then(|g| g.clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times THIS thread has read [`LAST_GOOD_PULL`], so a test can
+    /// pin that a caller never reads the store at all. Per-thread so a
+    /// concurrent test elsewhere in the process cannot move it.
+    static LAST_GOOD_PULL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's [`last_good_pull`] read count. See [`LAST_GOOD_PULL_READS`].
+#[cfg(test)]
+pub(super) fn last_good_pull_reads_on_this_thread() -> usize {
+    LAST_GOOD_PULL_READS.with(|c| c.get())
+}
+
+/// Seed the process-wide last-good pull, as a 2xx would have.
+#[cfg(test)]
+pub(super) fn seed_last_good_pull_for_test(pull: LastGoodPull) {
+    if let Ok(mut g) = LAST_GOOD_PULL.write() {
+        *g = Some(pull);
+    }
+}
+
+/// Serializes the tests that touch [`LAST_GOOD_PULL`], which is process-wide.
+#[cfg(test)]
+pub(super) static LAST_GOOD_PULL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clear the process-wide last-good pull, so a test cannot pick up a snapshot
+/// another test recorded.
+#[cfg(test)]
+pub(super) fn reset_last_good_pull_for_test() {
+    if let Ok(mut g) = LAST_GOOD_PULL.write() {
+        *g = None;
+    }
+}
+
+/// Record a pull coord answered and hand it back, with the time recorded.
+/// Every 2xx that [`fetch_pull`] receives goes through here, from both takers.
+fn accept_pull(
+    device_id: Uuid,
+    coord_base: &str,
+    pull: ReclaimPull,
+    taker: PullTaker,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>) {
+    accept_pull_into(&LAST_GOOD_PULL, device_id, coord_base, pull, taker, now)
+}
+
+/// [`accept_pull`] against an injected store, so its recording is testable
+/// without the process-wide static.
+fn accept_pull_into(
+    store: &std::sync::RwLock<Option<LastGoodPull>>,
+    device_id: Uuid,
+    coord_base: &str,
+    pull: ReclaimPull,
+    taker: PullTaker,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>) {
+    let recorded = LastGoodPull {
+        device_id,
+        coord_base: coord_base.to_string(),
+        pull: std::sync::Arc::new(pull.clone()),
+        taken_at: now,
+        taker,
+    };
+    match store.write() {
+        Ok(mut g) => *g = Some(recorded),
+        Err(e) => warn!("worktree_reclaim: last-good pull store poisoned, not recorded: {e}"),
+    }
+    (device_id, pull, now)
+}
+
 /// A snapshot of the background poller's health.
 ///
 /// This exists because of the 2026-07-28 → 08-01 outage: the poller failed
@@ -1594,7 +1740,15 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
 /// `remove_armed` boolean only tells the *silent background* path whether it
 /// may act. The consented on-demand path reads
 /// the same cleared set without needing the silent path armed.
-pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> {
+///
+/// `timeout` bounds the whole request; `taker` labels the pull when it is
+/// recorded as the last-good one ([`accept_pull`]), which every 2xx is. The
+/// returned time is the `taken_at` that record carries, so a caller labels
+/// the pull with the same timestamp the store holds.
+pub(super) async fn fetch_pull(
+    timeout: Duration,
+    taker: PullTaker,
+) -> Result<Option<(Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>)>, String> {
     let device_id = match super::census::load_device_id_pub() {
         Some(id) => id,
         None => {
@@ -1616,7 +1770,7 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
         device_id
     );
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("build reclaim http client: {}", error_chain(&e)))?;
     let resp = crate::coord_http::coord_get(&client, &url)
@@ -1633,7 +1787,13 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
         .json()
         .await
         .map_err(|e| format!("decode reclaim pull: {e}"))?;
-    Ok(Some((device_id, pull)))
+    Ok(Some(accept_pull(
+        device_id,
+        &base,
+        pull,
+        taker,
+        chrono::Utc::now(),
+    )))
 }
 
 /// The FULL-source-chain renderer, now shared rather than private here.
@@ -1676,7 +1836,11 @@ fn latch_coord_live(coord_ever_live: bool, outcome: &TickOutcome) -> bool {
 /// One reclaim cycle: pull + execute. `Err` only on a transport / non-2xx
 /// failure.
 pub async fn tick_once() -> Result<TickOutcome, String> {
-    let Some((_device_id, pull)) = fetch_pull().await? else {
+    // The longer poller timeout: nobody waits on this pull, and the survey
+    // answers from it ([`last_good_pull`]) while coord is too slow for 15 s.
+    let Some((_device_id, pull, _taken_at)) =
+        fetch_pull(poller_pull_timeout(), PullTaker::Poller).await?
+    else {
         return Ok(TickOutcome::Skipped);
     };
     // execute_pull runs synchronous git/cmd subprocesses and filesystem
@@ -2974,5 +3138,99 @@ pub(in crate::agent_worktree) mod tests {
         // which one `target_dir_for` would pick.
         std::fs::create_dir_all(wt.join("target")).unwrap();
         assert_eq!(plan_reclaim(&i, true, true), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull
+    // -----------------------------------------------------------------------
+
+    fn empty_pull() -> ReclaimPull {
+        serde_json::from_value(serde_json::json!({"remove_armed": true}))
+            .expect("pull fixture parses")
+    }
+
+    /// (6) Every accepted pull is recorded with its taker and key, and the
+    /// pull itself is handed back unchanged.
+    #[test]
+    fn accept_pull_records_the_last_good_pull_with_its_taker() {
+        let store = std::sync::RwLock::new(None);
+        let dev = Uuid::from_u128(7);
+        let now = chrono::Utc::now();
+
+        let (id, pull, taken_at) = accept_pull_into(
+            &store,
+            dev,
+            "https://coord.example.test",
+            empty_pull(),
+            PullTaker::Poller,
+            now,
+        );
+        assert_eq!(id, dev);
+        assert!(pull.remove_armed);
+        // The caller gets the SAME timestamp the store recorded.
+        assert_eq!(taken_at, now);
+        let got = store.read().unwrap().clone().expect("recorded");
+        assert_eq!(got.taker, PullTaker::Poller);
+        assert_eq!(got.device_id, dev);
+        assert_eq!(got.coord_base, "https://coord.example.test");
+        assert_eq!(got.taken_at, now);
+        assert!(got.pull.remove_armed);
+
+        // A later on-demand pull replaces it, and is labelled as on-demand.
+        let later = now + chrono::Duration::seconds(5);
+        accept_pull_into(
+            &store,
+            dev,
+            "https://coord.example.test",
+            empty_pull(),
+            PullTaker::OnDemand,
+            later,
+        );
+        let got = store.read().unwrap().clone().expect("recorded");
+        assert_eq!(got.taker, PullTaker::OnDemand);
+        assert_eq!(got.taken_at, later);
+    }
+
+    /// (6, the process-wide store) `accept_pull` writes what `last_good_pull`
+    /// reads.
+    #[test]
+    fn accept_pull_feeds_last_good_pull() {
+        let _lock = LAST_GOOD_PULL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_last_good_pull_for_test();
+        assert!(last_good_pull().is_none());
+        let now = chrono::Utc::now();
+        accept_pull(
+            Uuid::from_u128(9),
+            "https://coord.example.test",
+            empty_pull(),
+            PullTaker::OnDemand,
+            now,
+        );
+        let got = last_good_pull().expect("recorded");
+        assert_eq!(got.taker, PullTaker::OnDemand);
+        assert_eq!(got.device_id, Uuid::from_u128(9));
+        reset_last_good_pull_for_test();
+    }
+
+    /// The poller's timeout: 60 s by default, clamped to 15..=240.
+    #[test]
+    fn poller_pull_timeout_defaults_to_60s_and_is_clamped() {
+        assert_eq!(poller_pull_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(
+            poller_pull_timeout_from(Some("garbage")),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            poller_pull_timeout_from(Some("90")),
+            Duration::from_secs(90)
+        );
+        assert_eq!(poller_pull_timeout_from(Some("1")), Duration::from_secs(15));
+        assert_eq!(
+            poller_pull_timeout_from(Some("9999")),
+            Duration::from_secs(240)
+        );
+        assert_eq!(ON_DEMAND_PULL_TIMEOUT, Duration::from_secs(15));
     }
 }

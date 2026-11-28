@@ -76,7 +76,7 @@ use axum::{
 };
 
 use crate::agent_worktree::edit_sibling::{EditSiblingError, EditSiblingOutcome};
-use crate::agent_worktree::on_demand::{self, ReclaimRequest, SurveyQuery};
+use crate::agent_worktree::on_demand::{self, PullPolicy, ReclaimRequest, SurveyQuery};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -193,6 +193,9 @@ async fn edit_sibling_handler(
 ///     "device_id": "…",
 ///     "coord_reachable": true,
 ///     "coord_error": null,
+///     "coord_pull_source": "poller_snapshot", // "live" | "poller_snapshot" | "on_demand_snapshot" | null
+///     "coord_pull_taken_at": "2026-07-19T11:51:02Z",
+///     "coord_pull_age_secs": 140,
 ///     "remove_armed": false,      // informational; this path does not need it
 ///     "canonical_excluded": 12,   // canonical checkouts filtered out (never reapable)
 ///     "items": [
@@ -231,10 +234,25 @@ async fn edit_sibling_handler(
 ///
 /// The disk census is a MULTI-MINUTE walk, so this route reads the snapshot
 /// published by the periodic census task rather than rebuilding one per
-/// request (which made it hang indefinitely). It answers within the bounded
-/// coord pull (15s) plus a ≤10s snapshot wait, always — a cold start with no
-/// snapshot yet returns `census_status: "pending"` with an empty `items` and a
-/// note saying so, never an implied "nothing to clean up".
+/// request (which made it hang indefinitely). A cold start with no snapshot
+/// yet returns `census_status: "pending"` with an empty `items` and a note
+/// saying so, never an implied "nothing to clean up".
+///
+/// ### The coord half is snapshot-first
+///
+/// This route passes `PullPolicy::SnapshotFirst`: when the reclaim poller (or
+/// an earlier on-demand survey) holds a pull coord answered no more than 600 s
+/// ago, for this device and this coord base, the answer is built from it and
+/// makes NO coord request; `coord_pull_source` / `coord_pull_age_secs` say
+/// which pull and how old. Only without one does it make a live pull, bounded
+/// at 15s and joined concurrently with the ≤10s snapshot wait. A live failure
+/// with only an over-age snapshot reads `coord_reachable: false` — an over-age
+/// pull is absent, never reachable. Plan
+/// `2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull`:
+/// a live pull per GET blinded every `/cleanup-steward` class-2 pass whenever
+/// coord was slower than 15s, while the poller held a good pull throughout.
+/// `POST /agent-worktrees/reclaim` (`reclaim_now`) stays on a live pull, since
+/// its coord half authorizes removals.
 ///
 /// ### The free-space half is independent (INV-D1)
 ///
@@ -256,7 +274,7 @@ async fn reclaimable_handler(
     State(_state): State<Arc<ApiState>>,
     Query(query): Query<SurveyQuery>,
 ) -> Result<Json<ApiResponse<on_demand::Survey>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match on_demand::survey(query).await {
+    match on_demand::survey(query, PullPolicy::SnapshotFirst).await {
         Ok(survey) => Ok(Json(ApiResponse::success(survey))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
