@@ -73,12 +73,81 @@ pub enum ValidatorError {
         /// so downstream emit sites (Plan 06 `FlywheelProposalDemoted`) can
         /// join against tracing spans / `workflow_verification_phase_results`.
         snapshot_id: String,
-        /// First failing assertion's `(state_id, assertion_id)`. None when
-        /// the red came from policy `Indeterminate` over a fully-passing
-        /// result set (e.g. empty in-scope assertions); the demote emit
-        /// substitutes an empty string in that case.
-        failing_assertion: Option<(String, String)>,
+        /// The first failing assertion, else the first unknown one (see
+        /// `first_failing_assertion`), so an `Indeterminate` red caused by an
+        /// unknown still names its assertion — and its `verdict` says which
+        /// of the two it is, so an unevaluated assertion is never read as a
+        /// failed one. None when no assertion failed or was unknown (e.g.
+        /// policy `Indeterminate` over empty in-scope assertions); the demote
+        /// emit substitutes an empty string in that case.
+        failing_assertion: Option<FailingAssertion>,
+        /// Assertions whose verdict is `Unknown` (they could not be
+        /// evaluated). `result_summary.severity_counts` counts decided
+        /// failures only, so a red caused by unknowns alone has every
+        /// severity bucket at zero; this count is what names that cause in
+        /// the detail strings.
+        unknown_count: usize,
     },
+}
+
+/// The assertion a gate-B red names as its cause, with the verdict that put
+/// it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailingAssertion {
+    pub state_id: String,
+    pub assertion_id: String,
+    pub verdict: FailingVerdict,
+}
+
+/// Which non-pass verdict a [`FailingAssertion`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailingVerdict {
+    /// A decided `Fail`: the page was judged and did not satisfy it.
+    Fail,
+    /// An `Unknown`: the assertion could not be evaluated, so nothing is
+    /// known about whether the page satisfies it.
+    Unknown,
+}
+
+impl FailingVerdict {
+    /// The `status` tag of the `SpecAssertionVerdict` it came from:
+    /// `"fail"` or `"unknown"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailingVerdict::Fail => "fail",
+            FailingVerdict::Unknown => "unknown",
+        }
+    }
+}
+
+/// The `FlywheelProposalDemoted` event a gate-B red emits. The named
+/// assertion's state, id and verdict ("fail" / "unknown") land in their own
+/// named fields; `None` (a red from a policy `Indeterminate` over an empty
+/// in-scope set) emits empty strings, so the wire shape stays uniform, and a
+/// reader tells that apart from an older emitter's absent verdict by the
+/// empty id.
+pub fn demoted_event(
+    app_id: String,
+    proposal_id: String,
+    page_id: String,
+    failing: Option<FailingAssertion>,
+    snapshot_id: String,
+    at_ms: u64,
+) -> qontinui_types::spec_api_events::SpecApiEvent {
+    let (failing_state_id, failing_assertion_id, failing_assertion_verdict) = match failing {
+        Some(f) => (f.state_id, f.assertion_id, f.verdict.as_str().to_string()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    qontinui_types::spec_api_events::SpecApiEvent::FlywheelProposalDemoted {
+        app_id,
+        proposal_id,
+        page_id,
+        failing_assertion_id,
+        failing_state_id,
+        failing_assertion_verdict,
+        snapshot_id,
+        at_ms,
+    }
 }
 
 /// Short, stable reason code for each variant. Used as the `reason` field
@@ -114,16 +183,29 @@ pub fn validator_error_detail(e: &ValidatorError) -> String {
         ValidatorError::BExecutionRed {
             result_summary,
             policy_eval,
+            unknown_count,
             ..
         } => {
             let sc = &result_summary.severity_counts;
             let misses = sc.critical + sc.error + sc.warning + sc.info;
             format!(
-                "B-execution red: overall_status={:?}, miss_count={}",
-                policy_eval.overall_status, misses
+                "B-execution red: overall_status={:?}, miss_count={}, unknown_count={}",
+                policy_eval.overall_status, misses, unknown_count
             )
         }
     }
+}
+
+/// Detail recorded in `spec_proposals.last_error` when the sweep demotes a
+/// `_pending/` candidate on a gate-B red. The severity buckets count decided
+/// failures only, so `unknown` is what names a red that came from assertions
+/// that could not be evaluated.
+pub fn single_red_detail(result_summary: &SpecCheckSummary, unknown_count: usize) -> String {
+    let sc = &result_summary.severity_counts;
+    format!(
+        "single-red: critical={} error={} warning={} info={} unknown={}",
+        sc.critical, sc.error, sc.warning, sc.info, unknown_count
+    )
 }
 
 /// Run the four gates in order: distinctness → round-trip → coverage →
@@ -235,25 +317,48 @@ pub(crate) fn gate_b_execution_green_with_snapshot(
             policy_eval: eval,
             snapshot_id: result.snapshot_id.clone(),
             failing_assertion,
+            unknown_count: unknown_assertion_count(&result),
         });
     }
     Ok(result)
 }
 
-/// Locate the first assertion with a `Fail` outcome in result-iteration
-/// order. Returns `Some((state_id, assertion_id))` or `None` if every
-/// assertion passed (the red came from policy `Indeterminate` rather than
-/// a structural failure).
-fn first_failing_assertion(result: &SpecCheckResult) -> Option<(String, String)> {
-    use qontinui_types::spec_check::AssertionOutcome;
+/// Number of assertions, across every state, whose verdict is `Unknown`.
+fn unknown_assertion_count(result: &SpecCheckResult) -> usize {
+    use qontinui_types::spec_check::SpecAssertionVerdict;
+    result
+        .state_results
+        .iter()
+        .flat_map(|state| &state.assertions)
+        .filter(|a| matches!(a.outcome, SpecAssertionVerdict::Unknown { .. }))
+        .count()
+}
+
+/// Locate the assertion that made gate B red, in result-iteration order:
+/// the first `Fail`, else the first `Unknown` (a red that came from an
+/// assertion that could not be evaluated still names it, as an unknown).
+/// Returns `None` when every assertion passed (the red came from a policy
+/// `Indeterminate` such as an empty scope).
+fn first_failing_assertion(result: &SpecCheckResult) -> Option<FailingAssertion> {
+    use qontinui_types::spec_check::SpecAssertionVerdict;
+    let mut first_unknown = None;
     for state in &result.state_results {
         for assertion in &state.assertions {
-            if matches!(assertion.outcome, AssertionOutcome::Fail { .. }) {
-                return Some((state.state_id.clone(), assertion.assertion_id.clone()));
+            let named = |verdict: FailingVerdict| FailingAssertion {
+                state_id: state.state_id.clone(),
+                assertion_id: assertion.assertion_id.clone(),
+                verdict,
+            };
+            match assertion.outcome {
+                SpecAssertionVerdict::Fail { .. } => return Some(named(FailingVerdict::Fail)),
+                SpecAssertionVerdict::Unknown { .. } if first_unknown.is_none() => {
+                    first_unknown = Some(named(FailingVerdict::Unknown));
+                }
+                _ => {}
             }
         }
     }
-    None
+    first_unknown
 }
 
 /// Pull a fresh UI Bridge snapshot for the active app via the WS dispatch
@@ -744,6 +849,160 @@ mod tests {
             }
             Err(other) => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    /// Plan 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass
+    /// D4: a gate-B red that came from an assertion that could not be
+    /// evaluated still names that assertion, and names it as unknown. s0's
+    /// criteria do not parse (`Unknown`), s1's match — so the red is
+    /// `Indeterminate`, with no `Fail` anywhere. Mutations: the `Fail`-only
+    /// scan returns `None`; tagging every named assertion `Fail` (or
+    /// `as_str` always answering `"fail"`) reds the verdict assertions.
+    #[test]
+    fn gate_b_red_from_unknown_names_the_unknown_assertion() {
+        let mut ir = chain_ir("b-unknown", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        let snapshot = body_snapshot();
+        match gate_b_execution_green_with_snapshot(&snapshot, &ir) {
+            Err(ValidatorError::BExecutionRed {
+                policy_eval,
+                failing_assertion,
+                ..
+            }) => {
+                assert_eq!(policy_eval.overall_status, PolicyStatus::Indeterminate);
+                let named = failing_assertion.expect("the unknown is named");
+                assert_eq!(
+                    (named.state_id.as_str(), named.assertion_id.as_str()),
+                    ("s0", "a-s0")
+                );
+                assert_eq!(named.verdict, FailingVerdict::Unknown);
+                assert_eq!(named.verdict.as_str(), "unknown");
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
+        }
+    }
+
+    /// When both exist, the decided `Fail` is named ahead of an earlier
+    /// `Unknown`, as a fail. Mutations: returning the first non-`Pass` names
+    /// s0; tagging every named assertion `Unknown` (or `as_str` always
+    /// answering `"unknown"`) reds the verdict assertions.
+    #[test]
+    fn gate_b_red_names_a_fail_ahead_of_an_earlier_unknown() {
+        let mut ir = chain_ir("b-mixed", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        ir.states[1].assertions[0].target.criteria = json!({ "tagName": "no-such-tag" });
+        let snapshot = body_snapshot();
+        match gate_b_execution_green_with_snapshot(&snapshot, &ir) {
+            Err(ValidatorError::BExecutionRed {
+                policy_eval,
+                failing_assertion,
+                ..
+            }) => {
+                assert_eq!(policy_eval.overall_status, PolicyStatus::Fail);
+                let named = failing_assertion.expect("the fail is named");
+                assert_eq!(
+                    (named.state_id.as_str(), named.assertion_id.as_str()),
+                    ("s1", "a-s1")
+                );
+                assert_eq!(named.verdict, FailingVerdict::Fail);
+                assert_eq!(named.verdict.as_str(), "fail");
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
+        }
+    }
+
+    /// A red from unknowns alone leaves every severity bucket at zero (they
+    /// count decided failures only), so both demote detail strings carry the
+    /// unknown count that names the cause. Mutation: dropping the count from
+    /// either string, or computing it as zero, reds this.
+    #[test]
+    fn red_from_unknowns_alone_names_the_unknown_count_in_its_detail() {
+        let mut ir = chain_ir("b-unknown-detail", 2, true);
+        ir.states[0].assertions[0].target.criteria = json!({ "tagName": 42 });
+        let snapshot = body_snapshot();
+        let err = gate_b_execution_green_with_snapshot(&snapshot, &ir)
+            .expect_err("an unknown assertion makes gate B red");
+        match &err {
+            ValidatorError::BExecutionRed {
+                result_summary,
+                unknown_count,
+                ..
+            } => {
+                assert_eq!(*unknown_count, 1);
+                let sc = &result_summary.severity_counts;
+                assert_eq!(sc.critical + sc.error + sc.warning + sc.info, 0);
+                assert_eq!(
+                    single_red_detail(result_summary, *unknown_count),
+                    "single-red: critical=0 error=0 warning=0 info=0 unknown=1"
+                );
+            }
+            other => panic!("expected BExecutionRed, got {:?}", other),
+        }
+        let detail = validator_error_detail(&err);
+        assert!(
+            detail.ends_with("miss_count=0, unknown_count=1"),
+            "{detail}"
+        );
+    }
+
+    /// The demote event puts each locator part in its own named field and
+    /// says which verdict named the assertion. Mutation: swapping the state
+    /// and assertion ids, swapping any two of the app / proposal / page ids,
+    /// hardcoding `"fail"`, or emitting a verdict for `None` reds this. (A
+    /// swap at the sweep's call site, which passes those ids positionally and
+    /// has no test of its own, would not.)
+    #[test]
+    fn demoted_event_names_state_assertion_and_verdict() {
+        use qontinui_types::spec_api_events::SpecApiEvent;
+        let named = |verdict| FailingAssertion {
+            state_id: "s1".to_string(),
+            assertion_id: "a1".to_string(),
+            verdict,
+        };
+        let fields = |failing| match demoted_event(
+            "app".to_string(),
+            "prop".to_string(),
+            "page".to_string(),
+            failing,
+            "snap".to_string(),
+            7,
+        ) {
+            SpecApiEvent::FlywheelProposalDemoted {
+                app_id,
+                proposal_id,
+                page_id,
+                failing_state_id,
+                failing_assertion_id,
+                failing_assertion_verdict,
+                snapshot_id,
+                at_ms,
+            } => {
+                // The pass-through ids are pinned once here, so a swap of
+                // demoted_event's three leading String parameters reds it.
+                assert_eq!(
+                    (app_id.as_str(), proposal_id.as_str(), page_id.as_str()),
+                    ("app", "prop", "page")
+                );
+                (
+                    failing_state_id,
+                    failing_assertion_id,
+                    failing_assertion_verdict,
+                    snapshot_id,
+                    at_ms,
+                )
+            }
+            other => panic!("expected FlywheelProposalDemoted, got {other:?}"),
+        };
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            fields(Some(named(FailingVerdict::Fail))),
+            (s("s1"), s("a1"), s("fail"), s("snap"), 7)
+        );
+        assert_eq!(
+            fields(Some(named(FailingVerdict::Unknown))),
+            (s("s1"), s("a1"), s("unknown"), s("snap"), 7)
+        );
+        assert_eq!(fields(None), (s(""), s(""), s(""), s("snap"), 7));
     }
 
     // -------- All-gates-pass smoke --------------------------------------

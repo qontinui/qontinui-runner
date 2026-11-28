@@ -27,9 +27,9 @@ use crate::diff::compute_miss;
 use crate::fetch::{compute_content_sha256, millis_to_iso8601};
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{
-    AssertionMiss, AssertionOutcome, AssertionResult, AssertionSeverityCounts, BridgeFingerprint,
-    MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, SpecValidation,
-    StateMatchResult, ThresholdConfig, UIBridgeSnapshot,
+    AssertionResult, AssertionSeverityCounts, BridgeFingerprint, MatchOutcome, MatchedElement,
+    SpecAssertionVerdict, SpecCheckResult, SpecCheckSummary, SpecValidation, StateMatchResult,
+    ThresholdConfig, UIBridgeSnapshot, UnknownCode,
 };
 
 /// `recommendation_reason` value set when the matcher refuses to recommend
@@ -41,8 +41,13 @@ pub const REASON_SPEC_VALIDATION_FAILED: &str = "spec_validation_failed";
 // Constants
 // ===========================================================================
 
-/// `result_schema_version` v1.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+/// `result_schema_version` this evaluator writes. v2 added the `unknown`
+/// assertion verdict (`{ "status": "unknown", "code": … }`, plan
+/// `2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass` D4);
+/// nothing else changed, so a v1 row is a valid v2 row and
+/// [`crate::result_migration`] reads it unchanged. See that module for what
+/// a reader predating v2 does with a v2 row.
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// Sentinel `snapshot_id` used when the evaluator runs directly on a
 /// pre-parsed snapshot (i.e. the caller didn't go through
@@ -258,7 +263,7 @@ fn evaluate_state(indexed: &IndexedSnapshot, state: &IrState) -> StateMatchResul
     let total = assertions.len();
     let passed = assertions
         .iter()
-        .filter(|a| matches!(a.outcome, AssertionOutcome::Pass { .. }))
+        .filter(|a| matches!(a.outcome, SpecAssertionVerdict::Pass { .. }))
         .count();
 
     // Per Plan §Step 4 acceptance: empty enabled-assertion set → 0.0
@@ -283,11 +288,12 @@ fn evaluate_assertion(indexed: &IndexedSnapshot, assertion: &IrAssertion) -> Ass
     let crit = parse_criteria(&assertion.target.criteria);
     let outcome = match crit {
         Ok(crit) => run_two_phase_match(indexed, &crit),
-        Err(_) => AssertionOutcome::Fail {
-            miss: AssertionMiss {
-                reason: crate::MissReason::NoCandidates,
-                candidates: Vec::new(),
-            },
+        // Criteria that do not parse leave nothing to judge the page against:
+        // the assertion was never evaluated, so it is unknown — not a
+        // `NoCandidates` miss, which would claim the page was looked at and
+        // lacked the element.
+        Err(_) => SpecAssertionVerdict::Unknown {
+            code: UnknownCode::NoExpectation,
         },
     };
 
@@ -304,8 +310,8 @@ fn evaluate_assertion(indexed: &IndexedSnapshot, assertion: &IrAssertion) -> Ass
 /// into a strongly-typed [`IrElementCriteria`]. The IR keeps the criteria
 /// loose at the schema layer so synthesis can emit partial criteria
 /// without tripping `deny_unknown_fields`; the matcher takes the strict
-/// view. Unparseable criteria → error → assertion fails with
-/// `MissReason::NoCandidates`.
+/// view. Unparseable criteria → error → the assertion is
+/// `Unknown { code: no_expectation }`.
 fn parse_criteria(value: &serde_json::Value) -> Result<IrElementCriteria, serde_json::Error> {
     // `null` or omitted criteria deserialize to the default (every field
     // None), which `matches_all` treats as "any element matches".
@@ -318,15 +324,18 @@ fn parse_criteria(value: &serde_json::Value) -> Result<IrElementCriteria, serde_
 /// Two-phase matcher core:
 /// - Phase 1: `narrow_candidates` → first `matches_all` winner → Pass.
 /// - Phase 2: `compute_miss` → Fail with structured AssertionMiss.
-fn run_two_phase_match(indexed: &IndexedSnapshot, crit: &IrElementCriteria) -> AssertionOutcome {
+fn run_two_phase_match(
+    indexed: &IndexedSnapshot,
+    crit: &IrElementCriteria,
+) -> SpecAssertionVerdict {
     for idx in narrow_candidates(indexed, crit) {
         if matches_all(indexed, crit, idx) {
-            return AssertionOutcome::Pass {
+            return SpecAssertionVerdict::Pass {
                 matched: matched_from(indexed, idx),
             };
         }
     }
-    AssertionOutcome::Fail {
+    SpecAssertionVerdict::Fail {
         miss: compute_miss(indexed, crit),
     }
 }
@@ -412,7 +421,7 @@ fn match_outcome_for(state_results: &[StateMatchResult]) -> MatchOutcome {
     for s in state_results {
         for a in &s.assertions {
             total += 1;
-            if matches!(a.outcome, AssertionOutcome::Pass { .. }) {
+            if matches!(a.outcome, SpecAssertionVerdict::Pass { .. }) {
                 passed += 1;
             }
         }
@@ -432,7 +441,10 @@ fn match_outcome_for(state_results: &[StateMatchResult]) -> MatchOutcome {
     }
 }
 
-/// Aggregate failure counts across every state. Unknown severity strings
+/// Aggregate failure counts across every state. Only decided `Fail`
+/// verdicts count: an `Unknown` verdict is not a failure of any severity
+/// (the policy conjunct's `Indeterminate` and the per-result verdict carry
+/// it). Unknown severity strings
 /// route to the `error` bucket (the "least restrictive" choice — visible to
 /// policy gates that fail on `error` and above, but doesn't escalate to
 /// `critical`).
@@ -440,7 +452,7 @@ fn aggregate_severity_counts(state_results: &[StateMatchResult]) -> AssertionSev
     let mut counts = AssertionSeverityCounts::default();
     for s in state_results {
         for a in &s.assertions {
-            if !matches!(a.outcome, AssertionOutcome::Fail { .. }) {
+            if !matches!(a.outcome, SpecAssertionVerdict::Fail { .. }) {
                 continue;
             }
             // Severity matching is case-insensitive — wire is free-form but
@@ -677,7 +689,7 @@ mod tests {
         let spec = page_spec("page-1", vec![st]);
 
         let result = evaluate(&s, &spec);
-        assert_eq!(result.result_schema_version, 1);
+        assert_eq!(result.result_schema_version, 2);
         assert_eq!(result.spec_version, "1.0");
         assert_eq!(result.page_id, "page-1");
         assert_eq!(result.state_results.len(), 1);
@@ -1040,6 +1052,114 @@ mod tests {
         assert_eq!(result.summary.severity_counts.error, 1);
         assert_eq!(result.summary.severity_counts.critical, 0);
         assert_eq!(result.summary.severity_counts.warning, 0);
+    }
+
+    // ----- Unknown verdicts (plan
+    // 2026-11-06-no-verification-instrument-reads-an-absence-as-a-pass D4) -----
+
+    /// Criteria that do not parse leave nothing to judge the page against,
+    /// so the verdict is `Unknown { no_expectation }` — not a
+    /// `NoCandidates` miss that claims the page lacked the element.
+    /// Mutation: restoring the `Fail { NoCandidates }` arm reds this.
+    #[test]
+    fn unparseable_criteria_answer_unknown_no_expectation() {
+        // An element that WOULD match a well-formed `role: "button"` is
+        // present, so a Fail here could only be the parse arm's doing.
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let a = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let st = state("s1", "Loaded", Some(true), vec![a]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        let outcome = &result.state_results[0].assertions[0].outcome;
+        assert!(
+            matches!(
+                outcome,
+                SpecAssertionVerdict::Unknown {
+                    code: UnknownCode::NoExpectation
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// An `Unknown` is not a failure of any severity: the severity tally
+    /// counts decided `Fail`s only. Mutation: counting non-`Pass` verdicts
+    /// (the pre-D4 two-state reading) reds this.
+    #[test]
+    fn severity_counts_skip_unknown_verdicts() {
+        let s = snap(vec![]);
+        let unknown = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let failed = assertion("a2", "warning", json!({ "role": "button" }), true);
+        let st = state("s1", "Loaded", Some(true), vec![unknown, failed]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        assert!(matches!(
+            result.state_results[0].assertions[0].outcome,
+            SpecAssertionVerdict::Unknown { .. }
+        ));
+        assert_eq!(result.summary.severity_counts.critical, 0);
+        assert_eq!(result.summary.severity_counts.error, 0);
+        assert_eq!(result.summary.severity_counts.warning, 1);
+    }
+
+    /// The two pass-only readers leave an `Unknown` out of the passes:
+    /// `evaluate_state`'s `passed` count (which feeds `match_rate`) and
+    /// `match_outcome_for` (which feeds `summary.match_outcome`, the value
+    /// the no-policy step path `decide_pass(None, FullMatch)` passes a step
+    /// on alone). One pass beside one unevaluated assertion is half a match,
+    /// not a whole one. Mutation: counting `Unknown` as a pass in
+    /// `evaluate_state` reds the `match_rate` assertion (1.0); doing so in
+    /// `match_outcome_for` reds the `PartialMatch` assertion (`FullMatch`).
+    #[test]
+    fn unknown_verdict_is_not_counted_as_a_pass() {
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let passing = assertion("a1", "critical", json!({ "role": "button" }), true);
+        let unknown = assertion("a2", "critical", json!({ "role": 42 }), true);
+        let st = state("s1", "Loaded", Some(true), vec![passing, unknown]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        let assertions = &result.state_results[0].assertions;
+        assert!(
+            matches!(assertions[0].outcome, SpecAssertionVerdict::Pass { .. }),
+            "{:?}",
+            assertions[0].outcome
+        );
+        assert!(
+            matches!(assertions[1].outcome, SpecAssertionVerdict::Unknown { .. }),
+            "{:?}",
+            assertions[1].outcome
+        );
+        assert_eq!(result.state_results[0].match_rate, 0.5);
+        assert_eq!(result.summary.match_outcome, MatchOutcome::PartialMatch);
+    }
+
+    /// A spec whose every assertion is unevaluated matched nothing: the
+    /// outcome is `NoMatch`, never the `FullMatch` a step with no policy
+    /// passes on. Mutation: counting `Unknown` as a pass in
+    /// `match_outcome_for` reds the outcome assertion (`FullMatch`); doing so
+    /// in `evaluate_state` reds the `match_rate` assertion (1.0).
+    #[test]
+    fn all_unknown_verdicts_are_no_match() {
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let a1 = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let a2 = assertion("a2", "info", json!({ "text": ["Save"] }), true);
+        let st = state("s1", "Loaded", Some(true), vec![a1, a2]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        for a in &result.state_results[0].assertions {
+            assert!(
+                matches!(a.outcome, SpecAssertionVerdict::Unknown { .. }),
+                "{}: {:?}",
+                a.assertion_id,
+                a.outcome
+            );
+        }
+        assert_eq!(result.state_results[0].match_rate, 0.0);
+        assert_eq!(result.summary.match_outcome, MatchOutcome::NoMatch);
     }
 
     #[test]

@@ -222,7 +222,8 @@ fn count_eval_lines(captured: &str) -> usize {
 // wire is verified the moment Stream C lands.
 //
 // `#[ignore]` — gated behind the `integration` feature so `cargo test` skips
-// it; CI runs `cargo test --features integration -- --ignored`.
+// it. No CI job runs it: run it by hand with
+// `cargo test -p qontinui-spec-check --features integration -- --ignored`.
 
 #[cfg(feature = "integration")]
 #[test]

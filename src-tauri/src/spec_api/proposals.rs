@@ -897,15 +897,11 @@ pub async fn post_sweep_pending(
                 result_summary,
                 snapshot_id: red_snapshot_id,
                 failing_assertion,
+                unknown_count,
                 ..
             }) => {
-                let detail = format!(
-                    "single-red: critical={} error={} warning={} info={}",
-                    result_summary.severity_counts.critical,
-                    result_summary.severity_counts.error,
-                    result_summary.severity_counts.warning,
-                    result_summary.severity_counts.info,
-                );
+                let detail =
+                    crate::spec_api::validator::single_red_detail(&result_summary, unknown_count);
                 // Demote — rm -rf _pending/, reset greens, requeue.
                 if let Err(e) = storage::demote_pending(&root, &spec_id) {
                     warn!(
@@ -925,21 +921,40 @@ pub async fn post_sweep_pending(
                 // when the red came from policy `Indeterminate` over an
                 // empty-in-scope assertion set — emit empty-string locator
                 // in that case so the wire shape stays uniform.
-                let (failing_state_id, failing_assertion_id) =
-                    failing_assertion.unwrap_or_default();
-                events::emit(SpecApiEvent::FlywheelProposalDemoted {
-                    app_id: app_id.clone(),
-                    proposal_id: prop.id.clone(),
-                    page_id: spec_id.clone(),
-                    failing_assertion_id,
-                    failing_state_id,
-                    snapshot_id: red_snapshot_id,
-                    at_ms: events::now_ms(),
-                });
-                info!(
-                    "post_sweep_pending: demoted {} (spec_id={}): {}",
-                    prop.id, spec_id, detail
+                //
+                // The named assertion may be an UNKNOWN one (never evaluated)
+                // rather than a failed one, so the event says which in
+                // `failing_assertion_verdict` ("fail" / "unknown", "" when none
+                // is named).
+                let event = crate::spec_api::validator::demoted_event(
+                    app_id.clone(),
+                    prop.id.clone(),
+                    spec_id.clone(),
+                    failing_assertion,
+                    red_snapshot_id,
+                    events::now_ms(),
                 );
+                if let SpecApiEvent::FlywheelProposalDemoted {
+                    failing_state_id,
+                    failing_assertion_id,
+                    failing_assertion_verdict,
+                    snapshot_id,
+                    ..
+                } = &event
+                {
+                    info!(
+                        proposal_id = %prop.id,
+                        app_id = %app_id,
+                        spec_id = %spec_id,
+                        snapshot_id = %snapshot_id,
+                        failing_state_id = %failing_state_id,
+                        failing_assertion_id = %failing_assertion_id,
+                        failing_assertion_verdict = %failing_assertion_verdict,
+                        detail = %detail,
+                        "post_sweep_pending: demoted"
+                    );
+                }
+                events::emit(event);
             }
             Err(other) => {
                 // SnapshotFetchFailed et al. — infra error, no state change

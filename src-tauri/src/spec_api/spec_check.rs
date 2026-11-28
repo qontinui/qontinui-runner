@@ -1506,7 +1506,7 @@ mod tests {
         assert_eq!(r.status, "ok");
         let result = r.result.expect("ok status carries a result");
         assert_eq!(result.page_id, "batch-page");
-        assert_eq!(result.result_schema_version, 1);
+        assert_eq!(result.result_schema_version, 2);
         // The caller-supplied fingerprint + snapshot identity flow through
         // instead of the in-process sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "test-app");
@@ -1944,7 +1944,7 @@ mod tests {
         // Hand-construct three SpecCheckResults with deterministic outcomes
         // to exercise the rate-mean + outcome-bucket math.
         let mk = |outcome: MatchOutcome, rate: f32| SpecCheckResult {
-            result_schema_version: 1,
+            result_schema_version: spec_check::evaluator::RESULT_SCHEMA_VERSION,
             snapshot_id: String::new(),
             snapshot_sha256: None,
             spec_content_hash: String::new(),

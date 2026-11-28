@@ -40,7 +40,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [features]
 # Plan 06 Step 7: the integration smoke test is gated behind this feature so
-# day-to-day `cargo test` skips it. CI runs `cargo test --features integration`.
+# day-to-day `cargo test` skips it. No CI job passes `--features integration`:
+# the required test job builds this crate's default-feature tests only, so the
+# gated smoke tests run only by hand, and they are also `#[ignore]`d:
+# `cargo test -p qontinui-spec-check --features integration -- --ignored`.
 integration = []
 
 [[bench]]
