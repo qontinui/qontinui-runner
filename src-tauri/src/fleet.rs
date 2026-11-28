@@ -3697,6 +3697,17 @@ struct HeartbeatPayload {
     /// block coord refuses is dropped without failing the register.
     #[serde(skip_serializing_if = "Option::is_none")]
     github_user_budget: Option<crate::github_budget::UserBudgetReport>,
+    /// Is `app-rt` starved RIGHT NOW (`runtime_lag::app_runtime_starved()`)?
+    /// Plan
+    /// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+    /// Phase 3: this heartbeat runs on `fleet-hb-rt`, a runtime of its own, so
+    /// it is the one off-box path that can carry `true` WHILE `app-rt` is
+    /// starved (the relay heartbeat runs on `app-rt` and carries only the
+    /// post-hoc history). Omitted when UNKNOWN (probe not registered, or
+    /// `app-rt` never ticked). Additive: coord's `DeviceRegisterRequest`
+    /// ignores a field it does not know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_runtime_starved: Option<bool>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -4002,6 +4013,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         main_sha,
         commits_behind,
         github_user_budget: crate::github_budget::user_budget_report(),
+        app_runtime_starved: qontinui_runner_lib::runtime_lag::app_runtime_starved(),
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -9255,6 +9267,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -9283,6 +9296,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget,
+            app_runtime_starved: None,
         };
         let absent = serde_json::to_value(payload(None)).unwrap();
         assert!(
@@ -9335,6 +9349,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9366,6 +9381,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9395,6 +9411,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9430,6 +9447,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9466,6 +9484,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -9541,6 +9560,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9582,6 +9602,7 @@ mod tests {",
             main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
             commits_behind: Some(4),
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -9633,6 +9654,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -9804,6 +9826,7 @@ mod tests {",
             main_sha: None,
             commits_behind: None,
             github_user_budget: None,
+            app_runtime_starved: None,
         }
     }
 
