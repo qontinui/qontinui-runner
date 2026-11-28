@@ -4755,6 +4755,22 @@ mod tests {
             .collect()
     }
 
+    /// `project.pr_watch_state` once held a plaintext `github_token` slot that only
+    /// ever stored `''`. qontinui-runner#2286 removed every reader and writer and the
+    /// column was dropped (coord finding e871ac27), so no token-shaped column may
+    /// come back to the table.
+    #[test]
+    fn pr_watch_state_declares_no_token_column() {
+        let token_columns: Vec<String> = declared_columns("project.pr_watch_state")
+            .into_iter()
+            .filter(|c| c.contains("token"))
+            .collect();
+        assert!(
+            token_columns.is_empty(),
+            "project.pr_watch_state declares token column(s) {token_columns:?}; plaintext              credential storage was removed (finding e871ac27, runner#2286)"
+        );
+    }
+
     /// Every identifier written as `<alias>.<ident>` in `sql`.
     #[expect(
         clippy::string_slice,
