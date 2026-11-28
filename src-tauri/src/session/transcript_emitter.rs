@@ -35,7 +35,7 @@
 //!    entry is created and nothing leaves the machine.
 //! 2. **Per-tenant** — checked HERE, at the source, before anything is
 //!    written: the tenant's `egress_transcript_sync` fleet-policy switch
-//!    (plan `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 7,
+//!    (plan `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 6,
 //!    which retired the `coord.tenant_policies.transcript_sync_enabled`
 //!    column into that domain). [`Self::emit`] reads
 //!    [`crate::egress::transcript_sync_permitted`], which is gate 1 AND this

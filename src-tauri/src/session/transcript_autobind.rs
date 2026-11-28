@@ -38,17 +38,24 @@
 //!    unsent prefix on first bind and stamps `account_label` / `config_dir` on
 //!    a minted row.
 //!
-//! Consent: transcript sync's gate (the user's toggle AND the tenant's
-//! `egress_transcript_sync` switch) is checked twice here. First in the device
-//! default scope, inline, before any coord traffic. Then, AFTER the coord round
-//! trip (`resolve_coord_row`, the mint gate) has settled a decision, in that
-//! decision's scope ([`bind_scope`]): a mint in the minting tenant's scope, an
-//! adoption — whose tenant is not known here — under the strictest verdict
-//! across every bound tenant ([`crate::egress::SessionScope::Unresolved`]).
-//! `bind_and_replay` then refuses on that verdict; the tenant's
-//! `transcript_sync_enabled` is enforced downstream by the emitter exactly as
-//! for a sniffed pane. Attempts are throttled per session ([`AttemptLedger`])
-//! so a coord outage costs one bounded probe per window, not one per append.
+//! Consent: ONE gate, transcript sync's — the user's own toggle AND the
+//! tenant's `egress_transcript_sync` fleet-policy switch
+//! ([`crate::egress::transcript_sync_gate_session`]). Plan
+//! `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 6 retired coord's
+//! per-tenant `transcript_sync_enabled` column into that domain, so there is no
+//! second, tenant-policy licence to ask. The gate is read in the device default
+//! scope, inline, before any coord traffic ([`spawn_ensure_bound`]); then, once
+//! a decision is settled, in that decision's scope ([`bind_scope`]): a mint, or
+//! a live pane with a stated tenant, in that tenant's scope; any other adoption
+//! — whose tenant is not known here — under the strictest verdict across the
+//! default scope and every bound tenant
+//! ([`crate::egress::SessionScope::Unresolved`]). `bind_and_replay` refuses on
+//! that verdict before it writes anything (no binding, no replay, no
+//! `config_dir` on a row), and the refusal is logged at INFO naming the scope
+//! and the verdict's source ([`BindGate`]) when it is new for that session,
+//! at DEBUG while it stands ([`note_refusal`]). Attempts are throttled per session
+//! ([`AttemptLedger`]) so a coord outage costs one bounded probe per window,
+//! not one per append.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -114,7 +121,8 @@ pub enum Decision {
     /// row from the pane's pin.
     AdoptLivePane { row: Uuid, tenant: NewSessionTenant },
     /// coord has no session for this id: register a fresh row owned by this
-    /// tenant (already proven resolvable and consenting — see [`mint_gate`]).
+    /// tenant (already proven resolvable — see [`mint_gate`]; whether it may
+    /// sync is the bind gate's question, asked in its scope — [`bind_scope`]).
     Mint(Uuid),
     /// coord's answer does not settle it; try again next window.
     Defer(String),
@@ -156,187 +164,93 @@ pub fn mint_tenant(
     }
 }
 
-/// How long a tenant's `transcript_sync_enabled` answer is reused.
-const POLICY_REUSE: Duration = Duration::from_secs(300);
-
-/// How long a NOT ESTABLISHED answer is reused. Short: a dark coord must not
-/// make every adoption of a boot storm wait out its own request timeout, but a
-/// recovered coord should be heard within moments.
-const POLICY_REUSE_UNKNOWN: Duration = Duration::from_secs(20);
-
-static POLICY_CACHE: Mutex<Option<HashMap<Uuid, (Instant, Option<bool>)>>> = Mutex::new(None);
-static POLICY_FETCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// `Some(answer)` when a fresh answer (possibly NOT ESTABLISHED) is cached.
-fn cached_policy(tenant: Uuid) -> Option<Option<bool>> {
-    let g = POLICY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.as_ref()
-        .and_then(|m| m.get(&tenant))
-        .filter(|(at, v)| {
-            at.elapsed()
-                < if v.is_some() {
-                    POLICY_REUSE
-                } else {
-                    POLICY_REUSE_UNKNOWN
-                }
-        })
-        .map(|(_, v)| *v)
-}
-
-fn remember_policy(tenant: Uuid, answer: Option<bool>) {
-    POLICY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_or_insert_with(HashMap::new)
-        .insert(tenant, (Instant::now(), answer));
-}
-
-/// The tenant's `transcript_sync_enabled`, from coord's `/tenant-policy`
-/// (presenting the queried tenant's own credential slot). `None` means NOT
-/// ESTABLISHED (unreachable, refused, undecodable) — which a caller must not
-/// read as consent. Cached for [`POLICY_REUSE`]; one fetch at a time, so a boot
-/// storm costs one request per tenant.
-async fn tenant_transcript_sync_enabled(tenant: Uuid) -> Option<bool> {
-    if let Some(v) = cached_policy(tenant) {
-        return v;
-    }
-    let _one = POLICY_FETCH.lock().await;
-    if let Some(v) = cached_policy(tenant) {
-        return v;
-    }
-    let answer = fetch_policy(tenant).await;
-    remember_policy(tenant, answer);
-    answer
-}
-
-/// Unit tests never reach coord: an unseeded tenant is NOT ESTABLISHED.
-#[cfg(test)]
-async fn fetch_policy(_tenant: Uuid) -> Option<bool> {
-    None
-}
-
-#[cfg(not(test))]
-async fn fetch_policy(tenant: Uuid) -> Option<bool> {
-    let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
-    let url = format!(
-        "{}/tenant-policy?tenant_id={tenant}",
-        base.trim_end_matches('/')
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let resp =
-        crate::coord_http::coord_get_for(&client, &url, crate::auth::TenantScope::Owned(tenant))
-            .send()
-            .await
-            .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("transcript_sync_enabled")?.as_bool()
-}
-
-/// Licence a mint: the tenant must be resolvable ([`mint_tenant`]) AND its
-/// `transcript_sync_enabled` must be observed `true`. A minted row carries the
-/// absolute `config_dir` on the wire, which a tenant that opted out of
-/// transcript sync has not agreed to send — so an unobserved or `false` answer
-/// mints nothing.
-async fn mint_gate() -> Result<Uuid, String> {
-    let tenant = mint_tenant(
+/// The tenant a mint files its row under ([`mint_tenant`] over this machine's
+/// tenant pin and bindings), or why there is none. It answers WHO would own
+/// the row, never WHETHER it may sync: that is the tenant's
+/// `egress_transcript_sync` switch, read once by [`bind_one_with`] in the
+/// mint's own scope ([`bind_scope`]) before anything is written — so a tenant
+/// with transcript sync off gets no row, no replay and no `config_dir`.
+fn mint_gate() -> Result<Uuid, String> {
+    mint_tenant(
         crate::session::tenant_pin::resolve_tenant_pin(),
         crate::auth::device_binding_count(),
         crate::auth::default_binding_tenant(),
     )
     .ok_or_else(|| {
         "tenant not resolved (unpinned multi-tenant device, or no binding): not minting".to_string()
-    })?;
-    match tenant_transcript_sync_enabled(tenant).await {
-        Some(true) => Ok(tenant),
-        Some(false) => Err(format!(
-            "tenant {tenant} has transcript sync off: not minting"
-        )),
-        None => Err(format!(
-            "tenant {tenant}'s transcript_sync_enabled not established: not minting"
-        )),
+    })
+}
+
+/// Transcript sync's gate as read for ONE bind, in the settled decision's
+/// [`bind_scope`]: whether the binder may write, and what a refusal names —
+/// the scope, which half closed it, and the source of the tenant switch's
+/// verdict — so a refused bind reads as a refusal in the log, not as a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BindGate {
+    gate: crate::egress::TranscriptGate,
+    scope: crate::egress::SessionScope,
+    source: crate::egress::LevelSource,
+}
+
+impl BindGate {
+    /// The gate in `scope`, read once
+    /// ([`crate::egress::transcript_sync_gate_session_verdict`]).
+    fn read(scope: crate::egress::SessionScope) -> Self {
+        let (gate, verdict) = crate::egress::transcript_sync_gate_session_verdict(scope);
+        Self {
+            gate,
+            scope,
+            source: verdict.source,
+        }
+    }
+
+    const fn is_open(self) -> bool {
+        self.gate.is_open()
     }
 }
 
-/// Pure: the tenants whose `transcript_sync_enabled` must ALL read `true`
-/// before an ADOPTION binds and replays. A live pane's stated tenant names
-/// itself; every other adoption's row belongs to a tenant this code does not
-/// know, so it takes every bound tenant (strictest wins), falling back to the
-/// default binding when no bound set was recorded. Empty means unresolvable
-/// and the adoption is refused. `None` for a mint or defer (not an adoption).
-pub fn adopt_gate_tenants(
-    decision: &Decision,
-    bound: &[Uuid],
-    default_binding: Option<Uuid>,
-) -> Option<Vec<Uuid>> {
-    match decision {
-        Decision::Mint(_) | Decision::Defer(_) => None,
-        Decision::AdoptLivePane {
-            tenant: NewSessionTenant::Stated(t),
-            ..
-        } => Some(vec![*t]),
-        Decision::Adopt(_) | Decision::AdoptLivePane { .. } => {
-            let mut v: Vec<Uuid> = bound.to_vec();
-            if v.is_empty() {
-                v.extend(default_binding);
-            }
-            Some(v)
-        }
+/// The transcript-sync refusal last REPORTED for each session. A closed gate
+/// is read again every [`ATTEMPT_WINDOW`], so without this a standing refusal
+/// would log the same INFO line for as long as the switch stays off. An
+/// attempt that reads the gate OPEN forgets the session, whatever it then
+/// does, so a refusal after that is reported afresh. (A key bound through
+/// another door and later unbound keeps its entry until an attempt here reads
+/// the gate open; its next refusal is then logged at DEBUG.)
+static REFUSALS: Mutex<Option<HashMap<String, BindGate>>> = Mutex::new(None);
+
+/// Record `gate` as `key`'s standing refusal. `true` when it is NEW for `key`
+/// (its first refusal, or a different scope, gate half or source): the caller
+/// logs that at INFO, and a repeat at DEBUG.
+fn note_refusal(key: &str, gate: BindGate) -> bool {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(key.to_string(), gate)
+        != Some(gate)
+}
+
+/// `key`'s gate read open (whether or not it then bound): forget its
+/// standing refusal.
+fn forget_refusal(key: &str) {
+    if let Some(m) = REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        m.remove(key);
     }
 }
 
-/// Pure: fold per-tenant answers into the adoption verdict. Anything but an
-/// observed `true` for every tenant (including an empty tenant set) refuses.
-pub fn adopt_verdict(answers: &[(Uuid, Option<bool>)]) -> Result<(), String> {
-    if answers.is_empty() {
-        return Err("no tenant resolved for the adoption: not binding".to_string());
-    }
-    for (t, a) in answers {
-        match a {
-            Some(true) => {}
-            Some(false) => return Err(format!("tenant {t} has transcript sync off: not adopting")),
-            None => {
-                return Err(format!(
-                    "tenant {t}'s transcript_sync_enabled not established: not adopting"
-                ))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Licence an adoption the way [`mint_gate`] licenses a mint: the binding
-/// replays the transcript into a coord row and stamps the absolute
-/// `config_dir`, which a tenant that opted out has not agreed to send.
-/// Non-adoption decisions pass through unchanged.
-async fn adopt_gate(decision: Decision) -> Decision {
-    let Some(tenants) = adopt_gate_tenants(
-        &decision,
-        &crate::egress::bound_tenant_ids(),
-        crate::auth::default_binding_tenant(),
-    ) else {
-        return decision;
-    };
-    let mut answers = Vec::with_capacity(tenants.len());
-    for t in tenants {
-        let answer = tenant_transcript_sync_enabled(t).await;
-        answers.push((t, answer));
-        // One refusal settles it: do not ask the remaining tenants.
-        if answer != Some(true) {
-            break;
-        }
-    }
-    match adopt_verdict(&answers) {
-        Ok(()) => decision,
-        Err(why) => Decision::Defer(why),
-    }
+/// The refusal standing for `key`, if any — a test's proof that the gate,
+/// and not some other refusal, is what kept a transcript unbound.
+#[cfg(test)]
+fn standing_refusal(key: &str) -> Option<BindGate> {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|m| m.get(key).copied())
 }
 
 /// Per-session attempt throttle.
@@ -366,15 +280,19 @@ impl AttemptLedger {
 static LEDGER: std::sync::LazyLock<AttemptLedger> =
     std::sync::LazyLock::new(AttemptLedger::default);
 
-/// Apply a [`Decision`] through the tailer's binder. Blocking (file I/O in the
-/// replay). Returns what to count, or `None` when the key was already bound.
-pub fn apply_decision(
+/// Apply a [`Decision`] through the tailer's binder, which writes nothing
+/// unless `gate` is open. Blocking (file I/O in the replay). Returns what to
+/// count, or `None` when the key was already bound.
+pub(crate) fn apply_decision(
     tailer: &SessionTranscriptTailer,
     identity: &TranscriptIdentity,
     path: &Path,
     decision: &Decision,
-    transcript_sync_permitted: bool,
+    gate: BindGate,
 ) -> Option<AutoBindKind> {
+    if gate.is_open() {
+        forget_refusal(&identity.claude_session_id);
+    }
     let adopt = match decision {
         Decision::Adopt(id) | Decision::AdoptLivePane { row: id, .. } => Some(*id),
         Decision::Mint(_) => None,
@@ -406,12 +324,7 @@ pub fn apply_decision(
     } else {
         AutoBindKind::Adopted
     };
-    match tailer.bind_and_replay(
-        &identity.claude_session_id,
-        path,
-        req,
-        transcript_sync_permitted,
-    ) {
+    match tailer.bind_and_replay(&identity.claude_session_id, path, req, gate.is_open()) {
         Ok(o) if o.already_bound => None,
         Ok(o) => {
             info!(
@@ -442,6 +355,22 @@ pub fn apply_decision(
                 AutoBindKind::Minted
             })
         }
+        Err(BindRefusal::SyncDisabled) => {
+            if note_refusal(&identity.claude_session_id, gate) {
+                info!(
+                    "transcript_autobind: {} not bound: transcript sync is closed in scope {:?} \
+                     ({:?}; egress_transcript_sync source {:?}); nothing was written",
+                    identity.claude_session_id, gate.scope, gate.gate, gate.source
+                );
+            } else {
+                debug!(
+                    "transcript_autobind: {} still not bound: transcript sync still closed \
+                     in scope {:?} ({:?})",
+                    identity.claude_session_id, gate.scope, gate.gate
+                );
+            }
+            Some(AutoBindKind::Deferred)
+        }
         Err(e) => {
             debug!(
                 "transcript_autobind: {} not bound: {e:?}",
@@ -458,7 +387,7 @@ pub fn apply_decision(
 /// steps before any row is written: an undelivered `Started` already in the
 /// outbox for this session is ADOPTED (a just-spawned pane whose row coord has
 /// not received yet — minting would create a second row beside it), and
-/// otherwise [`mint_gate`] must name a consenting tenant.
+/// otherwise [`mint_gate`] must name the tenant that will own the row.
 async fn settle(
     tailer: &Arc<SessionTranscriptTailer>,
     identity: &TranscriptIdentity,
@@ -477,7 +406,7 @@ async fn settle(
     if let Some(row) = pending {
         return Decision::Adopt(row);
     }
-    match mint_gate().await {
+    match mint_gate() {
         Ok(tenant) => decide(resolution, Some(tenant)),
         Err(why) => Decision::Defer(why),
     }
@@ -510,11 +439,13 @@ pub fn spawn_ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
     });
 }
 
-/// The scope a settled [`Decision`] is judged in before binding. A mint names
-/// the tenant that will own the row. An adoption's row belongs to a tenant this
-/// code does not know, so it is UNRESOLVED and takes the strictest bound
-/// tenant's verdict — the default scope would let tenant A's open switch replay
-/// a transcript into tenant B's row while B has sync off. PURE.
+/// The scope a settled [`Decision`] is judged in before binding — the one
+/// transcript gate's scope. A mint names the tenant that will own the row, and
+/// a live pane with a stated tenant names that tenant. Any other adoption's row
+/// belongs to a tenant this code does not know, so it is UNRESOLVED and takes
+/// the strictest bound tenant's verdict — the default scope would let tenant
+/// A's open switch replay a transcript into tenant B's row while B has sync
+/// off. PURE.
 fn bind_scope(decision: &Decision) -> crate::egress::SessionScope {
     match decision {
         Decision::Mint(t)
@@ -560,7 +491,9 @@ async fn bind_one(
 /// live pane's row is adopted without the round trip — then coord, then the
 /// local evidence AGAIN immediately before binding: at boot panes bind while
 /// the watcher starts tailing, and a pane bound during the round trip must
-/// not lose to coord's stale pick. Returns the decision applied.
+/// not lose to coord's stale pick. The settled decision is then applied under
+/// transcript sync's gate in its own scope ([`bind_scope`]) — the only consent
+/// check between it and the binder. Returns the decision applied.
 async fn bind_one_with<F, Fut>(
     tailer: &Arc<SessionTranscriptTailer>,
     identity: TranscriptIdentity,
@@ -589,21 +522,12 @@ where
             }
         }
     };
-    // The adoption licence: the decision RETURNED is what was settled; what is
-    // APPLIED is that decision unless a bound tenant's sync is not observed ON.
-    let applied = adopt_gate(decision.clone()).await;
-    if let Decision::Defer(why) = &applied {
-        if applied != decision {
-            info!(
-                "transcript_autobind: {} — adoption refused: {why}",
-                identity.claude_session_id
-            );
-        }
-    }
-    let permitted = crate::egress::transcript_sync_gate_session(bind_scope(&applied)).is_open();
-    let (t, p, d) = (tailer.clone(), path.to_path_buf(), applied);
+    // The one transcript gate, in the settled decision's scope. Read before the
+    // blocking hop: egress's test pins are per thread.
+    let gate = BindGate::read(bind_scope(&decision));
+    let (t, p, d) = (tailer.clone(), path.to_path_buf(), decision.clone());
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        apply_decision(&t, &identity, &p, &d, permitted).inspect(|k| t.note_autobind(*k))
+        apply_decision(&t, &identity, &p, &d, gate).inspect(|k| t.note_autobind(*k))
     })
     .await;
     if let Err(e) = joined {
@@ -794,79 +718,149 @@ mod tests {
 
     const CSID: &str = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4";
 
-    #[test]
-    fn adoption_needs_every_resolved_tenant_to_observe_sync_on() {
-        let (a, b) = (Uuid::from_u128(0xad01), Uuid::from_u128(0xad02));
-        let row = Uuid::from_u128(0xad03);
-        // Live pane with a stated tenant: just that tenant.
-        let pane = Decision::AdoptLivePane {
-            row,
-            tenant: NewSessionTenant::Stated(a),
-        };
-        assert_eq!(adopt_gate_tenants(&pane, &[a, b], None), Some(vec![a]));
-        // Coord row / outbox adoption: every bound tenant, else the default.
-        assert_eq!(
-            adopt_gate_tenants(&Decision::Adopt(row), &[a, b], None),
-            Some(vec![a, b])
-        );
-        assert_eq!(
-            adopt_gate_tenants(&Decision::Adopt(row), &[], Some(b)),
-            Some(vec![b])
-        );
-        assert_eq!(
-            adopt_gate_tenants(&Decision::Adopt(row), &[], None),
-            Some(vec![])
-        );
-        // Not adoptions.
-        assert_eq!(adopt_gate_tenants(&Decision::Mint(a), &[a], None), None);
-        assert_eq!(
-            adopt_gate_tenants(&Decision::Defer("x".into()), &[a], None),
-            None
-        );
-        // Verdict: only observed-true everywhere passes; UNKNOWN never counts as ON.
-        assert!(adopt_verdict(&[(a, Some(true)), (b, Some(true))]).is_ok());
-        assert!(adopt_verdict(&[(a, Some(true)), (b, Some(false))]).is_err());
-        assert!(adopt_verdict(&[(a, Some(true)), (b, None)]).is_err());
-        assert!(adopt_verdict(&[]).is_err());
-    }
+    /// The gate a test hands `apply_decision` directly: open, or closed on the
+    /// tenant switch.
+    const OPEN: BindGate = BindGate {
+        gate: crate::egress::TranscriptGate::Open,
+        scope: crate::egress::SessionScope::DeviceDefault,
+        source: crate::egress::LevelSource::ProductDefault,
+    };
+    const CLOSED: BindGate = BindGate {
+        gate: crate::egress::TranscriptGate::TenantSwitchOff,
+        scope: crate::egress::SessionScope::DeviceDefault,
+        source: crate::egress::LevelSource::Unknown,
+    };
 
-    fn seed_policy(tenant: Uuid, v: bool) {
-        remember_policy(tenant, Some(v));
-    }
-
-    /// A live pane's adoption binds only where its tenant's sync is observed
-    /// ON; unseeded (UNKNOWN) and off both defer; a mint passes through.
+    /// Plan `2026-11-26-the-transcript-adoption-licence-reads-a-tenant-policy-field-coord-retired-so-no-transcript-binds`:
+    /// a live pane's adoption BINDS when its tenant's `egress_transcript_sync`
+    /// switch is on, with nothing else asked. Asserted on the APPLIED bind —
+    /// the returned decision read `AdoptLivePane` before the fix too, while the
+    /// retired tenant-policy licence deferred the bind on every attempt.
     #[tokio::test]
-    async fn adopt_gate_defers_unless_the_tenant_is_observed_on() {
-        let (on, off, unknown) = (
-            Uuid::from_u128(0xad11),
-            Uuid::from_u128(0xad12),
-            Uuid::from_u128(0xad13),
-        );
-        seed_policy(on, true);
-        seed_policy(off, false);
-        let pane = |t| Decision::AdoptLivePane {
-            row: Uuid::from_u128(0xad14),
-            tenant: NewSessionTenant::Stated(t),
-        };
-        assert_eq!(adopt_gate(pane(on)).await, pane(on));
-        assert!(matches!(adopt_gate(pane(off)).await, Decision::Defer(_)));
-        assert!(matches!(
-            adopt_gate(pane(unknown)).await,
-            Decision::Defer(_)
-        ));
-        let mint = Decision::Mint(unknown);
-        assert_eq!(adopt_gate(mint.clone()).await, mint);
-    }
-
-    /// End to end: with no tenant observed ON, an adoption through
-    /// `bind_one_with` binds nothing and writes nothing.
-    #[tokio::test]
-    async fn an_adoption_without_observed_consent_binds_nothing() {
+    async fn a_live_pane_adoption_binds_when_the_tenant_switch_is_on() {
+        use crate::egress::test_support::pin_for;
+        use crate::egress::{Flow, Level};
         let dir = tempfile::tempdir().unwrap();
-        let (t, registrar, outbox) = tailer(dir.path());
+        let (t, r, _outbox) = tailer(dir.path());
         let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
         let id = identity_from_path(&path).unwrap();
+        let (pane_row, tenant) = (Uuid::new_v4(), Uuid::new_v4());
+        host_on_live_pane(
+            &r,
+            Arc::new(Mutex::new(Some(pane_row))),
+            NewSessionTenant::Stated(tenant),
+        );
+        let _on = pin_for(Flow::TranscriptSync, tenant, Level::On);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // `register_inner` is gated on an env var other suites toggle under
+        // their own lock: retry the whole bind, as `apply_retrying` does.
+        for _ in 0..100 {
+            bind_one_with(
+                &t,
+                id.clone(),
+                &path,
+                counting_resolver(
+                    calls.clone(),
+                    RowResolution::Existing(Uuid::new_v4()),
+                    || {},
+                ),
+            )
+            .await;
+            if r.session_id_for(CSID).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            r.session_id_for(CSID),
+            Some(pane_row),
+            "the pane's row is bound"
+        );
+        assert_eq!(t.coverage().autobind_adopted_live_pane, 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "coord was never asked"
+        );
+    }
+
+    /// The same live pane with its tenant's switch OFF — and with the tenant
+    /// unpinned, i.e. UNKNOWN (no flow-wide pin for `pinned_for` to fall back
+    /// to) — binds nothing and writes nothing: the closed gate is the refusal.
+    #[tokio::test]
+    async fn a_live_pane_adoption_defers_when_the_tenant_switch_is_off() {
+        use crate::egress::test_support::pin_for;
+        use crate::egress::{permit_session, Flow, Level, LevelSource, SessionScope};
+        for level in [Some(Level::Off), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, r, outbox) = tailer(dir.path());
+            let csid = Uuid::new_v4().to_string();
+            let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
+            let id = identity_from_path(&path).unwrap();
+            let (pane_row, tenant) = (Uuid::new_v4(), Uuid::new_v4());
+            host_on_live_pane_for(
+                &r,
+                &csid,
+                Arc::new(Mutex::new(Some(pane_row))),
+                NewSessionTenant::Stated(tenant),
+            );
+            let _pin = level.map(|l| pin_for(Flow::TranscriptSync, tenant, l));
+            let verdict = permit_session(Flow::TranscriptSync, SessionScope::Tenant(tenant));
+            assert!(!verdict.allowed, "{level:?}");
+            if level.is_none() {
+                assert_eq!(verdict.source, LevelSource::Unknown, "unpinned is UNKNOWN");
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            bind_one_with(
+                &t,
+                id,
+                &path,
+                counting_resolver(
+                    calls.clone(),
+                    RowResolution::Existing(Uuid::new_v4()),
+                    || {},
+                ),
+            )
+            .await;
+            assert_eq!(
+                r.session_id_for(&csid),
+                None,
+                "{level:?}: nothing was bound"
+            );
+            let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+            assert_eq!(refusal.gate, crate::egress::TranscriptGate::TenantSwitchOff);
+            assert_eq!(refusal.scope, SessionScope::Tenant(tenant), "{level:?}");
+            assert_eq!(refusal.source, verdict.source, "{level:?}");
+            let c = t.coverage();
+            assert_eq!(c.autobind_adopted_live_pane, 0, "{level:?}");
+            assert_eq!(
+                c.autobind_deferred, 1,
+                "{level:?}: the refusal is a deferral"
+            );
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "{level:?}: nothing was written"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    /// End to end through `bind_one_with`: an adoption of coord's row is judged
+    /// under the strictest bound tenant, so one bound tenant with the switch
+    /// off binds nothing and writes nothing while another's is on.
+    #[tokio::test]
+    async fn an_adoption_binds_nothing_while_a_bound_tenant_has_the_switch_off() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        use crate::egress::{Flow, Level};
+        let dir = tempfile::tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        let (on, off) = (Uuid::new_v4(), Uuid::new_v4());
+        let _on = pin_for(Flow::TranscriptSync, on, Level::On);
+        let _off = pin_for(Flow::TranscriptSync, off, Level::Off);
+        let _bound = fake_bound_tenants(vec![on, off]);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let coords = Uuid::new_v4();
         let decision = bind_one_with(
@@ -876,9 +870,174 @@ mod tests {
             counting_resolver(calls, RowResolution::Existing(coords), || {}),
         )
         .await;
-        assert_eq!(decision, Decision::Adopt(coords), "the SETTLED decision");
-        assert_eq!(registrar.session_id_for(CSID), None, "nothing was bound");
+        assert_eq!(decision, Decision::Adopt(coords));
+        assert_eq!(registrar.session_id_for(&csid), None, "nothing was bound");
         assert!(outbox.pending().unwrap().is_empty(), "nothing was written");
+        let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+        assert_eq!(refusal.gate, crate::egress::TranscriptGate::TenantSwitchOff);
+        assert_eq!(refusal.scope, crate::egress::SessionScope::Unresolved);
+    }
+
+    /// A MINT is judged in the minting tenant's own scope by the one gate:
+    /// with that tenant's switch off, or unpinned (UNKNOWN), no row is
+    /// registered — no `Started`, so no `config_dir` leaves — and the refusal
+    /// is the gate's; with it on, the row is minted under that tenant.
+    #[tokio::test]
+    async fn a_mint_registers_no_row_unless_the_minting_tenants_switch_is_on() {
+        use crate::egress::test_support::pin_for;
+        use crate::egress::{
+            permit_session, Flow, Level, LevelSource, SessionScope, TranscriptGate,
+        };
+        let started = |outbox: &OutboxWriter| {
+            outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+                .collect::<Vec<_>>()
+        };
+        for level in [Some(Level::Off), None, Some(Level::On)] {
+            let amb = crate::test_env::IsolatedAmbient::new();
+            let tenant = Uuid::new_v4();
+            amb.write_active_tenant_id(tenant);
+            let _pin = level.map(|l| pin_for(Flow::TranscriptSync, tenant, l));
+            let dir = tempfile::tempdir().unwrap();
+            let (t, registrar, outbox) = tailer(dir.path());
+            let csid = Uuid::new_v4().to_string();
+            let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
+            let id = identity_from_path(&path).unwrap();
+            // `register_inner` reads this variable, and every suite that sets it
+            // does so under the env lock `amb` now holds, so clearing it once
+            // (the fixture restores it) makes registration deterministic here.
+            std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+            let expected_source =
+                permit_session(Flow::TranscriptSync, SessionScope::Tenant(tenant)).source;
+            match level {
+                None => assert_eq!(expected_source, LevelSource::Unknown, "unpinned is UNKNOWN"),
+                Some(_) => assert_ne!(expected_source, LevelSource::Unknown, "{level:?} is pinned"),
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let decision = bind_one_with(
+                &t,
+                id,
+                &path,
+                counting_resolver(calls, RowResolution::Unknown, || {}),
+            )
+            .await;
+            assert_eq!(decision, Decision::Mint(tenant), "{level:?}");
+            if level == Some(Level::On) {
+                assert!(registrar.session_id_for(&csid).is_some(), "minted");
+                let rows = started(outbox.as_ref());
+                assert_eq!(rows.len(), 1, "exactly one Started row");
+                assert_eq!(rows[0].payload["tenant_id"], tenant.to_string());
+                assert_eq!(standing_refusal(&csid), None, "nothing refused it");
+            } else {
+                assert_eq!(registrar.session_id_for(&csid), None, "{level:?}");
+                assert!(
+                    started(outbox.as_ref()).is_empty(),
+                    "{level:?}: no row, no config_dir"
+                );
+                assert!(
+                    outbox.pending().unwrap().is_empty(),
+                    "{level:?}: nothing written"
+                );
+                assert_eq!(t.coverage().autobind_deferred, 1, "{level:?}");
+                let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+                assert_eq!(refusal.gate, TranscriptGate::TenantSwitchOff, "{level:?}");
+                assert_eq!(refusal.scope, SessionScope::Tenant(tenant), "{level:?}");
+                assert_eq!(refusal.source, expected_source, "{level:?}");
+            }
+        }
+    }
+
+    /// A standing refusal is reported once: the same gate again is not new,
+    /// a different one is, and an attempt that reads the gate OPEN forgets
+    /// the session even when it binds nothing (here a coord-dark `Defer`), so
+    /// an on-then-off flip is reported afresh.
+    #[test]
+    fn a_standing_refusal_is_new_only_when_it_changes() {
+        use crate::egress::{LevelSource, SessionScope, TranscriptGate};
+        let dir = tempfile::tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
+        let key = Uuid::new_v4().to_string();
+        let path = transcript(dir.path(), &key, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        let off = BindGate {
+            gate: TranscriptGate::TenantSwitchOff,
+            scope: SessionScope::Unresolved,
+            source: LevelSource::Unknown,
+        };
+        assert!(note_refusal(&key, off), "first refusal");
+        assert!(!note_refusal(&key, off), "the same refusal, standing");
+        let other = BindGate {
+            scope: SessionScope::DeviceDefault,
+            ..off
+        };
+        assert!(note_refusal(&key, other), "a different scope is new");
+        assert_eq!(
+            apply_decision(
+                &t,
+                &id,
+                &path,
+                &Decision::Defer("coord dark".into()),
+                CLOSED
+            ),
+            Some(AutoBindKind::Deferred)
+        );
+        assert_eq!(
+            standing_refusal(&key),
+            Some(other),
+            "a closed gate keeps it"
+        );
+        assert_eq!(
+            apply_decision(&t, &id, &path, &Decision::Defer("coord dark".into()), OPEN),
+            Some(AutoBindKind::Deferred)
+        );
+        assert_eq!(standing_refusal(&key), None, "the open gate forgot it");
+        assert!(
+            note_refusal(&key, other),
+            "reported afresh after the gate opened"
+        );
+        forget_refusal(&key);
+    }
+
+    /// `mint_gate` answers WHO owns a minted row, never whether it may sync:
+    /// with no egress pin at all the tenant's switch reads UNKNOWN (closed),
+    /// and the pinned tenant still resolves.
+    #[test]
+    fn mint_gate_resolves_the_tenant_without_reading_the_switch() {
+        let amb = crate::test_env::IsolatedAmbient::new();
+        let tenant = Uuid::new_v4();
+        amb.write_active_tenant_id(tenant);
+        assert!(
+            !crate::egress::permit_for(crate::egress::Flow::TranscriptSync, Some(tenant)).allowed,
+            "the switch would refuse, so an answer here did not read it"
+        );
+        assert_eq!(mint_gate(), Ok(tenant));
+    }
+
+    /// The licence coord retired stays retired: no non-test code here builds a
+    /// `/tenant-policy` read or looks up its dropped transcript field. The
+    /// needles are assembled with `concat!` so this test cannot match itself.
+    #[test]
+    fn the_licence_never_reads_the_retired_tenant_policy_field() {
+        let src = include_str!("transcript_autobind.rs").replace("\r\n", "\n");
+        let (code, _tests) = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests"))
+            .expect("the test module marker");
+        assert!(
+            code.contains("fn bind_one_with"),
+            "the split kept the module's code"
+        );
+        for needle in [
+            concat!("tenant-policy", "?"),
+            concat!("\"transcript_sync", "_enabled\""),
+        ] {
+            assert!(
+                !code.contains(needle),
+                "transcript_autobind.rs reads the retired tenant-policy field: {needle}"
+            );
+        }
     }
 
     #[test]
@@ -1010,7 +1169,7 @@ mod tests {
         d: &Decision,
     ) -> Option<AutoBindKind> {
         for _ in 0..100 {
-            let r = apply_decision(t, id, p, d, true);
+            let r = apply_decision(t, id, p, d, OPEN);
             if r != Some(AutoBindKind::Deferred) {
                 return r;
             }
@@ -1100,7 +1259,7 @@ mod tests {
         assert_eq!(patch[0].payload["no_heartbeat"], true);
         // A second pass never re-registers or double-counts.
         assert_eq!(
-            apply_decision(&t, &id, &path, &Decision::Mint(Uuid::new_v4()), true),
+            apply_decision(&t, &id, &path, &Decision::Mint(Uuid::new_v4()), OPEN),
             None
         );
         assert_eq!(registrar.session_id_for(CSID), Some(row));
@@ -1114,12 +1273,13 @@ mod tests {
         let id = identity_from_path(&path).unwrap();
 
         assert_eq!(
-            apply_decision(&t, &id, &path, &Decision::Defer("coord down".into()), true),
+            apply_decision(&t, &id, &path, &Decision::Defer("coord down".into()), OPEN),
             Some(AutoBindKind::Deferred)
         );
-        // Gate 1 off: bind_and_replay refuses before registering anything.
+        // The transcript gate closed: bind_and_replay refuses before
+        // registering anything.
         assert_eq!(
-            apply_decision(&t, &id, &path, &Decision::Mint(Uuid::new_v4()), false),
+            apply_decision(&t, &id, &path, &Decision::Mint(Uuid::new_v4()), CLOSED),
             Some(AutoBindKind::Deferred)
         );
         assert!(registrar.session_id_for(CSID).is_none());
@@ -1154,9 +1314,20 @@ mod tests {
         row: Arc<Mutex<Option<Uuid>>>,
         tenant: NewSessionTenant,
     ) {
+        host_on_live_pane_for(r, CSID, row, tenant);
+    }
+
+    /// [`host_on_live_pane`] for the session `csid`.
+    fn host_on_live_pane_for(
+        r: &AiCoordRegistrar,
+        csid: &str,
+        row: Arc<Mutex<Option<Uuid>>>,
+        tenant: NewSessionTenant,
+    ) {
         let pin = row.clone();
+        let csid = csid.to_string();
         r.attach_terminal_coord_lookup(move |c| {
-            (c == CSID).then(|| *pin.lock().unwrap()).flatten()
+            (c == csid).then(|| *pin.lock().unwrap()).flatten()
         });
         r.attach_pane_row_tenant(move |q| {
             (*row.lock().unwrap() == Some(q)).then_some(
@@ -1221,9 +1392,9 @@ mod tests {
             crate::egress::SessionScope::Tenant(tenant)
         );
 
-        // The bind itself (bind_one_with's own apply is gated on this
-        // machine's consent, so apply again with the gate open; a bound key
-        // answers None).
+        // The bind itself (bind_one_with's own apply was refused: nothing pins
+        // this tenant's switch, so it reads UNKNOWN — apply again with the
+        // gate open; a bound key answers None).
         let kind = apply_retrying(&t, &id, &path, &decision);
         assert!(
             matches!(kind, Some(AutoBindKind::AdoptedLivePane) | None),
