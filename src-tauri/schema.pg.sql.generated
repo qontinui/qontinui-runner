@@ -1886,8 +1886,83 @@ CREATE TABLE coord.agent_registry (
     fanout_bound integer DEFAULT 15 NOT NULL,
     definition_body text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    admin_disabled boolean DEFAULT false NOT NULL,
+    admin_disposition text,
+    admin_disabled_by text,
+    admin_disabled_at timestamp with time zone,
+    admin_reason text
 );
+
+
+--
+-- Name: COLUMN agent_registry.admin_disabled; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry.admin_disabled IS 'Tenant-admin CEILING (plan 2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type D1). coord folds enabled = NOT admin_disabled AND (member pref, else default_enabled): a member pref may narrow it, never widen it. Separate from default_enabled, which stays the tenant default.';
+
+
+--
+-- Name: COLUMN agent_registry.admin_disposition; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry.admin_disposition IS 'Disposition the admin picked from allowed_dispositions while admin_disabled holds. NULL = none picked, which coord reads as degrade. Vocabulary is coord-enforced, no CHECK.';
+
+
+--
+-- Name: COLUMN agent_registry.admin_disabled_by; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry.admin_disabled_by IS 'Actor of the LAST admin-switch write, in either direction (a re-enable writes it too). NULL = no admin has ever switched this row.';
+
+
+--
+-- Name: COLUMN agent_registry.admin_disabled_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry.admin_disabled_at IS 'Time of the LAST admin-switch write, in either direction. NULL = no admin has ever switched this row.';
+
+
+--
+-- Name: COLUMN agent_registry.admin_reason; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry.admin_reason IS 'Free-text reason the admin gave on the LAST admin-switch write. NULL = none given, or no admin has ever switched this row.';
+
+
+--
+-- Name: agent_registry_observed_names; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.agent_registry_observed_names (
+    tenant_id uuid NOT NULL,
+    agent_name text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_device_id uuid,
+    spawn_path_hint text
+);
+
+
+--
+-- Name: TABLE agent_registry_observed_names; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.agent_registry_observed_names IS 'Agent type names the spawn guard hook reported on an UNKNOWN_AGENT miss (no coord.agent_registry row), one row per tenant and name. The observed source of the admin agent catalog (plan 2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type D2). Written by coord only; alembic authors the DDL.';
+
+
+--
+-- Name: COLUMN agent_registry_observed_names.last_device_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry_observed_names.last_device_id IS 'Device that sent the most recent observation. NULL = the report carried no device.';
+
+
+--
+-- Name: COLUMN agent_registry_observed_names.spawn_path_hint; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_registry_observed_names.spawn_path_hint IS 'The spawn path the reporting hook could tell (e.g. in_session_subagent). NULL = it could tell nothing, which is UNKNOWN, not a default. Vocabulary is coord-enforced, no CHECK.';
 
 
 --
@@ -2018,7 +2093,8 @@ CREATE TABLE coord.agent_status (
     intent_globs text[],
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     expires_at timestamp with time zone NOT NULL,
-    agent_session_id uuid DEFAULT '00000000-0000-0000-0000-000000000000'::uuid NOT NULL
+    agent_session_id uuid DEFAULT '00000000-0000-0000-0000-000000000000'::uuid NOT NULL,
+    intent_globs_declared integer
 );
 
 
@@ -2027,6 +2103,13 @@ CREATE TABLE coord.agent_status (
 --
 
 COMMENT ON COLUMN coord.agent_status.agent_session_id IS 'The harness session (a coord.agent_sessions.id) that wrote this row. Sentinel: the nil UUID 00000000-0000-0000-0000-000000000000 means unattributed, because coord could not prove which session wrote it. Never NULL. Plan 2026-11-11-intent-overlap-excludes-the-callers-whole-device, Phase 1.';
+
+
+--
+-- Name: COLUMN agent_status.intent_globs_declared; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_status.intent_globs_declared IS 'How many intent globs this row should hold. Explicit/heuristic legs: recorded count plus scope-losing drops (absolute, overlong, over_cap, invalid_glob; not duplicates or blanks). LLM leg: the recorded count. A row with a non-empty intent_globs and intent_globs_declared > array_length(intent_globs, 1) is truncated, and readers withhold clearance on it. NULL = written by a coord before this column was read (not known to be truncated). Phase 3 of plan 2026-10-23-coord-declare-intent-silently-keeps-only-the-first-eight-explicit-globs writes it, only once schema_readiness observes the column. int4: read as i32.';
 
 
 --
@@ -2774,6 +2857,87 @@ COMMENT ON COLUMN coord.ci_job_observations.build_outcome IS 'Outcome of the job
 --
 
 COMMENT ON COLUMN coord.ci_job_observations.steps IS 'Per-step timings of this job, as the step-timing writer stores them from the GitHub jobs API: a JSON array with one object per step, in step order, carrying the step''s number, name, status, conclusion, started_at and completed_at. NULL = UNKNOWN (no steps were stored for this job), never an empty job; an empty array is a positive observation of zero steps. Kept with the row for its 30-day retention; the long compile-time trend is the merge-lane hourly rollup''s, not this column''s (plan 2026-10-19-the-merge-theory-has-no-data-to-test-it-against, Phase 1d).';
+
+
+--
+-- Name: ci_node_directives; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_node_directives (
+    device_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    directive_id uuid NOT NULL,
+    requested_at timestamp with time zone NOT NULL,
+    payload jsonb NOT NULL,
+    credential_arm text NOT NULL,
+    machine_id text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ci_node_directives_credential_arm_check CHECK ((credential_arm = ANY (ARRAY['operator'::text, 'device'::text]))),
+    CONSTRAINT ci_node_directives_payload_object_check CHECK ((jsonb_typeof(payload) = 'object'::text))
+);
+
+
+--
+-- Name: TABLE ci_node_directives; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.ci_node_directives IS 'One row per device: the LATEST CI-node settings directive coord accepted for it, written before the directive is published. The runner reads its own row on every device_ci connect, so a directive sent while the device was offline applies when it reconnects. Owned by coord; schema authored by qontinui-web alembic.';
+
+
+--
+-- Name: COLUMN ci_node_directives.device_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.device_id IS 'The device the directive targets. One row per device holds the LATEST accepted CI-node directive for it; the runner reads this row on every device_ci connect.';
+
+
+--
+-- Name: COLUMN ci_node_directives.tenant_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.tenant_id IS 'The tenant whose owner or agent issued the latest directive.';
+
+
+--
+-- Name: COLUMN ci_node_directives.directive_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.directive_id IS 'Coord-minted UUIDv7, once per accepted directive. The published payload carries the same id, so the runner treats an equal id as an already-applied replay.';
+
+
+--
+-- Name: COLUMN ci_node_directives.requested_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.requested_at IS 'Coord''s clock at acceptance, truncated to microseconds. The runner applies a directive only when this is strictly newer than the one it last applied.';
+
+
+--
+-- Name: COLUMN ci_node_directives.payload; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.payload IS 'The exact payload a live settings_requested frame carries for this directive; the runner parses both with one type.';
+
+
+--
+-- Name: COLUMN ci_node_directives.credential_arm; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.credential_arm IS 'Which coord door accepted the directive: operator (web PUT) or device (the agent twin).';
+
+
+--
+-- Name: COLUMN ci_node_directives.machine_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.machine_id IS 'The runner-local machine id, when the door supplied one.';
+
+
+--
+-- Name: COLUMN ci_node_directives.updated_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_node_directives.updated_at IS 'When coord last upserted this row. The default covers the insert only; the writer sets it to now() on every update.';
 
 
 --
@@ -9167,7 +9331,8 @@ CREATE TABLE coord.pr_check_runs (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     head_branch text,
     base_sha text,
-    check_suite_id bigint
+    check_suite_id bigint,
+    changed_at timestamp with time zone
 );
 
 
@@ -9200,6 +9365,13 @@ COMMENT ON COLUMN coord.pr_check_runs.check_suite_id IS 'The GitHub check suite 
 
 
 --
+-- Name: COLUMN pr_check_runs.changed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_check_runs.changed_at IS 'When this check row last CHANGED in a way a merge decision reads, as opposed to updated_at, the write stamp every redelivery and re-read moves. Set on insert and moved on conflict only when a decision input differs. NULL is a row no change has been stamped on since this column was added: read COALESCE(changed_at, updated_at). No default on purpose, because now() would stamp every existing row at migration time and make the whole open PR population read as having newer inputs at once.';
+
+
+--
 -- Name: pr_check_runs_latest; Type: VIEW; Schema: coord; Owner: -
 --
 
@@ -9216,7 +9388,8 @@ CREATE VIEW coord.pr_check_runs_latest WITH (security_invoker='true') AS
     updated_at,
     head_branch,
     base_sha,
-    check_suite_id
+    check_suite_id,
+    changed_at
    FROM coord.pr_check_runs
   ORDER BY repo, head_sha, name, COALESCE((conclusion = ANY (ARRAY['cancelled'::text, 'stale'::text])), false), started_at DESC NULLS LAST, check_id DESC;
 
@@ -12110,6 +12283,7 @@ CREATE TABLE coord.tenant_repo_profiles (
     expedite_max_files integer,
     expedite_max_changed_lines integer,
     expedite_review_arm boolean,
+    config_yaml_read_sha text,
     CONSTRAINT ck_tenant_repo_profiles_expedite_max_changed_lines CHECK (((expedite_max_changed_lines IS NULL) OR (expedite_max_changed_lines > 0))),
     CONSTRAINT ck_tenant_repo_profiles_expedite_max_files CHECK (((expedite_max_files IS NULL) OR (expedite_max_files > 0))),
     CONSTRAINT ck_tenant_repo_profiles_expedited_land CHECK (((expedited_land IS NULL) OR (expedited_land = ANY (ARRAY['on'::text, 'shadow'::text, 'off'::text])))),
@@ -12409,6 +12583,384 @@ CREATE TABLE coord.test_run_signatures (
 
 ALTER TABLE coord.test_run_signatures ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
     SEQUENCE NAME coord.test_run_signatures_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: test_selection_decisions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.test_selection_decisions (
+    id bigint NOT NULL,
+    tenant_id uuid NOT NULL,
+    repo text NOT NULL,
+    source text NOT NULL,
+    check_run_id bigint,
+    workflow_run_id bigint,
+    run_attempt integer,
+    job text NOT NULL,
+    head_sha text NOT NULL,
+    base_sha text,
+    tested_sha text,
+    ref_class text,
+    proposal_id uuid,
+    proposal_attempt integer,
+    map_ref text,
+    map_digest text,
+    map_age_lands integer,
+    selector_version text,
+    pinned_digest text,
+    latch_state text,
+    risk_digest text,
+    ladder_index integer,
+    audit_propensity double precision,
+    audit_draw double precision,
+    audit_commitment text,
+    ingest_state text,
+    mode text,
+    unit text,
+    reasons text[] DEFAULT '{}'::text[] NOT NULL,
+    fallback_reason text,
+    selected_count integer,
+    universe_count integer,
+    expected_count integer,
+    executed_count integer,
+    selected_digest text,
+    deferred_digest text,
+    expected_digest text,
+    executed_digest text,
+    input_digest text,
+    shard text,
+    decided_at timestamp with time zone NOT NULL,
+    ingested_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_test_selection_decisions_audit_draw CHECK (((audit_draw >= (0)::double precision) AND (audit_draw < (1)::double precision))),
+    CONSTRAINT ck_test_selection_decisions_audit_propensity CHECK (((audit_propensity >= (0)::double precision) AND (audit_propensity <= (1)::double precision))),
+    CONSTRAINT ck_test_selection_decisions_counts_nonnegative CHECK (((selected_count >= 0) AND (universe_count >= 0) AND (expected_count >= 0) AND (executed_count >= 0))),
+    CONSTRAINT ck_test_selection_decisions_digests CHECK ((((selected_digest IS NULL) OR (selected_digest ~ '^[0-9a-f]{64}$'::text)) AND ((deferred_digest IS NULL) OR (deferred_digest ~ '^[0-9a-f]{64}$'::text)) AND ((expected_digest IS NULL) OR (expected_digest ~ '^[0-9a-f]{64}$'::text)) AND ((executed_digest IS NULL) OR (executed_digest ~ '^[0-9a-f]{64}$'::text)) AND ((input_digest IS NULL) OR (input_digest ~ '^[0-9a-f]{64}$'::text)))),
+    CONSTRAINT ck_test_selection_decisions_ingest_state CHECK ((ingest_state = ANY (ARRAY['ingested'::text, 'pending'::text, 'absent'::text, 'rejected'::text]))),
+    CONSTRAINT ck_test_selection_decisions_ingest_state_iff_annotation CHECK (((source = 'ci_annotation'::text) = (ingest_state IS NOT NULL))),
+    CONSTRAINT ck_test_selection_decisions_mode CHECK ((mode = ANY (ARRAY['FULL'::text, 'SELECTED'::text, 'NOT-A-VERDICT'::text]))),
+    CONSTRAINT ck_test_selection_decisions_mode_iff_verdict CHECK (((mode IS NOT NULL) = (COALESCE((ingest_state = 'ingested'::text), false) OR (source = 'coord_selector'::text)))),
+    CONSTRAINT ck_test_selection_decisions_ref_class CHECK ((ref_class = ANY (ARRAY['pr_merge_ref'::text, 'candidate'::text, 'main_push'::text, 'schedule'::text, 'dispatch'::text, 'other'::text]))),
+    CONSTRAINT ck_test_selection_decisions_selected_le_universe CHECK ((selected_count <= universe_count)),
+    CONSTRAINT ck_test_selection_decisions_shas CHECK (((head_sha ~ '^[0-9a-f]{40}$'::text) AND ((base_sha IS NULL) OR (base_sha ~ '^[0-9a-f]{40}$'::text)) AND ((tested_sha IS NULL) OR (tested_sha ~ '^[0-9a-f]{40}$'::text)))),
+    CONSTRAINT ck_test_selection_decisions_source CHECK ((source = ANY (ARRAY['ci_annotation'::text, 'coord_selector'::text]))),
+    CONSTRAINT ck_test_selection_decisions_unit CHECK ((unit = ANY (ARRAY['test'::text, 'suite'::text, 'block'::text])))
+);
+
+
+--
+-- Name: TABLE test_selection_decisions; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.test_selection_decisions IS 'One typed verdict per check run (Definition 27: FULL, SELECTED, RED, NOT-A-VERDICT). Written by coord from a qontinui-selection-manifest annotation (source ci_annotation) or by the shadow selector (source coord_selector, never a verdict).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.id IS 'Surrogate key; coord retention prunes over this one column.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.tenant_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.tenant_id IS 'The repo''s proven owner tenant (coord owner_tenant_for_repo); an unresolvable owner writes no row.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.repo IS 'Canonical owner/name of the repository the check run belongs to.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.source; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.source IS 'Who wrote the row: ci_annotation (a job''s own manifest, a verdict) or coord_selector (a shadow decision, never a verdict).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.check_run_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.check_run_id IS 'GitHub check-run id (for Actions, the job id); the ingest conflict target with repo. Normally NULL on a coord_selector row, which decides before any check run exists.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.workflow_run_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.workflow_run_id IS 'GitHub Actions workflow run id (the manifest run_id, or parsed from the check run details_url).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.run_attempt; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.run_attempt IS 'GitHub Actions run attempt (the manifest run_attempt).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.job; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.job IS 'The check-run name exactly as GitHub reports it, e.g. frontmatter (1).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.head_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.head_sha IS '40-hex head sha of the check run.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.base_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.base_sha IS '40-hex base the job selected against (manifest base_sha); NULL when not reported.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.tested_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.tested_sha IS '40-hex tree the job tested (manifest tested_sha; GitHub''s merge commit on pull_request); NULL when not reported.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.ref_class; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.ref_class IS 'Which ref class ran the job, in coord.test_result_runs.ref_class''s six words exactly so the two tables join without a mapping; NULL when underivable.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.proposal_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.proposal_id IS 'Merge-train proposal id parsed from a candidate head branch; NULL off the train.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.proposal_attempt; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.proposal_attempt IS 'Merge-train proposal attempt; NULL off the train.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.map_ref; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.map_ref IS 'Coverage-map reference the selector read (manifest map_ref); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.map_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.map_digest IS 'Digest of the coverage map the selector read (manifest map_digest); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.map_age_lands; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.map_age_lands IS 'Coverage-map age in lands (A2 Definition 22, manifest map_age); NULL when absent, never 0.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.selector_version; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.selector_version IS 'The selector that decided, e.g. affected-guard-suites@<blob12> (manifest selector).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.pinned_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.pinned_digest IS 'Digest of the pinned (always-run) set (manifest pinned_digest); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.latch_state; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.latch_state IS 'Selector latch state (manifest latch_state); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.risk_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.risk_digest IS 'Risk-input digest for the shadow selector (plan D, integration hook 10); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.ladder_index; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.ladder_index IS 'Escalation-ladder index for the shadow selector (plan D, integration hook 10); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.audit_propensity; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.audit_propensity IS 'Logged audit propensity e in [0,1]; an audited candidate runs FULL. NULL when absent, never 0.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.audit_draw; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.audit_draw IS 'Keyed audit draw in [0,1); audited when audit_draw < audit_propensity. NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.audit_commitment; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.audit_commitment IS 'Commitment to the audit draw so it can be reproduced; NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.ingest_state; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.ingest_state IS 'ingested (a manifest verified), pending (the read was refused or failed; retried), absent (no manifest), rejected (malformed, or two manifests). Non-null exactly on a ci_annotation row; NULL on a coord_selector shadow row, which claims no ingest.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.mode; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.mode IS 'FULL, SELECTED or NOT-A-VERDICT; non-null exactly when ingest_state is ingested or the row is a coord_selector shadow decision. A SELECTED green never attests; NOT-A-VERDICT is neither green nor red.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.unit; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.unit IS 'What the counts count: test, suite or block.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.reasons; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.reasons IS 'The selector''s stated reasons, verbatim; empty when none.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.fallback_reason; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.fallback_reason IS 'Why a FULL or NOT-A-VERDICT run fell back, e.g. executed_differs; NULL otherwise.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.selected_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.selected_count IS '|R|: units the leg selected (manifest selected); NULL when unknown, never 0.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.universe_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.universe_count IS '|J|: units in the leg''s universe (manifest universe); NULL when unknown.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.expected_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.expected_count IS 'Units this job was expected to run, its part of R (manifest expected); NULL when unknown.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.executed_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.executed_count IS 'Units this job actually ran (manifest executed); NULL when unknown.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.selected_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.selected_digest IS 'sha256 of the selected unit ids, sorted, newline-terminated.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.deferred_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.deferred_digest IS 'sha256 of the deferred set J minus R (Definition 23).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.expected_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.expected_digest IS 'sha256 of the units this job was expected to run.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.executed_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.executed_digest IS 'sha256 of the units this job ran; FULL or SELECTED only when equal to expected_digest.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.input_digest; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.input_digest IS 'sha256 of the selector''s logged input record (manifest input_digest); NULL when absent.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.shard; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.shard IS 'k/n shard of the job, e.g. 1/12; NULL for an unsharded job.';
+
+
+--
+-- Name: COLUMN test_selection_decisions.decided_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.decided_at IS 'When the decision was taken (manifest decided_at, else the check run''s completion).';
+
+
+--
+-- Name: COLUMN test_selection_decisions.ingested_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.test_selection_decisions.ingested_at IS 'When coord wrote or last rewrote the row.';
+
+
+--
+-- Name: test_selection_decisions_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+ALTER TABLE coord.test_selection_decisions ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME coord.test_selection_decisions_id_seq
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
@@ -23655,6 +24207,14 @@ ALTER TABLE ONLY coord.agent_questions
 
 
 --
+-- Name: agent_registry_observed_names agent_registry_observed_names_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_registry_observed_names
+    ADD CONSTRAINT agent_registry_observed_names_pkey PRIMARY KEY (tenant_id, agent_name);
+
+
+--
 -- Name: agent_registry agent_registry_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -23844,6 +24404,14 @@ ALTER TABLE ONLY coord.ci_host_agents
 
 ALTER TABLE ONLY coord.ci_job_observations
     ADD CONSTRAINT ci_job_observations_pkey PRIMARY KEY (repo, job_id);
+
+
+--
+-- Name: ci_node_directives ci_node_directives_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_node_directives
+    ADD CONSTRAINT ci_node_directives_pkey PRIMARY KEY (device_id);
 
 
 --
@@ -26072,6 +26640,14 @@ ALTER TABLE ONLY coord.test_results
 
 ALTER TABLE ONLY coord.test_run_signatures
     ADD CONSTRAINT test_run_signatures_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: test_selection_decisions test_selection_decisions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.test_selection_decisions
+    ADD CONSTRAINT test_selection_decisions_pkey PRIMARY KEY (id);
 
 
 --
@@ -33197,6 +33773,20 @@ CREATE INDEX idx_test_run_signatures_repo_head ON coord.test_run_signatures USIN
 
 
 --
+-- Name: idx_test_selection_decisions_repo_head; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_test_selection_decisions_repo_head ON coord.test_selection_decisions USING btree (repo, head_sha);
+
+
+--
+-- Name: idx_test_selection_decisions_tenant_decided; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_test_selection_decisions_tenant_decided ON coord.test_selection_decisions USING btree (tenant_id, decided_at DESC);
+
+
+--
 -- Name: idx_topic_members_live_subproject; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -35077,6 +35667,13 @@ CREATE UNIQUE INDEX uq_subproject_members_live_work_unit ON coord.subproject_mem
 --
 
 CREATE UNIQUE INDEX uq_tenants_is_system ON coord.tenants USING btree (is_system) WHERE is_system;
+
+
+--
+-- Name: uq_test_selection_decisions_repo_check_run; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_test_selection_decisions_repo_check_run ON coord.test_selection_decisions USING btree (repo, check_run_id) WHERE (check_run_id IS NOT NULL);
 
 
 --
