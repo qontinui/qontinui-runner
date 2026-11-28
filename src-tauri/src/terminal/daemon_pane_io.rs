@@ -104,8 +104,8 @@ use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
-    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, SpawnError, Unprotected,
-    NEW_TAB_SPAWN_BUDGET,
+    holder_shares_runner_unit_cgroup, pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId,
+    SpawnError, Unprotected, NEW_TAB_SPAWN_BUDGET,
 };
 use tracing::{debug, info, warn};
 
@@ -132,15 +132,180 @@ pub struct HolderPaneError {
     pub reason: String,
     /// `Some` when the caller must NOT fall back to an in-process PTY.
     pub no_fallback: Option<NoFallback>,
+    /// The machine-readable failure kind a fallback pane is reported under
+    /// ([`NotUpgradeSafe::HolderSpawnFailed`]`.kind`); see
+    /// [`holder_spawn_failure_kind`] for the vocabulary.
+    pub kind: String,
+}
+
+impl HolderPaneError {
+    fn with_kind(kind: &str, reason: String) -> Self {
+        HolderPaneError {
+            reason,
+            no_fallback: None,
+            kind: kind.to_string(),
+        }
+    }
 }
 
 impl From<String> for HolderPaneError {
     fn from(reason: String) -> Self {
-        HolderPaneError {
-            reason,
-            no_fallback: None,
+        HolderPaneError::with_kind("other", reason)
+    }
+}
+
+/// The failure kind of a holder spawn, as one token (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7). The vocabulary:
+///
+/// - `child_<cause>` — the holder started but could not spawn the pane's
+///   child; `<cause>` is the holder's `cause=` token
+///   ([`qontinui_pty_holder::transient::failure_cause`]): `enoent`, `eacces`,
+///   `enoexec`, `etxtbsy` (a CLI reinstall window the holder's retry did not
+///   outlast), `emfile` (descriptor exhaustion — never retried, D7 (2b)) or
+///   `other`; plain `child` from a holder that names no cause;
+/// - `holder_error_<kind>` — any other `holder_error=<kind>` report
+///   (`lock_held`, `spec`, `detach`, `start`, `usage`);
+/// - `holder_process_spawn` / `holder_process_emfile` — the OS refused to
+///   start the holder process itself (the second when it said
+///   `Too many open files`);
+/// - `holder_silent`, `holder_route`, `holder_spec_write`, `not_our_holder`,
+///   `live_holder_unreachable`, `ran_unheld` — the other [`SpawnError`] arms;
+/// - set elsewhere: `holder_binary_unavailable`, `pane_dir_unusable`,
+///   `invalid_pane_id`, `attach_failed`.
+pub fn holder_spawn_failure_kind(e: &SpawnError) -> String {
+    match e {
+        SpawnError::Route(_) => "holder_route".into(),
+        SpawnError::Spec(_) => "holder_spec_write".into(),
+        SpawnError::Spawn(m) if is_fd_exhaustion_text(m) => "holder_process_emfile".into(),
+        SpawnError::Spawn(_) => "holder_process_spawn".into(),
+        SpawnError::Silent { .. } => "holder_silent".into(),
+        SpawnError::HolderFailed { line, .. } => match e.holder_error_kind() {
+            Some("child") => match qontinui_pty_holder::transient::cause_in_report(line) {
+                Some(cause) => format!("child_{cause}"),
+                None => "child".into(),
+            },
+            Some(kind) => format!("holder_error_{kind}"),
+            None => "holder_error".into(),
+        },
+        SpawnError::NotOurHolder { .. } => "not_our_holder".into(),
+        SpawnError::LiveHolderUnreachable(_) => "live_holder_unreachable".into(),
+        SpawnError::RanUnheld(_) => "ran_unheld".into(),
+    }
+}
+
+/// `SpawnError::Spawn` carries only text: the OS's own wording for EMFILE.
+fn is_fd_exhaustion_text(m: &str) -> bool {
+    m.contains("Too many open files") || m.contains("os error 24")
+}
+
+/// Why a LOCAL pane would not survive a runner upgrade (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7): the machine-readable half of what [`fallback_notice`] and
+/// [`unprotected_notice`] say in-band.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum NotUpgradeSafe {
+    /// `terminal.pty_holder` is off: every new pane is in-process by
+    /// configuration. A holder retry does not apply.
+    HolderDisabled,
+    /// The switch is on, but this pane's holder could not be started, and the
+    /// pane FELL BACK to an in-process PTY. `kind` is
+    /// [`holder_spawn_failure_kind`]'s token; `detail` the full reason.
+    HolderSpawnFailed { kind: String, detail: String },
+    /// A holder owns the PTY, but it shares the runner's systemd unit cgroup
+    /// and dies when that unit stops or restarts.
+    UnprotectedCgroup { detail: String },
+    /// A holder owns the PTY, but this runner adopted it and could not read
+    /// its cgroup, so whether it dies with the runner's unit is UNKNOWN --
+    /// never reported as safe.
+    CgroupUnknown { detail: String },
+}
+
+impl NotUpgradeSafe {
+    /// The reason as one token (`holder_disabled`, `holder_spawn_failed`,
+    /// `unprotected_cgroup`, `cgroup_unknown`), for counts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotUpgradeSafe::HolderDisabled => "holder_disabled",
+            NotUpgradeSafe::HolderSpawnFailed { .. } => "holder_spawn_failed",
+            NotUpgradeSafe::UnprotectedCgroup { .. } => "unprotected_cgroup",
+            NotUpgradeSafe::CgroupUnknown { .. } => "cgroup_unknown",
         }
     }
+}
+
+/// What backs a LOCAL pane's PTY, recorded when the pane is built and served
+/// on the terminal row (`GET /terminals`, `terminal_holder_states`) and in
+/// `/restart-readiness`. A remote mirror tab has none: the holder question is
+/// about the session's own device, not this one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HolderState {
+    /// A `qontinui-pty-holder` owns this pane's PTY.
+    pub holder: bool,
+    /// The pane's session survives a runner upgrade: a holder owns it and the
+    /// holder is outside the runner's cgroup. `false` exactly when
+    /// `not_upgrade_safe` is `Some`.
+    pub upgrade_safe: bool,
+    /// Why not, when not.
+    pub not_upgrade_safe: Option<NotUpgradeSafe>,
+}
+
+impl HolderState {
+    /// A holder pane, unprotected when `unprotected` says so.
+    pub fn holder(unprotected: Option<&Unprotected>) -> Self {
+        let why = unprotected.map(|u| NotUpgradeSafe::UnprotectedCgroup {
+            detail: u.to_string(),
+        });
+        HolderState {
+            holder: true,
+            upgrade_safe: why.is_none(),
+            not_upgrade_safe: why,
+        }
+    }
+
+    /// An ADOPTED holder pane: `shares` is the cgroup measurement
+    /// ([`holder_shares_runner_unit_cgroup`]) taken at adoption. `None` (the
+    /// cgroup could not be read) is not upgrade-safe: unknown, not safe.
+    pub fn adopted(unprotected: Option<&Unprotected>, cgroup_measured: bool) -> Self {
+        if unprotected.is_none() && !cgroup_measured {
+            return HolderState {
+                holder: true,
+                upgrade_safe: false,
+                not_upgrade_safe: Some(NotUpgradeSafe::CgroupUnknown {
+                    detail: "the adopted holder's cgroup could not be read, so whether it dies \
+                             with the runner's unit is unknown"
+                        .to_string(),
+                }),
+            };
+        }
+        Self::holder(unprotected)
+    }
+
+    /// An in-process pane, for `why`.
+    pub fn in_process(why: NotUpgradeSafe) -> Self {
+        HolderState {
+            holder: false,
+            upgrade_safe: false,
+            not_upgrade_safe: Some(why),
+        }
+    }
+
+    /// An in-process pane whose holder could not be started: a FALLBACK pane,
+    /// the kind a later holder retry would move into a holder.
+    pub fn is_fallback(&self) -> bool {
+        matches!(
+            self.not_upgrade_safe,
+            Some(NotUpgradeSafe::HolderSpawnFailed { .. })
+        )
+    }
+}
+
+/// A pane [`spawn_holder_pane_or_fallback`] built, and what backs it.
+pub struct SpawnedPane {
+    pub io: Arc<dyn PaneIo>,
+    pub state: HolderState,
 }
 
 impl std::fmt::Display for HolderPaneError {
@@ -183,7 +348,7 @@ impl std::fmt::Display for AttachError {
 
 impl From<AttachError> for HolderPaneError {
     fn from(e: AttachError) -> Self {
-        HolderPaneError::from(e.reason)
+        HolderPaneError::with_kind("attach_failed", e.reason)
     }
 }
 
@@ -361,7 +526,7 @@ pub fn spawn_holder_pane_or_fallback(
     cmd: ScrubbedCommand,
     cols: u16,
     rows: u16,
-) -> Result<Arc<dyn PaneIo>, String> {
+) -> Result<SpawnedPane, String> {
     spawn_holder_pane_or_fallback_in(
         holder_exe(),
         runner_pane_dir(),
@@ -404,7 +569,7 @@ fn spawn_holder_pane_or_fallback_in(
     cmd: ScrubbedCommand,
     cols: u16,
     rows: u16,
-) -> Result<Arc<dyn PaneIo>, String> {
+) -> Result<SpawnedPane, String> {
     off_the_async_workers(|| {
         spawn_holder_pane_or_fallback_blocking(exe, pane_dir, terminal_id, cmd, cols, rows)
     })
@@ -417,20 +582,28 @@ fn spawn_holder_pane_or_fallback_blocking(
     cmd: ScrubbedCommand,
     cols: u16,
     rows: u16,
-) -> Result<Arc<dyn PaneIo>, String> {
+) -> Result<SpawnedPane, String> {
     let attempt = (|| {
-        let exe = exe.map_err(HolderPaneError::from)?;
-        let pane_dir = pane_dir.map_err(HolderPaneError::from)?;
-        let pane_id = PaneId::new(terminal_id).map_err(|e| HolderPaneError::from(e.to_string()))?;
+        let exe = exe.map_err(|e| HolderPaneError::with_kind("holder_binary_unavailable", e))?;
+        let pane_dir = pane_dir.map_err(|e| HolderPaneError::with_kind("pane_dir_unusable", e))?;
+        let pane_id = PaneId::new(terminal_id)
+            .map_err(|e| HolderPaneError::with_kind("invalid_pane_id", e.to_string()))?;
         DaemonPaneIo::spawn(exe, &pane_dir, &pane_id, &cmd, cols, rows)
     })();
-    let reason = match attempt {
-        Ok(pane) => return Ok(Arc::new(pane)),
+    let (reason, kind) = match attempt {
+        Ok(pane) => {
+            let state = HolderState::holder(pane.unprotected());
+            return Ok(SpawnedPane {
+                io: Arc::new(pane),
+                state,
+            });
+        }
         // A holder for this pane may still be running its command: an
         // in-process fallback would run it a second time.
         Err(HolderPaneError {
             reason,
             no_fallback: Some(why),
+            ..
         }) => {
             let (log, user) = match why {
                 NoFallback::HolderStillRunning => (
@@ -450,10 +623,22 @@ fn spawn_holder_pane_or_fallback_blocking(
                  second time"
             ));
         }
-        Err(e) => e.reason,
+        Err(e) => (e.reason, e.kind),
     };
+    // D7 (2b): descriptor exhaustion is a hard error that no retry fixes —
+    // surfaced at ERROR, so it is not read as one more reinstall window.
+    if kind.ends_with("emfile") {
+        tracing::error!(
+            terminal_id,
+            kind = %kind,
+            reason = %reason,
+            "pty holder: descriptor exhaustion (EMFILE) — the holder could not be started; \
+             FALLING BACK to an in-process PTY"
+        );
+    }
     warn!(
         terminal_id,
+        kind = %kind,
         reason = %reason,
         "pty holder: terminal.pty_holder is on but the holder could not be started — \
          FALLING BACK to an in-process PTY; this pane will not survive a runner exit"
@@ -470,10 +655,16 @@ fn spawn_holder_pane_or_fallback_blocking(
         .map_err(|e| {
             format!("{e} (in-process fallback, after PTY holder unavailable: {reason})")
         })?;
-    Ok(Arc::new(WithNotice {
-        notice: fallback_notice(&reason),
-        inner: local,
-    }))
+    Ok(SpawnedPane {
+        io: Arc::new(WithNotice {
+            notice: fallback_notice(&reason),
+            inner: local,
+        }),
+        state: HolderState::in_process(NotUpgradeSafe::HolderSpawnFailed {
+            kind,
+            detail: reason,
+        }),
+    })
 }
 
 /// A [`PaneIo`] that prints `notice` before the inner pane's first byte and
@@ -562,6 +753,15 @@ pub fn holder_incompatible_notice(holder_pid: u32, holder_versions: &[u32]) -> V
          and this tab can no longer show it\x1b[0m\r\n"
     )
     .into_bytes()
+}
+
+/// What `attach` knows of a pane's protection from its unit cgroup.
+enum Protection {
+    /// The spawner saw the route: unprotected or not.
+    Known(Option<Unprotected>),
+    /// An adopted holder: `attach` measures its cgroup against this process
+    /// before the pump starts.
+    MeasureAdopted,
 }
 
 /// In-band notice for a pane whose holder will NOT survive the runner's
@@ -1013,6 +1213,9 @@ pub struct DaemonPaneIo {
     /// connection starts unpaused).
     paused: Arc<AtomicBool>,
     unprotected: Option<Unprotected>,
+    /// `false` when this pane was adopted ([`Self::attach_existing`]) and its
+    /// holder's cgroup could not be read; `true` otherwise.
+    cgroup_measured: bool,
     /// The holder's restore metadata, when this pane attached with a restore
     /// ([`Self::attach_existing`]) and the holder could answer one.
     restored: Option<RestoreMeta>,
@@ -1126,6 +1329,7 @@ impl DaemonPaneIo {
                     SpawnError::RanUnheld(_) => Some(NoFallback::CommandAlreadyRan),
                     _ => None,
                 },
+                kind: holder_spawn_failure_kind(&e),
                 reason: format!("PTY holder spawn failed: {e}"),
             }
         })?;
@@ -1174,7 +1378,7 @@ impl DaemonPaneIo {
             pane_dir,
             pane_id,
             FRESH_SPAWN_FROM_OFFSET,
-            unprotected,
+            Protection::Known(unprotected),
             None,
         )
     }
@@ -1204,7 +1408,15 @@ impl DaemonPaneIo {
             Some((cols, rows)) => RestoreAt::Fitted(cols, rows),
             None => RestoreAt::PtySize,
         };
-        Self::attach(pane_dir, pane_id, from_offset, None, Some(restore))
+        // This side did not see the spawn's route, so `attach` measures it
+        // (before any replayed byte is delivered, so its notice comes first).
+        Self::attach(
+            pane_dir,
+            pane_id,
+            from_offset,
+            Protection::MeasureAdopted,
+            Some(restore),
+        )
     }
 
     /// `restore_at`: `Some` for a fresh consumer — ask for the restore
@@ -1214,7 +1426,7 @@ impl DaemonPaneIo {
         pane_dir: &Path,
         pane_id: &PaneId,
         from_offset: Option<u64>,
-        unprotected: Option<Unprotected>,
+        protection: Protection,
         restore_at: Option<RestoreAt>,
     ) -> Result<Self, AttachError> {
         let deadline = Instant::now() + ATTACH_DEADLINE;
@@ -1229,6 +1441,31 @@ impl DaemonPaneIo {
                 reason: format!("PTY holder {pane_id}: attach failed: {e}"),
             })?;
         let info = stream.info.clone();
+        let (unprotected, cgroup_measured) = match protection {
+            Protection::Known(u) => (u, true),
+            // A holder still in the runner's own unit cgroup (a self-managed
+            // upgrade replaces the runner without stopping the unit) dies when
+            // the unit stops, exactly as a fresh plain spawn would.
+            Protection::MeasureAdopted => {
+                match holder_shares_runner_unit_cgroup(stream.hello_ack.holder_pid) {
+                    Some(true) => (
+                        Some(Unprotected::Cgroup {
+                            fallback_reason: None,
+                        }),
+                        true,
+                    ),
+                    Some(false) => (None, true),
+                    None => {
+                        warn!(
+                            pane = %pane_id,
+                            holder_pid = stream.hello_ack.holder_pid,
+                            "terminal: an adopted holder's cgroup could not be read; it is reported not upgrade-safe (unknown)"
+                        );
+                        (None, false)
+                    }
+                }
+            }
+        };
         if restore_at.is_some() && info.restore.is_none() {
             // An older holder (protocol < 3): the tail is replayed bare, so a
             // mode it set before the tail is unknown to this consumer.
@@ -1334,6 +1571,7 @@ impl DaemonPaneIo {
             rows,
             paused,
             unprotected,
+            cgroup_measured,
             restored: info.restore,
             kill_settle: KILL_SETTLE_MAX,
         })
@@ -1363,6 +1601,11 @@ impl DaemonPaneIo {
     /// it survives (the holder shares the runner's systemd unit cgroup).
     pub fn unprotected(&self) -> Option<&Unprotected> {
         self.unprotected.as_ref()
+    }
+
+    /// `false` when this adopted pane's holder cgroup could not be read.
+    pub fn cgroup_measured(&self) -> bool {
+        self.cgroup_measured
     }
 
     /// The holder's restore metadata (`cwd`, `title`), when this pane was
@@ -2092,6 +2335,30 @@ pub fn kill_failed_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_adopted_holder_whose_cgroup_was_not_read_is_not_upgrade_safe() {
+        let unknown = HolderState::adopted(None, false);
+        assert!(unknown.holder);
+        assert!(!unknown.upgrade_safe);
+        assert_eq!(
+            unknown
+                .not_upgrade_safe
+                .as_ref()
+                .map(NotUpgradeSafe::as_str),
+            Some("cgroup_unknown")
+        );
+        // Measured outside the unit: safe. Measured inside: unprotected.
+        assert!(HolderState::adopted(None, true).upgrade_safe);
+        let inside = Unprotected::Cgroup {
+            fallback_reason: None,
+        };
+        let st = HolderState::adopted(Some(&inside), true);
+        assert_eq!(
+            st.not_upgrade_safe.as_ref().map(NotUpgradeSafe::as_str),
+            Some("unprotected_cgroup")
+        );
+    }
+
     use super::*;
 
     /// Records everything a pane sends.
@@ -2199,6 +2466,7 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             unprotected: None,
+            cgroup_measured: true,
             restored: None,
             kill_settle: KILL_SETTLE_MAX,
         }
@@ -2739,7 +3007,8 @@ mod tests {
                     ScrubbedCommand::seal(cmd),
                     80,
                     24,
-                );
+                )
+                .map(|spawned| spawned.io);
                 let fell_back = pane
                     .as_ref()
                     .is_ok_and(|p| p.credential_scrub() == CredentialScrub::InProcessEnv);
@@ -2943,7 +3212,7 @@ mod tests {
         // See `pty_holder_spawn_door_does_not_park_a_tokio_worker`: never the
         // captured `$HOME`, which a concurrent test may have deleted.
         cmd.cwd(std::env::temp_dir());
-        let pane = spawn_holder_pane_or_fallback_in(
+        let spawned = spawn_holder_pane_or_fallback_in(
             Err("no holder in this test".into()),
             Err("unused".into()),
             "fallback-term",
@@ -2952,6 +3221,27 @@ mod tests {
             24,
         )
         .expect("fallback spawns");
+        // The fallback is a STRUCTURED state, not only the in-band notice
+        // (plan 2026-11-24 D7): `holder: false`, not upgrade-safe, and the
+        // machine-readable reason and kind.
+        assert_eq!(
+            spawned.state,
+            HolderState {
+                holder: false,
+                upgrade_safe: false,
+                not_upgrade_safe: Some(NotUpgradeSafe::HolderSpawnFailed {
+                    kind: "holder_binary_unavailable".into(),
+                    detail: "no holder in this test".into(),
+                }),
+            }
+        );
+        assert!(spawned.state.is_fallback());
+        let wire = serde_json::to_value(&spawned.state).unwrap();
+        assert_eq!(wire["holder"], false);
+        assert_eq!(wire["upgradeSafe"], false);
+        assert_eq!(wire["notUpgradeSafe"]["reason"], "holder_spawn_failed");
+        assert_eq!(wire["notUpgradeSafe"]["kind"], "holder_binary_unavailable");
+        let pane = spawned.io;
         assert_eq!(pane.credential_scrub(), CredentialScrub::InProcessEnv);
         let mut reader = pane.reader().unwrap();
         let collected = Arc::new(Mutex::new(Vec::new()));
@@ -3106,6 +3396,82 @@ mod tests {
             });
             rx.recv_timeout(bound)
                 .unwrap_or_else(|_| panic!("wait did not settle within {bound:?}"))
+        }
+
+        /// Plan 2026-11-24 D7 (2a): a pane spawned while its program is
+        /// missing — the Claude CLI's auto-update reinstall window, here a
+        /// script that appears ~1.5 s after the spawn — is HOLDER-backed, not
+        /// an in-process fallback. Entered through the door production calls
+        /// (`spawn_holder_pane_or_fallback_in`), against the real holder,
+        /// whose child spawn retries the transient ENOENT and re-resolves the
+        /// path on each attempt. Without the retry the holder exits 5 at once
+        /// and this pane is a `holder_spawn_failed` fallback.
+        #[test]
+        fn pty_holder_enoent_window_gets_a_holder_pane_not_a_fallback() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = pane_dir("enoent");
+            let bin_dir = dir.with_extension("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let program = bin_dir.join("claude");
+            let (p2, b2) = (program.clone(), bin_dir.clone());
+            let installer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                // Written aside and renamed in, as npm's reify step does, so
+                // the holder never execs a half-written file.
+                let tmp = b2.join(".claude-tmp");
+                std::fs::write(
+                    &tmp,
+                    "#!/bin/sh
+printf REINSTALLED
+sleep 30
+",
+                )
+                .unwrap();
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::rename(&tmp, &p2).unwrap();
+            });
+            let mut cmd = portable_pty::CommandBuilder::new(&program);
+            cmd.cwd("/tmp");
+            let spawned = spawn_holder_pane_or_fallback_in(
+                Ok(holder().as_path()),
+                Ok(dir.clone()),
+                "enoent-pane",
+                ScrubbedCommand::seal(cmd),
+                80,
+                24,
+            )
+            .expect("the pane spawns");
+            installer.join().unwrap();
+            assert_eq!(
+                spawned.state,
+                HolderState::holder(None),
+                "a reinstall window must not demote the pane to an in-process PTY"
+            );
+            assert_eq!(
+                spawned.io.credential_scrub(),
+                CredentialScrub::ScrubbedOutOfProcess,
+                "holder-backed, not LocalPty"
+            );
+            let mut reader = spawned.io.reader().unwrap();
+            let collected = Arc::new(Mutex::new(Vec::new()));
+            let sink = collected.clone();
+            let t = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            until(&collected, Duration::from_secs(10), |c| {
+                contains(c, b"REINSTALLED")
+            });
+            spawned.io.kill(Duration::from_secs(5)).unwrap();
+            let _ = spawned.io.release(Duration::from_secs(5));
+            let _ = t.join();
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&bin_dir);
         }
 
         /// Input typed into a `DaemonPaneIo` reaches the holder's child, the
@@ -3518,11 +3884,19 @@ mod tests {
                 offset,
                 "resumes where the first left off"
             );
+            // The adoption measured the holder's cgroup itself, and what it
+            // recorded agrees with a fresh read of the same holder.
+            let shares = holder_shares_runner_unit_cgroup(second.holder_pid());
+            assert!(shares.is_some(), "a live holder's cgroup reads");
+            assert!(second.cgroup_measured());
+            assert_eq!(second.unprotected().is_some(), shares == Some(true));
             let (c2, t2) = drain(&second);
             second.writer().unwrap().write_all(b"two\r").unwrap();
             until(&c2, Duration::from_secs(10), |c| contains(c, b"two"));
+            // cat's echoed line, as above: an unprotected notice pushed on
+            // adoption may itself contain the bare word.
             assert!(
-                !contains(&c2.lock().unwrap(), b"one"),
+                !contains(&c2.lock().unwrap(), b"one\r\n"),
                 "no duplicate replay"
             );
             second.release(Duration::from_secs(2)).unwrap();
@@ -3540,7 +3914,7 @@ mod tests {
                     &dir,
                     &id,
                     Some(second.stream_offset()),
-                    Some(why.clone()),
+                    Protection::Known(Some(why.clone())),
                     None,
                 )
                 .expect("reattach again"),

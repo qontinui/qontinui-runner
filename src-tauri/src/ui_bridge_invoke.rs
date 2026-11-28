@@ -684,6 +684,15 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         observe_projection: None,
     },
     ProxyableCommand {
+        name: "terminal_holder_states",
+        dispatch: Dispatch::Frontend,
+        description: "Return what backs every open terminal's PTY, keyed by terminal id (plan 2026-11-24-runner-upgrades-itself-daily D7). READ-ONLY. Each value is `{holder, upgradeSafe, notUpgradeSafe}`: `holder: false` is an in-process pane, with `notUpgradeSafe.reason` `holder_disabled` (terminal.pty_holder off) or `holder_spawn_failed` (a fallback; `kind` names the failure, e.g. `child_enoent`, `child_emfile`, `holder_silent`), and `unprotected_cgroup` marks a holder that dies with the runner's unit, `cgroup_unknown` an adopted holder whose cgroup could not be read (not upgrade-safe: unknown, not safe). `null` is a remote mirror tab, whose holder question belongs to its own device. A poisoned registry is an invoke error, never an empty map.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","description":"map of terminalId -> holder state or null"}}}"#,
+        probe_with_empty_args: true,
+        observe_projection: None,
+    },
+    ProxyableCommand {
         name: "terminal_resize",
         dispatch: Dispatch::Frontend,
         description: "Resize an existing terminal's PTY to `cols` x `rows` (already registered in Tauri; this entry only allowlists it over HTTP). Errors with `Terminal not found: <id>` for an unknown `terminalId`. Does not create, attach or close anything.",

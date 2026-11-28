@@ -511,6 +511,23 @@ pub async fn terminal_close(
 /// frontend stores it as the immutable `TerminalTab.spawnName`.
 pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
 
+/// Every open terminal's holder state keyed by terminal id (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7): `{holder, upgradeSafe, notUpgradeSafe}`, or `null` for a remote mirror.
+/// The tab header marks a pane that is not upgrade-safe from this. Rides
+/// beside `terminal_list` because `TerminalInfo` is the cross-repo schema.
+#[tauri::command]
+pub fn terminal_holder_states(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<CommandResponse, String> {
+    let map = terminal_manager.holder_states()?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(map).map_err(|e| e.to_string())?),
+    })
+}
+
 /// List all terminal sessions.
 ///
 /// Alongside the `terminals` array (`TerminalInfo`, which structurally does

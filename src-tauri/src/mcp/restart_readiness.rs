@@ -238,6 +238,14 @@ pub struct SessionEntry {
     pub terminal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// What backs this session's pane, when its terminal is open here and
+    /// recorded one (plan
+    /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+    /// D7): `holder: false` with the machine-readable reason for an
+    /// in-process pane. Absent = no open local pane (or a remote mirror),
+    /// never "holder-backed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<crate::terminal::daemon_pane_io::HolderState>,
 }
 
 /// The terminal-hosted agent-session plane — the population in the incident.
@@ -558,7 +566,88 @@ pub struct RestartReadiness {
     /// `0`.
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
+    /// The open LOCAL panes that would not survive a runner upgrade, with the
+    /// machine-readable reason for each (plan
+    /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+    /// D7). REPORT-ONLY: the verdict above does not read it (a fallback pane's
+    /// `claude` is already counted in `terminal_sessions`). `null` when the
+    /// terminal registry could not be read — never an empty block.
+    pub not_upgrade_safe_panes: Option<NotUpgradeSafePanes>,
     pub boundary: &'static str,
+}
+
+/// `not_upgrade_safe_panes`: every open local pane whose
+/// [`HolderState`](crate::terminal::daemon_pane_io::HolderState) is not
+/// upgrade-safe.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NotUpgradeSafePanes {
+    /// Panes not upgrade-safe, for any reason.
+    pub count: usize,
+    /// Of `count`, the panes with NO holder (`holder: false`): in-process
+    /// PTYs, by configuration or by fallback.
+    pub non_holder_count: usize,
+    /// `count` split by reason token (`holder_disabled`,
+    /// `holder_spawn_failed`, `unprotected_cgroup`, `cgroup_unknown`).
+    pub by_reason: std::collections::BTreeMap<&'static str, usize>,
+    /// Per pane, ordered by terminal id.
+    pub panes: Vec<NotUpgradeSafePane>,
+}
+
+/// One pane in [`NotUpgradeSafePanes`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NotUpgradeSafePane {
+    pub terminal_id: String,
+    pub holder: bool,
+    pub reason: crate::terminal::daemon_pane_io::NotUpgradeSafe,
+}
+
+/// Build [`NotUpgradeSafePanes`] from the registry's holder states, and stamp
+/// each terminal-plane session whose terminal is open here with its pane's
+/// state. PURE over its inputs. `Err` (an unreadable registry) leaves the
+/// sessions unstamped and the block `null`.
+pub fn attach_holder_states(
+    verdict: &mut RestartReadiness,
+    states: Result<
+        &std::collections::HashMap<String, Option<crate::terminal::daemon_pane_io::HolderState>>,
+        &str,
+    >,
+) {
+    let Ok(states) = states else {
+        verdict.not_upgrade_safe_panes = None;
+        return;
+    };
+    if let Some(t) = verdict.terminal_sessions.as_mut() {
+        for entry in &mut t.sessions {
+            entry.holder = entry
+                .terminal_id
+                .as_ref()
+                .and_then(|id| states.get(id))
+                .cloned()
+                .flatten();
+        }
+    }
+    let mut panes: Vec<NotUpgradeSafePane> = states
+        .iter()
+        .filter_map(|(id, st)| {
+            let st = st.as_ref()?;
+            Some(NotUpgradeSafePane {
+                terminal_id: id.clone(),
+                holder: st.holder,
+                reason: st.not_upgrade_safe.clone()?,
+            })
+        })
+        .collect();
+    panes.sort_by(|a, b| a.terminal_id.cmp(&b.terminal_id));
+    let mut by_reason = std::collections::BTreeMap::new();
+    for p in &panes {
+        *by_reason.entry(p.reason.as_str()).or_insert(0) += 1;
+    }
+    verdict.not_upgrade_safe_panes = Some(NotUpgradeSafePanes {
+        count: panes.len(),
+        non_holder_count: panes.iter().filter(|p| !p.holder).count(),
+        by_reason,
+        panes,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +707,7 @@ pub fn terminal_plane_from(
             state: r.state.clone(),
             terminal_id: Some(r.terminal_id.clone()),
             title: r.title.clone(),
+            holder: None,
         })
         .collect();
 
@@ -933,6 +1023,7 @@ pub fn ai_plane_from(
             state: e.state.clone(),
             terminal_id: None,
             title: None,
+            holder: None,
         })
         .collect();
 
@@ -1053,6 +1144,7 @@ pub fn build_verdict(
             census,
             session_status_source: status_source,
             wind_down_candidates,
+            not_upgrade_safe_panes: None,
             boundary: BOUNDARY,
         };
     }
@@ -1242,6 +1334,7 @@ pub fn build_verdict(
         census,
         session_status_source: status_source,
         wind_down_candidates,
+        not_upgrade_safe_panes: None,
         boundary: BOUNDARY,
     }
 }
@@ -1508,6 +1601,16 @@ pub async fn restart_readiness_handler(
         census,
         status_source,
     );
+    // Which open panes would not survive an upgrade, and why (plan
+    // 2026-11-24 D7) — report-only, read from the registry, not the census.
+    let mut verdict = verdict;
+    {
+        use tauri::Manager;
+        let holder_states = app
+            .state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+            .holder_states();
+        attach_holder_states(&mut verdict, holder_states.as_ref().map_err(String::as_str));
+    }
     // Fresher than the 600 s background census: the systemd watchdog gate
     // reads the newest published verdict (plan 2026-10-19 Phase 2b).
     crate::sd_notify::publish_readiness_verdict(&verdict, observed_at);
@@ -1651,6 +1754,80 @@ mod tests {
 
     fn fresh_census(now_ms: i64) -> CensusInfo {
         census_info(Some(&empty_report(now_ms - 60_000)), now_ms)
+    }
+
+    /// Plan 2026-11-24 D7: `/restart-readiness` names every open pane that
+    /// would not survive an upgrade, per pane and as counts by reason, and
+    /// stamps each terminal-plane session with its pane's state. An
+    /// unreadable registry is `null`, never an empty block.
+    #[test]
+    fn not_upgrade_safe_panes_are_counted_by_reason_and_stamped_per_session() {
+        use crate::terminal::daemon_pane_io::{HolderState, NotUpgradeSafe};
+        let now_ms = 1_800_000_000_000;
+        let records = vec![
+            record("sid-fallback", "t-fallback", now_ms - 1000),
+            record("sid-holder", "t-holder", now_ms - 1000),
+        ];
+        let mut v = verdict_from(
+            &empty_report(now_ms),
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert_eq!(v.not_upgrade_safe_panes, None, "unset until attached");
+        let fallback = HolderState::in_process(NotUpgradeSafe::HolderSpawnFailed {
+            kind: "child_enoent".into(),
+            detail: "PTY holder spawn failed".into(),
+        });
+        let states = HashMap::from([
+            ("t-fallback".to_string(), Some(fallback.clone())),
+            ("t-holder".to_string(), Some(HolderState::holder(None))),
+            (
+                "t-plain".to_string(),
+                Some(HolderState::in_process(NotUpgradeSafe::HolderDisabled)),
+            ),
+            (
+                "t-cgroup".to_string(),
+                Some(HolderState::holder(Some(
+                    &qontinui_runner_lib::pty_holder::spawn::Unprotected::Cgroup {
+                        fallback_reason: None,
+                    },
+                ))),
+            ),
+            ("t-remote".to_string(), None),
+        ]);
+        attach_holder_states(&mut v, Ok(&states));
+        let block = v.not_upgrade_safe_panes.clone().expect("attached");
+        assert_eq!(block.count, 3);
+        assert_eq!(block.non_holder_count, 2);
+        assert_eq!(block.by_reason.get("holder_spawn_failed"), Some(&1));
+        assert_eq!(block.by_reason.get("holder_disabled"), Some(&1));
+        assert_eq!(block.by_reason.get("unprotected_cgroup"), Some(&1));
+        let ids: Vec<&str> = block.panes.iter().map(|p| p.terminal_id.as_str()).collect();
+        assert_eq!(ids, ["t-cgroup", "t-fallback", "t-plain"]);
+        let sessions = &v.terminal_sessions.as_ref().unwrap().sessions;
+        let by_tid = |tid: &str| {
+            sessions
+                .iter()
+                .find(|e| e.terminal_id.as_deref() == Some(tid))
+                .unwrap()
+                .holder
+                .clone()
+        };
+        assert_eq!(by_tid("t-fallback"), Some(fallback));
+        assert_eq!(by_tid("t-holder"), Some(HolderState::holder(None)));
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["not_upgrade_safe_panes"]["count"], 3);
+        assert_eq!(
+            json["not_upgrade_safe_panes"]["panes"][1]["reason"]["kind"],
+            "child_enoent"
+        );
+
+        attach_holder_states(&mut v, Err("terminal registry lock poisoned"));
+        assert_eq!(v.not_upgrade_safe_panes, None, "unreadable is null");
     }
 
     /// `build_verdict` over ONE pass, shaping every census-derived plane from
