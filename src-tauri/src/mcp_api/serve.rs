@@ -197,14 +197,21 @@ pub(super) fn acquire_api_listener_with(
 /// learns the runner is coming back instead of waiting out its own timeout.
 pub(super) fn booting_response() -> axum::response::Response {
     use axum::response::IntoResponse;
-    let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
-        "the runner is booting: it holds its listener but its routes are not ready yet — \
-         retry after the Retry-After interval",
-        qontinui_runner_lib::listeners::RUNNER_BOOTING_CODE,
+    const RETRY_AFTER_S: u32 = 2;
+    let message = "the runner is booting: it holds its listener but its routes are not ready \
+                   yet — retry after the Retry-After interval";
+    let code = qontinui_runner_lib::listeners::RUNNER_BOOTING_CODE;
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Some(message),
+        None,
+        Some(RETRY_AFTER_S),
     );
+    let body = crate::mcp::types::ApiResponse::<()>::error_with_refusal(message, code, refusal);
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        [(axum::http::header::RETRY_AFTER, "2")],
+        [(axum::http::header::RETRY_AFTER, RETRY_AFTER_S.to_string())],
         axum::Json(body),
     )
         .into_response()
