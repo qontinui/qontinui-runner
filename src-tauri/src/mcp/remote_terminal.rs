@@ -3222,7 +3222,7 @@ pub enum EndGrant<'a> {
 
 /// Parse a `remote_terminal_ended` frame. The outcome is REQUIRED: a frame
 /// with none is `unknown`, never `ended`.
-fn parse_ended(data: &Value) -> EndReply {
+pub(crate) fn parse_ended(data: &Value) -> EndReply {
     let text = |k: &str| {
         data.get(k)
             .and_then(|v| v.as_str())

@@ -3898,6 +3898,8 @@ impl TerminalSession {
                 .writer
                 .lock()
                 .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+            // Under the writer lock, so the tag is the one of THIS write.
+            self.io.note_writer(&caller.tag());
             writer
                 .write_all(data)
                 .map_err(|e| format!("Failed to write to PTY: {}", e))?;

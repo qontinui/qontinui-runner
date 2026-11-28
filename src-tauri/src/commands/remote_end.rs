@@ -40,6 +40,9 @@ pub enum EndGrantSource {
     Minted,
     /// No grant was sent — the mint itself failed or was refused.
     None,
+    /// No grant: the operator twin's end went through the web backend's
+    /// user-session terminal path under the operator's own sign-in.
+    UserSession,
 }
 
 /// What `remote_session_end` returns. `outcome` is the wire vocabulary
@@ -164,6 +167,18 @@ fn open_tab_candidates(tm: &TerminalManager) -> Vec<OpenTabCandidate> {
         .collect()
 }
 
+/// The target terminal id an open, live tab onto `(device_id, session)` holds
+/// — the operator twin's force fallback addresses the close by it.
+pub(crate) fn open_tab_grant_terminal(
+    tm: &TerminalManager,
+    device_id: &str,
+    session_id: uuid::Uuid,
+) -> Option<String> {
+    select_open_tab_grant(open_tab_candidates(tm), device_id, session_id)
+        .map(|g| g.remote_terminal_id)
+        .filter(|t| !t.trim().is_empty())
+}
+
 fn result_from(
     reply: EndReply,
     device_id: &str,
@@ -258,26 +273,101 @@ where
     result_from(reply, device_id, session_id, None, EndGrantSource::Minted)
 }
 
-/// The shared body of the Tauri command and the `/ui-bridge/tauri/invoke`
-/// door. `Err` only for an argument that is not a session uuid.
+/// Which source door an end came in through (plan
+/// `2026-10-28-one-session-lifecycle-authority`, Phase 16 (c) step 2). It
+/// picks the path and NEVER rides a frame: a target reads the stamp the web
+/// backend's user-session path adds, not anything this side claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndDoor {
+    /// The operator twin `operator_remote_session_end` — the only door that
+    /// takes the user-session path, and the only one allowed to `force`.
+    OperatorSingle,
+    /// The plain `remote_session_end` Tauri command (the webview; bulk close).
+    WebviewCommand,
+    /// The `/ui-bridge/tauri/invoke` proxy arm (an agent's door).
+    HttpProxy,
+}
+
+/// Typed refusal of a proxied `force: true`.
+pub(crate) const FORCE_REQUIRES_OPERATOR: &str = "force_requires_operator";
+
+/// The message of that refusal.
+pub(crate) fn force_requires_operator_message() -> String {
+    format!(
+        "{FORCE_REQUIRES_OPERATOR}: a forced remote end is the operator's own act — it goes \
+         through the operator's sign-in in the runner UI, not this door; nothing was sent"
+    )
+}
+
+/// What one end asks for. `terminal_id` is the target's terminal the graceful
+/// answer reported (or an open tab's), used only by the operator twin's force
+/// fallback.
+#[derive(Debug, Clone)]
+pub(crate) struct EndRequest {
+    pub device_id: String,
+    pub session_id: String,
+    pub force: bool,
+    pub tenant: Option<String>,
+    pub terminal_id: Option<String>,
+}
+
+/// The shared body of the Tauri commands and the `/ui-bridge/tauri/invoke`
+/// door. `Err` only for an argument that is not a session uuid, or a proxied
+/// `force`.
 pub(crate) async fn end_remote_session(
     tm: &Arc<TerminalManager>,
     coord_base: &str,
-    device_id: &str,
-    session_id: &str,
-    force: bool,
-    tenant: Option<String>,
+    req: EndRequest,
+    door: EndDoor,
 ) -> Result<RemoteSessionEndResult, String> {
-    let session_uuid = uuid::Uuid::parse_str(session_id.trim()).map_err(|e| {
-        format!("remote_end:invalid_session_id: {session_id:?} is not a session uuid: {e}")
+    let session_uuid = uuid::Uuid::parse_str(req.session_id.trim()).map_err(|e| {
+        format!(
+            "remote_end:invalid_session_id: {:?} is not a session uuid: {e}",
+            req.session_id
+        )
     })?;
+    if door == EndDoor::HttpProxy && req.force {
+        return Err(force_requires_operator_message());
+    }
     info!(
-        device = %device_id,
+        device = %req.device_id,
         session = %session_uuid,
-        force,
+        force = req.force,
+        door = ?door,
         "remote end: requested"
     );
-    let result = end_remote_session_with(
+    let result = match door {
+        EndDoor::OperatorSingle => {
+            super::operator_remote_end::end_as_operator(tm, coord_base, &req, session_uuid).await
+        }
+        EndDoor::WebviewCommand | EndDoor::HttpProxy => {
+            end_over_device_socket(tm, coord_base, &req, session_uuid).await
+        }
+    };
+    info!(
+        device = %req.device_id,
+        session = %session_uuid,
+        outcome = result.outcome.as_str(),
+        via = ?result.via,
+        reason = ?result.reason,
+        grant_source = ?result.grant_source,
+        "remote end: answered"
+    );
+    Ok(result)
+}
+
+/// Today's device-socket end: an attach grant (an open tab's, else a mint)
+/// presented through the relay socket.
+pub(crate) async fn end_over_device_socket(
+    tm: &Arc<TerminalManager>,
+    coord_base: &str,
+    req: &EndRequest,
+    session_uuid: uuid::Uuid,
+) -> RemoteSessionEndResult {
+    let device_id = req.device_id.as_str();
+    let force = req.force;
+    let tenant = req.tenant.clone();
+    end_remote_session_with(
         open_tab_candidates(tm),
         device_id,
         session_uuid,
@@ -303,17 +393,7 @@ pub(crate) async fn end_remote_session(
             client().end(wire, force, END_TIMEOUT).await
         },
     )
-    .await;
-    info!(
-        device = %device_id,
-        session = %session_uuid,
-        outcome = result.outcome.as_str(),
-        via = ?result.via,
-        reason = ?result.reason,
-        grant_source = ?result.grant_source,
-        "remote end: answered"
-    );
-    Ok(result)
+    .await
 }
 
 /// END a session running on another device (plan
@@ -335,10 +415,14 @@ pub async fn remote_session_end(
     end_remote_session(
         terminal_manager.inner(),
         &base,
-        &device_id,
-        &session_id,
-        force.unwrap_or(false),
-        tenant,
+        EndRequest {
+            device_id,
+            session_id,
+            force: force.unwrap_or(false),
+            tenant,
+            terminal_id: None,
+        },
+        EndDoor::WebviewCommand,
     )
     .await
 }

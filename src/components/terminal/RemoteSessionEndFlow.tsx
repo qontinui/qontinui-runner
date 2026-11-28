@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { Power } from "lucide-react";
 
 import { ConfirmDialog } from "../ui/ConfirmDialog";
-import { remoteSessionEnd } from "./remoteSessionEnd";
+import { operatorRemoteSessionEnd } from "./remoteSessionEnd";
 import {
   describeEndResult,
   endInvokeFailure,
@@ -57,15 +57,16 @@ export function RemoteSessionEndFlow({
   const [phase, setPhase] = useState<Phase>({ step: "confirm" });
 
   const run = useCallback(
-    async (force: boolean) => {
+    async (force: boolean, terminalId: string | null = null) => {
       setPhase({ step: "running", force });
       let result: RemoteSessionEndResult;
       try {
-        result = await remoteSessionEnd(
+        result = await operatorRemoteSessionEnd(
           target.deviceId,
           target.sessionId,
           force,
           target.tenant ?? null,
+          terminalId,
         );
       } catch (err) {
         result = endInvokeFailure(err, target.deviceId, target.sessionId);
@@ -173,7 +174,7 @@ export function RemoteSessionEndFlow({
           confirmId={REMOTE_END_FORCE_CONFIRM_ID}
           cancelId={REMOTE_END_CANCEL_ID}
           onClose={close}
-          onConfirm={() => void run(true)}
+          onConfirm={() => void run(true, phase.result.terminalId)}
         >
           <div className="text-sm text-zinc-400 break-words">
             The graceful end said: {phase.view.headline}

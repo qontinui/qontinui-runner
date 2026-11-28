@@ -210,6 +210,19 @@ impl TauriInvokeResponse {
             None => Self::err(error),
         }
     }
+    /// A proxied `remote_session_end` with `force: true`: a typed 400
+    /// `force_requires_operator`, answered before anything is sent (plan
+    /// `2026-10-28-one-session-lifecycle-authority`, Phase 16 (c) step 3).
+    fn force_requires_operator() -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(crate::commands::remote_end::force_requires_operator_message()),
+            code: Some(crate::commands::remote_end::FORCE_REQUIRES_OPERATOR.to_string()),
+            status: Some(StatusCode::BAD_REQUEST),
+        }
+    }
+
     /// A refused `editSiblings` input: a typed 400 `invalid_edit_sibling`,
     /// answered before any allocation (vet V9).
     fn edit_sibling_refusal(
@@ -573,6 +586,11 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
+            // A forced end is the operator's own act (Phase 16 (c) step 3):
+            // refused here, typed, with nothing sent.
+            if a.force {
+                return TauriInvokeResponse::force_requires_operator();
+            }
             let tm: Arc<TerminalManager> = state
                 .app_handle
                 .state::<Arc<TerminalManager>>()
@@ -582,10 +600,14 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             match crate::commands::remote_end::end_remote_session(
                 &tm,
                 &base,
-                &a.device_id,
-                &a.session_id,
-                a.force,
-                a.tenant,
+                crate::commands::remote_end::EndRequest {
+                    device_id: a.device_id,
+                    session_id: a.session_id,
+                    force: false,
+                    tenant: a.tenant,
+                    terminal_id: None,
+                },
+                crate::commands::remote_end::EndDoor::HttpProxy,
             )
             .await
             {
@@ -972,5 +994,34 @@ mod terminal_create_coord_wiring_tests {
             .unwrap_or_else(|| panic!("coord-session must be non-null: {body}"));
         let coord = uuid::Uuid::parse_str(coord).expect("a uuid");
         assert_eq!(tm.get(&id).unwrap().coord_session_id(), Some(coord));
+    }
+}
+
+#[cfg(test)]
+mod operator_end_door_tests {
+    use super::*;
+
+    /// Phase 16 (c) step 3: a proxied `force` is a typed 400, nothing sent.
+    #[test]
+    fn the_proxy_refuses_force_with_a_typed_400() {
+        let r = TauriInvokeResponse::force_requires_operator();
+        assert!(!r.success);
+        assert_eq!(r.status, Some(StatusCode::BAD_REQUEST));
+        assert_eq!(r.code.as_deref(), Some("force_requires_operator"));
+        assert!(r.data.is_none());
+        let body = serde_json::to_value(&r).unwrap();
+        assert_eq!(body["code"], "force_requires_operator");
+    }
+
+    /// The twin is on neither UI-Bridge borrow route: not proxy-safelisted,
+    /// not an invoke-allowlist entry, not observe-allowed.
+    #[test]
+    fn the_operator_twin_is_off_both_borrow_routes() {
+        let twin = "operator_remote_session_end";
+        assert!(!ALLOWED_PROXIED_COMMANDS.contains(&twin));
+        assert!(!crate::ui_bridge_invoke::is_allowlisted(twin));
+        assert!(!crate::ui_bridge_invoke::UI_BRIDGE_OBSERVE_COMMANDS
+            .iter()
+            .any(|c| c.name == twin));
     }
 }

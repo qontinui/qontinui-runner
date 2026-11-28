@@ -6485,7 +6485,7 @@ pub(crate) async fn try_device_machine_key_exchange(
 pub(crate) async fn ensure_fresh_cognito_bearer(
     auth_manager: &crate::auth::AuthManager,
 ) -> Option<String> {
-    refresh_cognito_bearer(auth_manager).await.0
+    refresh_cognito_bearer(auth_manager, false).await.0
 }
 
 /// The classifying core behind [`ensure_fresh_cognito_bearer`]. Returns the
@@ -6506,8 +6506,15 @@ pub(crate) async fn ensure_fresh_cognito_bearer(
 /// session — so the REPLACE-not-REVOKE invariant holds (we never clear a stored
 /// token on a transient error; `try_refresh_once` independently preserves the
 /// device JWT).
+///
+/// `force` refreshes even when the stored access token is not yet near expiry
+/// — the operator twin's one retry after the web backend answered a token
+/// `authentication_failed` (plan `2026-10-28-one-session-lifecycle-authority`,
+/// Phase 16 (c)). It is still THIS refresh-and-persist path, so the
+/// `invalid_grant` classification above is unchanged.
 pub(crate) async fn refresh_cognito_bearer(
     auth_manager: &crate::auth::AuthManager,
+    force: bool,
 ) -> (Option<String>, RefreshClass) {
     // No Cognito session → legacy/local-login install; let the caller use its
     // existing bearer source.
@@ -6516,7 +6523,7 @@ pub(crate) async fn refresh_cognito_bearer(
         _ => return (None, RefreshClass::NoSession),
     };
 
-    if auth_manager.cognito_token_needs_refresh() {
+    if force || auth_manager.cognito_token_needs_refresh() {
         info!("device_jwt_refresher: Cognito access token stale — refreshing first");
         let rt = refresh_token.clone();
         let refreshed =
@@ -7291,7 +7298,8 @@ async fn refresher_loop(
                 // dead refresh token (`invalid_grant`) instead of silently
                 // stalling. `refresh_class` drives the wait + notification at
                 // each exit below.
-                let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
+                let (cognito_bearer, refresh_class) =
+                    refresh_cognito_bearer(&auth_manager, false).await;
                 let bearer = pair_bearer_for(
                     cognito_bearer,
                     auth_manager.get_access_token().ok(),

@@ -399,6 +399,18 @@ describe("wiring", () => {
     expect(src).toContain("<RemoteTabEndAction tab={remoteTab} />");
   });
 
+  it("RemoteSessionEndFlow calls the operator twin; the bulk close calls the plain command with force false", () => {
+    const flow = read("./RemoteSessionEndFlow.tsx");
+    expect(flow).toContain("operatorRemoteSessionEnd(");
+    expect(flow).not.toMatch(/[^r]remoteSessionEnd\(/);
+    const wrappers = read("./remoteSessionEnd.ts");
+    expect(wrappers).toContain('invoke<RemoteSessionEndResult>("operator_remote_session_end"');
+    expect(wrappers).toContain('invoke<RemoteSessionEndResult>("remote_session_end"');
+    const bulk = read("./CloseAllFinishedDialog.tsx");
+    expect(bulk).toContain("remoteSessionEnd(it.deviceId, it.sessionId, false, it.tenant ?? null)");
+    expect(bulk).not.toContain("operatorRemoteSessionEnd");
+  });
+
   it("the bulk confirm re-reads first and runs over exactly the list it showed", () => {
     const picker = read("./FleetSessionPicker.tsx");
     expect(picker).toContain("const read = await refreshFinished();");
