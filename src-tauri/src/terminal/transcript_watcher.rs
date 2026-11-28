@@ -711,7 +711,7 @@ async fn run_orchestrator(
                 continue;
             }
         };
-        if let Err(e) = watcher.watch(&projects_root, RecursiveMode::Recursive) {
+        if let Err(e) = watcher.watch(&projects_root, PROJECTS_WATCH_MODE) {
             warn!(
                 "transcript_watcher: failed to watch {:?}: {}",
                 projects_root, e
@@ -735,13 +735,8 @@ async fn run_orchestrator(
     let mut cohort = CohortWakeDetector::new(COHORT_WAKE_THRESHOLD, Instant::now());
     while let Some(event) = rx.recv().await {
         for path in &event.paths {
-            // Only attend to *.jsonl files inside a `projects/` subtree.
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            let Some(session_id) = tail_key_for_event_path(path) else {
                 continue;
-            }
-            let session_id = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
             };
 
             match event.kind {
@@ -879,12 +874,75 @@ enum ModifyAction {
     Fresh,
 }
 
+/// How each `<config>/projects` root is watched. RECURSIVE is load-bearing
+/// twice over: a session transcript sits one level below the root
+/// (`projects/<cwd>/<sid>.jsonl`), and a subagent sidechain three
+/// (`projects/<cwd>/<sid>/subagents/<name>.jsonl`) — the file whose growth is
+/// its parent session's liveness while the parent waits on it ([`SidechainTail`]).
+const PROJECTS_WATCH_MODE: RecursiveMode = RecursiveMode::Recursive;
+
+/// The dispatcher's decision for one watch-event path: the key its tail runs
+/// under, or `None` to ignore the path. Only `*.jsonl` files are attended to,
+/// keyed by their file stem — so a top-level transcript is keyed by its
+/// session id, and a subagent sidechain `<sid>/subagents/agent-x.jsonl` by
+/// `agent-x` (its tail then resolves the parent through [`SidechainTail`]).
+fn tail_key_for_event_path(path: &Path) -> Option<String> {
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+}
+
+/// What a tail knows, once at tail start, about the file it tails when that
+/// file is a subagent SIDECHAIN (`<projects>/<cwd>/<sid>/subagents/<name>.jsonl`).
+/// `None` for every other transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidechainTail {
+    /// The parent session: its key and its own transcript path.
+    owner: crate::session::transcript_autobind::SidechainOwner,
+    /// The parent's first lines carry the workflow marker. The watcher never
+    /// tails a workflow transcript into the session tailer, yet such a parent
+    /// CAN be bound: the pinned plane keys the registrar by `task_run_id`,
+    /// which the runner pins as the CLI session id, so its sidechains would
+    /// heartbeat the task-run row. The sidechain lane serves the plane the
+    /// parent lane serves, so a workflow parent's sidechain neither heartbeats
+    /// nor binds it. Read once per sidechain tail (the marker is the parent's
+    /// FIRST record, written long before any subagent starts); an unreadable
+    /// parent reads as not-workflow, as the dispatcher reads it.
+    owner_is_workflow: bool,
+}
+
+impl SidechainTail {
+    fn resolve(path: &Path) -> Option<Self> {
+        let owner = crate::session::transcript_autobind::sidechain_owner(path)?;
+        let owner_is_workflow = path_looks_like_workflow_session(&owner.path);
+        Some(Self {
+            owner,
+            owner_is_workflow,
+        })
+    }
+
+    /// The parent this sidechain's growth is liveness for, if any.
+    fn liveness_owner(&self) -> Option<&crate::session::transcript_autobind::SidechainOwner> {
+        (!self.owner_is_workflow).then_some(&self.owner)
+    }
+}
+
 /// Cheap sniff for `is_workflow_session` without re-loading via
-/// `list_sessions`. Reads up to the first 5 lines of the file. Returns true
-/// if it's a workflow session OR if the file can't be read yet (which is
-/// common immediately after `Create` because the writer hasn't flushed) —
-/// callers fall back to spawning the task and the in-task re-check (step 7
-/// in the loop) catches it after the first wake.
+/// `list_sessions`. Reads up to the first 5 lines of the file and returns true
+/// only when they carry the workflow marker. A file that cannot be opened yet
+/// (common immediately after `Create`, before the writer has flushed) reads as
+/// NOT a workflow session, and both callers depend on that:
+///
+/// - the dispatcher then schedules the tail, and the in-task re-check (step 6
+///   of [`tail_session`]) tears it down if the marker shows up after the
+///   first wake;
+/// - [`SidechainTail::resolve`] reads the PARENT through this function, so an
+///   unreadable parent must not read as workflow: if it did, a parent that was
+///   briefly unreadable at a sidechain's tail start would stop that sidechain
+///   heartbeating it for the whole tail.
 fn path_looks_like_workflow_session(path: &Path) -> bool {
     use std::io::{BufRead, BufReader};
     let f = match std::fs::File::open(path) {
@@ -1419,6 +1477,8 @@ async fn tail_session(
     if let Some(t) = tailer.as_ref() {
         crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
     }
+    // A subagent sidechain's parent, resolved once for the tail's lifetime.
+    let sidechain = SidechainTail::resolve(&path);
 
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
@@ -1597,51 +1657,106 @@ async fn tail_session(
         // (the per-wake fan-out that `commit_report`'s bounded queue exists to
         // prevent).
         if let Some(t) = tailer.as_ref() {
-            use crate::session::session_transcript_tailer::Admit;
             let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
+            hand_batch_to_tailer(
+                t,
+                &session_id,
+                &path,
+                sidechain.as_ref(),
+                file_start,
+                &bytes,
+                truncated,
+            )
+            .await;
+        }
+    }
+}
+
+/// Step 7 of [`tail_session`]: hand one appended batch of `path` (keyed
+/// `session_id`, starting at FILE offset `file_start`) to the session tailer,
+/// then the emit / withhold two-step. For a session transcript that is the
+/// bind retry and `admit` (liveness heartbeat + Gate 1 + coverage). For a
+/// subagent `sidechain` it is the PARENT's bind retry and liveness note, then
+/// `admit_sidechain` under the sidechain's own key. Its own function so the
+/// per-batch handoff `tail_session` performs can be driven by a test without
+/// the `AppHandle` / `PgDb` the rest of the loop needs.
+async fn hand_batch_to_tailer(
+    t: &Arc<SessionTranscriptTailer>,
+    session_id: &str,
+    path: &Path,
+    sidechain: Option<&SidechainTail>,
+    file_start: u64,
+    bytes: &str,
+    truncated: bool,
+) {
+    use crate::session::session_transcript_tailer::Admit;
+    let verdict = match sidechain {
+        None => {
             // An append found the session unbound (coord was unreachable at
             // tail start, or the throttle window had not elapsed): retry the
             // bind, which is a cheap no-op inside its throttle window.
-            if !t.is_bound(&session_id) {
-                crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
+            if !t.is_bound(session_id) {
+                crate::session::transcript_autobind::spawn_ensure_bound(t, path);
             }
-            let verdict = t.admit(
-                &session_id,
-                bytes.len(),
-                t.transcript_sync_open(&session_id),
+            t.admit(session_id, bytes.len(), t.transcript_sync_open(session_id))
+        }
+        Some(sc) => {
+            // A subagent sidechain (`<sid>/subagents/<name>.jsonl`) is keyed
+            // by `<name>`, which nothing binds: its growth is liveness for the
+            // PARENT session, heartbeated under the parent's key and throttle
+            // slot, with no bytes emitted there (plan
+            // `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+            // Phase 2). A parent whose own `.jsonl` is quiet gets no bind
+            // retry of its own, so an unbound parent's bind is retried here —
+            // for the PARENT's path, under the same per-session attempt
+            // throttle. A workflow parent gets neither ([`SidechainTail`]).
+            if let Some(owner) = sc.liveness_owner() {
+                if !bytes.is_empty() {
+                    if !t.is_bound(&owner.key) {
+                        crate::session::transcript_autobind::spawn_ensure_bound(t, &owner.path);
+                    }
+                    t.note_sidechain_activity(&owner.key, bytes.len());
+                }
+            }
+            t.admit_sidechain(session_id, bytes.len(), t.transcript_sync_open(session_id))
+        }
+    };
+    // Same two-step for a batch whose consent was withheld (Gate 1
+    // off): a tracked session's mark moves past it, so no later gap
+    // fill sends bytes written while sync was off.
+    if verdict == Admit::Withheld
+        && !t.try_withhold_batch(session_id, path, file_start, bytes.len())
+    {
+        let (t, sid, p, n) = (
+            t.clone(),
+            session_id.to_string(),
+            path.to_path_buf(),
+            bytes.len(),
+        );
+        if let Err(e) =
+            spawn_blocking_tracked(move || t.withhold_batch(&sid, &p, file_start, n)).await
+        {
+            warn!(
+                "transcript_watcher: withholding a consent-off batch for {} failed to run: {}",
+                session_id, e
             );
-            // Same two-step for a batch whose consent was withheld (Gate 1
-            // off): a tracked session's mark moves past it, so no later gap
-            // fill sends bytes written while sync was off.
-            if verdict == Admit::Withheld
-                && !t.try_withhold_batch(&session_id, &path, file_start, bytes.len())
-            {
-                let (t, sid, p, n) = (t.clone(), session_id.clone(), path.clone(), bytes.len());
-                if let Err(e) =
-                    spawn_blocking_tracked(move || t.withhold_batch(&sid, &p, file_start, n)).await
-                {
-                    warn!(
-                        "transcript_watcher: withholding a consent-off batch for {} failed to run: {}",
-                        session_id, e
-                    );
-                }
-            }
-            if verdict == Admit::Emit
-                && !t.try_emit_batch(&session_id, &path, file_start, &bytes, truncated)
-            {
-                let (t, sid, p, b) = (t.clone(), session_id.clone(), path.clone(), bytes.clone());
-                if let Err(e) = spawn_blocking_tracked(move || {
-                    t.emit_batch(&sid, &p, file_start, &b, truncated)
-                })
-                .await
-                {
-                    warn!(
-                        "transcript_watcher: deferred transcript emit for {} failed to run: {} \
-                         (the file mark is unchanged; the next batch or a bind carries it)",
-                        session_id, e
-                    );
-                }
-            }
+        }
+    }
+    if verdict == Admit::Emit && !t.try_emit_batch(session_id, path, file_start, bytes, truncated) {
+        let (t, sid, p, b) = (
+            t.clone(),
+            session_id.to_string(),
+            path.to_path_buf(),
+            bytes.to_string(),
+        );
+        if let Err(e) =
+            spawn_blocking_tracked(move || t.emit_batch(&sid, &p, file_start, &b, truncated)).await
+        {
+            warn!(
+                "transcript_watcher: deferred transcript emit for {} failed to run: {} \
+                 (the file mark is unchanged; the next batch or a bind carries it)",
+                session_id, e
+            );
         }
     }
 }
@@ -2061,6 +2176,288 @@ mod tests {
             initial_len + ASSISTANT_LINE.len() as u64,
             "the cursor advanced by exactly the append"
         );
+    }
+
+    // ── Subagent sidechains (plan
+    // `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+    // Phase 2) ───────────────────────────────────────────────────────────────
+
+    /// A session transcript and one subagent sidechain of it under
+    /// `<tmp>/.claude/projects/<cwd>/`, plus a session tailer whose heartbeat
+    /// sink (the outbox) is observable.
+    struct SidechainFixture {
+        _dir: tempfile::TempDir,
+        parent: String,
+        sidechain: PathBuf,
+        tailer: Arc<SessionTranscriptTailer>,
+        registrar: Arc<AiCoordRegistrar>,
+        outbox: Arc<crate::session::local_store::OutboxWriter>,
+    }
+
+    /// `parent_first_line` is the parent transcript's first record — the
+    /// workflow marker, or an ordinary user line.
+    fn sidechain_fixture(parent_first_line: &str) -> SidechainFixture {
+        use crate::session::local_store::OutboxWriter;
+        use crate::session::transcript_emitter::TranscriptEmitter;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let cwd = dir.path().join(".claude/projects/-home-u-proj");
+        std::fs::create_dir_all(cwd.join(&parent).join("subagents")).unwrap();
+        std::fs::write(
+            cwd.join(format!("{parent}.jsonl")),
+            format!("{parent_first_line}{USER_LINE}"),
+        )
+        .unwrap();
+        let sidechain = cwd.join(&parent).join("subagents/agent-x.jsonl");
+        std::fs::write(&sidechain, USER_LINE).unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let machine_id = uuid::Uuid::new_v4();
+        let registrar = Arc::new(AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            machine_id,
+            || None,
+        ));
+        let emitter = Arc::new(TranscriptEmitter::new(
+            outbox.clone(),
+            machine_id,
+            registrar.clone(),
+        ));
+        let tailer = Arc::new(SessionTranscriptTailer::new(emitter, registrar.clone()));
+        SidechainFixture {
+            _dir: dir,
+            parent,
+            sidechain,
+            tailer,
+            registrar,
+            outbox,
+        }
+    }
+
+    /// Retry a registration briefly: it is gated on a process-global env var
+    /// another suite toggles under its own lock.
+    fn registered(mut register: impl FnMut() -> Option<uuid::Uuid>) -> uuid::Uuid {
+        (0..100)
+            .find_map(|_| {
+                register().or_else(|| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                })
+            })
+            .expect("registration")
+    }
+
+    fn rows_for(
+        outbox: &crate::session::local_store::OutboxWriter,
+        coord: uuid::Uuid,
+        kind: crate::session::SessionEventKind,
+    ) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == kind.as_str() && r.session_id == coord)
+            .count()
+    }
+
+    /// Append one line to `path` and read it back through a `TailReader`
+    /// opened the way `tail_session` opens it: `(bytes, truncated, file_start)`.
+    async fn tailed_append(path: &Path) -> (String, bool, u64) {
+        let mut reader = open_reader(path, TailStart::Eof, Duration::ZERO).await;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            f.write_all(ASSISTANT_LINE.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+        let step = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
+            .await
+            .expect("the sidechain tail must deliver within 3 s")
+            .unwrap();
+        let TailStep::Appended { bytes, truncated } = step else {
+            panic!("expected an append, got {step:?}");
+        };
+        let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
+        (bytes, truncated, file_start)
+    }
+
+    /// The dispatcher delivers a subagent sidechain to a tail keyed by its
+    /// stem: the projects root is watched RECURSIVELY (a sidechain sits three
+    /// levels below it), `*.jsonl` passes the filter, and the key is the stem.
+    /// This pins the path from the watch event to `tail_session`, whose tail
+    /// then resolves the parent through `SidechainTail`.
+    #[test]
+    fn the_dispatcher_delivers_a_subagent_sidechain_under_its_stem_key() {
+        assert_eq!(PROJECTS_WATCH_MODE, RecursiveMode::Recursive);
+        let parent = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4";
+        let projects = Path::new("/home/u/.claude/projects/-home-u-proj");
+        let sidechain = projects.join(parent).join("subagents/agent-x.jsonl");
+        assert_eq!(
+            tail_key_for_event_path(&sidechain).as_deref(),
+            Some("agent-x")
+        );
+        assert_eq!(
+            tail_key_for_event_path(&projects.join(format!("{parent}.jsonl"))).as_deref(),
+            Some(parent)
+        );
+        assert_eq!(
+            tail_key_for_event_path(&projects.join(parent).join("subagents/notes.txt")),
+            None
+        );
+        assert_eq!(tail_key_for_event_path(projects), None);
+        // The key the tail runs under is NOT the parent: the parent is
+        // resolved separately, once per tail.
+        let tail = SidechainTail::resolve(&sidechain).expect("a sidechain tail");
+        assert_eq!(tail.owner.key, parent);
+        assert_eq!(tail.owner.path, projects.join(format!("{parent}.jsonl")));
+    }
+
+    /// A sidechain batch, read by a real `TailReader` and handed through
+    /// `hand_batch_to_tailer` (the per-batch handoff `tail_session` calls —
+    /// `tail_session` itself needs an `AppHandle` no unit test can build), under
+    /// the key the dispatcher gives it, heartbeats the BOUND parent exactly
+    /// once per window, sends no transcript chunk under the parent's coord
+    /// session, and leaves the sidechain key unbound.
+    #[tokio::test]
+    async fn a_sidechain_batch_through_hand_batch_to_tailer_heartbeats_its_bound_parent() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        use crate::session::SessionEventKind;
+        // Gate 1 ON, so "no chunk under the parent" is not an artefact of a
+        // closed gate; the gate's settings read lands in this test's ambient.
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture("");
+        let coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+        let before = rows_for(&fx.outbox, coord, SessionEventKind::Heartbeat);
+
+        let key = tail_key_for_event_path(&fx.sidechain).expect("dispatcher key");
+        let sidechain = SidechainTail::resolve(&fx.sidechain);
+        assert!(sidechain.is_some(), "the tail recognises its sidechain");
+        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        for _ in 0..2 {
+            // Two batches inside one window: one heartbeat.
+            hand_batch_to_tailer(
+                &fx.tailer,
+                &key,
+                &fx.sidechain,
+                sidechain.as_ref(),
+                file_start,
+                &bytes,
+                truncated,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            rows_for(&fx.outbox, coord, SessionEventKind::Heartbeat) - before,
+            1,
+            "a tailed sidechain append heartbeats its bound parent exactly once per window"
+        );
+        assert_eq!(
+            fx.tailer.coverage().sidechain_heartbeats,
+            1,
+            "the served coverage report counts that heartbeat as sidechain-sourced"
+        );
+        assert_eq!(
+            rows_for(&fx.outbox, coord, SessionEventKind::OutputChunk),
+            0,
+            "no sidechain byte reached the parent's transcript lane"
+        );
+        assert!(
+            !fx.tailer.is_bound(&key),
+            "the sidechain key itself stays unbound — the heartbeat went to the parent"
+        );
+    }
+
+    /// Review fix (runner review r1, finding 1): a parent whose own `.jsonl`
+    /// is quiet gets no bind attempt of its own after tail start, so a
+    /// sidechain append of an UNBOUND parent attempts the PARENT's bind, for
+    /// the parent's path. Observed at `spawn_ensure_bound`'s first step,
+    /// which records the parent's id as seen-unbound; Gate 1 is pinned off so
+    /// the attempt stops there instead of asking coord.
+    #[tokio::test]
+    async fn a_sidechain_append_attempts_the_bind_of_its_unbound_parent() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_off = pin(Flow::TranscriptSync, Level::Off);
+        let fx = sidechain_fixture("");
+        let key = "agent-x"; // the dispatcher's key: see the dispatcher test
+        let sidechain = SidechainTail::resolve(&fx.sidechain);
+        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        hand_batch_to_tailer(
+            &fx.tailer,
+            key,
+            &fx.sidechain,
+            sidechain.as_ref(),
+            file_start,
+            &bytes,
+            truncated,
+        )
+        .await;
+
+        let unbound = fx.tailer.coverage().unbound_session_ids;
+        assert!(
+            unbound.contains(&fx.parent),
+            "the unbound parent's bind was attempted from its sidechain: {unbound:?}"
+        );
+        assert!(
+            !unbound.iter().any(|k| k == "agent-x"),
+            "the sidechain stem is not a coverage hole: {unbound:?}"
+        );
+        assert_eq!(
+            fx.tailer.coverage().sidechain_heartbeats,
+            0,
+            "an unbound parent's sidechain sends, and counts, no heartbeat"
+        );
+    }
+
+    /// Review fix (runner review r1, finding 4): a WORKFLOW parent can be
+    /// bound — the pinned plane registers under the `task_run_id`, which is
+    /// the CLI session id and so the transcript stem — but the watcher never
+    /// serves its transcript, so its sidechains must not heartbeat it either.
+    #[tokio::test]
+    async fn a_workflow_parents_sidechain_heartbeats_nothing() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        use crate::session::SessionEventKind;
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_off = pin(Flow::TranscriptSync, Level::Off);
+        let fx = sidechain_fixture(
+            "{\"type\":\"system\",\"subtype\":\"queue-operation\",\"timestamp\":\"2026-11-23T00:00:00Z\"}\n",
+        );
+        // Registered as the pinned plane registers a task run.
+        let coord = registered(|| fx.registrar.register_session(&fx.parent, "workflow", None));
+        assert!(
+            fx.tailer.is_bound(&fx.parent),
+            "a workflow parent CAN be bound"
+        );
+        let before = rows_for(&fx.outbox, coord, SessionEventKind::Heartbeat);
+
+        let key = "agent-x"; // the dispatcher's key: see the dispatcher test
+        let sidechain = SidechainTail::resolve(&fx.sidechain);
+        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        hand_batch_to_tailer(
+            &fx.tailer,
+            key,
+            &fx.sidechain,
+            sidechain.as_ref(),
+            file_start,
+            &bytes,
+            truncated,
+        )
+        .await;
+
+        assert_eq!(
+            rows_for(&fx.outbox, coord, SessionEventKind::Heartbeat) - before,
+            0,
+            "a workflow parent's sidechain heartbeats nothing"
+        );
+        assert_eq!(fx.tailer.coverage().sidechain_heartbeats, 0);
+        assert!(sidechain.is_some_and(|sc| sc.owner_is_workflow));
     }
 
     #[tokio::test]

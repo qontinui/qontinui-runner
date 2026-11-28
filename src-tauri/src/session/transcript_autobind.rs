@@ -51,7 +51,7 @@
 //! so a coord outage costs one bounded probe per window, not one per append.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,50 @@ pub fn identity_from_path(path: &Path) -> Option<TranscriptIdentity> {
         config_dir,
         account_label,
     })
+}
+
+/// The parent session of a SUBAGENT SIDECHAIN: its key and its own
+/// transcript. See [`sidechain_owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainOwner {
+    /// The parent's session key — its Claude Code session id.
+    pub key: String,
+    /// The parent's own transcript, `<config>/projects/<cwd>/<sid>.jsonl`:
+    /// the path a bind of the parent is attempted for
+    /// ([`spawn_ensure_bound`]), since the sidechain's own path names no
+    /// session.
+    pub path: PathBuf,
+}
+
+/// The session a SUBAGENT SIDECHAIN belongs to, read from its path alone.
+///
+/// Claude Code writes a subagent's transcript to
+/// `<config>/projects/<cwd>/<sid>/subagents/<name>.jsonl`, beside the parent's
+/// `<config>/projects/<cwd>/<sid>.jsonl`. The watcher keys every append by the
+/// file stem, so a sidechain arrives under `<name>` — a key no binding ever
+/// names — and its appends would heartbeat nothing while the parent session is
+/// working through that subagent (plan
+/// `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+/// Phase 2).
+///
+/// Returns the parent only when the path has exactly that shape AND the
+/// sibling parent path `<config>/projects/<cwd>/<sid>.jsonl` passes
+/// [`identity_from_path`] — the UUID and `projects`-depth checks are that
+/// parser's, not a second one. `None` otherwise, including for a top-level
+/// transcript. The parent file need not exist.
+pub fn sidechain_owner(path: &Path) -> Option<SidechainOwner> {
+    if path.extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+    let subagents = path.parent()?;
+    if subagents.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    let session_dir = subagents.parent()?;
+    let sid = session_dir.file_name()?.to_str()?;
+    let parent = session_dir.with_file_name(format!("{sid}.jsonl"));
+    let key = identity_from_path(&parent)?.claude_session_id;
+    Some(SidechainOwner { key, path: parent })
 }
 
 /// What to do with a transcript given what coord said.
@@ -909,6 +953,63 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(id.account_label, ".claude");
+    }
+
+    #[test]
+    fn sidechain_owner_names_the_parent_of_a_subagent_sidechain() {
+        let p = Path::new("/home/u/.claude-gmail/projects/-home-u-proj")
+            .join(CSID)
+            .join("subagents/agent-a1b2c3.jsonl");
+        assert_eq!(sidechain_owner(&p).map(|o| o.key).as_deref(), Some(CSID));
+        // The owner's own transcript is the path a bind of the parent is
+        // attempted for.
+        let owner = sidechain_owner(&p).expect("a sidechain has an owner");
+        assert_eq!(
+            owner.path,
+            Path::new("/home/u/.claude-gmail/projects/-home-u-proj").join(format!("{CSID}.jsonl"))
+        );
+        assert_eq!(
+            identity_from_path(&owner.path).unwrap().claude_session_id,
+            CSID
+        );
+    }
+
+    #[test]
+    fn sidechain_owner_refuses_everything_that_is_not_a_sidechain() {
+        // A non-UUID grandparent.
+        assert!(sidechain_owner(Path::new(
+            "/c/.claude/projects/p/not-a-uuid/subagents/agent-x.jsonl"
+        ))
+        .is_none());
+        // A top-level transcript is its own session, not a sidechain.
+        assert!(
+            sidechain_owner(Path::new(&format!("/c/.claude/projects/p/{CSID}.jsonl"))).is_none()
+        );
+        // A `subagents` dir at the wrong depth (directly under projects/).
+        assert!(sidechain_owner(Path::new(&format!(
+            "/c/.claude/projects/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // ...or one level too deep.
+        assert!(sidechain_owner(Path::new(&format!(
+            "/c/.claude/projects/p/q/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // A `<uuid>/subagents/x.jsonl` outside `projects/<cwd>/`.
+        assert!(sidechain_owner(Path::new(&format!(
+            "/c/.claude/other/p/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // The directory is not named `subagents`.
+        assert!(sidechain_owner(Path::new(&format!(
+            "/c/.claude/projects/p/{CSID}/tools/agent-x.jsonl"
+        )))
+        .is_none());
+        // Not a JSONL.
+        assert!(sidechain_owner(Path::new(&format!(
+            "/c/.claude/projects/p/{CSID}/subagents/agent-x.txt"
+        )))
+        .is_none());
     }
 
     #[test]

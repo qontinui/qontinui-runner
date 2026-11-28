@@ -2022,7 +2022,9 @@ async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageB
 /// how many panes it reaches, which ids it is dropping for want of a coord
 /// binding (the ones `POST /sessions/transcript-bind` exists to fix), and the
 /// `transcript_holes` / `held_batches` counts that make a lost or deferred
-/// range visible. Until now the report reached only the periodic log line.
+/// range visible, and `sidechain_heartbeats` — the coord heartbeats sent for a
+/// parent session because its subagent sidechain grew. Until now the report
+/// reached only the periodic log line.
 ///
 /// - `200` — the report. Every counter is since this runner process started.
 /// - `503 {"error":"tailer_unavailable"}` — this runner booted without its
@@ -2362,10 +2364,15 @@ mod tests {
                 "appends_emitted",
                 "transcript_holes",
                 "held_batches",
+                "sidechain_heartbeats",
             ] {
                 assert!(body.get(key).is_some(), "missing {key}: {body}");
             }
             assert_eq!(body["transcript_holes"], 0);
+            // The fleet sentinel for plan
+            // `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+            // Phase 2 reads this counter here.
+            assert_eq!(body["sidechain_heartbeats"], 0);
             assert!(
                 body["transcript_sync_permitted"].is_null(),
                 "no append observed yet"
