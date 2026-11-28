@@ -133,6 +133,8 @@ mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 â
 mod runner_close_sites;
 #[cfg(test)]
 mod runner_spawn_sites;
+#[cfg(test)]
+mod spawn_key_guard;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps

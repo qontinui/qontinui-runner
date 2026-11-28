@@ -164,7 +164,7 @@ pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
 /// fixtures such as `"fn door() {\n"`, a `b'{'` match arm — so it closed
 /// `terminal/spawn_refusal.rs`'s test module hundreds of lines early and
 /// reported that module's fixtures as unlisted spawn sites.
-fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
