@@ -29,6 +29,7 @@ use crate::scheduler::{
     ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
     TaskExecutionRecordExt,
 };
+use crate::scheduler_start_recheck::SlotRecheck;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -149,8 +150,11 @@ fn due_task_order(a: &ScheduledTask, b: &ScheduledTask) -> std::cmp::Ordering {
 /// `max_concurrent` is 1 by default: slots taken before the conditions were
 /// checked let `return-to-main`, parked on its quiet probe from 2026-10-28, hold
 /// the other due tasks overdue for days.
-async fn start_due_tasks<T, Fut>(due: Vec<T>, mut slots: usize, mut try_start: impl FnMut(T) -> Fut)
-where
+pub(crate) async fn start_due_tasks<T, Fut>(
+    due: Vec<T>,
+    mut slots: usize,
+    mut try_start: impl FnMut(T) -> Fut,
+) where
     Fut: std::future::Future<Output = bool>,
 {
     for candidate in due {
@@ -546,7 +550,7 @@ impl SchedulerService {
         // so it holds `pass_lock` longer when many tasks are waiting.
         let available_slots = (settings.max_concurrent - running_count) as usize;
         start_due_tasks(due_tasks, available_slots, |task| {
-            self.clone().try_start_due_task(pg, task)
+            SchedulerService::try_start_due_task(self.clone(), pg, task)
         })
         .await;
     }
@@ -616,6 +620,22 @@ impl SchedulerService {
 
         // Check conditions if task has any
         if task.has_conditions() {
+            // A met probe verdict is spent by `gate_conditions`, so do not
+            // spend one on a copy whose slot is already gone: an unmarked
+            // look at the row first. The marked re-check below stays the
+            // authority; this only spares the probe.
+            let early = crate::scheduler_start_recheck::recheck_slot(
+                &task,
+                pg.get_scheduled_task(&task.id).await,
+            );
+            if early != SlotRecheck::Start {
+                info!(
+                    "Scheduler: not checking conditions for task '{}' — {} since this tick read it",
+                    task.name,
+                    early.reason()
+                );
+                return false;
+            }
             match self.gate_conditions(&task, std::time::Instant::now()).await {
                 ConditionGate::TimedOut => {
                     info!(
@@ -681,8 +701,22 @@ impl SchedulerService {
             }
         }
 
+        // The walk awaits between this tick's snapshot and here, so the row
+        // may have stopped being true: a run that finalized mid-walk, an
+        // edit, a disable. Mark first, then re-read under the mark (see
+        // `scheduler_start_recheck`). A refusal here after a Fire loses that
+        // met probe verdict until the probe's next poll (`poll_seconds`): a
+        // "Run now" or a finalize that lands during the gate's inline probe
+        // wait. The unmarked look above keeps the common case, a slot
+        // consumed before the gate, from spending one.
+        let verdict = self
+            .mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))
+            .await;
+        if verdict != Some(SlotRecheck::Start) {
+            return false;
+        }
         info!("Scheduler: Executing task '{}'", task.name);
-        self.clone().execute_task(task).await;
+        self.clone().run_marked_task(task, None).await;
         true
     }
 
@@ -747,22 +781,32 @@ impl SchedulerService {
         task: ScheduledTask,
         catch_up: Option<CatchUpContext>,
     ) {
-        let task_id = task.id.clone();
-        let task_name = task.name.clone();
-        let auto_fix_on_failure = task.auto_fix_on_failure;
-
         // Mark as running (stays marked until the spawned poller completes
         // for async workflows; until the sync execute_* returns otherwise).
         // Check-and-insert is one step under one write lock: the tick, a
         // catch-up and "Run now" can all reach here, and a separate
         // read-then-push lets two of them both start the task.
-        if !self.try_mark_running(&task_id).await {
+        if !self.try_mark_running(&task.id).await {
             warn!(
                 "Scheduler: task '{}' is already running; not starting a second run",
-                task_name
+                task.name
             );
             return;
         }
+        self.run_marked_task(task, catch_up).await
+    }
+
+    /// Run a task whose `running_tasks` mark the caller already holds; the
+    /// run releases it. Reached from [`Self::execute_task_with_context`] and
+    /// from the tick's slot re-check, which marks before it re-reads the row.
+    async fn run_marked_task(
+        self: Arc<Self>,
+        task: ScheduledTask,
+        catch_up: Option<CatchUpContext>,
+    ) {
+        let task_id = task.id.clone();
+        let task_name = task.name.clone();
+        let auto_fix_on_failure = task.auto_fix_on_failure;
 
         // === Async launch-and-poll paths ===
         match &task.task {
@@ -2164,10 +2208,9 @@ After making fixes, run tests if applicable to verify the fixes work."#
             .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
     }
 
-    /// Check if a specific task is currently running
     /// Atomically mark `task_id` running: `false` (and no change) when it
     /// already is.
-    async fn try_mark_running(&self, task_id: &str) -> bool {
+    pub(crate) async fn try_mark_running(&self, task_id: &str) -> bool {
         let mut running = self.running_tasks.write().await;
         if running.iter().any(|id| id == task_id) {
             return false;
@@ -2176,6 +2219,14 @@ After making fixes, run tests if applicable to verify the fixes work."#
         true
     }
 
+    /// Release a mark taken by [`Self::try_mark_running`] for a task that
+    /// was NOT started, so there is no `next_run` to write first.
+    pub(crate) async fn release_unstarted_mark(&self, task_id: &str) {
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+    }
+
+    /// Check if a specific task is currently running
     pub async fn is_task_running(&self, task_id: &str) -> bool {
         let running = self.running_tasks.read().await;
         running.contains(&task_id.to_string())
@@ -4807,9 +4858,50 @@ mod tests {
             "a skip or a condition wait must not spend a slot"
         );
         let (before_true, _) = body.split_once("\n        true\n").expect("started arm");
+        assert!(before_true.trim_end().ends_with(
+            "if verdict != Some(SlotRecheck::Start) {\n            return false;\n        }\n        \
+             info!(\"Scheduler: Executing task '{}'\", task.name);\n        \
+             self.clone().run_marked_task(task, None).await;"
+        ));
         assert!(before_true
-            .trim_end()
-            .ends_with("self.clone().execute_task(task).await;"));
+            .contains(".mark_and_recheck_slot(&task, || pg.get_scheduled_task(&task.id))"));
+    }
+
+    /// Every site that releases a run's mark writes `next_run` BEFORE it
+    /// releases: the tick's slot re-check (`scheduler_start_recheck`) relies
+    /// on a free mark meaning the previous run's `next_run` has landed.
+    #[test]
+    fn every_release_writes_next_run_before_the_mark() {
+        let src = include_str!("scheduler_service.rs");
+        let (src, _) = src.split_once("#[cfg(test)]").expect("tests follow");
+        let release = "running.retain(|id| id != ";
+        let releases: Vec<usize> = src.match_indices(release).map(|(at, _)| at).collect();
+        assert_eq!(
+            releases.len(),
+            5,
+            "four run releases plus release_unstarted_mark"
+        );
+        let writes = [
+            "self.apply_launch_failure_backoff(",
+            "self.update_task_next_run_db(",
+            "self.write_next_run_after_limit(",
+        ];
+        let mut checked = 0;
+        for at in releases {
+            let (head, _) = src.split_at(at);
+            let fn_start = head.rfind("async fn ").expect("enclosing fn");
+            let fn_head = &head[fn_start..];
+            if fn_head.starts_with("async fn release_unstarted_mark(") {
+                continue;
+            }
+            assert!(
+                writes.iter().any(|w| fn_head.contains(w)),
+                "a release with no next_run write before it: {}",
+                &fn_head[..fn_head.find('(').unwrap()]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
     }
 
     /// The drain gate is read again for each task, before its condition
@@ -4878,18 +4970,49 @@ mod tests {
         assert!(hold_fn.contains("!t.enabled"));
     }
 
-    /// `execute_task_with_context` starts only through the atomic mark.
+    /// A task runs only through the atomic mark: `execute_task_with_context`
+    /// marks then runs, and `run_marked_task` is otherwise reached only from
+    /// the tick's started arm, after `mark_and_recheck_slot` kept the mark.
     #[test]
     fn execute_task_starts_only_through_the_atomic_mark() {
         let src = include_str!("scheduler_service.rs");
         let (_, body) = src
             .split_once("async fn execute_task_with_context(")
             .expect("execute_task_with_context");
-        let (head, _) = body
-            .split_once("// === Async launch-and-poll paths ===")
-            .expect("launch section");
-        assert!(head.contains("if !self.try_mark_running(&task_id).await {"));
-        assert!(!head.contains("running.push("));
+        let (wrapper, _) = body
+            .split_once("async fn run_marked_task(")
+            .expect("run_marked_task follows the wrapper");
+        let mark = wrapper
+            .find("if !self.try_mark_running(&task.id).await {")
+            .expect("the wrapper marks");
+        let run = wrapper
+            .find("self.run_marked_task(task, catch_up).await")
+            .expect("the wrapper runs");
+        assert!(mark < run);
+        assert!(!wrapper.contains("running.push("));
+
+        let (code, _) = src.split_once("#[cfg(test)]").expect("tests follow");
+        assert_eq!(
+            code.matches("run_marked_task(").count(),
+            3,
+            "def + two calls"
+        );
+        let (_, arm) = code
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task");
+        let (arm, _) = arm
+            .split_once("/// Record a skipped execution")
+            .expect("fn ends");
+        assert_eq!(
+            arm.matches("self.clone().run_marked_task(task, None).await;")
+                .count(),
+            1
+        );
+        let check = arm
+            .find(".mark_and_recheck_slot(")
+            .expect("the slot re-check");
+        let start = arm.find("run_marked_task(").unwrap();
+        assert!(check < start);
     }
 
     /// A condition timeout records its Skipped row and last_run ONLY after the
@@ -5453,5 +5576,141 @@ mod tests {
             let fin = fin.split_once("\n    }\n").expect("finalize body").0;
             assert!(fin.contains("self.write_next_run_after_limit(task_id, decision).await;"));
         }
+    }
+}
+
+/// The tick's real start path against a real row: the stale-snapshot defect
+/// (plan `2026-11-27-devops-runner-scheduler-relaunches-a-cron-task-from-a-stale-tick-snapshot`)
+/// entered through `try_start_due_task`, the call `tick_pass` makes.
+#[cfg(test)]
+mod stale_snapshot_tests {
+    use super::*;
+    use crate::scheduler::ScheduledTaskExt;
+
+    /// The tick read the row while the slot was 05:27; before the walk reached
+    /// it, that slot's run finalized and moved `next_run` to 06:27. Starting
+    /// from the stale copy would run the 05:27 slot a second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tick_does_not_start_a_task_from_a_stale_snapshot() {
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "stale-snapshot-probe".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T06:27:00+00:00".to_string());
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+
+        let mut snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+        snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
+
+        assert!(
+            !started,
+            "a slot consumed since the tick's read must not be started again"
+        );
+        assert!(
+            svc.get_running_tasks().await.is_empty(),
+            "no mark is left behind"
+        );
+    }
+
+    /// Positive control for the stale-snapshot refusals: an UNCHANGED real
+    /// row is started through the same path. (A Script run releases its
+    /// mark from its own poller, after this call returns.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tick_starts_a_task_whose_row_is_unchanged() {
+        // The started Script run resolves the workspace root; keep it off
+        // the operator's config.
+        let _amb = crate::test_env::isolated_ambient();
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "unchanged-snapshot-control".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+        let snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
+
+        assert!(started, "an unchanged row is started");
+    }
+
+    /// A probe-gated copy whose slot is already gone is refused BEFORE its
+    /// probe runs: a met probe verdict is spent by the condition gate, so
+    /// running the probe for a slot that will be refused wastes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_probe_gated_copy_does_not_run_its_probe() {
+        let marker =
+            std::env::temp_dir().join(format!("stale-snapshot-probe-{}", uuid::Uuid::new_v4()));
+        let pg = PgDb::new_for_test().await;
+        let mut stored = <ScheduledTask as ScheduledTaskExt>::new(
+            "stale-snapshot-probe-gated".to_string(),
+            None,
+            crate::scheduler::schedule_expression_default(),
+            ScheduledTaskType::Script {
+                command: "true".to_string(),
+                working_directory: None,
+                timeout_seconds: Some(30),
+            },
+        );
+        stored.enabled = true;
+        stored.next_run = Some("2026-11-27T06:27:00+00:00".to_string());
+        stored.conditions = Some(crate::scheduler::ScheduleConditions {
+            require_probe: Some(crate::scheduler::ProbeCondition {
+                enabled: true,
+                command: vec!["touch".to_string(), marker.to_string_lossy().into_owned()],
+                poll_seconds: 60,
+                timeout_seconds: 10,
+            }),
+            ..Default::default()
+        });
+        pg.insert_scheduled_task(&stored)
+            .await
+            .expect("insert the task row");
+
+        let mut snapshot = pg
+            .get_scheduled_task(&stored.id)
+            .await
+            .expect("read the row back")
+            .expect("the row exists");
+        snapshot.next_run = Some("2026-11-27T05:27:00+00:00".to_string());
+
+        let svc = Arc::new(SchedulerService::new(pg.clone()));
+        let started = SchedulerService::try_start_due_task(svc.clone(), &pg, snapshot).await;
+
+        let probed = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!started);
+        assert!(!probed, "the probe must not run for a consumed slot");
     }
 }
