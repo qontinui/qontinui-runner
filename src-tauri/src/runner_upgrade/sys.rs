@@ -382,7 +382,10 @@ mod tests {
             "--upgrade-successor",
             "/u/rec.json"
         ));
-        // This test process was not started with the flag.
+        // This test process was not started with the flag. Only Linux reads
+        // the command line; elsewhere `pid_runs_with` checks liveness alone,
+        // so it is `true` for this live process by design.
+        #[cfg(target_os = "linux")]
         assert!(!pid_runs_with(
             std::process::id(),
             "--upgrade-successor",
