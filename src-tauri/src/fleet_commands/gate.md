@@ -810,11 +810,32 @@ Then POST the forwarder routes (`$LIVE_URL` ends in `/coord-mcp`):
 # row is written for this door yet. They are sent now so the rows are correct
 # from the day the forwarder records them (a tracked follow-up).
 DECL_W=(-H 'x-qontinui-transport: write_forwarder' -H 'x-qontinui-reporter: gate')
+# Every forwarder call rides out the runner's BOOT GAP through runner_curl
+# (scripts/lib/runner-call.sh; plan 2026-11-24-runner-upgrades-itself-daily-
+# keeping-sessions-alive-with-no-outage-and-automatic-rollback, D2): it re-sends
+# a call ONLY on a 503 RUNNER_BOOTING (nothing was dispatched) or a refusal while
+# the upgrade's booting marker names this port (nothing was sent), for at most
+# 90 s, and fails LOUDLY (exit 75, a RUNNER_BOOT_BUDGET_SPENT line) when the
+# budget is spent. A runner that is simply down still fails on the first attempt.
+# The workspace root is resolved HERE, as Step 2 resolves it, so this block
+# does not depend on a $ROOT some earlier shell set.
+RC_ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
+if [ -z "$RC_ROOT" ]; then
+  RC_GC="$(git rev-parse --git-common-dir 2>/dev/null)"
+  [ -n "$RC_GC" ] && RC_GC="$(cd "$RC_GC" 2>/dev/null && pwd)"
+  [ -n "$RC_GC" ] && RC_ROOT="$(dirname "$(dirname "$RC_GC")")"
+fi
+RC_LIB="${RC_ROOT:-$PWD}/qontinui-claude-config/scripts/lib/runner-call.sh"
+if [ -r "$RC_LIB" ]; then . "$RC_LIB"
+else
+  echo "gate: $RC_LIB is not readable -- the forwarder calls below use plain curl, with NO boot-gap ride-out" >&2
+  runner_curl() { local rc_a=() rc_seen="" rc_x; for rc_x in "$@"; do if [ -n "$rc_seen" ]; then rc_a+=("$rc_x"); elif [ "$rc_x" = -- ]; then rc_seen=1; fi; done; curl "${rc_a[@]}"; }
+fi
 # 1. plan-anchored: upsert the work unit (capture work_unit_id), then register:
-WU=$(curl -fsS -X POST "$LIVE_URL/work-units/upsert" \
+WU=$(runner_curl -- -fsS -X POST "$LIVE_URL/work-units/upsert" \
   -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{"slug":"<stem>","title":"<plan H1>"}')   # work_unit_id is in $WU
-curl -fsS -X POST "$LIVE_URL/work-units/<stem>/register-gate" \
+runner_curl -- -fsS -X POST "$LIVE_URL/work-units/<stem>/register-gate" \
   -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{ "phase_name":"deploy confirmation",
         "predicate":{"kind":"deploy_healthy","service":"coord",
@@ -822,7 +843,7 @@ curl -fsS -X POST "$LIVE_URL/work-units/<stem>/register-gate" \
         "clearance_audience":"agent",
         "gate_class":"ops-confirm" }'
 # 2. claim-anchored (no slug) — the NEW forwarder route:
-curl -fsS -X POST "$LIVE_URL/gates/register" \
+runner_curl -- -fsS -X POST "$LIVE_URL/gates/register" \
   -H @"$(hdrp)" "${DECL_W[@]}" -H "Content-Type: application/json" \
   -d '{ "claim_kind":"file_glob", "resource_key":"qontinui-coord/crates/coord/src/gates.rs",
         "predicate":{"kind":"ci_green","repo":"qontinui/qontinui-coord",
@@ -832,7 +853,7 @@ curl -fsS -X POST "$LIVE_URL/gates/register" \
 # ^ security-surface: the guarded file IS the gate-clearance authority code.
 #   ci_green takes a FIXED head_sha — never a branch name.
 # attest (unchanged — keyed by gate_id):
-curl -fsS -X POST "$LIVE_URL/gates/<gate_id>/attest" \
+runner_curl -- -fsS -X POST "$LIVE_URL/gates/<gate_id>/attest" \
   -H @"$(hdrp)" "${DECL_W[@]}"
 ```
 

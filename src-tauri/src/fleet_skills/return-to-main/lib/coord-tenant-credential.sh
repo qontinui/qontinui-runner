@@ -47,8 +47,24 @@
 #   CTC_CONNECT_TIMEOUT  seconds to connect, per HTTP call (default 10).
 #   CTC_DEVICE     device id (default $QONTINUI_MACHINE_ID, else
 #                  ~/.qontinui/machine.json device_id / machine_id).
-#   CTC_NO_MINT=1  never mint at coord (POST /agents/credential); only a static
-#                  token or the local runner's (below) claiming the tenant is used.
+#   CTC_NO_MINT=1  never mint at coord -- neither the anonymous POST
+#                  /agents/credential nor the per-binding POST /coord/devices/
+#                  <device_id>/tenant-token -- so only a static token or the
+#                  local runner's (below) claiming the tenant is used. A token
+#                  this CTC_TMP already holds from either mint is still
+#                  re-served (mint(cached), binding(cached)): the flag stops a
+#                  NEW request, not the reuse of one this run already made.
+#   CTC_NO_ANON_MINT=1  never make the ANONYMOUS POST /agents/credential mint
+#                  -- neither the stage cascade's last rung nor ctc_bindings'
+#                  tenant-less read, which is that same mint -- while the
+#                  per-binding door still runs. For a caller whose own door
+#                  refuses the bootstrap token that mint returns (coord's
+#                  POST /coord/verification-runs: scripts/verification-outcome-
+#                  flush.sh). CTC_NO_MINT=1 is the stricter flag and wins: with
+#                  both set, neither door is asked and the reason reads
+#                  `minting is disabled`. A token this CTC_TMP already holds is
+#                  still re-served, as under CTC_NO_MINT. Only the exact value
+#                  1 enables either flag.
 #   CTC_NO_RUNNER=1  never ask the local runner (hermetic suites on a dev box).
 #                  The runner is also never asked when the coord url is not
 #                  https://coord.qontinui.io: its token is minted for that coord.
@@ -61,15 +77,27 @@
 #
 # FUNCTIONS
 #   ctc_stage_for_tenant <tenant>  -> writes $CTC_TMP/bearer.hdr; prints its
-#       source (env|file|runner|runner(cached)|mint|mint(cached)) or
-#       `rejected(<why>)` and writes nothing. Only a token whose `tenant_id`
-#       claim IS <tenant> is staged. Order: $COORD_DEVICE_JWT, the file token,
-#       the local runner's UI Bridge mint (POST http://127.0.0.1:<port>/ui-bridge
-#       /invoke/get_coord_device_token {"args":{"tenantId":<tenant>}}), then the
-#       anonymous POST /agents/credential mint.
+#       source (env|file|runner|runner(cached)|binding|binding(cached)|mint|
+#       mint(cached)) or `rejected(<why>)` and writes nothing. Only a token
+#       whose `tenant_id` claim IS <tenant> is staged. Order: $COORD_DEVICE_JWT,
+#       the file token, the local runner's UI Bridge mint (POST
+#       http://127.0.0.1:<port>/ui-bridge/invoke/get_coord_device_token
+#       {"args":{"tenantId":<tenant>}}), coord's per-binding door (POST
+#       /coord/devices/<device_id>/tenant-token {"tenant_id":<tenant>},
+#       presenting the first STATIC token -- env, then file -- that is a fresh
+#       device JWT with a user_id, for THIS device when its id resolves,
+#       claiming ANOTHER tenant;
+#       its answer is staged only when it is a fresh device token for <tenant>
+#       and that device), then the anonymous POST /agents/credential mint,
+#       whose bootstrap token coord refuses for every write outside its
+#       closeout allowlist. A `binding` token is a PAIRED device JWT (coord
+#       jwt.rs issue_device): callers class it with `runner`, never with a
+#       bootstrap `mint` -- but unlike `runner`, a 401 to it is neither dropped
+#       nor retried (the walkers below re-stage only a `runner*` source).
 #   ctc_drop_runner_token <tenant> <why> -> forget the runner's token for
 #       <tenant> and refuse the runner rung for it for the rest of the run (a
-#       caller whose coord answered 401 to it re-stages and reaches the mint).
+#       caller whose coord answered 401 to it re-stages and reaches the
+#       per-binding door, then the mint).
 #   ctc_bindings                   -> CTC_BINDINGS (space-separated tenant ids)
 #       or empty with CTC_BINDINGS_NOTE; CTC_BINDING_SLUGS (space-separated
 #       `<uuid>=<slug>` pairs, only for a served slug that is a plain
@@ -84,6 +112,11 @@
 #       The slugs come from that identity read; when the tenant-less mint is
 #       refused (422) there is no read, so every slug is UNKNOWN until
 #       ctc_bindings_over is given a credential the caller already holds.
+#       Under CTC_NO_MINT=1 or CTC_NO_ANON_MINT=1 the list is not read at all
+#       (the tenant-less read IS the anonymous mint): it stays UNKNOWN, with
+#       the flag named in CTC_BINDINGS_NOTE, and is cached as unread for the
+#       shell. A caller holding a static device credential reads it with
+#       ctc_bindings_over instead.
 #   ctc_bindings_over <bearer-header-file> -> the same list and slugs, read
 #       over that (tenant-scoped) bearer; fills the fields only on a readable
 #       answer, otherwise leaves them as they were. ctc_expected_tenant calls it
@@ -461,6 +494,220 @@ ctc_drop_runner_token() { # <tenant> <why>
   printf '%s' "$2" > "$slot.runner.rejected"
 }
 
+# _ctc_presenter_facts <jwt> -> "<exp> <sub_type> <device_id> <user> <tenant_id>"
+# for a token that may be PRESENTED at coord's per-binding door, in ONE
+# interpreter start (the hot-path rule _ctc_facts states). A field is the claim
+# when it is a plain [A-Za-z0-9._:-] word, `-` when it is absent or empty, `?`
+# otherwise; <user> is 1 for a non-empty string user_id, else 0. An ABSENT
+# sub_type stays `-`, never `device`: coord's SubType deserializes an absent
+# claim as Agent (jwt.rs), and the door answers an agent presenter 403. A reader
+# of its own, not a widened _ctc_facts: that one's two-field output is parsed
+# outside this file (recon-tenant.sh, install-claude-settings.sh,
+# verification-outcome-flush.sh).
+_ctc_presenter_facts() {
+  H_JWT="$1" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
+import base64, json, os, re
+plain = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+def word(v):
+    if v is None or v == "":
+        return "-"
+    return v if isinstance(v, str) and plain.fullmatch(v) else "?"
+try:
+    seg = os.environ["H_JWT"].split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    pc = json.loads(base64.urlsafe_b64decode(seg))
+    if not isinstance(pc, dict):
+        raise ValueError("the claims are not an object")
+    pe = pc.get("exp")  # envelope-ok: JWT claims, not a fleet response envelope
+    pe = str(int(pe)) if isinstance(pe, (int, float)) and not isinstance(pe, bool) else "-"
+    pst = pc.get("sub_type")  # envelope-ok: JWT claims; an absent sub_type is Agent at coord, never device
+    pu = pc.get("user_id")  # envelope-ok: JWT claims, not a fleet response envelope
+    pu = "1" if isinstance(pu, str) and pu.strip() else "0"
+    print(" ".join((pe, word(pst), word(pc.get("device_id")), pu, word(pc.get("tenant_id")))))  # envelope-ok: JWT claims, not a fleet response envelope
+except Exception:
+    print("- - - 0 -")
+PY
+}
+
+# _ctc_binding_answer <body-file> -> "<token> <exp> <sub_type> <device_id> <tenant_id>"
+# for the per-binding door's 200 answer, coord's DeviceRefreshResponse {token,
+# device_id, jti, exp, tenant_id} (tokens.rs), in ONE interpreter start. Every
+# field after <token> is read off the TOKEN's own claims, never the answer's
+# sibling fields: the claims are what every later door checks. Fields as
+# _ctc_presenter_facts; <token> is `-` when the answer carries none. The BODY
+# rides the environment, never a path (see _ctc_token_facts).
+_ctc_binding_answer() {
+  H_BODY="$(cat "$1" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
+import base64, json, os, re
+plain = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+def word(v):
+    if v is None or v == "":
+        return "-"
+    return v if isinstance(v, str) and plain.fullmatch(v) else "?"
+tok, rest = "-", ["-", "-", "-", "-"]
+try:
+    ans = json.loads(os.environ.get("H_BODY") or "")
+    t = ans.get("token") if isinstance(ans, dict) else None  # envelope-ok: coord's DeviceRefreshResponse {token, device_id, jti, exp, tenant_id}
+    if isinstance(t, str) and t.strip() and " " not in t.strip():
+        tok = t.strip()
+        seg = tok.split(".")[1]; seg += "=" * (-len(seg) % 4)
+        bc = json.loads(base64.urlsafe_b64decode(seg))
+        be = bc.get("exp")  # envelope-ok: JWT claims, not a fleet response envelope
+        be = str(int(be)) if isinstance(be, (int, float)) and not isinstance(be, bool) else "-"
+        rest = [be, word(bc.get("sub_type")), word(bc.get("device_id")), word(bc.get("tenant_id"))]  # envelope-ok: JWT claims, not a fleet response envelope
+except Exception:
+    pass
+print(" ".join([tok] + rest))
+PY
+}
+
+# _ctc_binding_refusal <body-file> -> a refusal body's `error` string, else its
+# `code`, else nothing. ONLY that string ever reaches a reason -- never other
+# body text, which could carry a token (the T17a lesson). The caller sanitises.
+_ctc_binding_refusal() {
+  H_BODY="$(cat "$1" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
+import json, os
+try:
+    rb = json.loads(os.environ.get("H_BODY") or "")
+except Exception:
+    raise SystemExit(0)
+if isinstance(rb, dict):
+    for k in ("error", "code"):
+        v = rb.get(k)  # envelope-ok: coord's SeedRefusal {error, code, message} and its flat {"error"} refusals
+        if isinstance(v, str) and v.strip():
+            print(" ".join(v.split())); break
+PY
+}
+
+# _ctc_binding_presenter <tenant> -> `OK <device_id> <jwt>` naming the first
+# STATIC token, $COORD_DEVICE_JWT then the file, that may be presented at
+# coord's per-binding door for <tenant>; else `NONE <why>`, or a bare `NONE`
+# when there is no static token at all. A presenter is shaped, more than 60 s
+# from expiry, sub_type device, carries a uuid device_id and a user_id, claims a
+# uuid tenant OTHER than <tenant>, and -- when this device's id resolves --
+# names this device. When no device id resolves, the presenter's own claim
+# names the path, which coord checks against the token anyway (the same trust
+# the static rungs extend). One presenter: a refusal is never retried with the
+# second candidate (the rung below asks at most once).
+_ctc_binding_presenter() {
+  local want="$1" home_dir="${HOME:-${USERPROFILE:-}}" bt cand cname mydev skipped=""
+  local pexp psub pdev puser pten pwhy
+  mydev="$(_ctc_device)"
+  for cand in env file; do
+    bt=""
+    if [ "$cand" = env ]; then
+      cname='$COORD_DEVICE_JWT'; bt="$(printf '%s' "${COORD_DEVICE_JWT:-}" | tr -d '[:space:]')"
+    else
+      cname='~/.qontinui/coord-device-jwt'
+      if [ -n "$home_dir" ] && [ -r "$home_dir/.qontinui/coord-device-jwt" ]; then
+        bt="$(tr -d '[:space:]' < "$home_dir/.qontinui/coord-device-jwt" 2>/dev/null || true)"
+      fi
+    fi
+    [ -n "$bt" ] || continue
+    pwhy=""
+    if ! _ctc_shaped "$bt"; then pwhy="is not a JWT"
+    else
+      read -r pexp psub pdev puser pten <<<"$(_ctc_presenter_facts "$bt")"
+      if ! [[ "$pexp" =~ ^[0-9]+$ ]] || (( 10#$pexp - $(date +%s) <= 60 )); then pwhy="is expired, exp-less or within 60 s of expiry"
+      elif [ "$psub" != device ]; then pwhy="is not a device token (sub_type ${psub/#-/<absent>})"
+      elif ! ctc_is_uuid "$pdev"; then pwhy="carries no uuid device_id"
+      elif [ "$puser" != 1 ]; then pwhy="carries no user_id"
+      elif ! ctc_is_uuid "$pten"; then pwhy="carries no uuid tenant_id"
+      elif [ "${pten,,}" = "$want" ]; then pwhy="already claims tenant $want"
+      elif [ -n "$mydev" ] && [ "${mydev,,}" != "${pdev,,}" ]; then pwhy="names device $pdev, not this device ($(ctc_sanitize "$mydev"))"
+      fi
+    fi
+    if [ -z "$pwhy" ]; then printf 'OK %s %s' "$pdev" "$bt"; return 0; fi
+    skipped="${skipped:+$skipped; }$cname $pwhy"
+  done
+  printf 'NONE%s' "${skipped:+ $skipped}"
+}
+
+# _ctc_binding_verdict <tenant> <device_id> <body-file> -> `OK <jwt>` when the
+# door's 200 answer carries a JWT-shaped, more-than-60-s-fresh, sub_type device
+# token claiming <tenant> and naming <device_id>; else `ERR <why>`. Every check
+# reads the TOKEN's own claims (_ctc_binding_answer, one interpreter start),
+# never the answer's sibling fields: the claims are what every later door checks.
+_ctc_binding_verdict() {
+  local want="$1" pdev="$2" btok bexp bsub bdv bten
+  read -r btok bexp bsub bdv bten <<<"$(_ctc_binding_answer "$3")"
+  if ! _ctc_shaped "$btok"; then printf 'ERR answered HTTP 200 with no JWT-shaped token -- not used'
+  elif ! [[ "$bexp" =~ ^[0-9]+$ ]] || (( 10#$bexp - $(date +%s) <= 60 )); then printf 'ERR returned a token that is expired or exp-less -- not used'
+  elif [ "${bten,,}" != "$want" ]; then printf 'ERR returned a token claiming tenant %s -- not used' "$(ctc_sanitize "$bten")"
+  elif [ "$bsub" != device ]; then printf 'ERR returned a token that is not a device token (sub_type %s) -- not used' "$(ctc_sanitize "${bsub/#-/<absent>}")"
+  elif [ "${bdv,,}" != "${pdev,,}" ]; then printf 'ERR returned a token for device %s, not %s -- not used' "$(ctc_sanitize "$bdv")" "$pdev"
+  else printf 'OK %s' "$btok"
+  fi
+}
+
+# _ctc_binding_rung <tenant> <slot> -> `OK <src> <jwt>`, `ERR <why>`, or `SKIP`
+# (nothing to say: no static token to present, or CTC_NO_MINT=1 with nothing
+# cached -- the cascade's own `minting is disabled` says that once). Never fatal.
+#
+# coord's per-binding door, POST /coord/devices/<device_id>/tenant-token
+# (tenant_token_seed.rs post_device_tenant_token, qontinui-coord#3173), turns a
+# paired device JWT for ONE tenant the device is bound to into a paired device
+# JWT for ANOTHER bound tenant: the mint the runner's binding-gap seed uses for
+# its per-tenant slots. It writes nothing at coord, and coord's own admission
+# rule (tenant_admission::decide_facts) decides whether the binding admits the
+# presenter. This rung sits after the runner rung and before the anonymous mint,
+# whose bootstrap token coord refuses for every write outside its closeout
+# allowlist (auth_bootstrap_scope.rs; finding 267bd8b3): a device whose runner
+# is down, signed out or mid-seed still gets a WRITE-capable credential for its
+# second tenant, as long as a static presenter is fresh. With none, the cascade
+# ends at the bootstrap mint as it did before this rung.
+#
+# The presenter is _ctc_binding_presenter's; the answer is
+# _ctc_binding_verdict's. A usable answer is cached in <slot>.binding.jwt and
+# served as binding(cached) while it stays usable (a stale one is re-asked); a
+# refusal of ANY kind, 000 included, is cached in <slot>.binding.rejected and is
+# never re-asked in the same CTC_TMP, as a refused mint is not retried. "No
+# qualifying presenter" sent nothing and is not cached. A 000 is deliberately NOT marked (_ctc_mark):
+# CTC_TRANSPORT says "coord unreachable", the mint that follows marks its own
+# 000, and this door failing before a WORKING mint is no evidence that coord is
+# unreachable. The cost: when coord answers nothing at all, a stage with a
+# qualifying presenter waits out two curl timeouts (the door's, then the
+# mint's; CTC_CONNECT_TIMEOUT / CTC_TIMEOUT, 10 s / 30 s by default) where it
+# waited out one before this rung.
+_ctc_binding_rung() {
+  local want="$1" slot="$2" bt presenter pdev pjwt bcode verdict refusal
+  if [ -r "$slot.binding.jwt" ]; then
+    bt="$(tr -d '[:space:]' < "$slot.binding.jwt")"
+    _ctc_usable_for "$bt" "$want" && { printf 'OK binding(cached) %s' "$bt"; return 0; }
+  fi
+  # The door mints (issue_device), so CTC_NO_MINT covers it: no request.
+  [ "${CTC_NO_MINT:-0}" = 1 ] && { printf 'SKIP'; return 0; }
+  if [ -r "$slot.binding.rejected" ]; then printf 'ERR %s' "$(cat "$slot.binding.rejected")"; return 0; fi
+  presenter="$(_ctc_binding_presenter "$want")"
+  case "$presenter" in
+    "OK "*) presenter="${presenter#OK }"; pdev="${presenter%% *}"; pjwt="${presenter#* }" ;;
+    "NONE "*) printf 'ERR the per-binding door was not asked (no qualifying presenter: %s)' "${presenter#NONE }"; return 0 ;;
+    *) printf 'SKIP'; return 0 ;;
+  esac
+  # The presenter rides a 0600 header file, never argv, and is removed right
+  # after the call. <want> is a lowercased uuid and <pdev> a uuid (both
+  # checked), so the path and the body need no escaping.
+  ( umask 077; printf 'Authorization: Bearer %s\n' "$pjwt" > "$slot.binding.hdr"; : > "$slot.binding.body" )
+  bcode="$("${CTC_CURL:-curl}" -sS -o "$(_ctc_np "$slot.binding.body")" -w '%{http_code}' --connect-timeout "${CTC_CONNECT_TIMEOUT:-10}" -m "${CTC_TIMEOUT:-30}" \
+    -X POST "$(_ctc_url)/coord/devices/$pdev/tenant-token" -H "@$(_ctc_np "$slot.binding.hdr")" -H 'Content-Type: application/json' \
+    -d "{\"tenant_id\": \"$want\"}" 2>/dev/null)" || bcode=000
+  rm -f "$slot.binding.hdr"
+  if [ "$bcode" = 200 ]; then
+    verdict="$(_ctc_binding_verdict "$want" "$pdev" "$slot.binding.body")"
+  else
+    verdict="ERR answered HTTP $(ctc_sanitize "${bcode:-000}")"
+    refusal="$(_ctc_binding_refusal "$slot.binding.body")"
+    [ -n "$refusal" ] && verdict="$verdict: $(ctc_sanitize "$refusal")"
+  fi
+  rm -f "$slot.binding.body"
+  if [[ "$verdict" == "OK "* ]]; then
+    ( umask 077; printf '%s\n' "${verdict#OK }" > "$slot.binding.jwt" )
+    printf 'OK binding %s' "${verdict#OK }"; return 0
+  fi
+  printf 'POST /coord/devices/%s/tenant-token for tenant %s %s' "$pdev" "$want" "${verdict#ERR }" > "$slot.binding.rejected"
+  printf 'ERR %s' "$(cat "$slot.binding.rejected")"
+}
+
 ctc_stage_for_tenant() {
   local want="${1,,}" home_dir="${HOME:-${USERPROFILE:-}}" jwt="" src="" why="" f code c slot
   _ctc_tmp_ok || { printf 'rejected(%s)' "$_CTC_TMP_WHY"; return 0; }
@@ -487,6 +734,15 @@ ctc_stage_for_tenant() {
       *) why="${why:+$why; }${c#ERR }" ;;
     esac
   fi
+  if [ -z "$jwt" ]; then
+    # The per-binding door (see _ctc_binding_rung): before the anonymous mint.
+    local brung
+    brung="$(_ctc_binding_rung "$want" "$slot")"
+    case "$brung" in
+      "OK "*) brung="${brung#OK }"; src="${brung%% *}"; jwt="${brung#* }" ;;
+      "ERR "*) why="${why:+$why; }${brung#ERR }" ;;
+    esac
+  fi
   if [ -z "$jwt" ] && [ -r "$slot.jwt" ]; then
     f="$(tr -d '[:space:]' < "$slot.jwt")"
     _ctc_usable_for "$f" "$want" && { jwt="$f"; src="mint(cached)"; }
@@ -497,6 +753,8 @@ ctc_stage_for_tenant() {
     grep -q 'HTTP 000' "$slot.rejected" 2>/dev/null && _ctc_mark 000
   elif [ -z "$jwt" ] && [ "${CTC_NO_MINT:-0}" = 1 ]; then
     why="${why:+$why; }minting is disabled"
+  elif [ -z "$jwt" ] && [ "${CTC_NO_ANON_MINT:-0}" = 1 ]; then
+    why="${why:+$why; }the anonymous mint is disabled (CTC_NO_ANON_MINT=1)"
   elif [ -z "$jwt" ]; then
     code="$(_ctc_mint "$want" "$slot.body")"
     if [ "$code" = nodev ]; then
@@ -550,6 +808,7 @@ ctc_bindings() {
   CTC_BINDING_SLUGS=""; CTC_BINDINGS_COUNT=""; CTC_BINDINGS_MULTI=0
   if ! _ctc_url_ok; then CTC_BINDINGS_NOTE="coord url $(_ctc_url) is neither https nor loopback"; return 0; fi
   if [ "${CTC_NO_MINT:-0}" = 1 ]; then CTC_BINDINGS_NOTE="minting is disabled, so the binding list was not read"; return 0; fi
+  if [ "${CTC_NO_ANON_MINT:-0}" = 1 ]; then CTC_BINDINGS_NOTE="the anonymous mint is disabled (CTC_NO_ANON_MINT=1), so the binding list was not read"; return 0; fi
   code="$(_ctc_mint "" "$CTC_TMP/ctc.anon.body")"
   case "$code" in
     nodev) CTC_BINDINGS_NOTE="no device_id to mint with"; rm -f "$CTC_TMP/ctc.anon.body"; return 0 ;;

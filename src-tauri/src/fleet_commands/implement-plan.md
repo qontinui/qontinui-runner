@@ -825,6 +825,28 @@ So the read-back is the evidence, never the transition's `ok`. If a later read
 shows `vetted` again, re-apply it and cite that plan; do not treat the hold as
 lifted.
 
+### Step 0.47: Repo intake preflight — is a target repo backlogged?
+
+New implementation work for a repo whose train cannot land what it already
+holds only deepens that repo's queue. Coord answers per repo (plan
+`2026-11-25-merge-capacity-before-new-work-fixer-priority-and-repo-intake-cap`
+Phase 4): call the coord MCP tool `coord_query_launch_budget` with
+`repo=<owner/name>` once for each repo on the plan's `**Repo(s):**` line —
+still read-only, and before the reserve below. Its answer carries a separate
+`repo_intake` object (`verdict`, `reason`, `backlog_days`, …). Branch on that
+object only; the account `verdict` beside it is the budget gate's business, not
+this step's:
+
+| Any target repo's `repo_intake` reads | Do |
+|---|---|
+| `verdict: HOLD`, `reason: repo_backlog` | Stop before Step 0.48 — reserve nothing, stamp nothing — and report `SKIPPED: repo_backlog <repo> <days>d` (its `backlog_days`), the same skip `/vet-imp-sweep` Step 3 records, so a sweep caller backfills from another repo. |
+| `verdict: LAUNCH` everywhere | Proceed. |
+| `verdict: UNKNOWN` (any reason), no `repo_intake` in the answer (a coord that predates it), an argument refusal, or the tool not reachable | Proceed, and carry `repo_intake: UNKNOWN (<reason>)` into the final report. UNKNOWN never holds and is never read as LAUNCH. |
+
+The fixer, steward and shepherd lanes are the drain and are not subject to this
+cap; a `--phase N` run of a plan another session already started is not exempt —
+it is new implementation work on the same repo.
+
 ### Step 0.48: Reserve the PLAN in coord (before the first write)
 
 Everything up to here is read-only. Everything after it writes: the IN PROGRESS
