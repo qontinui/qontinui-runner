@@ -21,9 +21,13 @@ pub async fn ui_bridge_clipboard_read_handler(
 ) -> Json<ApiResponse<serde_json::Value>> {
     info!("UI Bridge API: Reading clipboard");
 
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            let text = clipboard.get_text().ok();
+    // The shared instance, not a fresh one: see `SYSTEM_CLIPBOARD`.
+    let read = crate::commands::clipboard::run_system_clipboard(
+        crate::commands::clipboard::system_clipboard_read_text,
+    )
+    .await;
+    match read {
+        Ok(text) => {
             let has_text = text.is_some();
             Json(ApiResponse::success(serde_json::json!({
                 "text": text,
@@ -44,40 +48,29 @@ pub async fn ui_bridge_clipboard_write_handler(
 ) -> Json<ApiResponse<serde_json::Value>> {
     info!("UI Bridge API: Writing to clipboard");
 
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            if let Some(html) = &body.html {
-                // Write both HTML and plain text alternatives
-                let alt_text = body.text.clone();
-                match clipboard.set_html(html.as_str(), Some(&alt_text)) {
-                    Ok(()) => Json(ApiResponse::success(serde_json::json!({
-                        "written": true,
-                        "formats": ["text/html", "text/plain"],
-                    }))),
-                    Err(e) => {
-                        error!("UI Bridge API: Clipboard HTML write failed: {}", e);
-                        Json(ApiResponse::error(format!("Clipboard write failed: {}", e)))
-                    }
-                }
-            } else {
-                match clipboard.set_text(&body.text) {
-                    Ok(()) => Json(ApiResponse::success(serde_json::json!({
-                        "written": true,
-                        "formats": ["text/plain"],
-                    }))),
-                    Err(e) => {
-                        error!("UI Bridge API: Clipboard write failed: {}", e);
-                        Json(ApiResponse::error(format!("Clipboard write failed: {}", e)))
-                    }
-                }
-            }
-        }
+    // The shared instance, not a fresh one: a dropped instance takes the
+    // content with it on Linux (see `SYSTEM_CLIPBOARD`).
+    let formats = if body.html.is_some() {
+        vec!["text/html", "text/plain"]
+    } else {
+        vec!["text/plain"]
+    };
+    let result = crate::commands::clipboard::run_system_clipboard(move || {
+        crate::commands::clipboard::with_system_clipboard(|clipboard| match &body.html {
+            // Write both HTML and plain text alternatives
+            Some(html) => clipboard.set_html(html.as_str(), Some(body.text.as_str())),
+            None => clipboard.set_text(body.text.as_str()),
+        })
+    })
+    .await;
+    match result {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "written": true,
+            "formats": formats,
+        }))),
         Err(e) => {
-            error!("UI Bridge API: Clipboard init failed: {}", e);
-            Json(ApiResponse::error(format!(
-                "Clipboard initialization failed: {}",
-                e
-            )))
+            error!("UI Bridge API: Clipboard write failed: {}", e);
+            Json(ApiResponse::error(format!("Clipboard write failed: {}", e)))
         }
     }
 }
