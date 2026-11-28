@@ -91,8 +91,7 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
 /// consumer with `timing` `live` or `next_start`. Two surfaces are
 /// `next_start`, read once at startup: the coord-mcp nonce restore and the
-/// boot reconcile's on-disk nonce adoption. The dual-write gate is `live`: its
-/// flag poll re-reads the pin each tick.
+/// boot reconcile's on-disk nonce adoption.
 /// `data.existing_sessions` counts this process's device coord-mcp keys, live
 /// AND graced (an evicted key keeps serving for the grace TTL): those pinned
 /// at creation keep their tenant, and those that were unpinned follow the new
@@ -321,8 +320,7 @@ mod tests {
 
     /// The per-surface effect report: every surface names a timing of `live`
     /// or `next_start` and a non-empty evidence locator, both timings occur,
-    /// the two startup readers are the ones classified `next_start` (the
-    /// dual-write gate is `live`), and the
+    /// the two startup readers are the ones classified `next_start`, and the
     /// running-session census carries both counts.
     #[tokio::test]
     async fn put_reports_per_surface_effect_timing_and_a_session_census() {

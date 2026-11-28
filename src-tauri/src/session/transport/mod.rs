@@ -37,9 +37,9 @@ pub enum TransportHandle {
     /// transport just records the `task_run_id` for log/observation
     /// hookups.
     Workflow { task_run_id: String },
-    /// Externally-owned session (plan §Phase 10 dual-write). The real
-    /// process is owned by the legacy path; this handle carries the
-    /// legacy id purely for cross-referencing in the dashboard. No
+    /// Externally-owned session: the real process (a `terminal_create` PTY
+    /// or `claude_session` subprocess) is owned by that path, and this
+    /// handle is pure dashboard bookkeeping (see [`ExternalTransport`]). No
     /// transport op touches the underlying process.
     External,
     /// A tab attached to a terminal on ANOTHER device (plan
