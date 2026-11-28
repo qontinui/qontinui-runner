@@ -63,6 +63,7 @@ import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-car
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, textArg, useTerminalCommands } from "./commands";
+import { fetchTenantSlugs } from "./commands/tenantSlugs";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import {
@@ -1495,6 +1496,7 @@ function TerminalPageInner({
     spawnAi: handleLaunchAiSession,
     accounts: spawnAccounts,
     tenantCandidates,
+    tenantSlugs: fetchTenantSlugs,
     approveAll,
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
