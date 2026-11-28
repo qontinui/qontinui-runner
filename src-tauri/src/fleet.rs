@@ -1494,6 +1494,9 @@ pub fn spawn_budget_republisher(role: MachineRole) {
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
+                // A kill tick adds at most 3 s + 5 s here: the reporter waits
+                // out its journal lookahead, then reads under a 5 s deadline
+                // (`slice_oom::collect_from`).
                 resource_sample::publish_once().await;
                 // Pressure-stop events the resource guard queued since the
                 // last tick (plan 2026-11-24-pressure-stops-record-box-stats-

@@ -45,8 +45,10 @@
 pub(crate) mod access;
 pub(crate) mod events;
 pub(crate) mod identity;
+pub(crate) mod journal_oom;
 pub(crate) mod services;
 pub(crate) mod services_bound;
+pub(crate) mod slice_oom;
 pub(crate) mod wsl_guest;
 
 use std::collections::BTreeMap;
@@ -112,6 +114,27 @@ pub(crate) struct Observed {
     pub(crate) base: ComputerReport,
     pub(crate) oom_kill_total: Option<u64>,
     pub(crate) scan: ServiceScan,
+    /// The host's OOM-placement reads (`slice_oom`), taken before the derive;
+    /// empty for a guest.
+    pub(crate) oom: slice_oom::OomReads,
+}
+
+/// The deriver's view of one observed computer. PURE.
+pub(crate) fn obs_input(o: &Observed) -> ObsInput<'_> {
+    ObsInput {
+        boot_id: o.base.boot_id.as_deref(),
+        booted_at: o.base.booted_at.as_deref(),
+        oom_kill_total: o.oom_kill_total,
+        services: o.scan.units.as_deref(),
+        complete_kinds: &o.scan.complete_kinds,
+        // A guest's VM-wide counter moves between guests (see
+        // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
+        // owner this tick must not keep a baseline it no longer tracks.
+        carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
+        slices: o.oom.slices.as_ref(),
+        journal: o.oom.journal.as_ref(),
+        kernel: o.oom.kernel.as_ref(),
+    }
 }
 
 /// The part of a row whose change triggers an immediate delta. `memory_peak`
@@ -188,6 +211,7 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             WatchedUnit {
                 row: services::row_from_props(p, runner),
                 cgroup_oom_kill: None,
+                control_group: p.control_group.clone(),
             }
         })
         .collect();
@@ -215,6 +239,7 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             events: Vec::new(),
         },
         oom_kill_total: g.oom_kill_total,
+        oom: slice_oom::OomReads::default(),
         // Without systemd as PID 1 there was no one to ask: no information,
         // not "no units".
         //
@@ -879,7 +904,7 @@ impl Reporter {
         let facts = self.facts.clone().unwrap_or_default();
 
         // ---- observe --------------------------------------------------
-        let mut observed = vec![Observed {
+        let mut host = Observed {
             base: host_report(
                 host_id.clone(),
                 identity::host_kind(),
@@ -889,7 +914,17 @@ impl Reporter {
             ),
             oom_kill_total: axes.oom_kill_total,
             scan: self.scan_host_services().await,
-        }];
+            oom: slice_oom::OomReads::default(),
+        };
+        // The OOM-placement reads run here, before the (sync, pure) derive,
+        // against the previous observation.
+        let oom = slice_oom::collect(
+            self.state.as_ref().and_then(|s| s.computers.get(&host_id)),
+            &obs_input(&host),
+        )
+        .await;
+        host.oom = oom;
+        let mut observed = vec![host];
         // Guests cost a `wsl.exe` fork each, so they are probed at the
         // full-snapshot cadence — or sooner when one has events waiting.
         #[cfg(windows)]
@@ -1019,17 +1054,7 @@ impl Reporter {
         let state = self.state.get_or_insert_with(ObserverState::default);
         for o in observed {
             let id = &o.base.identity_hash;
-            let input = ObsInput {
-                boot_id: o.base.boot_id.as_deref(),
-                booted_at: o.base.booted_at.as_deref(),
-                oom_kill_total: o.oom_kill_total,
-                services: o.scan.units.as_deref(),
-                complete_kinds: &o.scan.complete_kinds,
-                // A guest's VM-wide counter moves between guests (see
-                // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
-                // owner this tick must not keep a baseline it no longer tracks.
-                carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
-            };
+            let input = obs_input(o);
             let (mut evs, mut next) = events::derive(state.computers.get(id), &input, now);
             next.kind = Some(o.base.kind.clone());
             state.computers.insert(id.clone(), next);
@@ -1368,12 +1393,14 @@ mod tests {
                         .map(|p| WatchedUnit {
                             row: services::row_from_props(p, None),
                             cgroup_oom_kill: None,
+                            control_group: p.control_group.clone(),
                         })
                         .collect(),
                 ),
                 complete_kinds: vec!["gh_actions_runner", "qontinui_runner"],
                 completable_kinds: services::LINUX_COMPLETABLE_KINDS,
             },
+            oom: slice_oom::OomReads::default(),
         }
     }
 
@@ -1403,6 +1430,9 @@ mod tests {
                 services: o.scan.units.as_deref(),
                 complete_kinds: &o.scan.complete_kinds,
                 carry_oom_baseline: true,
+                slices: None,
+                journal: None,
+                kernel: None,
             }
         }
         let (_, obs0) = events::derive(None, &inp(&before, 5), t("2026-09-30T01:40:00Z"));
@@ -1484,7 +1514,10 @@ mod tests {
                             "oom_kill_total": 6,
                             "oom_policy": "stop",
                             "memory_peak": 21474836480_u64,
-                            "runner_name": "fleetbox"
+                            "runner_name": "fleetbox",
+                            "victim_slice": null,
+                            "victim_cgroup": null,
+                            "slices": "not_supported"
                         }
                     },
                     {
@@ -2399,7 +2432,19 @@ mod tests {
         ("wsl_guest.rs", include_str!("wsl_guest.rs")),
         ("access.rs", include_str!("access.rs")),
         ("identity.rs", include_str!("identity.rs")),
+        ("slice_oom.rs", include_str!("slice_oom.rs")),
+        ("journal_oom.rs", include_str!("journal_oom.rs")),
     ];
+
+    /// Plan `2026-11-27-devops-oom-kills-inside-agent-build-slices-carry-no-victim`
+    /// test 21: the OOM-placement modules are on the roster the structural
+    /// pins read, so their IO and their forks are covered.
+    #[test]
+    fn the_oom_placement_modules_are_reporter_sources() {
+        let names: Vec<&str> = REPORTER_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"slice_oom.rs"), "{names:?}");
+        assert!(names.contains(&"journal_oom.rs"), "{names:?}");
+    }
 
     /// The production part of a source file: its test module split off.
     fn prod_part(src: &str) -> &str {

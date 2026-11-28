@@ -111,11 +111,14 @@ pub(crate) struct ServiceRow {
 }
 
 /// A watched unit as the event deriver needs it: the wire row plus the cgroup
-/// `memory.events` `oom_kill` counter used to attribute an OOM kill.
+/// `memory.events` `oom_kill` counter used to attribute an OOM kill, and the
+/// unit's `ControlGroup=`, which places that kill inside a watched slice
+/// (`slice_oom`). Empty once the unit's cgroup is gone (`None`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WatchedUnit {
     pub(crate) row: ServiceRow,
     pub(crate) cgroup_oom_kill: Option<u64>,
+    pub(crate) control_group: Option<String>,
 }
 
 /// coord stores the byte columns as `bigint`; a value that does not fit is
@@ -347,6 +350,7 @@ pub(crate) fn watched_from_props(p: &UnitProps, read_cgroup: bool) -> WatchedUni
         } else {
             None
         },
+        control_group: p.control_group.clone(),
     }
 }
 
@@ -1026,6 +1030,7 @@ pub(crate) mod windows {
                         runner_dir.and_then(|d| read_runner_file(std::path::Path::new(&d))),
                     ),
                     cgroup_oom_kill: None,
+                    control_group: None,
                 })
                 .collect::<Vec<_>>()
         })
