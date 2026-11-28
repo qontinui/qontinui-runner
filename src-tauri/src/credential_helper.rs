@@ -20,20 +20,27 @@ const MAX_CONSECUTIVE_REFRESH_FAILURES: u32 = 3;
 /// another runner instance sharing the same %TEMP%.
 const SWEEP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The repo-local git config keys [`set_git_credential_helper`] installs —
-/// and therefore exactly the keys [`cleanup_credential_helper`] must unset.
-/// Kept as one list so the install and teardown sides can never drift: a key
-/// added to the install without a matching unset would be left behind in the
-/// working dir's `.git/config` forever (which is what happened to
-/// `credential.useHttpPath`).
-const INSTALLED_LOCAL_KEYS: [&str; 2] = ["credential.helper", "credential.useHttpPath"];
+/// The variable names [`set_git_credential_helper`] writes under the coord
+/// URL scope (`credential.<coord-scope>.<var>`) — and therefore exactly the
+/// variables [`unset_orphaned_install`] removes. Kept as one list so the
+/// install and teardown sides can never drift: a key added to the install
+/// without a matching unset would be left behind in the worktree's
+/// `config.worktree` forever (which is what happened to `useHttpPath` when it
+/// was still written unscoped).
+const HELPER_VAR: &str = "helper";
+const USE_HTTP_PATH_VAR: &str = "useHttpPath";
+
+/// `credential.<scope>.<var>`, the key git matches against a request URL.
+fn scoped_credential_key(scope: &str, var: &str) -> String {
+    format!("credential.{scope}.{var}")
+}
 
 /// Per-session credential-helper state, keyed by the stringified coord
 /// session UUID (the exact `session_id` passed to
 /// [`setup_credential_helper`]).
 #[derive(Default)]
 struct SessionCredState {
-    /// Working dirs where the repo-local [`INSTALLED_LOCAL_KEYS`] were
+    /// Working dirs where the per-worktree helper keys were
     /// written. Drained by [`cleanup_credential_helper`], which unsets them.
     dirs: Vec<PathBuf>,
     /// Whether a token refresh loop is currently live for this session —
@@ -48,6 +55,10 @@ fn registry() -> &'static Mutex<HashMap<String, SessionCredState>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, SessionCredState>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// The file stem of the helper binary; how a helper value is recognised as
+/// one of ours.
+const HELPER_BINARY_STEM: &str = "qontinui-git-credential";
 
 fn credential_helper_binary_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -213,41 +224,224 @@ fn is_git_repo(working_dir: &Path) -> GitRepoProbe {
     }
 }
 
-fn git_config_local(working_dir: &Path, key: &str, value: &str) -> Result<(), String> {
+/// Run `git -C <dir> <args>` under [`GIT_CONFIG_TIMEOUT`].
+fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args([
-        "-C",
-        &working_dir.to_string_lossy(),
-        "config",
-        "--local",
-        key,
-        value,
-    ]);
-    let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
-        .map_err(|e| format!("run git config: {e}"))?;
+    cmd.arg("-C").arg(dir).args(args);
+    crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git config --local {key} failed: {stderr}"));
+/// `git -C <dir> config <scope> [--type=bool] --get <key>`: `Ok(None)` when the
+/// key is absent (exit 1), the trimmed value otherwise.
+fn git_config_get_in(
+    dir: &Path,
+    scope: &str,
+    key: &str,
+    as_bool: bool,
+) -> Result<Option<String>, String> {
+    let mut args = vec!["config", scope];
+    if as_bool {
+        args.push("--type=bool");
     }
+    args.extend(["--get", key]);
+    let out = git_in(dir, &args)?;
+    if out.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ));
+    }
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(format!(
+        "git config {scope} --get {key} failed ({:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
 
+/// `git -C <dir> config --worktree <args>`, failing on a non-zero exit.
+fn git_config_worktree(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["config", "--worktree"];
+    full.extend_from_slice(args);
+    let out = git_in(dir, &full)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git config --worktree {} failed ({:?}): {}",
+        args.join(" "),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// Make `dir`'s repository read a per-worktree `config.worktree`: ensure
+/// `extensions.worktreeConfig=true` in the shared config (read first, so the
+/// steady path writes nothing).
+///
+/// Refuses when the shared config sets `core.bare=true` or `core.worktree`:
+/// git documents that with `extensions.worktreeConfig` on, those two keys must
+/// live in the main worktree's `config.worktree` instead, or every linked
+/// worktree inherits them. Moving an operator's repository layout is not this
+/// module's call, so the install is skipped there.
+fn ensure_worktree_config_enabled(dir: &Path) -> Result<(), String> {
+    if git_config_get_in(dir, "--local", "core.bare", true)?.as_deref() == Some("true") {
+        return Err(
+            "the shared git config sets core.bare=true; enabling extensions.worktreeConfig \
+             there would hand that setting to every worktree"
+                .to_string(),
+        );
+    }
+    if let Some(value) = git_config_get_in(dir, "--local", "core.worktree", false)? {
+        return Err(format!(
+            "the shared git config sets core.worktree={value}; enabling \
+             extensions.worktreeConfig there would hand that setting to every worktree"
+        ));
+    }
+    let before = git_config_get_in(dir, "--local", "extensions.worktreeConfig", true)?;
+    if before.as_deref() == Some("true") {
+        return Ok(());
+    }
+    write_worktree_config_extension(dir)?;
+    info!(
+        "credential_helper: set extensions.worktreeConfig=true in the shared config of {} \
+         (was {})",
+        dir.display(),
+        before.as_deref().unwrap_or("unset")
+    );
     Ok(())
 }
 
+/// Write `extensions.worktreeConfig=true` to the SHARED config, tolerating a
+/// concurrent first install in a sibling worktree. Nothing in this process
+/// serialises writes to the shared file across worktrees, and `git config`
+/// fails at once on a held `config.lock`; so a failed write re-reads the key
+/// and counts `true` as success (the sibling wrote it), and otherwise retries
+/// the write once after a short pause.
+fn write_worktree_config_extension(dir: &Path) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let out = git_in(
+            dir,
+            &["config", "--local", "extensions.worktreeConfig", "true"],
+        )?;
+        if out.status.success() {
+            return Ok(());
+        }
+        last_error = String::from_utf8_lossy(&out.stderr).to_string();
+        if git_config_get_in(dir, "--local", "extensions.worktreeConfig", true)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true")
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "git config --local extensions.worktreeConfig true failed: {last_error}"
+    ))
+}
+
+/// The lock serialising the read-modify-write of ONE worktree's helper list
+/// in this process, keyed by that worktree's `config.worktree` path. Two
+/// installs can land in one worktree (an agent-id install and a terminal
+/// session-id install), and two interleaved "reset missing → add reset → add
+/// ours" sequences would put the second empty reset AFTER the first helper,
+/// which silently drops that helper from git's list. Installs into different
+/// worktrees never wait on each other. Entries nobody holds are dropped on
+/// the way, so the map stays as small as the set of in-flight installs.
+fn worktree_config_lock(key: &Path) -> std::sync::Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    locks.entry(key.to_path_buf()).or_default().clone()
+}
+
+/// Install the session's helper for `working_dir` ONLY, scoped to the coord
+/// URL (`scope`, from [`credential_url_scope`]).
+///
+/// The keys go to the worktree's own `config.worktree` (`git config
+/// --worktree`), never the repository's shared `.git/config`: from a linked
+/// worktree `--local` writes the SHARED file, so parallel sessions in sibling
+/// worktrees replaced each other's helper, and a dead runner's helper was
+/// inherited by every checkout of the repo (plan
+/// 2026-11-26-runner-credential-helper-written-to-the-shared-repo-config-clobbers-parallel-worktree-sessions).
+/// The same path is used for a primary checkout, whose `.git/config.worktree`
+/// linked worktrees do not read. A failed `--worktree` write fails the install;
+/// there is deliberately no fallback to `--local`.
+///
+/// `credential.<scope>.helper` is a list and git reads the shared config
+/// before `config.worktree`, so an EMPTY reset entry is kept FIRST in this
+/// file: it clears whatever the shared config (a stale pre-worktree install,
+/// a dead runner) contributed for the coord host before ours is consulted.
+/// Ours is APPENDED (`--add`), because one worktree can hold two installs;
+/// removal is [`unset_orphaned_install`]'s exact token-file match. Scoping to
+/// the coord host leaves GitHub/GCM helpers untouched for this worktree — the
+/// binary answers only the coord host anyway.
 fn set_git_credential_helper(
     working_dir: &Path,
+    scope: &str,
     binary_path: &Path,
     config_path: &Path,
 ) -> Result<(), String> {
     let binary_str = binary_path.to_string_lossy().replace('\\', "/");
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let helper_value = format!("{binary_str} --config {config_str}");
+    let helper_key = scoped_credential_key(scope, HELPER_VAR);
 
-    git_config_local(working_dir, INSTALLED_LOCAL_KEYS[0], &helper_value)?;
+    ensure_worktree_config_enabled(working_dir)?;
+
+    // Keyed by the file the writes land in; a dir whose file did not resolve
+    // (the writes below then fail anyway) is keyed by itself.
+    let lock_key = git_local_config_file(working_dir).unwrap_or_else(|| working_dir.to_path_buf());
+    let lock = worktree_config_lock(&lock_key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let existing = {
+        let out = git_in(
+            working_dir,
+            &["config", "--worktree", "--get-all", &helper_key],
+        )?;
+        match out.status.code() {
+            Some(0) => parse_get_all(&out.stdout),
+            Some(1) => Vec::new(),
+            code => {
+                return Err(format!(
+                    "git config --worktree --get-all {helper_key} failed ({code:?}): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+            }
+        }
+    };
+    if existing.first().map(String::as_str) != Some("") {
+        // The reset must LEAD the list. Values that are already there (only
+        // possible from a hand edit) are kept, after it, in their order.
+        if !existing.is_empty() {
+            git_config_worktree(working_dir, &["--unset-all", &helper_key])?;
+        }
+        git_config_worktree(working_dir, &["--add", &helper_key, ""])?;
+        for value in existing.iter().filter(|v| !v.is_empty()) {
+            git_config_worktree(working_dir, &["--add", &helper_key, value])?;
+        }
+    }
+    if !existing.contains(&helper_value) {
+        git_config_worktree(working_dir, &["--add", &helper_key, &helper_value])?;
+    }
     // Without useHttpPath git never sends `path=` to the helper, and the
     // helper's repo-registry lookup is keyed on the request path — the
     // install would be a production no-op.
-    git_config_local(working_dir, INSTALLED_LOCAL_KEYS[1], "true")?;
+    git_config_worktree(
+        working_dir,
+        &[&scoped_credential_key(scope, USE_HTTP_PATH_VAR), "true"],
+    )?;
 
     Ok(())
 }
@@ -316,6 +510,21 @@ fn git_config_cmd(config_file: Option<&Path>) -> std::process::Command {
     cmd
 }
 
+/// The values of a successful `git config --get-all`, one per line.
+fn parse_get_all(stdout: &[u8]) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut values: Vec<String> = stdout
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
+    // Drop the artifact of the final newline — but only one element, so a
+    // genuinely empty-valued last entry ("key =") survives.
+    if values.last().is_some_and(|l| l.is_empty()) {
+        values.pop();
+    }
+    values
+}
+
 fn git_config_get_all_at(config_file: Option<&Path>, key: &str) -> Result<Vec<String>, String> {
     let mut cmd = git_config_cmd(config_file);
     cmd.args(["--get-all", key]);
@@ -323,17 +532,7 @@ fn git_config_get_all_at(config_file: Option<&Path>, key: &str) -> Result<Vec<St
         .map_err(|e| format!("run git config --get-all {key}: {e}"))?;
 
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut values: Vec<String> = stdout
-            .split('\n')
-            .map(|l| l.trim_end_matches('\r').to_string())
-            .collect();
-        // Drop the artifact of the final newline — but only one element, so a
-        // genuinely empty-valued last entry ("key =") survives.
-        if values.last().is_some_and(|l| l.is_empty()) {
-            values.pop();
-        }
-        return Ok(values);
+        return Ok(parse_get_all(&output.stdout));
     }
 
     // Exit code 1 = key not present (also what a not-yet-created --file
@@ -463,7 +662,7 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
         // PROCEED on an unknown. Skipping here is not the safe arm: it hands
         // the agent the interactive credential prompts this module exists to
         // eliminate, and the failure is invisible. Attempting the install
-        // costs a handful of bounded `git config --local` children which fail
+        // costs a handful of bounded `git config` children which fail
         // harmlessly (and are reported) outside a work tree — strictly cheaper
         // than a wedged interactive push.
         GitRepoProbe::Unknown => {
@@ -491,6 +690,13 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     };
 
     let (coord_base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let scope = match credential_url_scope(&coord_base) {
+        Ok(scope) => scope,
+        Err(e) => {
+            warn!("credential_helper: no credential URL scope for the coord base, skipping: {e}");
+            return;
+        }
+    };
 
     let (push_token_result, repos_result) = tokio::join!(
         fetch_push_token(&coord_base, session_id),
@@ -540,7 +746,23 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
         }
     };
 
-    match set_git_credential_helper(working_path, &binary_path, &config_path) {
+    // Several bounded git children behind a per-worktree lock: off the async
+    // worker, so a contended `config.lock` parks a blocking-pool thread, not
+    // a tokio worker.
+    let install = {
+        let (dir, scope, binary, config) = (
+            working_path.to_path_buf(),
+            scope.clone(),
+            binary_path.clone(),
+            config_path.clone(),
+        );
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            set_git_credential_helper(&dir, &scope, &binary, &config)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("helper install task failed: {e}")))
+    };
+    match install {
         Ok(()) => {
             info!(
                 session_id = session_id,
@@ -585,12 +807,21 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
         }
         Err(e) => {
             warn!("credential_helper: git config failed: {e}");
-            discard_failed_install(
-                session_id,
-                &config_path,
-                local_config.as_deref(),
-                created_config,
+            // git children under the config and worktree locks: off the
+            // async worker, like the install itself.
+            let (session, config, local) = (
+                session_id.to_string(),
+                config_path.clone(),
+                local_config.clone(),
             );
+            if let Err(e) =
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    discard_failed_install(&session, &config, local.as_deref(), created_config)
+                })
+                .await
+            {
+                warn!("credential_helper: discarding the failed install did not finish: {e}");
+            }
         }
     }
 }
@@ -945,14 +1176,14 @@ fn config_file_lock() -> std::sync::MutexGuard<'static, ()> {
 /// this call.
 ///
 /// `git_configs` lists the git config FILES the helper keys were written into
-/// (`git rev-parse --git-path config`), not the working dirs. The in-process
-/// registry drives teardown while the runner lives, but it dies with the
-/// process, so a crash leaves those keys behind pointing at a token file
-/// nothing will refresh. With the files recorded here,
+/// (`git rev-parse --git-path config.worktree`), not the working dirs. The
+/// in-process registry drives teardown while the runner lives, but it dies
+/// with the process, so a crash leaves those keys behind pointing at a token
+/// file nothing will refresh. With the files recorded here,
 /// [`sweep_stale_cred_files`] can unset the keys when it deletes the token
-/// file. It has to be the config FILE: from a linked worktree,
-/// `git config --local` writes the MAIN checkout's shared config, and by the
-/// time the sweep runs the worktree itself is usually deleted.
+/// file. It has to be the config FILE: by the time the sweep runs the worktree
+/// itself is usually deleted (and an older install, written with `--local`,
+/// recorded the MAIN checkout's shared config, which the same removal reads).
 ///
 /// Read-merge-write happens under [`config_file_lock`] and the write is
 /// atomic, so concurrent setups for one session cannot drop each other's
@@ -1006,6 +1237,47 @@ fn helper_names_token_file(value: &str, file_name: &str) -> bool {
         .is_some_and(|prefix| prefix.ends_with('/') || prefix.ends_with('\\'))
 }
 
+/// Every `credential.helper` / `credential.<scope>.helper` entry in the git
+/// config FILE `config_file`, as `(key, value)` in file order. The key comes
+/// back as git prints it: section and variable lower-cased, the URL scope as
+/// written.
+fn helper_entries_at(config_file: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut cmd = git_config_cmd(Some(config_file));
+    // `-z`: `key\nvalue\0` per entry, so a value with spaces (or an empty
+    // reset) parses unambiguously.
+    cmd.args(["-z", "--get-regexp", r"^credential\.(.*\.)?helper$"]);
+    let out = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
+        .map_err(|e| format!("run git config --get-regexp helper: {e}"))?;
+    if out.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !out.status.success() {
+        return Err(format!(
+            "git config --get-regexp helper failed ({:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| match chunk.split_once('\n') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (chunk.to_string(), String::new()),
+        })
+        .collect())
+}
+
+/// The `useHttpPath` key that belongs beside helper key `helper_key`
+/// (`credential.helper` → `credential.useHttpPath`,
+/// `credential.<scope>.helper` → `credential.<scope>.useHttpPath`).
+fn use_http_path_key_for(helper_key: &str) -> String {
+    let prefix = helper_key
+        .get(..helper_key.len().saturating_sub(HELPER_VAR.len()))
+        .unwrap_or("credential.");
+    format!("{prefix}{USE_HTTP_PATH_VAR}")
+}
+
 /// What [`unset_orphaned_install`] did with one recorded git config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanUnset {
@@ -1019,15 +1291,21 @@ enum OrphanUnset {
 
 /// Remove the helper keys in the git config file `local_config` that still
 /// point at `token_file`, the token config of a session whose teardown never
-/// ran.
+/// ran (or is running now).
 ///
-/// Only `credential.helper` values naming this exact token file are removed.
-/// A repo that a later session installed into again names a different, live
-/// file, so it is left untouched. `credential.useHttpPath` is unset only when
-/// no qontinui helper remains in that file, because a live install needs it.
-/// Operates on the FILE with `--file`, so it works after the worktree that
-/// wrote the keys has been deleted. Errors are debug!-logged and reported as
-/// [`OrphanUnset::Failed`], so the caller can keep the record and retry.
+/// Only helper values naming this exact token file are removed, under every
+/// helper key that carries one: the coord-scoped `credential.<scope>.helper`
+/// a current install writes into `config.worktree`, and the unscoped
+/// `credential.helper` an older `--local` install left in a shared config. A
+/// value another session installed names a different, live file, so it is
+/// left untouched. The matching `useHttpPath` is unset only when no qontinui
+/// helper remains under that key, because a live install needs it. The empty
+/// reset entry a scoped install keeps first is left in place: alone it only
+/// stops a shared-config helper being tried for the coord host in this
+/// worktree. Operates on the FILE with `--file`, so it works after the
+/// worktree that wrote the keys has been deleted. Errors are debug!-logged and
+/// reported as [`OrphanUnset::Failed`], so the caller can keep the record and
+/// retry.
 fn unset_orphaned_install(local_config: &Path, token_file: &Path) -> OrphanUnset {
     let Some(file_name) = token_file.file_name().and_then(|n| n.to_str()) else {
         return OrphanUnset::NothingToDo;
@@ -1035,81 +1313,88 @@ fn unset_orphaned_install(local_config: &Path, token_file: &Path) -> OrphanUnset
     if !local_config.is_file() {
         return OrphanUnset::NothingToDo;
     }
+    // The same per-file lock an install into this file holds (keyed by the
+    // same `git_local_config_file` path the install records), so a teardown
+    // and an install in one worktree never contend on its `config.lock`. No
+    // caller holds it here: installs release it before any removal runs.
+    let lock = worktree_config_lock(local_config);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let shown = local_config.display();
-    let helpers = match git_config_get_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[0]) {
-        Ok(values) => values,
+    let entries = match helper_entries_at(local_config) {
+        Ok(entries) => entries,
         Err(e) => {
             debug!("credential_helper: sweep read helpers in {shown}: {e}");
             return OrphanUnset::Failed;
         }
     };
-    if !helpers
-        .iter()
-        .any(|v| helper_names_token_file(v, file_name))
-    {
+    let mut keys: Vec<String> = Vec::new();
+    for (key, value) in &entries {
+        if helper_names_token_file(value, file_name) && !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    if keys.is_empty() {
         return OrphanUnset::NothingToDo;
     }
 
     // The same anchoring as `helper_names_token_file`, as a git value-pattern
     // (extended regex): a path separator, the literal name, end of value.
     let pattern = format!(r"[/\\]{}$", regex_literal(file_name));
-    let mut cmd = git_config_cmd(Some(local_config));
-    cmd.args(["--unset-all", INSTALLED_LOCAL_KEYS[0], &pattern]);
-    // Exit 5 ("no value matched") counts as a failure here: the check above
-    // just found a matching value, so git disagreeing means the key may still
-    // be there (e.g. a hand-quoted value with trailing whitespace that `$`
-    // does not reach). Keeping the record beats losing it.
-    match crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT) {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            debug!(
-                "credential_helper: sweep unset helper in {shown} failed ({:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            return OrphanUnset::Failed;
+    for key in &keys {
+        let mut cmd = git_config_cmd(Some(local_config));
+        cmd.args(["--unset-all", key, &pattern]);
+        // Exit 5 ("no value matched") counts as a failure here: the read above
+        // just found a matching value, so git disagreeing means the key may
+        // still be there (e.g. a hand-quoted value with trailing whitespace
+        // that `$` does not reach). Keeping the record beats losing it.
+        match crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                debug!(
+                    "credential_helper: sweep unset {key} in {shown} failed ({:?}): {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return OrphanUnset::Failed;
+            }
+            Err(e) => {
+                debug!("credential_helper: sweep unset {key} in {shown}: {e}");
+                return OrphanUnset::Failed;
+            }
         }
-        Err(e) => {
-            debug!("credential_helper: sweep unset helper in {shown}: {e}");
-            return OrphanUnset::Failed;
-        }
-    }
 
-    // Not atomic with the check below: a sibling session installing into the
-    // same shared config between the two git calls can lose its
-    // `useHttpPath`. Closing that window would take a lock git's own
-    // `config.lock` does not offer across two commands; the window is two
-    // child processes wide, and the old blanket unset lost it every time.
-    let qontinui_helper_remains =
-        git_config_get_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[0])
-            .map(|values| values.iter().any(|v| v.contains("qontinui-git-credential")))
+        // Not atomic with the removal above: a sibling session installing into
+        // the same file between the two git calls can lose its `useHttpPath`.
+        // Closing that window would take a lock git's own `config.lock` does
+        // not offer across two commands; the window is two child processes
+        // wide, and the old blanket unset lost it every time.
+        //
+        // Deliberately NOT `is_qontinui_helper_binary`: this check decides
+        // whether to KEEP `useHttpPath`, so it must err towards "something that
+        // might be ours remains" — a `!`-wrapped, quoted or otherwise unusual
+        // value naming the helper anywhere still counts. The stem test would be
+        // less conservative here.
+        let qontinui_helper_remains = git_config_get_all_at(Some(local_config), key)
+            .map(|values| values.iter().any(|v| v.contains(HELPER_BINARY_STEM)))
             .unwrap_or(true);
-    if !qontinui_helper_remains {
-        if let Err(e) = git_config_unset_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[1]) {
-            debug!("credential_helper: sweep unset useHttpPath in {shown}: {e}");
-            return OrphanUnset::Failed;
+        if !qontinui_helper_remains {
+            let use_http_path = use_http_path_key_for(key);
+            if let Err(e) = git_config_unset_all_at(Some(local_config), &use_http_path) {
+                debug!("credential_helper: sweep unset {use_http_path} in {shown}: {e}");
+                return OrphanUnset::Failed;
+            }
         }
     }
     OrphanUnset::Removed
 }
 
-/// The git config FILE that `git config --local` writes for `dir`
-/// (`git rev-parse --git-path config`), as an absolute path. From a linked
-/// worktree that is the main checkout's shared config. `None` when `dir` is
-/// not a repo or git did not answer in time.
-fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
+/// `git rev-parse --git-path <name>` for `dir`, as an absolute path. `None`
+/// when `dir` is not a repo or git did not answer in time.
+fn git_path_file(dir: &Path, name: &str) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
     }
-    let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args([
-        "-C",
-        &dir.to_string_lossy(),
-        "rev-parse",
-        "--git-path",
-        "config",
-    ]);
-    let out = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT).ok()?;
+    let out = git_in(dir, &["rev-parse", "--git-path", name]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1129,6 +1414,196 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
     Some(std::path::absolute(&path).unwrap_or(path))
 }
 
+/// The git config FILE that `git config --worktree` writes for `dir`
+/// (`git rev-parse --git-path config.worktree`): `.git/worktrees/<id>/config.worktree`
+/// for a linked worktree, `.git/config.worktree` for a primary checkout. This
+/// is where [`set_git_credential_helper`] puts the keys, and so what
+/// recording, cleanup, [`discard_failed_install`] and the boot sweep target.
+fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
+    git_path_file(dir, "config.worktree")
+}
+
+/// The repository's SHARED config file for `dir` (`.git/config`, read by
+/// every worktree of the repo). For a primary checkout it is read without a
+/// git child, which keeps the per-cycle repair below cheap on the steady path.
+/// `None` unless `dir` is a checkout ROOT (has a `.git` of its own), so a
+/// directory inside some other repository never resolves to that repository.
+fn git_shared_config_file(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if !dot_git.exists() {
+        return None;
+    }
+    if dot_git.is_dir() {
+        let path = dot_git.join("config");
+        return Some(std::path::absolute(&path).unwrap_or(path));
+    }
+    git_path_file(dir, "config")
+}
+
+/// One side of a helper value as a path: surrounding whitespace and one pair
+/// of matching quotes stripped.
+fn unquote_path(raw: &str) -> &str {
+    let raw = raw.trim();
+    for quote in ['"', '\''] {
+        if let Some(inner) = raw
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    raw
+}
+
+/// Whether `binary` (read out of a helper value, unquoted) is the qontinui
+/// helper: judged by its file stem, `.exe` or not. The one "is this ours"
+/// test for judging a helper dead.
+fn is_qontinui_helper_binary(binary: &Path) -> bool {
+    binary.file_stem().and_then(|s| s.to_str()) == Some(HELPER_BINARY_STEM)
+}
+
+/// Whether a path read out of a helper value is PROVABLY gone: only an
+/// absolute path that does not exist. A relative or bare name (resolved
+/// through `PATH` or the cwd by git) cannot be judged from here, so it is
+/// never dead.
+/// An existence check that FAILS (permissions, I/O) cannot judge either.
+fn absolute_and_missing(path: &Path) -> bool {
+    path.is_absolute() && matches!(path.try_exists(), Ok(false))
+}
+
+/// Why a `qontinui-git-credential` helper value is DEAD, with the token file
+/// it names: `None` when it is not ours, names no token file (nothing
+/// [`unset_orphaned_install`] could match), is alive, or cannot be judged.
+///
+/// The value is split at ` --config `. A `!`-prefixed value is a shell
+/// snippet whose binary git does not resolve as a path, so it is UNKNOWN and
+/// kept; so is a binary that is not an absolute path. Quotes around either
+/// side are stripped before it is judged.
+fn dead_qontinui_helper(value: &str) -> Option<(PathBuf, &'static str)> {
+    if value.trim_start().starts_with('!') {
+        return None;
+    }
+    let (binary, token) = value.split_once(" --config ")?;
+    let binary = Path::new(unquote_path(binary));
+    if !is_qontinui_helper_binary(binary) {
+        return None;
+    }
+    let token = unquote_path(token);
+    if token.is_empty() {
+        return None;
+    }
+    let token = PathBuf::from(token);
+    if absolute_and_missing(binary) {
+        Some((token, "its binary is gone"))
+    } else if absolute_and_missing(&token) {
+        Some((token, "its token file is gone"))
+    } else {
+        None
+    }
+}
+
+/// The (shared config, helper value) pairs already reported as dead but
+/// unremovable, so the publish cycle logs each at info only once.
+fn unmatched_dead_helpers_seen() -> &'static Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(PathBuf, String)>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Remove every DEAD qontinui helper from `checkout`'s shared git config:
+/// a `qontinui-git-credential` value (unscoped `credential.helper` or a
+/// `credential.<scope>.helper`) whose binary or token file provably no longer
+/// exists ([`dead_qontinui_helper`]; a value it cannot judge is kept).
+/// Returns how many token files' helpers were removed.
+///
+/// A runner that is stopped or crashes (a temp runner above all) leaves its
+/// helper naming a binary that is gone; while that value sits in the shared
+/// config, every fetch in every worktree of the repo — github.com included —
+/// prints `qontinui-git-credential: not found`. The boot sweep never repairs
+/// it while the primary runner stays up, so the fleet publish cycle calls
+/// this for every managed checkout before its fetch. A live install writes
+/// its token file before its helper, so a missing token file is as dead as a
+/// missing binary. Removal is [`unset_orphaned_install`], which also does the
+/// `useHttpPath` bookkeeping; one info line per repair. Best-effort: a git
+/// failure is debug!-logged and retried next cycle.
+pub(crate) fn repair_dead_shared_helpers(checkout: &Path) -> usize {
+    let Some(shared) = git_shared_config_file(checkout) else {
+        return 0;
+    };
+    // Steady path: no qontinui helper in the file, no git child at all.
+    match std::fs::read(&shared) {
+        Ok(raw)
+            if raw
+                .windows(HELPER_BINARY_STEM.len())
+                .any(|w| w == HELPER_BINARY_STEM.as_bytes()) => {}
+        _ => return 0,
+    }
+    let entries = match helper_entries_at(&shared) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug!(
+                "credential_helper: repair could not read the helpers in {}: {e}",
+                shared.display()
+            );
+            return 0;
+        }
+    };
+    let mut dead_tokens: Vec<(PathBuf, &'static str, &str)> = Vec::new();
+    for (_key, value) in &entries {
+        let Some((token, reason)) = dead_qontinui_helper(value) else {
+            continue;
+        };
+        if !dead_tokens.iter().any(|(t, _, _)| t == &token) {
+            dead_tokens.push((token, reason, value.as_str()));
+        }
+    }
+    let mut repaired = 0usize;
+    for (token, reason, value) in dead_tokens {
+        match unset_orphaned_install(&shared, &token) {
+            OrphanUnset::Removed => {
+                repaired += 1;
+                info!(
+                    "credential_helper: removed a dead qontinui-git-credential helper from {} \
+                     ({reason}; token file {})",
+                    shared.display(),
+                    token.display()
+                );
+            }
+            // Judged dead, yet the exact token-file match found nothing to
+            // remove: the value is not in the shape an install writes (e.g. a
+            // hand-quoted token). Left alone, but made visible.
+            OrphanUnset::NothingToDo => {
+                // Info once per (file, value) per process, then debug: this
+                // runs every publish cycle and the value stays until a human
+                // edits it.
+                let first = unmatched_dead_helpers_seen()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((shared.clone(), value.to_string()));
+                if first {
+                    info!(
+                        "credential_helper: a dead qontinui-git-credential helper in {} \
+                         ({reason}) could not be matched for removal and was left in place: \
+                         {value:?}",
+                        shared.display()
+                    );
+                } else {
+                    debug!(
+                        "credential_helper: unmatched dead helper still in {}: {value:?}",
+                        shared.display()
+                    );
+                }
+            }
+            OrphanUnset::Failed => debug!(
+                "credential_helper: repair could not remove the dead helper naming {} from {}; \
+                 retrying next cycle",
+                token.display(),
+                shared.display()
+            ),
+        }
+    }
+    repaired
+}
+
 /// Tear down everything [`setup_credential_helper`] installed for a session:
 /// remove this session's repo-local helper keys from every git config file
 /// it wrote, then remove the token config file (whose absence is also the
@@ -1140,11 +1615,12 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
 /// removal the boot sweep uses, over the config FILES the token file recorded
 /// plus those the registered dirs resolve to now. Two reasons it is not a
 /// blanket `--unset-all` per working dir:
-/// - every linked worktree of a repo writes the MAIN checkout's shared
-///   config, so a blanket unset there strips the helper a sibling session
-///   installed later, leaving its pushes with no helper ("Cannot prompt");
+/// - one worktree's `config.worktree` can hold two installs (an agent-id one
+///   and a terminal session-id one), and an older `--local` install shares the
+///   MAIN checkout's config with every sibling, so a blanket unset strips a
+///   helper another session still uses ("Cannot prompt");
 /// - a worktree deleted before teardown runs has no dir to `git -C` into,
-///   while its keys still sit in the main checkout's config.
+///   while an older install's keys still sit in the main checkout's config.
 ///
 /// When a removal fails the token file is kept as a tombstone: its
 /// `git_configs` record stays for the boot sweep to retry, and its token is
@@ -1568,6 +2044,7 @@ mod tests {
 
     use super::*;
 
+    /// A value from the repository's SHARED config (`git config --local`).
     fn git_config_get(dir: &Path, key: &str) -> Option<String> {
         let out = crate::process_helpers::no_window("git")
             .args(["-C", &dir.to_string_lossy(), "config", "--local", key])
@@ -1579,32 +2056,152 @@ mod tests {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
+    /// The coord scope every test install writes under.
+    const TEST_SCOPE: &str = "https://coord.example";
+
+    fn helper_key() -> String {
+        scoped_credential_key(TEST_SCOPE, HELPER_VAR)
+    }
+
+    fn use_http_path_key() -> String {
+        scoped_credential_key(TEST_SCOPE, USE_HTTP_PATH_VAR)
+    }
+
+    /// All values of `key` in `dir`'s own `config.worktree`.
+    fn worktree_values(dir: &Path, key: &str) -> Vec<String> {
+        let file = git_local_config_file(dir).expect("resolve config.worktree");
+        git_config_get_all_at(Some(&file), key).unwrap()
+    }
+
+    /// Every qontinui helper value in the SHARED config of `dir`'s repo, under
+    /// any helper key, scoped or not.
+    fn shared_qontinui_helpers(dir: &Path) -> Vec<String> {
+        let shared = git_path_file(dir, "config").expect("resolve the shared config");
+        helper_entries_at(&shared)
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| v.contains(HELPER_BINARY_STEM))
+            .collect()
+    }
+
+    /// The helper value an install pointing at `token` writes.
+    fn helper_value(token: &Path) -> String {
+        format!(
+            "C:/bin/qontinui-git-credential.exe --config {}",
+            token.to_string_lossy().replace('\\', "/")
+        )
+    }
+
+    /// The install lands in the checkout's OWN `config.worktree`, scoped to
+    /// the coord URL, with the empty reset first; the shared config gains only
+    /// `extensions.worktreeConfig`.
     #[test]
     fn set_git_credential_helper_writes_helper_and_use_http_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let status = crate::process_helpers::no_window("git")
-            .args(["init", "-q", &tmp.path().to_string_lossy()])
-            .status()
-            .expect("git init");
-        assert!(status.success());
+        git_init(tmp.path());
 
         set_git_credential_helper(
             tmp.path(),
+            TEST_SCOPE,
             Path::new("C:\\bin\\qontinui-git-credential.exe"),
             Path::new("C:\\tmp\\cred.json"),
         )
         .expect("set_git_credential_helper");
 
         assert_eq!(
-            git_config_get(tmp.path(), "credential.helper").as_deref(),
-            Some("C:/bin/qontinui-git-credential.exe --config C:/tmp/cred.json")
+            worktree_values(tmp.path(), &helper_key()),
+            vec![
+                String::new(),
+                "C:/bin/qontinui-git-credential.exe --config C:/tmp/cred.json".to_string()
+            ]
         );
         // Without useHttpPath git never passes `path=` to the helper, which
         // makes the whole install a production no-op — it must be set.
         assert_eq!(
-            git_config_get(tmp.path(), "credential.useHttpPath").as_deref(),
+            worktree_values(tmp.path(), &use_http_path_key()),
+            vec!["true".to_string()]
+        );
+        assert_eq!(
+            git_config_get(tmp.path(), "extensions.worktreeConfig").as_deref(),
             Some("true")
         );
+        assert!(shared_qontinui_helpers(tmp.path()).is_empty());
+        assert_eq!(git_config_get(tmp.path(), "credential.useHttpPath"), None);
+    }
+
+    /// A list someone edited by hand (a value, no reset) gets the reset put
+    /// back in FRONT, keeping the value after it.
+    #[test]
+    fn set_git_credential_helper_puts_the_reset_first_in_a_hand_edited_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        ensure_worktree_config_enabled(tmp.path()).unwrap();
+        git_config_worktree(tmp.path(), &["--add", &helper_key(), "hand-added"]).unwrap();
+        let token = tmp.path().join("qontinui-git-cred-hand.json");
+
+        set_git_credential_helper(
+            tmp.path(),
+            TEST_SCOPE,
+            Path::new("C:\\bin\\qontinui-git-credential.exe"),
+            &token,
+        )
+        .unwrap();
+
+        assert_eq!(
+            worktree_values(tmp.path(), &helper_key()),
+            vec![
+                String::new(),
+                "hand-added".to_string(),
+                helper_value(&token)
+            ]
+        );
+    }
+
+    /// git documents `core.bare` / `core.worktree` in the shared config as a
+    /// hazard once `extensions.worktreeConfig` is on, so the install refuses
+    /// there and writes nothing.
+    #[test]
+    fn set_git_credential_helper_refuses_a_shared_core_worktree_or_core_bare() {
+        for key in ["core.worktree", "core.bare"] {
+            let tmp = tempfile::tempdir().unwrap();
+            git_init(tmp.path());
+            // core.worktree must name a dir that exists, or git itself fails
+            // before the check is reached.
+            let worktree = tmp.path().to_string_lossy().to_string();
+            let value = if key == "core.bare" {
+                "true"
+            } else {
+                worktree.as_str()
+            };
+            let status = crate::process_helpers::no_window("git")
+                .args([
+                    "-C",
+                    &tmp.path().to_string_lossy(),
+                    "config",
+                    "--local",
+                    key,
+                    value,
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+
+            let err = set_git_credential_helper(
+                tmp.path(),
+                TEST_SCOPE,
+                Path::new("C:\\bin\\qontinui-git-credential.exe"),
+                Path::new("C:\\tmp\\cred.json"),
+            )
+            .unwrap_err();
+
+            assert!(err.contains(key), "{key}: unexpected error: {err}");
+            assert_eq!(
+                git_config_get(tmp.path(), "extensions.worktreeConfig"),
+                None,
+                "{key}: nothing may be written"
+            );
+        }
     }
 
     // Collect the env-injected git config into (key -> value) pairs, honoring
@@ -1709,11 +2306,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = set_git_credential_helper(
             tmp.path(),
+            TEST_SCOPE,
             Path::new("C:\\bin\\qontinui-git-credential.exe"),
             Path::new("C:\\tmp\\cred.json"),
         )
         .unwrap_err();
-        assert!(err.contains("credential.helper"), "unexpected error: {err}");
+        assert!(err.contains("git config"), "unexpected error: {err}");
     }
 
     const COORD_URL: &str = "https://coord.qontinui.io";
@@ -1990,9 +2588,20 @@ mod tests {
             "-m",
             "init",
         ]);
+        add_linked_worktree(main)
+    }
+
+    /// One more linked worktree of the (already committed) repo at `main`.
+    fn add_linked_worktree(main: &Path) -> (tempfile::TempDir, PathBuf) {
         let wt_parent = tempfile::tempdir().unwrap();
         let wt = wt_parent.path().join("wt");
-        git(&["worktree", "add", "-q", "--detach", &wt.to_string_lossy()]);
+        let status = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(main)
+            .args(["worktree", "add", "-q", "--detach", &wt.to_string_lossy()])
+            .status()
+            .expect("git worktree add");
+        assert!(status.success());
         (wt_parent, wt)
     }
 
@@ -2015,6 +2624,7 @@ mod tests {
     fn install_and_record(dir: &Path, token: &Path) {
         set_git_credential_helper(
             dir,
+            TEST_SCOPE,
             Path::new("C:\\bin\\qontinui-git-credential.exe"),
             token,
         )
@@ -2046,42 +2656,56 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(!stale.exists());
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(
-                git_config_get(repo.path(), key),
-                None,
-                "{key} pointing at the deleted token file must be unset"
-            );
-        }
+        assert_eq!(
+            worktree_values(repo.path(), &helper_key()),
+            vec![String::new()],
+            "the helper pointing at the deleted token file must be unset (the reset stays)"
+        );
+        assert!(worktree_values(repo.path(), &use_http_path_key()).is_empty());
     }
 
-    /// From a linked worktree `git config --local` writes the MAIN checkout's
-    /// config, and the worktree is usually deleted before the sweep runs. The
-    /// keys must still be found and removed from the main checkout.
+    /// A linked worktree's install lands in ITS `config.worktree` (under the
+    /// main checkout's `.git/worktrees/<id>/`), never in the shared config, and
+    /// the worktree is usually deleted before the sweep runs. The recorded file
+    /// must still be found and the keys removed from it.
     #[test]
-    fn sweep_unsets_keys_a_deleted_linked_worktree_wrote_into_the_main_checkout() {
+    fn sweep_unsets_keys_a_deleted_linked_worktree_wrote_into_its_config_worktree() {
         let temp = tempfile::tempdir().unwrap();
         let main = tempfile::tempdir().unwrap();
         let (_wt_parent, wt) = linked_worktree(main.path());
 
         let stale = temp.path().join("qontinui-git-cred-worktree-session.json");
         install_and_record(&wt, &stale);
+        let recorded = git_local_config_file(&wt).unwrap();
         assert!(
-            git_config_get(main.path(), INSTALLED_LOCAL_KEYS[0]).is_some(),
-            "precondition: the worktree install lands in the main checkout's config"
+            recorded.starts_with(main.path().join(".git").join("worktrees")),
+            "precondition: the install is recorded in the worktree's own config.worktree, \
+             got {}",
+            recorded.display()
+        );
+        assert_eq!(
+            worktree_values(&wt, &helper_key()),
+            vec![String::new(), helper_value(&stale)],
+            "precondition: the install lands in the worktree's own config.worktree"
+        );
+        assert!(
+            shared_qontinui_helpers(main.path()).is_empty(),
+            "precondition: the shared config carries no helper"
         );
         std::fs::remove_dir_all(&wt).unwrap();
         age_25h(&stale);
 
         sweep_stale_cred_files(temp.path(), SWEEP_MAX_AGE, SystemTime::now());
 
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(
-                git_config_get(main.path(), key),
-                None,
-                "{key} must be unset from the main checkout after its worktree is gone"
-            );
-        }
+        assert_eq!(
+            git_config_get_all_at(Some(&recorded), &helper_key()).unwrap(),
+            vec![String::new()],
+            "the helper must be unset from the gone worktree's config.worktree"
+        );
+        assert!(git_config_get_all_at(Some(&recorded), &use_http_path_key())
+            .unwrap()
+            .is_empty());
+        assert!(!stale.exists());
     }
 
     /// A repo a LATER session installed into again names that session's live
@@ -2101,12 +2725,14 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(live.exists());
-        let helper = git_config_get(repo.path(), INSTALLED_LOCAL_KEYS[0])
-            .expect("the live session's helper must survive");
-        assert!(helper.contains("qontinui-git-cred-live-session.json"));
         assert_eq!(
-            git_config_get(repo.path(), INSTALLED_LOCAL_KEYS[1]).as_deref(),
-            Some("true"),
+            worktree_values(repo.path(), &helper_key()),
+            vec![String::new(), helper_value(&live)],
+            "the live session's helper must survive"
+        );
+        assert_eq!(
+            worktree_values(repo.path(), &use_http_path_key()),
+            vec!["true".to_string()],
             "useHttpPath is still needed by the live install"
         );
     }
@@ -2120,9 +2746,9 @@ mod tests {
         let cfg = temp.path().join("config");
         let stale = "C:/bin/qontinui-git-credential.exe --config C:/t/qontinui-git-cred-old.json";
         let live = "C:/bin/qontinui-git-credential.exe --config C:/t/qontinui-git-cred-new.json";
-        git_config_add_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0], stale).unwrap();
-        git_config_add_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0], live).unwrap();
-        git_config_add_at(Some(&cfg), INSTALLED_LOCAL_KEYS[1], "true").unwrap();
+        git_config_add_at(Some(&cfg), "credential.helper", stale).unwrap();
+        git_config_add_at(Some(&cfg), "credential.helper", live).unwrap();
+        git_config_add_at(Some(&cfg), "credential.useHttpPath", "true").unwrap();
 
         // A name that is not a SUFFIX of any value must not match.
         assert_eq!(
@@ -2135,11 +2761,11 @@ mod tests {
         );
 
         assert_eq!(
-            git_config_get_all_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0]).unwrap(),
+            git_config_get_all_at(Some(&cfg), "credential.helper").unwrap(),
             vec![live.to_string()]
         );
         assert_eq!(
-            git_config_get_all_at(Some(&cfg), INSTALLED_LOCAL_KEYS[1]).unwrap(),
+            git_config_get_all_at(Some(&cfg), "credential.useHttpPath").unwrap(),
             vec!["true".to_string()]
         );
     }
@@ -2153,15 +2779,15 @@ mod tests {
         let cfg = temp.path().join("config");
         let ours = "C:/bin/qontinui-git-credential.exe --config C:/t/qontinui-git-cred-old.json";
         let other = "C:/bin/qontinui-git-credential.exe --config C:/t/xqontinui-git-cred-old.json";
-        git_config_add_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0], ours).unwrap();
-        git_config_add_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0], other).unwrap();
+        git_config_add_at(Some(&cfg), "credential.helper", ours).unwrap();
+        git_config_add_at(Some(&cfg), "credential.helper", other).unwrap();
 
         assert_eq!(
             unset_orphaned_install(&cfg, Path::new("C:/t/qontinui-git-cred-old.json")),
             OrphanUnset::Removed
         );
         assert_eq!(
-            git_config_get_all_at(Some(&cfg), INSTALLED_LOCAL_KEYS[0]).unwrap(),
+            git_config_get_all_at(Some(&cfg), "credential.helper").unwrap(),
             vec![other.to_string()]
         );
     }
@@ -2177,11 +2803,7 @@ mod tests {
         let local_config = git_local_config_file(repo.path()).unwrap();
         let created = write_session_config(&token, "c", "t", &[], Some(&local_config)).unwrap();
         // The half-done install: only the helper key landed.
-        let helper = format!(
-            "C:/bin/qontinui-git-credential.exe --config {}",
-            token.to_string_lossy().replace('\\', "/")
-        );
-        git_config_add_at(Some(&local_config), INSTALLED_LOCAL_KEYS[0], &helper).unwrap();
+        git_config_add_at(Some(&local_config), &helper_key(), &helper_value(&token)).unwrap();
 
         discard_failed_install(
             "no-such-session-failed-install",
@@ -2191,7 +2813,7 @@ mod tests {
         );
 
         assert!(!token.exists());
-        assert_eq!(git_config_get(repo.path(), INSTALLED_LOCAL_KEYS[0]), None);
+        assert!(worktree_values(repo.path(), &helper_key()).is_empty());
     }
 
     /// When another dir of the same session already installed successfully,
@@ -2266,8 +2888,8 @@ mod tests {
     }
 
     /// The token file is the only record of where the keys are. When removing
-    /// them fails (here: git cannot take `config.lock`), the sweep must keep
-    /// it, and the next sweep must finish the job.
+    /// them fails (here: git cannot take `config.worktree.lock`), the sweep
+    /// must keep it, and the next sweep must finish the job.
     #[test]
     fn sweep_keeps_the_token_file_when_a_recorded_removal_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -2276,24 +2898,31 @@ mod tests {
         let stale = temp.path().join("qontinui-git-cred-locked-session.json");
         install_and_record(repo.path(), &stale);
         age_25h(&stale);
-        let local_config = git_local_config_file(repo.path()).unwrap();
-        let lock = local_config.with_file_name("config.lock");
+        let lock = config_lock_path(repo.path());
         std::fs::write(&lock, "").unwrap();
 
         let deleted = sweep_stale_cred_files(temp.path(), SWEEP_MAX_AGE, SystemTime::now());
 
         assert_eq!(deleted, 0);
         assert!(stale.exists(), "the record must survive a failed removal");
-        assert!(git_config_get(repo.path(), INSTALLED_LOCAL_KEYS[0]).is_some());
+        assert!(worktree_values(repo.path(), &helper_key()).contains(&helper_value(&stale)));
 
         std::fs::remove_file(&lock).unwrap();
         let deleted = sweep_stale_cred_files(temp.path(), SWEEP_MAX_AGE, SystemTime::now());
 
         assert_eq!(deleted, 1);
         assert!(!stale.exists());
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(git_config_get(repo.path(), key), None, "{key} on retry");
-        }
+        assert_eq!(
+            worktree_values(repo.path(), &helper_key()),
+            vec![String::new()]
+        );
+        assert!(worktree_values(repo.path(), &use_http_path_key()).is_empty());
+    }
+
+    /// The lock git takes to write `dir`'s `config.worktree`.
+    fn config_lock_path(dir: &Path) -> PathBuf {
+        let file = git_local_config_file(dir).unwrap();
+        PathBuf::from(format!("{}.lock", file.display()))
     }
 
     #[test]
@@ -2376,12 +3005,8 @@ mod tests {
         // Install exactly what `setup_credential_helper` writes, so the test
         // pins the install/teardown pair rather than just one key.
         install_and_record(repo.path(), &config_path);
-        for key in INSTALLED_LOCAL_KEYS {
-            assert!(
-                git_config_get(repo.path(), key).is_some(),
-                "{key} should be installed"
-            );
-        }
+        assert!(worktree_values(repo.path(), &helper_key()).contains(&helper_value(&config_path)));
+        assert!(!worktree_values(repo.path(), &use_http_path_key()).is_empty());
 
         // Register the dir the way setup_credential_helper does, plus a
         // vanished dir cleanup must skip without erroring.
@@ -2396,16 +3021,14 @@ mod tests {
 
         cleanup_credential_helper(&session_id);
 
-        // EVERY installed key must be gone. `credential.useHttpPath` in
-        // particular: left behind, it keeps changing credential lookup for
-        // this repo long after the session that installed it ended.
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(
-                git_config_get(repo.path(), key),
-                None,
-                "local {key} should be unset"
-            );
-        }
+        // EVERY installed key must be gone. `useHttpPath` in particular: left
+        // behind, it keeps changing credential lookup for this checkout long
+        // after the session that installed it ended.
+        assert_eq!(
+            worktree_values(repo.path(), &helper_key()),
+            vec![String::new()]
+        );
+        assert!(worktree_values(repo.path(), &use_http_path_key()).is_empty());
         assert!(!config_path.exists(), "config file should be removed");
         assert!(
             !registry().lock().unwrap().contains_key(&session_id),
@@ -2415,43 +3038,313 @@ mod tests {
         cleanup_credential_helper(&session_id);
     }
 
-    /// Every linked worktree of a repo writes the main checkout's shared
-    /// config, so a later session's install replaces an earlier one's helper
-    /// there. Closing the EARLIER session must not strip the later one's.
+    /// Two linked worktrees of one repo, one session each: each gets its OWN
+    /// helper, the shared `.git/config` gets none, and closing one session
+    /// leaves the other's helper intact. With `--local` both installs wrote
+    /// the shared config and the second replaced the first.
     #[test]
-    fn cleanup_leaves_the_helper_a_sibling_session_installed_in_a_shared_config() {
-        let earlier = unique_session_id("cleanup-earlier");
-        let later_dir = tempfile::tempdir().unwrap();
-        let later = later_dir.path().join("qontinui-git-cred-later.json");
+    fn two_linked_worktrees_get_two_helpers_and_cleanup_of_one_keeps_the_other() {
+        let first = unique_session_id("wt-first");
+        let second = unique_session_id("wt-second");
         let main = tempfile::tempdir().unwrap();
-        let (_wt_parent, wt) = linked_worktree(main.path());
+        let (_wt1_parent, wt1) = linked_worktree(main.path());
+        let (_wt2_parent, wt2) = add_linked_worktree(main.path());
 
-        install_and_record(&wt, &config_file_path(&earlier));
+        install_and_record(&wt1, &config_file_path(&first));
+        assert!(
+            shared_qontinui_helpers(main.path()).is_empty(),
+            "the shared config carries no helper after the first install"
+        );
         registry()
             .lock()
             .unwrap()
-            .entry(earlier.clone())
+            .entry(first.clone())
             .or_default()
             .dirs
-            .push(wt.clone());
-        install_and_record(main.path(), &later);
-
-        cleanup_credential_helper(&earlier);
-
-        let helper = git_config_get(main.path(), INSTALLED_LOCAL_KEYS[0])
-            .expect("the later session's helper must survive");
-        assert!(helper.contains("qontinui-git-cred-later.json"));
-        assert_eq!(
-            git_config_get(main.path(), INSTALLED_LOCAL_KEYS[1]).as_deref(),
-            Some("true"),
-            "useHttpPath is still needed by the later install"
+            .push(wt1.clone());
+        install_and_record(&wt2, &config_file_path(&second));
+        assert!(
+            shared_qontinui_helpers(main.path()).is_empty(),
+            "the shared config carries no helper after the second install"
         );
-        assert!(!config_file_path(&earlier).exists());
+
+        assert_eq!(
+            worktree_values(&wt1, &helper_key()),
+            vec![String::new(), helper_value(&config_file_path(&first))]
+        );
+        assert_eq!(
+            worktree_values(&wt2, &helper_key()),
+            vec![String::new(), helper_value(&config_file_path(&second))]
+        );
+        assert_eq!(
+            git_config_get(main.path(), "credential.helper"),
+            None,
+            "the main checkout reads no helper from the shared config"
+        );
+
+        cleanup_credential_helper(&first);
+
+        assert_eq!(worktree_values(&wt1, &helper_key()), vec![String::new()]);
+        assert_eq!(
+            worktree_values(&wt2, &helper_key()),
+            vec![String::new(), helper_value(&config_file_path(&second))],
+            "the other worktree's helper must survive"
+        );
+        assert_eq!(
+            worktree_values(&wt2, &use_http_path_key()),
+            vec!["true".to_string()],
+            "useHttpPath is still needed by the other install"
+        );
+        assert!(!config_file_path(&first).exists());
+
+        cleanup_credential_helper(&second);
+        assert!(!config_file_path(&second).exists());
+    }
+
+    /// A first install racing a sibling: the shared `config.lock` is held, so
+    /// the write fails, but the sibling already set the key — success. With
+    /// the key still unset the (retried) write fails.
+    #[test]
+    fn worktree_config_extension_write_tolerates_a_sibling_holding_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let lock = tmp.path().join(".git").join("config.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        assert!(write_worktree_config_extension(tmp.path()).is_err());
+
+        std::fs::remove_file(&lock).unwrap();
+        let status = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["config", "--local", "extensions.worktreeConfig", "true"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(&lock, "").unwrap();
+
+        assert_eq!(write_worktree_config_extension(tmp.path()), Ok(()));
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    /// The retry arm: the first write meets a held `config.lock` and the key
+    /// is still unset; the lock is gone by the retry, which then succeeds.
+    #[test]
+    fn worktree_config_extension_write_retries_once_after_a_held_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let lock = tmp.path().join(".git").join("config.lock");
+        std::fs::write(&lock, "").unwrap();
+        let releaser = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                std::fs::remove_file(&lock).unwrap();
+            })
+        };
+
+        assert_eq!(write_worktree_config_extension(tmp.path()), Ok(()));
+        releaser.join().unwrap();
+        assert_eq!(
+            git_config_get(tmp.path(), "extensions.worktreeConfig").as_deref(),
+            Some("true")
+        );
+    }
+
+    /// "Ours" is judged by the binary's file stem, not a substring of the
+    /// value; a failed existence check cannot judge a path dead.
+    #[test]
+    fn dead_qontinui_helper_judges_ours_by_the_binary_stem() {
+        // Built from a tempdir (never created) so it is absolute on every OS;
+        // a POSIX literal is not `is_absolute()` on Windows.
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        let gone = gone.display();
+        assert!(dead_qontinui_helper(&format!(
+            "{gone}/qontinui-git-credential --config {gone}/qontinui-git-cred-a.json"
+        ))
+        .is_some());
+        assert!(dead_qontinui_helper(&format!(
+            "{gone}/qontinui-git-credential.exe --config {gone}/qontinui-git-cred-a.json"
+        ))
+        .is_some());
+        assert!(
+            dead_qontinui_helper(&format!(
+                "{gone}/other-helper --config {gone}/qontinui-git-credential/qontinui-git-cred-a.json"
+            ))
+            .is_none(),
+            "a value merely MENTIONING the stem is not ours"
+        );
+        assert!(!absolute_and_missing(Path::new(
+            "relative/qontinui-git-credential"
+        )));
+    }
+
+    /// From a linked worktree the shared config is the MAIN checkout's
+    /// `.git/config` (resolved through git, since `.git` is a file there).
+    #[test]
+    fn git_shared_config_file_resolves_the_main_config_from_a_linked_worktree() {
+        let main = tempfile::tempdir().unwrap();
+        let (_wt_parent, wt) = linked_worktree(main.path());
+        let shared = git_shared_config_file(&wt).expect("resolve the shared config");
+        assert_eq!(
+            std::fs::canonicalize(shared).unwrap(),
+            std::fs::canonicalize(main.path().join(".git").join("config")).unwrap()
+        );
+    }
+
+    /// Two installs under different keys (an agent-id one and a terminal
+    /// session-id one) in ONE worktree: both helpers are listed, and cleaning
+    /// up one leaves the other's value and its `useHttpPath`.
+    #[test]
+    fn two_installs_in_one_worktree_keep_each_others_helper() {
+        let agent = unique_session_id("one-wt-agent");
+        let terminal = unique_session_id("one-wt-terminal");
+        let main = tempfile::tempdir().unwrap();
+        let (_wt_parent, wt) = linked_worktree(main.path());
+
+        install_and_record(&wt, &config_file_path(&agent));
+        install_and_record(&wt, &config_file_path(&terminal));
+        // A repeated install of the same key adds nothing.
+        install_and_record(&wt, &config_file_path(&terminal));
+        assert_eq!(
+            worktree_values(&wt, &helper_key()),
+            vec![
+                String::new(),
+                helper_value(&config_file_path(&agent)),
+                helper_value(&config_file_path(&terminal)),
+            ]
+        );
+
+        cleanup_credential_helper(&agent);
+
+        assert_eq!(
+            worktree_values(&wt, &helper_key()),
+            vec![String::new(), helper_value(&config_file_path(&terminal))]
+        );
+        assert_eq!(
+            worktree_values(&wt, &use_http_path_key()),
+            vec!["true".to_string()]
+        );
+
+        cleanup_credential_helper(&terminal);
+
+        assert_eq!(worktree_values(&wt, &helper_key()), vec![String::new()]);
+        assert!(worktree_values(&wt, &use_http_path_key()).is_empty());
+        assert!(shared_qontinui_helpers(main.path()).is_empty());
+    }
+
+    /// A dead runner's helper sits UNSCOPED in the shared config (the
+    /// incident's shape). From a linked worktree with our install, a `git
+    /// credential fill` for the coord host reaches ONLY our helper — the
+    /// scoped reset in `config.worktree` clears both the global helper and the
+    /// dead one — while a `github.com` fill still reaches the global helper.
+    /// Isolated from the machine's config: `GIT_CONFIG_GLOBAL` points at a
+    /// temp file, `GIT_CONFIG_NOSYSTEM` drops the system file.
+    #[cfg(unix)]
+    #[test]
+    fn coord_fill_reaches_only_our_helper_past_a_dead_shared_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let main = tempfile::tempdir().unwrap();
+        let (_wt_parent, wt) = linked_worktree(main.path());
+        let home = tempfile::tempdir().unwrap();
+
+        let global = home.path().join("gitconfig");
+        git_config_add_at(
+            Some(&global),
+            "credential.helper",
+            "!f() { cat >/dev/null; echo username=global; echo password=global-pw; }; f",
+        )
+        .unwrap();
+
+        let dead = "/nonexistent-qontinui-dead-runner/qontinui-git-credential \
+                    --config /nonexistent-qontinui-dead-runner/qontinui-git-cred-dead.json";
+        let status = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(main.path())
+            .args(["config", "--local", "--add", "credential.helper", dead])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let bin_dir = home.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let ours = bin_dir.join("qontinui-git-credential");
+        std::fs::write(
+            &ours,
+            "#!/bin/sh\ncat >/dev/null\nfor a; do op=$a; done\n\
+             [ \"$op\" = get ] && { echo username=ours; echo password=ours-pw; }\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let token = home.path().join("qontinui-git-cred-fill.json");
+        set_git_credential_helper(&wt, TEST_SCOPE, &ours, &token).unwrap();
+        assert!(
+            worktree_values(&wt, &helper_key()).len() == 2,
+            "our helper is in the worktree's own config.worktree"
+        );
+        assert_eq!(
+            shared_qontinui_helpers(main.path()),
+            vec![dead.to_string()],
+            "nothing but the planted dead helper is in the shared config"
+        );
+
+        let fill = |host: &str| {
+            use std::io::Write as _;
+            let mut cmd = crate::process_helpers::no_window("git");
+            cmd.arg("-C")
+                .arg(&wt)
+                .args(["credential", "fill"])
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", home.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("SSH_ASKPASS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    format!("protocol=https\nhost={host}\npath=qontinui/x.git\n\n").as_bytes(),
+                )
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+
+        let (stdout, stderr) = fill("coord.example");
+        assert!(
+            stdout.contains("username=ours"),
+            "coord fill must be answered by our helper: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stderr.contains("nonexistent-qontinui-dead-runner"),
+            "the dead shared helper must not be tried for the coord host: {stderr:?}"
+        );
+
+        let (stdout, stderr) = fill("github.com");
+        assert!(
+            stdout.contains("username=global"),
+            "github.com fill must still reach the global helper: stdout={stdout:?} \
+             stderr={stderr:?}"
+        );
     }
 
     /// A worktree deleted before teardown runs leaves no dir to `git -C`
-    /// into, but its keys sit in the main checkout's config. The recorded
-    /// `git_configs` must reach them at teardown, not 24 h later.
+    /// into, but its keys sit in its `config.worktree` under the main
+    /// checkout's `.git/worktrees/`. The recorded `git_configs` must reach
+    /// them at teardown, not 24 h later.
     #[test]
     fn cleanup_unsets_keys_of_a_deleted_linked_worktree_from_the_record() {
         let session_id = unique_session_id("cleanup-gone-wt");
@@ -2460,6 +3353,7 @@ mod tests {
         let (_wt_parent, wt) = linked_worktree(main.path());
 
         install_and_record(&wt, &config_path);
+        let recorded = git_local_config_file(&wt).unwrap();
         registry()
             .lock()
             .unwrap()
@@ -2471,19 +3365,20 @@ mod tests {
 
         cleanup_credential_helper(&session_id);
 
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(
-                git_config_get(main.path(), key),
-                None,
-                "{key} must be unset from the main checkout at teardown"
-            );
-        }
+        assert_eq!(
+            git_config_get_all_at(Some(&recorded), &helper_key()).unwrap(),
+            vec![String::new()],
+            "the helper must be unset from the gone worktree's config at teardown"
+        );
+        assert!(git_config_get_all_at(Some(&recorded), &use_http_path_key())
+            .unwrap()
+            .is_empty());
         assert!(!config_path.exists());
     }
 
-    /// A removal that fails at teardown (a contended `config.lock`) must keep
-    /// the record without its token, so the boot sweep can retry and the
-    /// helper serves nothing meanwhile.
+    /// A removal that fails at teardown (a contended `config.worktree.lock`)
+    /// must keep the record without its token, so the boot sweep can retry and
+    /// the helper serves nothing meanwhile.
     #[test]
     fn cleanup_leaves_a_tokenless_tombstone_when_a_removal_fails() {
         let session_id = unique_session_id("cleanup-locked");
@@ -2492,7 +3387,7 @@ mod tests {
         git_init(repo.path());
         install_and_record(repo.path(), &config_path);
         let local_config = git_local_config_file(repo.path()).unwrap();
-        let lock = local_config.with_file_name("config.lock");
+        let lock = config_lock_path(repo.path());
         std::fs::write(&lock, "").unwrap();
 
         cleanup_credential_helper(&session_id);
@@ -2520,9 +3415,11 @@ mod tests {
             sweep_stale_cred_files(sweep_dir.path(), SWEEP_MAX_AGE, SystemTime::now()),
             1
         );
-        for key in INSTALLED_LOCAL_KEYS {
-            assert_eq!(git_config_get(repo.path(), key), None, "{key} on retry");
-        }
+        assert_eq!(
+            worktree_values(repo.path(), &helper_key()),
+            vec![String::new()]
+        );
+        assert!(worktree_values(repo.path(), &use_http_path_key()).is_empty());
     }
 
     /// The tombstone a failed cleanup leaves has no token; the refresh loop

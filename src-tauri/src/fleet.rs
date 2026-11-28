@@ -4459,6 +4459,16 @@ pub(crate) fn read_info_exclude(path: &std::path::Path) -> Result<String, String
 /// `.git/info/exclude` — lets the operator see who added the entries.
 const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts (auto-excluded)";
 
+/// The tree publisher's per-checkout credential repair, run on every managed
+/// checkout before its fetch: removes `qontinui-git-credential` helpers in the
+/// checkout's SHARED git config whose binary or token file no longer exists
+/// (a stopped temp runner, a crash), so the fetch does not fail on them.
+/// Returns how many were removed; the removal itself, and its one info line
+/// per repair, is [`crate::credential_helper::repair_dead_shared_helpers`].
+fn repair_dead_credential_helpers(repo_path: &std::path::Path) -> usize {
+    crate::credential_helper::repair_dead_shared_helpers(repo_path)
+}
+
 /// Idempotently ensure `<repo>/.git/info/exclude` ignores the runner's
 /// machine-local artifacts ([`MANAGED_REPO_EXCLUDES`]). `.git/info/exclude` is
 /// git's per-repo, NON-tracked ignore file: it hides matching UNTRACKED paths
@@ -7091,6 +7101,15 @@ pub async fn publish_tree_state() -> Result<(), String> {
         if !is_checkout_root(&path) {
             continue;
         }
+
+        // Remove a dead runner's `qontinui-git-credential` helper from the
+        // checkout's SHARED config BEFORE the fetch below: while it is there,
+        // every fetch in every worktree of the repo prints
+        // `qontinui-git-credential: not found`. Steady path for a primary
+        // checkout (`.git` a directory) is one file read; a linked-worktree
+        // root costs one `git rev-parse` child.
+        let repair_path = path.clone();
+        let _ = spawn_blocking_tracked(move || repair_dead_credential_helpers(&repair_path)).await;
 
         // capture_tree shells out to ~7 synchronous git subprocesses per
         // repo — multi-second on big or index-locked worktrees, and this
@@ -13470,5 +13489,197 @@ mod checkout_root_tests {
             super::is_checkout_root(&linked),
             "a .git file marks a linked worktree"
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_credential_helper_repair_tests {
+    //! Plan 2026-11-26-runner-credential-helper-written-to-the-shared-repo-config-clobbers-parallel-worktree-sessions
+    //! D2: the tree publisher repairs dead qontinui helpers in a managed
+    //! checkout's SHARED config. Every test enters through
+    //! [`super::repair_dead_credential_helpers`], the function the publish
+    //! cycle calls before its fetch.
+
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git")
+    }
+
+    fn shared_values(repo: &Path, key: &str) -> Vec<String> {
+        let out = git(repo, &["config", "--local", "--get-all", key]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn add_shared(repo: &Path, key: &str, value: &str) {
+        assert!(git(repo, &["config", "--local", "--add", key, value])
+            .status
+            .success());
+    }
+
+    fn value(binary: &Path, token: &Path) -> String {
+        format!(
+            "{} --config {}",
+            binary.to_string_lossy().replace('\\', "/"),
+            token.to_string_lossy().replace('\\', "/")
+        )
+    }
+
+    /// A primary checkout plus a dir holding a LIVE helper binary and token.
+    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(git(repo.path(), &["init", "-q"]).status.success());
+        let files = tempfile::tempdir().unwrap();
+        let binary = files.path().join("qontinui-git-credential");
+        std::fs::write(&binary, "").unwrap();
+        let token = files.path().join("qontinui-git-cred-live.json");
+        std::fs::write(&token, "{}").unwrap();
+        (repo, files, binary, token)
+    }
+
+    #[test]
+    fn publish_cycle_repair_removes_dead_binary_and_dead_token_helpers_and_keeps_a_live_one() {
+        let (repo, files, live_binary, live_token) = fixture();
+        let gone = files.path().join("stopped-temp-runner");
+        let dead_binary = value(
+            &gone.join("qontinui-git-credential"),
+            &files.path().join("qontinui-git-cred-dead-binary.json"),
+        );
+        std::fs::write(
+            files.path().join("qontinui-git-cred-dead-binary.json"),
+            "{}",
+        )
+        .unwrap();
+        let dead_token = value(
+            &live_binary,
+            &files.path().join("qontinui-git-cred-dead-token.json"),
+        );
+        let dead_scoped = value(
+            &gone.join("qontinui-git-credential"),
+            &files.path().join("qontinui-git-cred-dead-scoped.json"),
+        );
+        let live = value(&live_binary, &live_token);
+        add_shared(repo.path(), "credential.helper", &dead_binary);
+        add_shared(repo.path(), "credential.helper", &dead_token);
+        add_shared(repo.path(), "credential.helper", &live);
+        add_shared(repo.path(), "credential.useHttpPath", "true");
+        let scoped = "credential.https://coord.example.helper";
+        add_shared(repo.path(), scoped, &dead_scoped);
+        add_shared(
+            repo.path(),
+            "credential.https://coord.example.useHttpPath",
+            "true",
+        );
+
+        let repaired = super::repair_dead_credential_helpers(repo.path());
+
+        assert_eq!(
+            repaired, 3,
+            "dead binary, dead token and dead scoped helper"
+        );
+        assert_eq!(shared_values(repo.path(), "credential.helper"), vec![live]);
+        assert_eq!(
+            shared_values(repo.path(), "credential.useHttpPath"),
+            vec!["true".to_string()],
+            "the live helper still needs useHttpPath"
+        );
+        assert!(shared_values(repo.path(), scoped).is_empty());
+        assert!(
+            shared_values(repo.path(), "credential.https://coord.example.useHttpPath").is_empty(),
+            "no qontinui helper is left under the scope, so its useHttpPath goes too"
+        );
+        // Steady state: nothing left to repair.
+        assert_eq!(super::repair_dead_credential_helpers(repo.path()), 0);
+    }
+
+    #[test]
+    fn publish_cycle_repair_clears_use_http_path_once_no_qontinui_helper_is_left() {
+        let (repo, files, _live_binary, _live_token) = fixture();
+        let dead = value(
+            &files.path().join("gone").join("qontinui-git-credential"),
+            &files.path().join("qontinui-git-cred-gone.json"),
+        );
+        add_shared(repo.path(), "credential.helper", "manager");
+        add_shared(repo.path(), "credential.helper", &dead);
+        add_shared(repo.path(), "credential.useHttpPath", "true");
+
+        assert_eq!(super::repair_dead_credential_helpers(repo.path()), 1);
+
+        assert_eq!(
+            shared_values(repo.path(), "credential.helper"),
+            vec!["manager".to_string()],
+            "a helper that is not ours is never touched"
+        );
+        assert!(shared_values(repo.path(), "credential.useHttpPath").is_empty());
+    }
+
+    /// Only an ABSOLUTE binary path that does not exist is dead. A quoted live
+    /// path, a bare (PATH-resolved) name and a `!` shell form cannot be judged
+    /// as dead and are kept; a quoted absolute path that is gone is removed.
+    #[test]
+    fn publish_cycle_repair_keeps_helpers_it_cannot_judge_and_unquotes_paths() {
+        let (repo, files, live_binary, live_token) = fixture();
+        let token = |name: &str| {
+            let p = files.path().join(name);
+            std::fs::write(&p, "{}").unwrap();
+            p.to_string_lossy().replace('\\', "/")
+        };
+        let quoted_live = format!(
+            "\"{}\" --config {}",
+            live_binary.to_string_lossy().replace('\\', "/"),
+            live_token.to_string_lossy().replace('\\', "/")
+        );
+        let bare = format!(
+            "qontinui-git-credential --config {}",
+            token("qontinui-git-cred-bare.json")
+        );
+        let bang = "!/nonexistent-qontinui-bang/qontinui-git-credential --config \
+                    /nonexistent-qontinui-bang/qontinui-git-cred-bang.json"
+            .to_string();
+        let quoted_dead = format!(
+            "\"{}\" --config {}",
+            files
+                .path()
+                .join("gone dir")
+                .join("qontinui-git-credential")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            token("qontinui-git-cred-quoted-dead.json")
+        );
+        for v in [&quoted_live, &bare, &bang, &quoted_dead] {
+            add_shared(repo.path(), "credential.helper", v);
+        }
+
+        assert_eq!(super::repair_dead_credential_helpers(repo.path()), 1);
+
+        assert_eq!(
+            shared_values(repo.path(), "credential.helper"),
+            vec![quoted_live, bare, bang],
+            "only the quoted absolute path that is gone may be removed"
+        );
+    }
+
+    #[test]
+    fn publish_cycle_repair_is_a_no_op_without_a_qontinui_helper_or_a_repo() {
+        let (repo, _files, _b, _t) = fixture();
+        add_shared(repo.path(), "credential.helper", "manager");
+        let before = std::fs::read(repo.path().join(".git").join("config")).unwrap();
+
+        assert_eq!(super::repair_dead_credential_helpers(repo.path()), 0);
+        assert_eq!(
+            std::fs::read(repo.path().join(".git").join("config")).unwrap(),
+            before
+        );
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert_eq!(super::repair_dead_credential_helpers(not_a_repo.path()), 0);
     }
 }
