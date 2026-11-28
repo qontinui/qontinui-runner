@@ -3040,8 +3040,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checkpoints::checkpoint_list_active,
             commands::checkpoints::checkpoint_save,
             commands::checkpoints::checkpoint_status,
-            commands::checkpoints::session_create,
-            commands::checkpoints::session_update_status,
             commands::checkpoints::setting_get,
             commands::checkpoints::setting_set,
             commands::checkpoints::settings_get_all,

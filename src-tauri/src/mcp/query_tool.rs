@@ -136,8 +136,6 @@ fn is_valid_table_pg(table: &str) -> bool {
             | "task_run_screenshots"
             | "task_run_playwright_results"
             | "configs"
-            | "sessions"
-            | "session_events"
             | "verification_tests"
             | "test_results"
             | "checks"
@@ -694,4 +692,23 @@ async fn execute_web_query(
             embedding_used: false,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_table_pg;
+
+    /// `project.sessions` / `project.session_events` lost their only writer
+    /// (plan `2026-11-20-coord-native-sessions-phase-9-reverified-cleanup`
+    /// Phase 3) and are scheduled to be dropped, so the query tool refuses
+    /// them with its unknown-table error instead of reading a dead table.
+    #[test]
+    fn the_dropped_legacy_session_tables_are_not_queryable() {
+        assert!(!is_valid_table_pg("sessions"));
+        assert!(!is_valid_table_pg("session_events"));
+        assert!(
+            is_valid_table_pg("task_runs"),
+            "the allowlist still admits live tables"
+        );
+    }
 }
