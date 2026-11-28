@@ -434,6 +434,7 @@ GET /sessions/idle-status idle_status
 GET /sessions/policy-context-stats policy_context_stats
 GET /sessions/transcript-coverage transcript_coverage
 GET /sessions/tree-resets list_tree_resets
+GET /sessions/{id} get_session
 GET /sessions/{id}/latest-review get_latest_review_for_session
 GET /sessions/{id}/policy-context policy_context
 GET /sessions/{id}/stop-reason get_stop_reason

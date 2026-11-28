@@ -924,6 +924,11 @@ pub struct TerminalSessionRecord {
     /// write coord has not seen yet and reverting it would silently undo the
     /// operator's action.
     ///
+    /// **This is a runner-local ACK flag, not coord's state**: stamped only by
+    /// the outbox drain on an observed ack or by the finish heal sweep. `false`
+    /// or absent is NOT evidence coord is unfinished; coord's row is the
+    /// authority — read it via `coord.observed` on `GET /sessions/{id}`.
+    ///
     /// `false` on a finished record therefore means "coord write still owed".
     /// The write is enqueued when the mark is made, again when a re-finish
     /// RESTAMPS it (`set_finished` with a reason, which clears this flag), again
@@ -1546,6 +1551,11 @@ impl FinishOutcome {
             obj.insert(
                 "finishSynced".to_string(),
                 serde_json::Value::Bool(self.record.finish_synced),
+            );
+            // What the flag is, so no reader takes it for coord's state.
+            obj.insert(
+                "finishSyncedIs".to_string(),
+                serde_json::Value::String("runner_local_ack_flag".to_string()),
             );
         }
         serde_json::json!({

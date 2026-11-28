@@ -801,6 +801,15 @@ pub struct FinishSessionRequest {
 ///   while on a synced mark it queues nothing (`reason: "not_requeued"`) —
 ///   read `session.finishSynced` for the current verdict.
 ///
+/// **`finishSynced` is a runner-local ACK flag, not coord's state** (plan
+/// `2026-11-25-a-session-reads-its-own-finished-status-from-one-honest-door`,
+/// Phase 5a). It is stamped only by the outbox drain on an observed ack, or by
+/// the finish heal sweep; the reply says so as `session.finishSyncedIs:
+/// "runner_local_ack_flag"`. `false` or absent is NOT evidence coord is
+/// unfinished, and `true` is not evidence either. Coord's row is
+/// the authority: read it via `coord.observed` on the read-only
+/// `GET /sessions/{id}` ([`get_session`]), which never requeues or restamps.
+///
 /// Honest local-only cases: a session whose harness id changed inside the
 /// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
 /// in-process `/resume` picker, or an adoption whose hook posted `startup`
@@ -860,6 +869,70 @@ async fn finish_session(
         finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
     }
     Ok(Json(body))
+}
+
+/// `GET /sessions/{id}` — the read-only single-record read of a session's
+/// finish state: `session.{finishSynced, finishedAt, finishReason,
+/// finishCoordSessionId}` plus `coord.observed {sessionStatus, since,
+/// coordSessionId, observedAt, state, startedAt}` read from coord's
+/// work-status row.
+///
+/// Mutates nothing: unlike the reason-less re-`POST /finish` it neither heals,
+/// requeues nor restamps ([`finish_heal::observe`]). A session with no runner
+/// finish mark reports `finishSynced: null` + `finishSyncedReason:
+/// "no_runner_finish"`, never `false`. `finishSynced` is a runner-local ACK
+/// flag; `coord.observed` is the authority. `404` for an id the registry does
+/// not hold, `503` when the registry is unmanaged.
+async fn get_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::session::finish_heal;
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+    let port = registrar
+        .as_ref()
+        .map(|r| r.inner().as_ref() as &dyn finish_heal::HealPort);
+    get_session_core(
+        store.as_ref().map(|s| s.inner().as_ref()),
+        port,
+        &id,
+        |id| async move { crate::mcp::session_work_status::fetch(&[id]).await },
+    )
+    .await
+}
+
+/// The whole of [`get_session`] after state extraction, with the coord read
+/// injected, so the route can be driven over HTTP in a test (which cannot
+/// build the `AppHandle` an `ApiState` carries). `None` store (not managed)
+/// is a 503; an unknown id a 404 BEFORE any coord read. Observes only — it
+/// calls `finish_heal::observe_from`, never the healing `read_back_from`.
+async fn get_session_core<F, Fut>(
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    port: Option<&dyn crate::session::finish_heal::HealPort>,
+    id: &str,
+    fetch: F,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = crate::mcp::session_work_status::StatusFetch>,
+{
+    use crate::session::finish_heal;
+    let store = store.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "session lifecycle store unavailable".to_string(),
+    ))?;
+    let rec = store.get(id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no session `{id}` in the lifecycle registry"),
+    ))?;
+    let fetched = fetch(id.to_string()).await;
+    let rb = finish_heal::observe_from(store, port, id, &fetched, chrono::Utc::now());
+    Ok(Json(finish_heal::session_status_json(&rec, &rb)))
 }
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
@@ -3163,6 +3236,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/history", get(list_history))
+        .route("/sessions/{id}", get(get_session))
         .route("/sessions/compliance-coverage", get(compliance_coverage))
         .route("/sessions/tree-resets", get(list_tree_resets))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
@@ -4005,6 +4079,7 @@ mod permission_prompt_capture_route_tests {
                 "get(permission_prompts_snapshot)",
             ),
             ("\"/sessions/{id}/stop-reason\"", "get(get_stop_reason)"),
+            ("\"/sessions/{id}\"", "get(get_session)"),
         ] {
             let (_, tail) = body
                 .split_once(path)
@@ -4015,5 +4090,142 @@ mod permission_prompt_capture_route_tests {
                 "{path} not routed to {handler}"
             );
         }
+    }
+}
+
+/// `GET /sessions/{id}` over HTTP on its REAL path through
+/// [`get_session_core`] (the handler minus `AppHandle` extraction; that
+/// `routes()` mounts the real handler is pinned by
+/// `both_routes_are_registered_by_routes`).
+#[cfg(test)]
+mod get_session_route_tests {
+    use super::*;
+    use crate::mcp::session_work_status::{fetch_from_body_for_test, StatusFetch};
+    use crate::session::finish_heal::HealPort;
+    use crate::session::session_lifecycle_store::{
+        test_open_record, FinishSync, SessionLifecycleStore, TerminalSessionRecord,
+    };
+    use axum::body::Body;
+    use axum::extract::Path as AxPath;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    const ROW: &str = "01a1ab84-1c55-7a2e-9b41-6c0f3d2e8a17";
+
+    /// A port that resolves the mark's own row and counts any re-send.
+    struct RecordingPort {
+        sent: std::sync::Mutex<u32>,
+    }
+    impl HealPort for RecordingPort {
+        fn own_row(&self, rec: &TerminalSessionRecord) -> Option<uuid::Uuid> {
+            rec.finish_coord_session_id
+                .or_else(|| uuid::Uuid::parse_str(ROW).ok())
+        }
+        fn redeliver(&self, _: &str, _: i64, row: uuid::Uuid) -> Option<FinishSync> {
+            *self.sent.lock().unwrap() += 1;
+            Some(FinishSync::Queued {
+                coord_session_id: row,
+            })
+        }
+        fn finish_queued(&self, _: &str, _: i64, _: uuid::Uuid) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    async fn get_text(app: Router, uri: &str) -> (StatusCode, String) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn null_row_fetch(id: &str) -> StatusFetch {
+        fetch_from_body_for_test(
+            serde_json::json!({
+                "statuses": {id: {"session_status": null, "since": null,
+                                   "coord_session_id": ROW, "state": "closed"}},
+                "unknown": [], "invalid": [], "input_truncated": false,
+                "sessionBridgeColumnPresent": true
+            }),
+            1,
+        )
+    }
+
+    fn mount(
+        store: Option<Arc<SessionLifecycleStore>>,
+        port: Option<Arc<RecordingPort>>,
+    ) -> Router {
+        Router::new().route(
+            "/sessions/{id}",
+            get(move |AxPath(id): AxPath<String>| {
+                let store = store.clone();
+                let port = port.clone();
+                async move {
+                    get_session_core(
+                        store.as_deref(),
+                        port.as_deref().map(|p| p as &dyn HealPort),
+                        &id,
+                        |id| async move { null_row_fetch(&id) },
+                    )
+                    .await
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_synced_mark_over_a_coord_null_row_is_observed_and_never_healed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+        store.record_open(test_open_record("get-ro"));
+        let at = store
+            .set_finished("get-ro", true, Some("done".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        store.mark_finish_synced("get-ro", Some(at));
+        let before = store.get("get-ro").unwrap();
+        let port = Arc::new(RecordingPort {
+            sent: Default::default(),
+        });
+
+        let (status, body) = get_text(
+            mount(Some(store.clone()), Some(port.clone())),
+            "/sessions/get-ro",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["coord"]["observed"]["coordSessionId"], ROW);
+        assert_eq!(
+            v["coord"]["observed"]["sessionStatus"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["coord"]["heal"], serde_json::Value::Null, "{v}");
+
+        let after = store.get("get-ro").unwrap();
+        assert!(after.finish_synced, "the stamp is untouched");
+        assert_eq!(after.finished_at, before.finished_at);
+        assert_eq!(after.finish_reason, before.finish_reason);
+        assert_eq!(*port.sent.lock().unwrap(), 0, "nothing re-sent");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_is_404_and_an_unmanaged_store_is_503() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+        let (status, body) = get_text(mount(Some(store), None), "/sessions/nobody").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) = get_text(mount(None, None), "/sessions/nobody").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 }

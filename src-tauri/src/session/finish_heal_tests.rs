@@ -731,6 +731,73 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
 }
 
 // ---------------------------------------------------------------------------
+// GET /sessions/{id} — the read-only status (plan
+// 2026-11-25-a-session-reads-its-own-finished-status-from-one-honest-door, 5a)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_session_with_no_finish_mark_reports_null_with_a_reason_not_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
+    store.record_open(test_open_record("no-mark"));
+    let fetch = fetch_from_body_for_test(
+        body("no-mark", json!("finished"), json!(AFTER), ROW),
+        1,
+    );
+    let rb = observe_from(&store, None, "no-mark", &fetch, Utc::now());
+    let resp = session_status_json(&store.get("no-mark").unwrap(), &rb);
+    assert_eq!(resp["session"]["finishSynced"], json!(null), "{resp}");
+    assert_eq!(resp["session"]["finishSyncedReason"], "no_runner_finish");
+    // coord's row is still carried: the authority, whatever the runner holds.
+    assert_eq!(resp["coord"]["observed"]["sessionStatus"], "finished");
+}
+
+#[test]
+fn a_synced_mark_reports_true_with_coord_observed() {
+    let (_d, store, at) = synced_store("get-synced");
+    let p = port(&store);
+    let since = chrono::DateTime::<Utc>::from_timestamp_millis(at)
+        .unwrap()
+        .to_rfc3339();
+    let fetch = fetch_from_body_for_test(
+        body("get-synced", json!("finished"), json!(since.clone()), ROW),
+        1,
+    );
+    let now = chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap();
+    let rb = observe_from(&store, Some(&p), "get-synced", &fetch, now);
+    let resp = session_status_json(&store.get("get-synced").unwrap(), &rb);
+    assert_eq!(resp["session"]["finishSynced"], true, "{resp}");
+    assert_eq!(resp["session"]["finishedAt"], at);
+    assert_eq!(resp["session"]["finishReason"], "done");
+    assert_eq!(resp["session"]["finishSyncedIs"], "runner_local_ack_flag");
+    assert_eq!(resp["coord"]["observed"]["sessionStatus"], "finished");
+    assert_eq!(resp["coord"]["observed"]["coordSessionId"], ROW);
+    assert_eq!(resp["coord"]["observed"]["since"], since);
+    assert_eq!(resp["coord"]["observed"]["observedAt"], json!(now));
+}
+
+#[test]
+fn the_get_read_is_read_only_even_over_a_coord_null_row() {
+    // The reason-less re-POST of /finish would HEAL here (unstamp + requeue).
+    // The GET must change nothing and requeue nothing.
+    let (_d, store, at) = synced_store("get-ro");
+    let p = port(&store);
+    let before = store.get("get-ro").unwrap();
+    let fetch = fetch_from_body_for_test(body("get-ro", json!(null), json!(null), ROW), 1);
+    let now = chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap();
+    let rb = observe_from(&store, Some(&p), "get-ro", &fetch, now);
+    assert!(rb.heal.is_none());
+    let resp = session_status_json(&before, &rb);
+    assert_eq!(resp["coord"]["observed"]["sessionStatus"], json!(null));
+    assert_eq!(resp["coord"]["heal"], json!(null));
+    let after = store.get("get-ro").unwrap();
+    assert!(after.finish_synced, "the stamp is untouched");
+    assert_eq!(after.finished_at, before.finished_at);
+    assert_eq!(after.finish_reason, before.finish_reason);
+    assert!(p.sent.lock().unwrap().is_empty(), "nothing requeued");
+}
+
+// ---------------------------------------------------------------------------
 // Review round 2: the stored own row (F2), unsynced marks (F3), chunking
 // ---------------------------------------------------------------------------
 
