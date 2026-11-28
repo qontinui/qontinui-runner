@@ -2913,6 +2913,13 @@ async fn health(
         // snapshot that gated it. `notifySocket: false` = inert (every
         // desktop/dev runner); `lastDecision: null` = UNKNOWN, not healthy.
         "sdNotify": crate::sd_notify::health_json(),
+        // The runner-owned Claude CLI updater (plan 2026-11-26-runner-cli-
+        // updater-fails-silently-on-a-read-only-install-dir, Phase 2): the last
+        // tick's decision and versions, the last install's outcome (persisted,
+        // so a restart serves it as `fromPriorProcess`), and `inProgress`.
+        // `null` = the updater has not ticked yet (UNKNOWN);
+        // `{"updaterRunsHere": false}` = no updater in this process (secondary).
+        "cliUpdate": crate::claude_cli_update::health_json(),
         // The six per-tenant egress switches (plan
         // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
         // each flow, whether it may send right now, which rung decided it
