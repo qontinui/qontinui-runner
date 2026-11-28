@@ -14,6 +14,7 @@ import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { PendingMessagesBadge } from "../PendingMessagesBadge";
 import { TabTitle } from "../displayTitle";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
@@ -354,6 +355,8 @@ function CompactZoneCardInner({
             Self-hides for a tab with no Claude session, like every other mount
             site. */}
         <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIndex} />
+        {/* Pending coord messages, at parity with the full-zone header. */}
+        {!tab.remote && <PendingMessagesBadge terminalId={tab.id} zoneIndex={zoneIndex} />}
         {lastLines.length > 0 && (
           <button
             className={`p-0.5 rounded transition-colors shrink-0 ${

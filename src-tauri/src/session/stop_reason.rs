@@ -1530,6 +1530,11 @@ mod tests {
             ("main.rs", "run_app", "CLOSE_REASON_NEVER_STARTED"),
             ("main.rs", "run_app", "CLOSE_REASON_NO_TERMINAL"),
             (
+                "mcp/test_fixtures/pending_message_seam.rs",
+                "close_seam_terminal",
+                "CLOSE_REASON_PTY_EXIT",
+            ),
+            (
                 "orchestration_loop/ai_session_executor.rs",
                 "teardown_unbound_worker",
                 "CLOSE_REASON_WORKER_BIND_FAILED",

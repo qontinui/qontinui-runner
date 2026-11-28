@@ -17,6 +17,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Mail } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 
 export const PENDING_VIEW_EVENT = "session-messages-pending-view";
 
@@ -74,11 +75,7 @@ export type PaneBadge =
   | { kind: "none" }
   | { kind: "pending"; entries: PendingViewEntry[] };
 
-export function paneBadge(
-  view: PendingView | null,
-  terminalId: string,
-  nowMs: number,
-): PaneBadge {
+export function paneBadge(view: PendingView | null, terminalId: string, nowMs: number): PaneBadge {
   if (!view) return { kind: "unknown", reason: "no poll has reported yet" };
   if (view.state === "unknown") {
     return { kind: "unknown", reason: view.unknownReason ?? "unknown" };
@@ -161,15 +158,18 @@ export function PendingMessagesBadge({
   const view = usePendingView();
   const now = useNow(5000);
   const badge = paneBadge(view, terminalId, now);
-  if (badge.kind === "none") return null;
   const text = paneBadgeText(badge);
   const elementId = pendingMessagesBadgeElementId(zoneIndex);
+  // The UI Bridge DOM scan discovers interactive elements only; a plain chip
+  // is in a snapshot only once registered (called before the early return:
+  // hooks may not be conditional).
+  const { ref } = useUIElement({ id: elementId, label: text, type: "generic" });
+  if (badge.kind === "none") return null;
   const tone =
-    badge.kind === "pending"
-      ? "text-[#e0af68] bg-[#e0af68]/15"
-      : "text-[#565f89] bg-[#565f89]/15";
+    badge.kind === "pending" ? "text-[#e0af68] bg-[#e0af68]/15" : "text-[#565f89] bg-[#565f89]/15";
   return (
     <span
+      ref={ref}
       // `data-ui-bridge-id` is the runner's DOM-scan discovery attribute, so a
       // snapshot reads this chip and its label (message ids + reasons).
       data-ui-bridge-id={elementId}

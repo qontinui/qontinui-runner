@@ -74,6 +74,7 @@ mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
 scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::try_start_due_task > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
 mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
 mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
+mcp/test_fixtures/pending_message_seam.rs | open_bound_terminal_handler | exempt | debug-build test seam (POST /ui-bridge/test/open-bound-terminal): opens a bare shell that prints one line and launches nothing — never claude, no session work
 mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
 mcp/unified_workflows.rs | generate_unified_workflow_async | autonomous | generate_unified_workflow_async
 mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_workflow

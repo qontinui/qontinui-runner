@@ -170,6 +170,59 @@ struct PendingMessage {
     /// as coord-attested metadata; any other shape is ignored.
     #[serde(default)]
     action: Option<serde_json::Value>,
+    /// Injected by the debug-only test seam
+    /// (`/ui-bridge/test/seed-pending-message`), not read from coord: it is
+    /// never reported to coord, and delivering it drops it from the seam.
+    #[serde(skip)]
+    injected: bool,
+}
+
+/// The test seam's injected messages, as pending messages (debug builds and
+/// the `test-fixtures` feature; empty otherwise).
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+fn seam_messages() -> Vec<PendingMessage> {
+    crate::mcp::test_fixtures::pending_message_seam::poller_messages()
+        .into_iter()
+        .map(|m| PendingMessage {
+            message_id: m.message_id,
+            to_session: Some(m.to_session),
+            from_session: Some("test-seam".to_string()),
+            kind: "test_seam".to_string(),
+            priority: m.priority,
+            body: m.body,
+            created_at: Some(m.created_at),
+            action: None,
+            injected: true,
+        })
+        .collect()
+}
+
+#[cfg(not(any(debug_assertions, feature = "test-fixtures")))]
+fn seam_messages() -> Vec<PendingMessage> {
+    Vec::new()
+}
+
+/// An injected message was delivered: drop it from the seam.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+fn seam_delivered(message_id: &str) {
+    crate::mcp::test_fixtures::pending_message_seam::mark_delivered(message_id);
+}
+
+#[cfg(not(any(debug_assertions, feature = "test-fixtures")))]
+fn seam_delivered(_message_id: &str) {}
+
+/// Coord's pending set with the seam's injected messages appended (an id coord
+/// already returned is not added twice).
+fn with_seam_messages(
+    mut coord: Vec<PendingMessage>,
+    seam: Vec<PendingMessage>,
+) -> Vec<PendingMessage> {
+    for msg in seam {
+        if !coord.iter().any(|m| m.message_id == msg.message_id) {
+            coord.push(msg);
+        }
+    }
+    coord
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -790,7 +843,7 @@ async fn surface_blocked_delivery(
     let Some(blocked_since) = verdict.surface_since else {
         return;
     };
-    if !posts_to_coord(&msg.priority, reason) {
+    if msg.injected || !posts_to_coord(&msg.priority, reason) {
         return;
     }
     let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
@@ -1935,9 +1988,13 @@ async fn deliver_once(
     guard: &mut DeliveryGuard,
     tracker: &mut SurfacingTracker,
 ) -> anyhow::Result<TickView> {
-    // Device JWT — unpaired ⇒ skip the tick quietly (no spam).
+    // The debug-only test seam's injected messages (empty in a release build).
+    let seam = seam_messages();
+    // Device JWT — unpaired ⇒ skip the tick quietly (no spam), unless the seam
+    // injected messages, which are then the whole pending set.
     let token = match crate::auth::AuthManager::new().get_access_token() {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        _ if !seam.is_empty() => None,
         _ => {
             debug!("session_message_poller: no device JWT yet (unpaired) — skipping tick");
             return Ok(TickView::Unknown("this runner is not paired with coord"));
@@ -1953,16 +2010,26 @@ async fn deliver_once(
     let ctx = SurfaceCtx {
         client: &client,
         base: &base,
-        token: &token,
+        // Empty only when the tick carries nothing but seam messages, which
+        // never reach coord.
+        token: token.as_deref().unwrap_or_default(),
     };
 
     // 1. Pull undelivered messages for this device's sessions (device from JWT).
-    let pending_url = format!("{base}/coord/session-messages/pending");
-    let resp = client.get(&pending_url).bearer_auth(&token).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("pull {pending_url} -> HTTP {}", resp.status());
-    }
-    let pending: PendingResponse = resp.json().await?;
+    let coord_messages = match token.as_deref() {
+        Some(token) => {
+            let pending_url = format!("{base}/coord/session-messages/pending");
+            let resp = client.get(&pending_url).bearer_auth(token).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("pull {pending_url} -> HTTP {}", resp.status());
+            }
+            resp.json::<PendingResponse>().await?.messages
+        }
+        None => Vec::new(),
+    };
+    let pending = PendingResponse {
+        messages: with_seam_messages(coord_messages, seam),
+    };
     // Drop surfacing entries for messages no longer pending (delivered
     // elsewhere / cancelled / expired) so the tracker stays bounded.
     let pending_ids: std::collections::HashSet<&str> = pending
@@ -2172,12 +2239,24 @@ async fn deliver_once(
         // A successful delivery clears the message's blocked-surfacing state.
         tracker.clear_message(&msg.message_id);
 
+        if msg.injected {
+            // Not coord's message: there is nothing to ack there.
+            seam_delivered(&msg.message_id);
+            delivered += 1;
+            info!(
+                "session_message_poller: delivered seam msg {} to session {to_session} via {}",
+                msg.message_id,
+                arm.as_str()
+            );
+            continue;
+        }
+
         let mark_url = format!("{base}/coord/session-messages/mark-delivered");
         // coord-auth-exempt(device-jwt-required): same device JWT as the pending GET
         // above, read once per tick and skipped entirely when unpaired.
         if let Err(e) = client
             .post(&mark_url)
-            .bearer_auth(&token)
+            .bearer_auth(ctx.token)
             .json(&serde_json::json!({ "message_id": msg.message_id }))
             .send()
             .await
@@ -2256,6 +2335,38 @@ mod tests {
 
     // ---- delivery guard: dedup + cooldown -------------------------------
 
+    /// The test seam's messages join coord's set; an id coord already returned
+    /// is not added twice, and only the seam's carry `injected` (so they are
+    /// never reported to coord).
+    #[test]
+    fn seam_messages_are_appended_to_coords_set_once() {
+        let msg = |id: &str, injected: bool| PendingMessage {
+            message_id: id.to_string(),
+            to_session: Some("sess".to_string()),
+            from_session: None,
+            kind: String::new(),
+            priority: String::new(),
+            body: String::new(),
+            created_at: None,
+            action: None,
+            injected,
+        };
+        let merged = with_seam_messages(
+            vec![msg("coord-1", false)],
+            vec![msg("coord-1", true), msg("seam-1", true)],
+        );
+        let ids: Vec<(&str, bool)> = merged
+            .iter()
+            .map(|m| (m.message_id.as_str(), m.injected))
+            .collect();
+        assert_eq!(ids, vec![("coord-1", false), ("seam-1", true)]);
+        // A coord decode never sets it.
+        let decoded: PendingMessage =
+            serde_json::from_value(serde_json::json!({"message_id": "x", "injected": true}))
+                .unwrap();
+        assert!(!decoded.injected);
+    }
+
     #[test]
     fn delivered_message_is_not_redelivered() {
         let mut g = DeliveryGuard::default();
@@ -2318,6 +2429,7 @@ mod tests {
             body: "Your PR is red, please rework.".to_string(),
             created_at: None,
             action: None,
+            injected: false,
         };
         let framed = frame_message(&msg);
         assert!(framed.contains("coord_ack_message message_id=m-42 session_id=sess "));
@@ -2353,6 +2465,7 @@ mod tests {
                 "head_sha": "abc1234def",
                 "block_reason_code": "ci_red",
             })),
+            injected: false,
         }
     }
 
@@ -2471,6 +2584,7 @@ mod tests {
             body: "hi".to_string(),
             created_at: None,
             action: None,
+            injected: false,
         };
         let framed = frame_message(&msg);
         assert!(framed.contains("directed message"));
@@ -2503,6 +2617,7 @@ mod tests {
             body: body.to_string(),
             created_at: None,
             action: None,
+            injected: false,
         }
     }
 
@@ -2561,6 +2676,7 @@ mod tests {
             body: "benign".to_string(),
             created_at: None,
             action: None,
+            injected: false,
         };
         let framed = frame_message(&m);
         assert!(
@@ -3006,6 +3122,7 @@ mod tests {
             body: String::new(),
             created_at: None,
             action: None,
+            injected: false,
         };
         let mut by_terminal = std::collections::BTreeMap::new();
         note_view(
@@ -3557,6 +3674,7 @@ mod tests {
             body: "hello".to_string(),
             created_at: None,
             action: None,
+            injected: false,
         };
         let before = health_snapshot()["push_miss"]["target_not_live"]
             .as_u64()

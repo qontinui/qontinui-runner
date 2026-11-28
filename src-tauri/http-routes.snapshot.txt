@@ -1720,8 +1720,10 @@ POST /ui-bridge/test/force-identity-evidence force_identity_evidence_handler
 POST /ui-bridge/test/inject-errors inject_errors_handler
 POST /ui-bridge/test/inject-session inject_session_handler
 POST /ui-bridge/test/list-lifecycle-open list_lifecycle_open_handler
+POST /ui-bridge/test/open-bound-terminal open_bound_terminal_handler
 POST /ui-bridge/test/seed-error-scenario seed_error_scenario_handler
 POST /ui-bridge/test/seed-lifecycle-store seed_lifecycle_store_handler
+POST /ui-bridge/test/seed-pending-message seed_pending_message_handler
 POST /ui-bridge/test/seed-terminal-scenario seed_scenario_handler
 POST /ui-bridge/vision/analyze vision_analyze_handler
 POST /ui-bridge/vision/annotate vision_annotate_handler

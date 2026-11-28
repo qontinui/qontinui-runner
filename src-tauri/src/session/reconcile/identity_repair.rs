@@ -776,6 +776,73 @@ mod tests {
         .is_empty());
     }
 
+    /// The identity source is the account dir the pane's claude ACTUALLY runs
+    /// under, read from disk (manual-test-loop iteration 2): the record names
+    /// the runner's dir (`.claude-support`) and a pinned id, the runner's dir
+    /// holds only a stale row for an earlier holder of the anchor pid, and the
+    /// live row sits in `.claude-ben/sessions/<pid>.json`. The real reader
+    /// ([`read_provider_rows`], every discovered dir) finds the live row, and
+    /// the record is re-keyed to its id under `.claude-ben`.
+    #[test]
+    fn a_pane_under_another_config_dir_is_rekeyed_from_that_dirs_provider_row() {
+        use crate::session::claude_activity::read_provider_rows;
+
+        const PID: u32 = 3_999_917;
+        const CREATED: i64 = 1_795_762_191;
+        let homes = tempdir().unwrap();
+        let support = homes.path().join(".claude-support");
+        let ben = homes.path().join(".claude-ben");
+        // A Windows-domain row: its FILETIME `procStart` is checked against the
+        // anchor's creation time on every OS.
+        let write_row = |dir: &PathBuf, sid: &str, started: i64| {
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            let row = serde_json::json!({
+                "pid": PID,
+                "sessionId": sid,
+                "pidDomain": "win32:test",
+                "procStart": ((started + 11_644_473_600) * 10_000_000).to_string(),
+            });
+            std::fs::write(
+                dir.join("sessions").join(format!("{PID}.json")),
+                row.to_string(),
+            )
+            .unwrap();
+        };
+        write_row(&support, "rk-dir-pinned", CREATED - 3_600);
+        write_row(&ben, "rk-dir-live", CREATED);
+        let (support_str, ben_str) = (support.to_str().unwrap(), ben.to_str().unwrap());
+
+        let (_d, store) = store();
+        store.record_open(bind_record(
+            &live("term-1", PID),
+            "rk-dir-pinned",
+            support_str,
+            ORIGIN_AUTHORITATIVE,
+            true,
+            UNZONED_ZONE_INDEX,
+        ));
+        let snapshot = PreEvidenceSnapshot::take(&store);
+        let mut verdicts =
+            read_provider_rows(&[support.clone(), ben.clone()], &[(PID, Some(CREATED))]);
+        let rows = ProviderRows::from_entries([(
+            "term-1".to_string(),
+            (PID, Some(CREATED)),
+            verdicts.remove(&PID).unwrap(),
+        )]);
+
+        let repairs = repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none());
+
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(repairs[0].session_id, "rk-dir-live");
+        assert_eq!(repairs[0].rekeyed_from.as_deref(), Some("rk-dir-pinned"));
+        assert_eq!(repairs[0].from.as_deref(), Some(support_str));
+        assert_eq!(repairs[0].to, ben_str);
+        assert!(store.get("rk-dir-pinned").is_none());
+        let rec = store.get("rk-dir-live").unwrap();
+        assert_eq!(rec.terminal_id, "term-1");
+        assert_eq!(rec.config_dir.as_deref(), Some(ben_str));
+    }
+
     /// The re-key's guards: an overlap-window row (two panes' valid rows name
     /// the live id), a live id that already keys another open record, two
     /// open records on the pane, and another pane's argv naming either id
