@@ -4470,7 +4470,7 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else if let Some(lbl) = label {
         let escaped = lbl.replace('\\', "\\\\").replace('\'', "\\'");
         format!(
-            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact="true"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
+            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact=\"true\"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
             escaped.to_lowercase()
         )
     } else {
