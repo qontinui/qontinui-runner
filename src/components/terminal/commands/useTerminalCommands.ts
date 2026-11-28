@@ -994,7 +994,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         try {
           slugs = await ctx.tenantSlugs();
         } catch (e) {
-          namesUnread = e instanceof Error ? e.message : String(e);
+          namesUnread = describeThrown(e, "tenant names could not be read");
         }
       }
       if (namesUnread && rawTenant && !ID_SHAPED.test(rawTenant)) {
