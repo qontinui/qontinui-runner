@@ -101,6 +101,25 @@ pub fn negotiate(offered: &[u32], supported: &[u32]) -> Option<u32> {
         .max()
 }
 
+/// The `--protocol-versions` line: [`PROTOCOL_VERSIONS`] as one JSON array
+/// (`[1,2,3]`). A runner upgrading to a candidate build runs the candidate's
+/// holder binary with that flag and reads this line back with
+/// [`parse_protocol_versions`], so the two spellings are one pair of
+/// functions (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// Phase 5).
+pub fn render_protocol_versions(versions: &[u32]) -> String {
+    serde_json::to_string(versions).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Read a `--protocol-versions` line. `None` for anything that is not a
+/// non-empty JSON array of versions: an empty or unreadable answer names no
+/// version, and a caller must treat it as UNKNOWN, never as "speaks nothing".
+pub fn parse_protocol_versions(line: &str) -> Option<Vec<u32>> {
+    let versions: Vec<u32> = serde_json::from_str(line.trim()).ok()?;
+    (!versions.is_empty()).then_some(versions)
+}
+
 /// A human-readable build identity for `hello_ack.holder_build`.
 pub fn holder_build() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -401,6 +420,20 @@ pub fn parse_reply(payload: &[u8]) -> Result<Reply, serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protocol_versions_line_round_trips_and_refuses_an_empty_answer() {
+        let line = render_protocol_versions(PROTOCOL_VERSIONS);
+        assert_eq!(line, "[1,2,3]");
+        assert_eq!(
+            parse_protocol_versions(&line).as_deref(),
+            Some(PROTOCOL_VERSIONS)
+        );
+        assert_eq!(parse_protocol_versions(" [2,3]\n"), Some(vec![2, 3]));
+        assert_eq!(parse_protocol_versions("[]"), None);
+        assert_eq!(parse_protocol_versions("usage: ..."), None);
+        assert_eq!(parse_protocol_versions(""), None);
+    }
+
     use super::*;
     use crate::frame::{encode_frame, KIND_CONTROL};
 

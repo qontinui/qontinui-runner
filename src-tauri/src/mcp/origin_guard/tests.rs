@@ -1558,6 +1558,31 @@ fn resume_door_is_a_credential_door_and_on_no_allowlist() {
     ));
 }
 
+/// The upgrade verb (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// D3.7): `POST /runner/upgrade` swaps the build and exits the runner, and
+/// `GET /runner/upgrade/preflight` runs the named candidate's binaries. Both
+/// are credential doors on no browser allowlist; an agent (NonBrowser) reaches
+/// them.
+#[test]
+fn runner_upgrade_routes_are_credential_doors_and_on_no_allowlist() {
+    for (m, p) in [
+        ("POST", "/runner/upgrade"),
+        ("GET", "/runner/upgrade/preflight"),
+    ] {
+        assert!(is_credential_door(m, p), "{m} {p}");
+        for list in [TRUSTED_ROUTES, FOREIGN_ROUTES, REVIEWED_NOT_DOOR] {
+            assert!(!list.contains(&(m, p)), "{m} {p}");
+        }
+        assert!(!route_allowed(OriginClass::Trusted, m, p), "{m} {p}");
+        assert!(!route_allowed(OriginClass::Foreign, m, p), "{m} {p}");
+        assert!(route_allowed(OriginClass::NonBrowser, m, p), "{m} {p}");
+    }
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(registered.contains(&("POST".to_string(), "/runner/upgrade".to_string())));
+    assert!(registered.contains(&("GET".to_string(), "/runner/upgrade/preflight".to_string())));
+}
+
 /// Vet V4 of plan
 /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`:
 /// the mid-session edit-sibling route writes under a caller-named path, so it

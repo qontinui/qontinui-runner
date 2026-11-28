@@ -724,12 +724,42 @@ fn retry_in_background(
     AdoptOutcome::Deferred(last)
 }
 
+/// Run the D8 coord rebind of an adopted pane
+/// (`commands::terminal::rebind_adopted_terminal`) on its own thread, OFF the
+/// sweep's settle path. It can wait up to `ADOPTION_REGISTRY_WAIT` for
+/// `setup()` to manage the `SessionRegistry` and then blocks on a live coord
+/// resume probe — neither of which [`RESTORE_WAIT`] counts, and neither of
+/// which the webview's restore needs: it waits for the pane to be ADOPTED, not
+/// for its coord row to be resumed. A pane that exits before the rebind wires
+/// its hook is caught by the rebind's own exit-snapshot check — but only while
+/// it is still listed with its exit recorded: a tab the operator closes before
+/// the rebind reaches it, or one whose explicit close has unlisted it but not
+/// yet recorded the exit, leaves its row for coord's stale watcher to reap and
+/// its holder binding in the store. Closing on "no longer listed" instead would
+/// be wrong: a handoff teardown unlists every pane it DETACHES.
+fn spawn_adoption_rebind(manager: &Arc<TerminalManager>, app_handle: &AppHandle, pane_id: &str) {
+    let (manager, app_handle, id) = (manager.clone(), app_handle.clone(), pane_id.to_string());
+    let spawned = std::thread::Builder::new()
+        .name(format!("pty-holder-rebind-{pane_id}"))
+        .spawn(move || {
+            crate::commands::terminal::rebind_adopted_terminal(&app_handle, &manager, &id);
+        });
+    if let Err(e) = spawned {
+        warn!(
+            pane = %pane_id,
+            error = %e,
+            "pty holder boot sweep: the coord rebind thread did not start — the adopted pane is \
+             left without a coord row"
+        );
+    }
+}
+
 /// The adoption door for `adoption`, as [`adopt_with_retries`] and
 /// The adoption door for `adoption`, as [`adopt_with_retries`] and
 /// [`retry_in_background`] call it. A rejection of a request this runner
 /// malformed is a runner BUG: logged loudly here, and only retried.
 fn adopt_once(
-    manager: &TerminalManager,
+    manager: &Arc<TerminalManager>,
     app_handle: &AppHandle,
     adoption: &Adoption,
 ) -> Result<(), AdoptError> {
@@ -743,6 +773,14 @@ fn adopt_once(
             adoption.pinned_session_id.clone(),
         )
         .map(|_| ());
+    // D8 (plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`):
+    // the adopted pane resumes the coord session its terminal had before the
+    // last runner let go of it, and gets the same close hook every create
+    // path installs — so a handed-off session's row stays `active`, and the
+    // pane's eventual real exit closes it.
+    if result.is_ok() {
+        spawn_adoption_rebind(manager, app_handle, &adoption.pane_id);
+    }
     if let Err(AdoptError::Attach(e)) = &result {
         if e.runner_bug {
             error!(

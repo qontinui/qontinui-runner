@@ -133,6 +133,9 @@ mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 �
 mod runner_close_sites;
 #[cfg(test)]
 mod runner_spawn_sites;
+// The runner upgrades itself: preflight, executor, rollback guard, probation
+// (plan 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, Phase 5).
+mod runner_upgrade;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps
@@ -1738,6 +1741,15 @@ fn main() {
         std::process::exit(code as i32);
     }
 
+    // The upgrade's headless doors (`--provenance`, `--upgrade-guard <record>`)
+    // — same posture and the same reason as the manifest above: before the
+    // single-instance plugin, so the guard and a candidate's identity read
+    // never reach a running GUI. A bare launch, a deep link and
+    // `--upgrade-successor` fall through.
+    if let Some(code) = runner_upgrade::cli::try_headless_upgrade_door() {
+        std::process::exit(code);
+    }
+
     // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
     // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
     // BEFORE any Tauri/GUI init, so the installed runner binary doubles as the
@@ -1776,6 +1788,19 @@ fn main() {
     // the outcome, including a failed probe, is logged by
     // `outbound_net::log_startup_posture` in `run_app`.
     qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
+
+    // Take every listening socket handed to this process through the
+    // `sd_listen_fds(3)` protocol (a systemd socket unit, or a predecessor's
+    // handoff) and REMOVE `LISTEN_PID` / `LISTEN_FDS` / `LISTEN_FDNAMES`, so no
+    // child believes the fds are its own; each taken fd is marked
+    // close-on-exec. HERE, beside the other environment writes, because
+    // removing a variable is sound only while no other thread exists. Nothing
+    // is validated or served yet, and nothing is logged (logging does not
+    // exist); `run_app` logs the outcome and starts answering an adopted API
+    // listener. Plan
+    // `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+    // Phase 2.
+    qontinui_runner_lib::listeners::adopt_inherited_at_startup();
 
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
@@ -1870,6 +1895,35 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // N, source, mallopt's return code. An attempt, not proof; the health
     // monitor's `allocator` line carries the arena count that shows it holds.
     qontinui_runner_lib::malloc_tuning::log_startup_attempt();
+
+    // A self-managed upgrade's successor (`--upgrade-successor <record>`)
+    // waits for its predecessor to exit BEFORE it adopts the inherited API
+    // listener (two processes accepting on one socket would split clients
+    // between a booting successor and a runner that may yet abort the
+    // upgrade) and BEFORE the single-instance plugin registers: while the
+    // predecessor lives, the plugin would forward this launch to it and exit
+    // (plan
+    // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, D1).
+    match runner_upgrade::cli::wait_for_predecessor_if_successor() {
+        Ok(true) => {
+            info!("runner upgrade: the predecessor has exited; this successor continues its boot")
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!("runner upgrade: not starting as the successor: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // What `main` took from LISTEN_FDS before logging existed, then — when an
+    // `api` listener was inherited — start answering it NOW, on the dedicated
+    // API runtime, with 503 RUNNER_BOOTING until `mcp_api::start_server`
+    // installs the router. Under a socket unit every connect made while this
+    // process boots is already queued on that socket; accepting it this early
+    // turns a silent wait into an answer. A plain launch inherits nothing and
+    // this is a no-op, so the normal boot path is unchanged.
+    qontinui_runner_lib::listeners::log_startup_adoption();
+    mcp_api::start_early_api_if_inherited();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write
@@ -2741,6 +2795,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         prehydration_cache: Arc::new(
             crate::unified_workflow_executor::prehydration::PrehydrationCache::new(),
         ),
+        pending_close_mode: crate::terminal::PendingCloseMode::default(),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -6151,6 +6206,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            // Upgrade probation (plan 2026-11-24-runner-upgrades-itself-daily-
+            // keeping-sessions-alive-with-no-outage-and-automatic-rollback,
+            // Phase 5): when an in-flight upgrade names THIS build as its
+            // to-sha, prove it before the rollback guard fires; then report
+            // any concluded upgrade coord has not heard about. A no-op when
+            // no upgrade record exists.
+            runner_upgrade::probation::spawn_at_boot(app.handle().clone(), api_port);
+
             // The 3s `ui-bridge-ping` emitter, on its OWN OS thread — never a
             // tokio task. It used to be a `tokio::spawn` in
             // `mcp_api::create_router`, which put it on `app-rt`: when
@@ -7346,6 +7409,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // of WIP-ref capture and silently lose stashed work.
                 let worker_app_handle = window.app_handle().clone();
                 let worker_app_state = app_state.inner().clone();
+                // Taken HERE, once per main-window `CloseRequested`: the
+                // close-request door stages a handoff just before its
+                // `window.close()`, and taking it empties the slot, so a
+                // later X click can never inherit it. No staged mode (the
+                // window X) is `Kill` (plan
+                // `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`, D1).
+                let close_mode = worker_app_state.pending_close_mode.take();
+                debug_lifecycle::log_lifecycle(
+                    "SHUTDOWN",
+                    &format!("Close mode for this teardown: {close_mode:?}"),
+                );
                 std::thread::spawn(move || {
                     // ── ONE teardown per process, across BOTH doors ──
                     //
@@ -7398,6 +7472,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         &worker_app_handle,
                         &worker_app_state,
                         &budget,
+                        close_mode,
                     );
 
                     // ── Explicit exit request, anchored to WORKER COMPLETION ──

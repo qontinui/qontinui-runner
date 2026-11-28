@@ -19,6 +19,10 @@ use crate::database::pg::PgDb;
 use crate::settings::{RunnerInstanceConfig, SpawnPlacement};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// How long [`InstanceManager::purge_unreachable_registered`] waits for a
+/// registered runner's `/livez` before calling it gone.
+const REGISTERED_LIVEZ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Status of a runner instance.
 #[derive(Debug, Clone, Serialize)]
 pub struct InstanceStatus {
@@ -232,8 +236,19 @@ impl InstanceManager {
         registered.values().cloned().collect()
     }
 
-    /// Remove registered instances whose ports are not reachable.
+    /// Remove registered instances whose port is positively not a runner's (a
+    /// failed connect, or a non-runner answer to `/livez`).
     /// Returns the number of instances removed.
+    ///
+    /// An HTTP answer, not a TCP connect: a port held by a socket unit (or by an
+    /// unrelated process) accepts connects while no runner serves it (plan
+    /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+    /// D1). A booting runner (`503 RUNNER_BOOTING`) counts as alive, and so does
+    /// a port that accepts the connect but stays silent inside the budget
+    /// (`LivezVerdict::Silent`): that is also what a live but loaded runner
+    /// looks like, and deregistering a live instance costs more than keeping a
+    /// dead one's row for as long as its port stays silent. An unrelated server
+    /// that answers on the port, or a failed connect, is purged.
     pub async fn purge_unreachable_registered(&self) -> u32 {
         let registered = self.registered.lock().await;
         let to_check: Vec<(String, u16)> = registered
@@ -244,7 +259,14 @@ impl InstanceManager {
 
         let mut removed = 0u32;
         for (id, port) in &to_check {
-            if !crate::process_capture::health::is_port_in_use(*port) {
+            let port = *port;
+            let alive = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::listeners::loopback_runner_alive(port, REGISTERED_LIVEZ_BUDGET)
+            })
+            .await
+            // A probe task that could not run decides nothing: keep the row.
+            .unwrap_or(true);
+            if !alive {
                 self.deregister_instance(id).await;
                 info!("Purged unreachable registered instance (port {})", port);
                 removed += 1;

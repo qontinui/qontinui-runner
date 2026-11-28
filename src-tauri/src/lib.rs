@@ -69,6 +69,15 @@ pub mod profiles;
 pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
+// Inherited listening sockets (`sd_listen_fds(3)`: LISTEN_PID / LISTEN_FDS /
+// LISTEN_FDNAMES), the one `adopt_or_bind` the API listener goes through, and
+// the `/livez` liveness probe that replaces connect-only probes once a socket
+// unit can hold the port of a dead runner. In the LIB because it needs nothing
+// from the bin and a self-managed predecessor's encoding must be read by the
+// same parser (plan
+// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+// Phase 2).
+pub mod listeners;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 

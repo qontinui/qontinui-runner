@@ -5792,7 +5792,7 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1) —
 /// see [`mint_and_register_nonce`] for what it freezes. The caller has already
 /// validated it ([`validate_spawn_tenant`]); `None` keeps the machine pin.
-fn register_proxy_nonce(
+pub(crate) fn register_proxy_nonce(
     workdir: &str,
     terminal_id: Option<&str>,
     session_tenant: Option<Uuid>,
@@ -9467,15 +9467,28 @@ fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
     removed
 }
 
-/// True iff something is LISTENING on `127.0.0.1:port` (a short connect probe).
-/// Used by the session-restore reaper to distinguish "another live runner's
-/// config" (keep) from "a dead runner's leftover" (reap).
+/// How long the session-restore reaper waits for a sibling runner's `/livez`.
+/// Generous on purpose: a false "dead" reaps a LIVE sibling's credential file,
+/// while a true "dead" only costs this wait once per port per reap pass.
+const SIBLING_LIVEZ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True unless `127.0.0.1:port` is positively not a runner: the connect fails,
+/// or something other than a runner answers (`LivezVerdict::may_be_alive` —
+/// serving, booting with `503 RUNNER_BOOTING`, or silent). Used by the session-restore reaper to
+/// distinguish "another live runner's config" (keep) from "a dead runner's
+/// leftover" (reap).
+///
+/// Not a TCP connect: under a socket unit the port stays bound while the runner
+/// behind it is dead, and the kernel completes the handshake from the backlog,
+/// so a connect-only probe could not tell a runner from an unrelated HTTP
+/// server. A port that accepts the connect and stays SILENT is still kept
+/// (`LivezVerdict::may_be_alive`): a live runner too loaded to answer in the
+/// budget looks the same, and the runner that owns a socket-unit port reaps its
+/// own leftovers when it comes back (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// D1).
 fn loopback_port_alive(port: u16) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(400),
-    )
-    .is_ok()
+    qontinui_runner_lib::listeners::loopback_runner_alive(port, SIBLING_LIVEZ_BUDGET)
 }
 
 /// Reap stale `~/.qontinui/runner/session-restore/coord-mcp/*.json` configs
@@ -9492,7 +9505,18 @@ fn loopback_port_alive(port: u16) -> bool {
 ///   shares this per-user dir and owns its own nonces), reap if dead.
 pub(crate) fn reap_stale_session_restore_configs(bound_port: u16) -> usize {
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
-    reap_stale_session_restore_configs_in(&dir, bound_port, &loopback_port_alive)
+    // One `/livez` per port per pass: several configs usually name the same
+    // sibling, and a dead one costs the whole probe budget each time it is asked.
+    let seen = std::cell::RefCell::new(std::collections::HashMap::<u16, bool>::new());
+    let port_alive = |port: u16| -> bool {
+        if let Some(&alive) = seen.borrow().get(&port) {
+            return alive;
+        }
+        let alive = loopback_port_alive(port);
+        seen.borrow_mut().insert(port, alive);
+        alive
+    };
+    reap_stale_session_restore_configs_in(&dir, bound_port, &port_alive)
 }
 
 /// Injectable core of [`reap_stale_session_restore_configs`]: the directory
@@ -22024,6 +22048,76 @@ mod tests {
 
         // Cleanup.
         revoke_proxy_nonce(&live_nonce);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reaper's REAL liveness probe asks `/livez`, not a TCP connect
+    /// (plan 2026-11-24-runner-upgrades-itself-daily-..., D1): a port that
+    /// accepts the connect and answers as something OTHER than a runner has
+    /// its config reaped — the connect-only probe this replaced kept it —
+    /// while a sibling answering `/livez` (or booting with
+    /// `503 RUNNER_BOOTING`) keeps its own. A port that accepts the connect
+    /// and stays SILENT is kept too (`LivezVerdict::may_be_alive`): a live
+    /// runner too loaded to answer looks the same, and the owner of a
+    /// socket-unit port reaps its own leftovers when it comes back.
+    #[test]
+    fn reaper_liveness_is_a_livez_answer_not_a_connect() {
+        use std::io::{Read, Write};
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = std::env::temp_dir().join(format!("coord-mcp-livez-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_body = |port: u16| {
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:{port}/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"sibling"}}}}}}}}"#
+            )
+        };
+
+        // Holds the port, completes handshakes from the backlog, never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        assert!(std::net::TcpStream::connect(("127.0.0.1", silent_port)).is_ok());
+
+        // A sibling runner that answers /livez (one served, one booting).
+        let serve_once = |response: &'static str| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let h = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).unwrap();
+                s.write_all(response.as_bytes()).unwrap();
+            });
+            (port, h)
+        };
+        let (live_port, live_h) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let (booting_port, booting_h) = serve_once(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nConnection: close\r\n\r\n{\"success\":false,\"code\":\"RUNNER_BOOTING\"}",
+        );
+        // Accepts the connect and answers HTTP, but not as a runner.
+        let (other_port, other_h) =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+        let quiet = dir.join("silent.json");
+        std::fs::write(&quiet, cfg_body(silent_port)).unwrap();
+        let live = dir.join("live.json");
+        std::fs::write(&live, cfg_body(live_port)).unwrap();
+        let booting = dir.join("booting.json");
+        std::fs::write(&booting, cfg_body(booting_port)).unwrap();
+        let other = dir.join("other.json");
+        std::fs::write(&other, cfg_body(other_port)).unwrap();
+
+        let reaped = reap_stale_session_restore_configs_in(&dir, 9876, &loopback_port_alive);
+        live_h.join().unwrap();
+        booting_h.join().unwrap();
+        other_h.join().unwrap();
+
+        assert_eq!(reaped, 1, "only the non-runner port's config is reaped");
+        assert!(!other.exists(), "a connect-only liveness kept this");
+        assert!(live.exists());
+        assert!(booting.exists(), "a booting sibling is alive");
+        assert!(quiet.exists(), "a silent port may be a loaded live runner");
+        drop(silent);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
