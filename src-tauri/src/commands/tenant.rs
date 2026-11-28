@@ -736,6 +736,113 @@ pub fn set_active_tenant(tenant_id: String) -> Result<CommandResponse, String> {
     })
 }
 
+/// Slugs of this device's bound tenants, read from coord's identity door.
+///
+/// `/spawn-ai --tenant <name>` accepts a unique substring of a tenant's slug,
+/// and the slug is not on the local wire (`paired_user.json` holds ids only), so
+/// it takes ONE coord round-trip. That is why this is its own command and not a
+/// field of [`ActiveTenantView`]: that view is built offline on purpose.
+///
+/// Answers `[{tenant_id, slug}]`. A failed read is an `Err`, never an empty
+/// list: empty would read as "no tenant has a name", and the frontend must say
+/// UNKNOWN instead.
+#[tauri::command]
+pub async fn get_tenant_slugs() -> Result<CommandResponse, String> {
+    let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let url = format!("{}/mcp", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("tenant slugs: build http client: {e}"))?;
+    let rb = client
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "coord_query_identity", "arguments": {}}
+        }));
+    let resp = crate::auth::attach_device_auth(rb)
+        .send()
+        .await
+        .map_err(|e| format!("tenant slugs: POST /mcp coord_query_identity: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "tenant slugs: POST /mcp coord_query_identity answered HTTP {status}"
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("tenant slugs: unreadable identity answer: {e}"))?;
+    let slugs = parse_identity_slugs(&body)?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(slugs).map_err(|e| e.to_string())?),
+    })
+}
+
+/// One bound tenant's coord slug.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TenantSlug {
+    pub tenant_id: String,
+    pub slug: String,
+}
+
+/// Pull `device_tenant_bindings.tenant_ids[].{tenant_id, tenant_slug}` out of a
+/// JSON-RPC `tools/call` answer. A binding with no usable slug is omitted (its
+/// tenant then simply cannot be addressed by name); a `null` binding list is an
+/// `Err`, because coord is saying it could not read the bindings.
+pub(crate) fn parse_identity_slugs(body: &serde_json::Value) -> Result<Vec<TenantSlug>, String> {
+    if let Some(err) = body.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("no message");
+        return Err(format!("tenant slugs: coord answered a JSON-RPC error: {msg}"));
+    }
+    let result = body
+        .get("result")
+        .ok_or_else(|| "tenant slugs: identity answer has no result".to_string())?;
+    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        let msg = result.pointer("/content/0/text").and_then(|v| v.as_str()).unwrap_or("no message");
+        return Err(format!("tenant slugs: coord answered an error result: {msg}"));
+    }
+    let parsed: serde_json::Value;
+    let ident = match result.get("structuredContent").filter(|v| v.is_object()) {
+        Some(s) => s,
+        None => {
+            let text = result
+                .pointer("/content/0/text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "tenant slugs: identity answer carries no content".to_string())?;
+            parsed = serde_json::from_str(text)
+                .map_err(|e| format!("tenant slugs: identity content is not JSON: {e}"))?;
+            &parsed
+        }
+    };
+    let list = ident
+        .pointer("/device_tenant_bindings/tenant_ids")
+        .ok_or_else(|| "tenant slugs: identity answer has no device_tenant_bindings".to_string())?
+        .as_array()
+        .ok_or_else(|| {
+            "tenant slugs: device_tenant_bindings.tenant_ids is null (coord could not read the bindings)"
+                .to_string()
+        })?;
+    Ok(list
+        .iter()
+        .filter_map(|b| {
+            let id = b.get("tenant_id")?.as_str()?.trim();
+            let slug = b.get("tenant_slug")?.as_str()?.trim();
+            if uuid::Uuid::parse_str(id).is_err() || slug.is_empty() {
+                return None;
+            }
+            Some(TenantSlug {
+                tenant_id: id.to_ascii_lowercase(),
+                slug: slug.to_string(),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,5 +1532,48 @@ mod tests {
             test_mod_skip_end(&["#[cfg(test)]", "fn helper() {}"], 0),
             None
         );
+    }
+    #[test]
+    fn identity_slugs_are_read_from_the_text_content_and_unusable_bindings_dropped() {
+        let inner = serde_json::json!({"device_tenant_bindings": {"tenant_ids": [
+            {"tenant_id": "ce1ec20c-9cf1-427a-857d-81d6449cc6e4", "tenant_slug": "bauhaus-b2b"},
+            {"tenant_id": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a", "tenant_slug": ""},
+            {"tenant_id": "not-a-uuid", "tenant_slug": "x"},
+        ]}});
+        let body = serde_json::json!({"result": {"content": [{"text": inner.to_string()}]}});
+        let got = parse_identity_slugs(&body).unwrap();
+        assert_eq!(
+            got,
+            vec![TenantSlug {
+                tenant_id: "ce1ec20c-9cf1-427a-857d-81d6449cc6e4".into(),
+                slug: "bauhaus-b2b".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn identity_slugs_null_binding_list_is_an_error_not_an_empty_list() {
+        let body = serde_json::json!({"result": {"structuredContent":
+            {"device_tenant_bindings": {"tenant_ids": null}}}});
+        assert!(parse_identity_slugs(&body).is_err());
+    }
+
+    #[test]
+    fn identity_slugs_a_jsonrpc_error_keeps_coords_message() {
+        let body = serde_json::json!({"error": {"code": -32001, "message": "unauthorized"}});
+        assert!(parse_identity_slugs(&body).unwrap_err().contains("unauthorized"));
+        let body = serde_json::json!({"result": {"isError": true, "content": [{"text": "boom"}]}});
+        assert!(parse_identity_slugs(&body).unwrap_err().contains("boom"));
+    }
+
+    #[test]
+    fn identity_slugs_structured_content_wins_and_ids_are_lowercased() {
+        let body = serde_json::json!({"result": {
+            "structuredContent": {"device_tenant_bindings": {"tenant_ids": [
+                {"tenant_id": "CE1EC20C-9CF1-427A-857D-81D6449CC6E4", "tenant_slug": "bauhaus-b2b"}]}},
+            "content": [{"text": "{\"device_tenant_bindings\": {\"tenant_ids\": []}}"}]}});
+        let got = parse_identity_slugs(&body).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].tenant_id, "ce1ec20c-9cf1-427a-857d-81d6449cc6e4");
     }
 }

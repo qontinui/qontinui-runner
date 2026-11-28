@@ -122,6 +122,13 @@ export interface TerminalCommandsContext {
    */
   tenantCandidates: readonly string[];
   /**
+   * Read the bound tenants' coord slugs (one coord round-trip), so
+   * `--tenant` can take a name. Optional and called only when the value is not
+   * an exact bound id; a rejection is treated as "names UNKNOWN" and the
+   * resolver falls back to ids alone, saying so in its error.
+   */
+  tenantSlugs?: () => Promise<readonly TenantSlug[]>;
+  /**
    * Deliver an approval keystroke to the named panes and report what
    * actually reached a PTY (`../approveAll.ts`).
    *
@@ -217,8 +224,10 @@ export const LAYOUT_IDS: readonly string[] = [
 const SCHEMA = {
   focus: { target: 'number | "next" | "prev" | "needs-input"' },
   spawn: { count: "number (>= 1, defaults to 1)" },
+  // Grammar: `/spawn-ai [<tenant>] [count] [account] [context]` — a first word
+  // that is not a number is the tenant (`tenantFirstArgs`), so `/spawn-ai bau` works.
   spawnAi: {
-    count: "number (>= 1, defaults to 1)",
+    count: "number (>= 1, defaults to 1); a leading non-number is read as the TENANT name instead",
     account:
       'string — either a Claude account label (e.g. "gmail", "hotmail") or the literal "best" to pick the lowest-utilization account',
     context: "string (optional initial prompt auto-typed after `claude` starts)",
@@ -226,7 +235,7 @@ const SCHEMA = {
     // positionally and can sit anywhere on the line without shifting
     // `context`. See `parse.ts::FLAG_PREFIX`.
     "--tenant":
-      "string (optional tenant slug or uuid this spawn binds to; defaults to the device's default tenant for new sessions)",
+      "string (optional tenant — any unique part of its slug, or its id; may also be the first word: `/spawn-ai bau`; defaults to the device's default tenant for new sessions)",
   },
   spawnWith: {
     count: "number (>= 1, defaults to 1)",
@@ -477,6 +486,59 @@ export function readCountArg(args: Record<string, unknown>, field: string = "cou
 }
 
 /**
+ * `/spawn-ai <tenant> [count] [account] [context…]` — the tenant as the
+ * DEFAULT first parameter.
+ *
+ * The positional grammar is `count account context`, and a first word that is
+ * not a number used to be an `invalid-count` error. That slot is now read as
+ * the tenant name instead, so `/spawn-ai bau` spawns one session of the best
+ * account under the tenant matching `bau`. Everything after it keeps its old
+ * meaning: an optional count, then an optional account (only a known account
+ * label or `best`, so a free-form prompt is never mistaken for one), then the
+ * context.
+ *
+ * Returns `null` when the form does not apply: the first word is a number or
+ * absent, or `--tenant` was also given (two tenants is a contradiction the
+ * existing grammar already reports, not one to guess through).
+ */
+export function tenantFirstArgs(
+  args: Record<string, unknown>,
+  accountLabels: readonly string[],
+): Record<string, unknown> | null {
+  const first = readCountArg(args);
+  if (first.kind !== "invalid" || typeof args.count !== "string") return null;
+  // One bare word only: `3 best` bound whole into `count` is a malformed count, not a tenant.
+  if (/\s/.test(first.raw)) return null;
+  // A number-like word (`2.5`) is a malformed count, and a 1-2 letter word is a typo, not a tenant name.
+  if (/^[\d.,+-]+$/.test(first.raw) || first.raw.length < 3) return null;
+  if (args.tenant !== undefined) return null;
+  const rest = [args.account, args.context]
+    .filter((v): v is string => typeof v === "string" && v.trim() !== "")
+    .join(" ")
+    .trim();
+  const out: Record<string, unknown> = { ...args, tenant: first.raw };
+  delete out.count;
+  delete out.account;
+  delete out.context;
+  let text = rest;
+  const num = /^(\d+)(?:\s+(.*))?$/s.exec(text);
+  if (num) {
+    out.count = num[1];
+    text = (num[2] ?? "").trim();
+  }
+  const acct = /^(\S+)(?:\s+(.*))?$/s.exec(text);
+  if (acct) {
+    const word = acct[1].toLowerCase();
+    if (word === "best" || accountLabels.some((l) => l.toLowerCase() === word)) {
+      out.account = acct[1];
+      text = (acct[2] ?? "").trim();
+    }
+  }
+  if (text) out.context = text;
+  return out;
+}
+
+/**
  * Upper bound on a single spawn. `/spawn`, `/spawn-ai` and `/spawn-with` all
  * route through {@link resolveCount}, so declaring it once covers all three.
  *
@@ -621,14 +683,29 @@ function resolveAccountConfigDir(
   return match?.config_dir ?? null;
 }
 
+/** A value that can only be a tenant id or a prefix of one: hex and dashes, long enough to be the displayed short form. */
+const ID_SHAPED = /^[0-9a-f-]{8,}$/i;
+
+/** A bound tenant's coord slug, as `get_tenant_slugs` serves it. */
+export interface TenantSlug {
+  tenantId: string;
+  slug: string;
+}
+
 /**
  * F3 — resolve a `--tenant` argument to a bound tenant id.
  *
- * The backend takes a tenant UUID, but the operator sees the SHORT form
- * everywhere in the UI (the zone badge and the spawn picker both render an
- * 8-char stem), so a bare stem must work. Accepted, in order:
- *  - exact match against a bound tenant id;
- *  - a unique case-insensitive PREFIX of exactly one bound tenant id.
+ * The backend takes a tenant UUID, but the operator thinks in tenant NAMES, so
+ * the value may be any of:
+ *  - an exact bound tenant id, or an exact (case-insensitive) slug;
+ *  - the short form the UI renders (a prefix of a bound tenant id);
+ *  - any substring of a tenant's slug (`bauhaus`, `b2b`, `zeria`).
+ *
+ * Every non-exact form must pick exactly ONE bound tenant. The id-prefix and
+ * slug-substring matches are pooled before that test, so a value that is a hex
+ * prefix of one tenant's id AND a substring of another's slug (`b2b` is both
+ * shapes) is ambiguous rather than silently resolved to whichever form was
+ * tried first. A slug is only consulted for tenants in `candidates`.
  *
  * Returns `{ error }` rather than falling back when the value matches nothing
  * or is ambiguous: silently spawning under a different tenant than the
@@ -638,15 +715,39 @@ function resolveAccountConfigDir(
 export function resolveTenantArg(
   raw: string | undefined,
   candidates: readonly string[],
+  slugs: readonly TenantSlug[] = [],
 ): { tenantId?: string; error?: string } {
   const value = raw?.trim();
   if (!value) return {};
   if (candidates.includes(value)) return { tenantId: value };
   const lower = value.toLowerCase();
-  const prefixed = candidates.filter((c) => c.toLowerCase().startsWith(lower));
-  if (prefixed.length === 1) return { tenantId: prefixed[0] };
-  if (prefixed.length > 1) {
-    return { error: `tenant "${value}" is ambiguous (matches ${prefixed.length} bindings)` };
+  // Ids compare case-insensitively (a uuid is the same uuid in any case) and
+  // the answer is always the CANDIDATE's own spelling.
+  const byLower = new Map(candidates.map((c) => [c.toLowerCase(), c] as const));
+  const named = slugs.flatMap((s) => {
+    const id = byLower.get(s.tenantId.toLowerCase());
+    return id ? [{ tenantId: id, slug: s.slug }] : [];
+  });
+  const idPrefix = new Set<string>();
+  for (const c of candidates) if (c.toLowerCase().startsWith(lower)) idPrefix.add(c);
+  const exactSlug = named.filter((s) => s.slug.toLowerCase() === lower);
+  if (exactSlug.length === 1) {
+    // An exact name still loses to a DIFFERENT tenant's id prefix: say so
+    // rather than silently choosing between two readings of one word.
+    const other = [...idPrefix].filter((id) => id !== exactSlug[0].tenantId);
+    if (other.length === 0) return { tenantId: exactSlug[0].tenantId };
+  }
+  const hits = new Set<string>(idPrefix);
+  for (const s of named) if (s.slug.toLowerCase().includes(lower)) hits.add(s.tenantId);
+  if (hits.size === 1) return { tenantId: [...hits][0] };
+  if (hits.size > 1) {
+    const label = (id: string) => {
+      const slug = named.find((s) => s.tenantId === id)?.slug;
+      return slug ? `${slug} (${id.slice(0, 8)})` : id.slice(0, 8);
+    };
+    return {
+      error: `tenant "${value}" is ambiguous (matches ${[...hits].map(label).join(", ")})`,
+    };
   }
   return { error: `no tenant binding matches "${value}"` };
 }
@@ -839,7 +940,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       /^spawn-ai\s+(?<count>\d+)\s+(?<account>[\w-]+|best)(?:\s+(?<context>.+))?$/i,
       /^spawn\s+(?<count>\d+)\s+(?<account>best|claude|[\w-]+)$/i,
     ],
-    handler: async (args: Record<string, unknown>): Promise<CommandResult<string[]>> => {
+    handler: async (rawArgs: Record<string, unknown>): Promise<CommandResult<string[]>> => {
+      // The tenant is the default first parameter: `/spawn-ai bau`.
+      const args =
+        tenantFirstArgs(
+          rawArgs,
+          ctx.accounts.map((a) => a.label),
+        ) ?? rawArgs;
       const counted = resolveCount(args);
       if ("ok" in counted) return counted;
       const { count } = counted;
@@ -867,7 +974,26 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const tenantRead = resolveText(args, "tenant");
       if ("ok" in tenantRead) return tenantRead;
       const rawTenant = tenantRead.text.trim() || undefined;
-      const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
+      let slugs: readonly TenantSlug[] = [];
+      let namesUnread = "";
+      if (rawTenant && !ctx.tenantCandidates.includes(rawTenant) && ctx.tenantSlugs) {
+        try {
+          slugs = await ctx.tenantSlugs();
+        } catch (e) {
+          namesUnread = e instanceof Error ? e.message : String(e);
+        }
+      }
+      if (namesUnread && rawTenant && !ID_SHAPED.test(rawTenant)) {
+        // The name lookup failed, so a fragment cannot be told apart from an
+        // id prefix that happens to share its letters (`ce` is both). Only an
+        // id-shaped value is attempted offline; anything else is refused
+        // instead of being matched against ids by accident.
+        return fail(
+          "unknown-tenant",
+          `tenant names could not be read (${namesUnread}); pass an id or an 8+ character id prefix`,
+        );
+      }
+      const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates, slugs);
       if (error) return fail("unknown-tenant", error);
       const result = await ctx.spawnAi(count, configDir, context, tenantId);
       return spawnVerdict(result, count, "AI sessions");
