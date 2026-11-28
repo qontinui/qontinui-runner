@@ -488,6 +488,32 @@ pub struct PaneProcesses {
     pub exempted_children: Vec<u32>,
     /// Of the identities asked about, those alive ANYWHERE in the table.
     pub tracked_alive: Vec<ProcIdentity>,
+    /// The pane's root process itself, read from the SAME snapshot.
+    pub root: PaneRoot,
+}
+
+/// The pane's root process (the PTY child) as one snapshot shows it.
+///
+/// This is what tells a bare idle shell from a pane with work in it: a shell
+/// pane's root is the shell, and the shell has no descendant at all while it
+/// sits at its prompt. Whether `image` is a shell is the caller's question
+/// (`terminal_probe_claude` answers it against the runner's shell list); the
+/// probe only reports what the table holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneRoot {
+    /// The root's image name as the table records it (`bash`, `pwsh.exe`, …);
+    /// `None` when the root pid is not in the table.
+    pub image: Option<String>,
+    /// How many processes descend from the root, at any depth.
+    pub descendants: usize,
+}
+
+/// The pane's root process in `snapshot`. PURE.
+pub fn pane_root_in(root_pid: u32, snapshot: &ProcessSnapshot) -> PaneRoot {
+    PaneRoot {
+        image: snapshot.names.get(&root_pid).cloned(),
+        descendants: crate::process_capture::process_tree::descendant_count(root_pid, snapshot),
+    }
 }
 
 /// What a probe saw.
@@ -1466,6 +1492,7 @@ fn probe_within(
         top_level_children,
         exempted_children,
         tracked_alive,
+        root: pane_root_in(root_pid, snapshot),
     })
 }
 
@@ -2285,6 +2312,25 @@ pub(crate) mod probe_fixtures {
 
 #[cfg(test)]
 mod tests {
+    /// A probe with the pane-root half cleared. The marks tests below assert
+    /// the claude half of an answer; the root half has its own test
+    /// (`probe_reports_the_root_image_and_every_descendant`).
+    fn sans_root(p: ClaudeProbe) -> ClaudeProbe {
+        match p {
+            ClaudeProbe::Readable(mut v) => {
+                v.root = PaneRoot::default();
+                ClaudeProbe::Readable(v)
+            }
+            other => other,
+        }
+    }
+
+    macro_rules! assert_probe_eq {
+        ($l:expr, $r:expr $(, $($m:tt)+)?) => {
+            assert_eq!(sans_root($l), sans_root($r) $(, $($m)+)?)
+        };
+    }
+
     use super::*;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -2837,6 +2883,56 @@ mod tests {
         assert_eq!(view.tracked_alive, vec![id(200, 20)]);
     }
 
+    /// The root half of the answer comes from the same snapshot as the claude
+    /// half: the root's own image, and every process under it at any depth.
+    #[test]
+    fn probe_reports_the_root_image_and_every_descendant() {
+        // An npm-installed claude: `node … cli.js` under the shell, which
+        // `is_claude_image` does not count — the descendants still do.
+        let busy = snapshot(&[
+            (100, 1, "bash", 10),
+            (200, 100, "node", 20),
+            (210, 200, "rg", 21),
+            (300, 1, "sshd", 5),
+        ]);
+        let ClaudeProbe::Readable(view) =
+            probe_from_snapshot(100, &busy, &[], &RegistryWitness::naming(&[]))
+        else {
+            panic!("readable");
+        };
+        assert!(view.subtree_claude.is_empty());
+        assert_eq!(
+            view.root,
+            PaneRoot {
+                image: Some("bash".to_string()),
+                descendants: 2,
+            }
+        );
+
+        // A bare shell at its prompt: the root is the shell, nothing under it.
+        let idle = snapshot(&[(100, 1, "pwsh.exe", 10), (300, 1, "sshd", 5)]);
+        let ClaudeProbe::Readable(view) =
+            probe_from_snapshot(100, &idle, &[], &RegistryWitness::naming(&[]))
+        else {
+            panic!("readable");
+        };
+        assert_eq!(
+            view.root,
+            PaneRoot {
+                image: Some("pwsh.exe".to_string()),
+                descendants: 0,
+            }
+        );
+
+        // A root pid the table does not hold has no image to report.
+        let ClaudeProbe::Readable(view) =
+            probe_from_snapshot(4242, &idle, &[], &RegistryWitness::naming(&[]))
+        else {
+            panic!("readable");
+        };
+        assert_eq!(view.root, PaneRoot::default());
+    }
+
     #[test]
     fn a_claude_gone_from_the_subtree_but_alive_elsewhere_is_still_alive() {
         // Re-parented to init (pid 1) while still running.
@@ -3143,6 +3239,7 @@ mod tests {
                 top_level_children: 0,
                 exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
+                root: PaneRoot::default(),
             },
             vec![77, 78],
         );
@@ -3216,7 +3313,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let recorded = config_dir(root.path(), ".claude-npm", &[(NODE, npm_record(NODE, 20))]);
         let pane = node_pane(vec![recorded], no_kernel);
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(pane.root_pid), vec![]).await,
             readable(&[id(NODE, 20)], 0, &[]),
             "a registry-named `node` is a live claude"
@@ -3224,7 +3321,7 @@ mod tests {
 
         let unrecorded = config_dir(root.path(), ".claude-other", &[]);
         let bare = node_pane(vec![unrecorded], no_kernel);
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(bare.root_pid), vec![]).await,
             readable(&[], 0, &[]),
             "a `node` no record names is judged by its image"
@@ -3330,7 +3427,7 @@ mod tests {
             config_dirs: vec![dir],
             proc_start: no_kernel,
         });
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(pane.root_pid), vec![]).await,
             readable(&[id(NATIVE, 20)], 1, &[])
         );
@@ -3363,7 +3460,7 @@ mod tests {
                 .is_some_and(|why| why.contains("could not be listed")),
             "{witness:?}"
         );
-        assert_eq!(
+        assert_probe_eq!(
             probe_from_snapshot(100, &snap, &[], &witness),
             readable(&[id(NODE, 20)], 0, &[])
         );
@@ -3423,7 +3520,7 @@ mod tests {
             no_kernel,
         )
         .await;
-        assert_eq!(
+        assert_probe_eq!(
             probe_from_snapshot(100, &snap, &[], &witness),
             readable(&[id(NODE, 20)], 0, &[]),
             "the default home's record was read"
@@ -3491,7 +3588,7 @@ mod tests {
             config_dirs: vec![dir],
             proc_start: no_kernel,
         });
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(pane.root_pid), vec![]).await,
             readable(&[id(NATIVE, 20)], 0, &[])
         );
@@ -3556,7 +3653,7 @@ mod tests {
             config_dirs: vec![fresh, never],
             proc_start: no_kernel,
         });
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(pane.root_pid), vec![]).await,
             readable(&[], 0, &[])
         );
@@ -3584,13 +3681,13 @@ mod tests {
             )],
         );
         let reused = node_pane(vec![stale.clone()], kernel_disagrees);
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(reused.root_pid), vec![]).await,
             readable(&[], 0, &[]),
             "procStart disagrees with the kernel: an earlier holder's record"
         );
         let same = node_pane(vec![stale], kernel_agrees);
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(same.root_pid), vec![]).await,
             readable(&[id(NODE, 20)], 0, &[])
         );
@@ -3608,7 +3705,7 @@ mod tests {
             )],
         );
         let reused = node_pane(vec![day_old], no_kernel);
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(reused.root_pid), vec![]).await,
             readable(&[], 0, &[]),
             "startedAt a day before the process began: an earlier holder's record"
@@ -3644,7 +3741,7 @@ mod tests {
         let unreadable = RegistryWitness::unreadable("x");
         let native = snapshot(&[(100, 1, "bash", 10), (200, 100, "claude", 20)]);
         for witness in [unreadable.clone(), RegistryWitness::default()] {
-            assert_eq!(
+            assert_probe_eq!(
                 probe_from_snapshot(100, &native, &[], &witness),
                 readable(&[id(200, 20)], 0, &[]),
                 "{witness:?}"
@@ -3698,7 +3795,7 @@ mod tests {
             snapshot(&[(100, 1, "bash", 10), (300, 1, "bash", 30)]),
             RegistryWitness::naming(&[]),
         );
-        assert_eq!(look.probe(100, &[]), readable(&[], 0, &[]));
+        assert_probe_eq!(look.probe(100, &[]), readable(&[], 0, &[]));
         assert!(matches!(look.probe(300, &[]), ClaudeProbe::Unreadable(_)));
         assert!(matches!(
             PaneLook::default().probe(100, &[]),
@@ -3801,6 +3898,7 @@ mod tests {
             top_level_children: children,
             exempted_children: Vec::new(),
             tracked_alive: alive.to_vec(),
+            root: PaneRoot::default(),
         })
     }
 
@@ -4340,9 +4438,10 @@ mod tests {
             top_level_children: 0,
             exempted_children: Vec::new(),
             tracked_alive: Vec::new(),
+            root: PaneRoot::default(),
         });
         let root = pane.root_pid;
-        assert_eq!(
+        assert_probe_eq!(
             probe_claude_under(Some(root), vec![CLAUDE, id(7, 7)]).await,
             readable(&[CLAUDE], 0, &[CLAUDE])
         );

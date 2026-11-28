@@ -14,8 +14,9 @@
 [ -f "$HOME/.zprofile" ] && source "$HOME/.zprofile"
 [ -f "$HOME/.zshrc" ]    && source "$HOME/.zshrc"
 
-# Guard: only install the integration hooks once.
-if [ "${QONTINUI_INTEGRATION}" = "1" ]; then
+# Guard: only install the integration hooks once. `${…-}` everywhere below: the
+# user's rc above may have set `nounset`.
+if [ "${QONTINUI_INTEGRATION-}" = "1" ]; then
     return 0 2>/dev/null
 fi
 export QONTINUI_INTEGRATION=1
@@ -32,7 +33,12 @@ __qontinui_precmd() {
     __qontinui_osc633 "P;Cwd=${PWD}"
 }
 
-# preexec: fires before a user-typed command runs. Emit E;<cmd> and C.
+# preexec: fires once per typed command line, before it runs, and never for a
+# hook. Emit E;<cmd> and C. Installed FIRST in preexec_functions, so our C
+# precedes every hook in that array for as long as it stays first, which each
+# prompt checks. A user `preexec` FUNCTION is not in the array: zsh runs that
+# function before it, so our C would wait for it — which is why a prompt does
+# not announce the capability while one is defined.
 __qontinui_preexec() {
     local cmd="$1"
     local escaped="${cmd//;/\\x3b}"
@@ -40,12 +46,77 @@ __qontinui_preexec() {
     __qontinui_osc633 "C"
 }
 
-add-zsh-hook precmd __qontinui_precmd
-add-zsh-hook preexec __qontinui_preexec
+# precmd, registered LAST: P;CommandMarks=1, then A (prompt start). Written
+# here rather than baked into PROMPT, so a theme that reassigns PROMPT in its
+# own precmd (or a hook added after this one) cannot drop A — and no hook can
+# emit a C after it. The capability tells the runner this prompt's A means
+# "nothing is running"; it is sent only while our C path is present, and no
+# REGISTERED user hook runs ahead of it. Between an accepted line and our C,
+# zsh runs (Src/init.c loop(), Src/hist.c hend()): the `zshaddhistory`
+# function and zshaddhistory_functions, then the `preexec` function, then
+# preexec_functions in order — and a DEBUG trap fires before every command,
+# our preexec's first one included. So: our preexec must be the FIRST entry of
+# preexec_functions (a hook prepended later, like a deferred plugin's
+# `preexec_functions=(slow $preexec_functions)`, runs ahead of our C; one
+# appended later does not), and there must be no `preexec` or `zshaddhistory`
+# function, no zshaddhistory_functions entry, and no DEBUG trap (a TRAPDEBUG
+# function, or `trap … DEBUG`, which zsh lists only as `builtin trap` text).
+# Otherwise the pane is kept. `emulate -L zsh`: the user's options
+# (KSH_ARRAYS shifts every subscript to 0-based, NO_UNSET) stay out of it.
+#
+# Reading that text is the one fork in these hooks, made last and only when
+# everything else passed. A fork that fails (EAGAIN at a task/PID ceiling) is
+# caught: nothing is printed, the trap is taken as possibly present (no
+# capability), and A is still sent.
+#
+# Residual, documented rather than gated: line-editor-time code. ZLE widgets
+# (`zle-line-finish`, a wrapped `accept-line`) and PS2 continuation prompts run
+# before the line is accepted, and a PROMPT_SUBST SPROMPT (spelling
+# correction) is expanded AFTER it is accepted, before our C; none is checked,
+# and anything they fork shows in the runner's process read. Gating them would
+# switch the capability off for most p10k and zsh-syntax-highlighting users.
+# The literal is pinned against the webview's COMMAND_MARKS_CAPABILITY by a
+# source scan in src-tauri/src/session/spawn_prompt.rs.
+__qontinui_precmd_prompt_start() {
+    emulate -L zsh
+    local announce=0 traps=
+    if [[ ${preexec_functions[1]-} == __qontinui_preexec ]] &&
+        (( ! ${+functions[preexec]} && ! ${+functions[zshaddhistory]} &&
+            ${#zshaddhistory_functions} == 0 && ! ${+functions[TRAPDEBUG]} )); then
+        {
+            {
+                traps="$(builtin trap)" && announce=1
+            } always {
+                TRY_BLOCK_ERROR=0
+            }
+        } 2>/dev/null
+        if [[ $'\n'${traps}$'\n' == *' DEBUG'$'\n'* ]]; then
+            announce=0
+        fi
+    fi
+    if (( announce )); then
+        __qontinui_osc633 "P;CommandMarks=1"
+    fi
+    __qontinui_osc633 "A"
+}
 
-# Wrap PROMPT with A (prompt start) and B (command ready) markers. %{...%} marks
-# them zero-width so zsh doesn't miscount the prompt length.
-PROMPT="%{$(printf '\033]633;A\007')%}${PROMPT}%{$(printf '\033]633;B\007')%}"
+add-zsh-hook precmd __qontinui_precmd
+# Ours first in preexec_functions, once, the user's hooks after it in their
+# order. Under `emulate -L zsh`, so a user's KSH_ARRAYS cannot make the
+# expansion keep only one element.
+() {
+    emulate -L zsh
+    typeset -ga preexec_functions
+    preexec_functions=(__qontinui_preexec "${(@)preexec_functions:#__qontinui_preexec}")
+}
+add-zsh-hook precmd __qontinui_precmd_prompt_start
+
+# B (command ready) at the end of PROMPT. %{...%} marks it zero-width so zsh
+# doesn't miscount the prompt length. Cosmetic: a theme that rewrites PROMPT
+# drops it, and nothing reads it as state. `$'…'`, not a printf command
+# substitution: no fork, so a shell whose rc left it at a process ceiling
+# installs without an error.
+PROMPT="${PROMPT-}%{"$'\e]633;B\a'"%}"
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap `claude` so sessions launched from this terminal know they run inside
@@ -60,7 +131,7 @@ PROMPT="%{$(printf '\033]633;A\007')%}${PROMPT}%{$(printf '\033]633;B\007')%}"
 # exists, it is passed via --append-system-prompt-file INSTEAD of the inline
 # flag; Claude Code refuses both together, and a missing file is a fatal start,
 # hence the existence check.
-if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
+if [ "${QONTINUI_RUNNER_TERMINAL-}" = "1" ]; then
     claude() {
         case "${1:-}" in
             mcp|config|update|doctor|api-key)

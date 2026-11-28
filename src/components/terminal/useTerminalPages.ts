@@ -255,7 +255,16 @@ export function pageLabelRegistration(
 export function pageIdsFromTerminals(
   terminals: Array<{ pageId?: string; page_id?: string }>,
 ): string[] {
-  return terminals.map((t) => t.pageId || t.page_id || "default");
+  return terminals.map(terminalPageId);
+}
+
+/**
+ * The page one `terminal_list` entry sits on — the single reading of the wire
+ * field that {@link pageIdsFromTerminals} and the page reorganize share
+ * (`pageId`; see above for why `page_id` is only a fallback).
+ */
+export function terminalPageId(t: { pageId?: string; page_id?: string }): string {
+  return t.pageId || t.page_id || "default";
 }
 
 /**
@@ -1552,6 +1561,12 @@ export function useTerminalPages() {
     addPage,
     openPage,
     removePage,
+    /**
+     * Record-only removal of a page that is empty at removal time (re-lists
+     * the terminals, keeps the page when it finds one or cannot read). Closes
+     * no PTY — the page reorganize's removal door. `null` when kept.
+     */
+    removeEmptyPage,
     closeEmptyPages,
     /** Tabs the Close-empty button would close, per the last-known occupancy (a hint; the click re-reads). */
     emptyPageCount,

@@ -723,4 +723,40 @@ describe("probeClaudeInPane", () => {
       }),
     ).toEqual(unknown);
   });
+
+  it("carries the root process only when the answer names all of it", async () => {
+    const answer = (extra: Record<string, unknown>) => async () => ({
+      data: { state: "absent", sessionIds: [], ...extra },
+    });
+    expect(
+      await probeClaudeInPane(
+        "t",
+        answer({ rootImage: "bash", rootIsShell: true, rootDescendants: 1 }),
+      ),
+    ).toEqual({
+      state: "absent",
+      sessionIds: [],
+      root: { image: "bash", isShell: true, descendants: 1 },
+    });
+    expect(
+      await probeClaudeInPane(
+        "t",
+        answer({ rootImage: null, rootIsShell: false, rootDescendants: 0 }),
+      ),
+    ).toEqual({
+      state: "absent",
+      sessionIds: [],
+      root: { image: null, isShell: false, descendants: 0 },
+    });
+    // An older runner sends no root; a partial or malformed one is no root.
+    for (const extra of [
+      {},
+      { rootImage: "bash", rootIsShell: true },
+      { rootImage: "bash", rootIsShell: "yes", rootDescendants: 0 },
+      { rootImage: "bash", rootIsShell: true, rootDescendants: -1 },
+    ]) {
+      const probe = await probeClaudeInPane("t", answer(extra));
+      expect(probe.root).toBeUndefined();
+    }
+  });
 });
