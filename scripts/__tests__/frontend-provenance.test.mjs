@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import {
   computeRustSrcHash,
   foldLines,
   frontendInputs,
+  RUST_SRC_PATHSPECS,
   unignoredPaths,
   verifyFrontend,
   verifyRust,
@@ -62,6 +63,48 @@ function build(dir) {
 test("fold format matches the shared fixture build.rs is pinned to", () => {
   const fx = JSON.parse(readFileSync(path.join(here, "../fixtures/provenance-fold.json"), "utf8"));
   assert.equal(foldLines(fx.entries), fx.expected_fold);
+});
+
+test("the Rust pathspec list is the same in build.rs and here", () => {
+  const buildRs = readFileSync(path.join(here, "../../src-tauri/build.rs"), "utf8");
+  const block = buildRs.match(/const RUST_SRC_PATHSPECS: &\[&str\] = &\[([\s\S]*?)\];/);
+  assert.ok(block, "build.rs no longer declares RUST_SRC_PATHSPECS in the expected shape");
+  const inBuildRs = [...block[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(inBuildRs, RUST_SRC_PATHSPECS);
+});
+
+// The list's stated contract is "the crate, its in-repo path dependencies, the
+// vendored [patch]". Stated in prose it drifted twice: `crates/pty-holder` and
+// `vendor/portable-pty-0.8.1` both reached the binary without moving the hash.
+test("every in-repo path dependency and [patch] of the runner is a provenance input", () => {
+  const repoRoot = path.join(here, "../..");
+  // Walks the manifests, because a dependency of a path dependency reaches the
+  // binary too. `path =` also names [lib] and [[bin]] sources; a directory holding
+  // a manifest is what makes it a crate, in the inline and the table spelling alike.
+  const seen = new Set();
+  const walk = (dir) => {
+    const manifest = readFileSync(path.join(repoRoot, dir, "Cargo.toml"), "utf8");
+    for (const [, value] of manifest.matchAll(/^[^#\n]*\bpath\s*=\s*"([^"]+)"/gm)) {
+      const dep = path.posix.normalize(path.posix.join(dir, value));
+      if (dep.startsWith("../") || seen.has(dep)) continue;
+      if (!existsSync(path.join(repoRoot, dep, "Cargo.toml"))) continue;
+      seen.add(dep);
+      walk(dep);
+    }
+  };
+  walk("src-tauri");
+  walk(".");
+  const inRepo = [...seen];
+  // Pin the parse: an empty or shrunken read would pass the loop below.
+  for (const known of ["crates/pty-holder", "vendor/tao-0.35.0", "vendor/portable-pty-0.8.1"]) {
+    assert.ok(inRepo.includes(known), `manifest read did not find ${known}: ${inRepo}`);
+  }
+  for (const dep of inRepo) {
+    assert.ok(
+      RUST_SRC_PATHSPECS.some((spec) => dep === spec || dep.startsWith(`${spec}/`)),
+      `${dep} reaches the runner binary but is not in RUST_SRC_PATHSPECS`,
+    );
+  }
 });
 
 test("input set: module graph ∩ git-unignored, plus explicit config inputs", () => {
