@@ -15,7 +15,14 @@ name: Python executor command table
 # and neither pyautogui nor mouseinfo, which would bring back the python3-xlib
 # fork (same plan, phase 3).
 #
-# Hermetic: no network, no credentials. NOT a merge gate (absent from the repo
+# The whole python-bridge/tests suite (plus the scripts/ci conformance-script
+# tests) runs from python-bridge/poetry.lock, with the path-dependency siblings
+# (qontinui, multistate, qontinui-schemas) beside the checkout as
+# build-python-executor.yml lays them out, so a lock that stops resolving or a
+# locked dependency that breaks the suite fails here rather than at release.
+# Plan 2026-11-05-dependency-advisory-followups-after-the-pillow-13-lift, Phase 4.
+#
+# Hermetic apart from the lock install: no credentials. NOT a merge gate (absent from the repo
 # ruleset's required contexts). It is inside ci-integrity.yml's scope
 # (`.github/workflows/**`) on a main-based PR, so the PR that adds or edits this
 # file needs `ci:gate-change=declared`.
@@ -26,12 +33,16 @@ on:
     paths:
       - "python-bridge/**"
       - "src-tauri/src/**"
+      - "scripts/ci/assert-venv-matches-lock.py"
+      - "scripts/ci/test_assert_venv_matches_lock.py"
       - ".github/workflows/python-executor-command-table.yml"
   pull_request:
     branches: [main]
     paths:
       - "python-bridge/**"
       - "src-tauri/src/**"
+      - "scripts/ci/assert-venv-matches-lock.py"
+      - "scripts/ci/test_assert_venv_matches_lock.py"
       - ".github/workflows/python-executor-command-table.yml"
   workflow_dispatch:
 
@@ -63,27 +74,87 @@ concurrency:
 jobs:
   command-table:
     name: Executor command table guards
-    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_PYTHON_EXECUTOR_COMMAND_TABLE || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
-    timeout-minutes: 10
+    # ram-16g: the lock install pulls torch and its CUDA wheels, and the suite
+    # imports them (plan 2026-10-28-heavy-ci-jobs-land-only-on-runners-sized-for-them);
+    # peak unmeasured, so the class is the 16 GiB hosted VM, the one known-good bound.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_PYTHON_EXECUTOR_COMMAND_TABLE || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-16g"]' || '"ubuntu-latest"') }}
+    timeout-minutes: 45
     steps:
+      # LAYOUT: the runner under `path:` with the siblings beside it, because
+      # python-bridge/poetry.lock resolves them as `../../<name>`.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          path: qontinui-runner
+
+      - name: Check out sibling qontinui
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          repository: qontinui/qontinui
+          path: qontinui
+
+      - name: Check out sibling multistate
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          repository: qontinui/multistate
+          path: multistate
+
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # A per-job venv under runner.temp, not the interpreter setup-python
-      # resolved: on a persistent self-hosted runner that interpreter lives in
-      # the runner's tool cache and outlives the job, so a bare `pip install`
-      # would leave these packages behind for every later job on the runner.
-      - name: Install test dependencies
+      # Poetry 2.4.1 writes python-bridge/poetry.lock (lock-version 2.1).
+      # pip into a per-job venv under runner.temp, not the setup-python
+      # interpreter: on a persistent self-hosted runner that interpreter
+      # outlives the job.
+      - name: Install Poetry
         run: |
-          python -m venv "$RUNNER_TEMP/venv"
-          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install pytest numpy pillow
+          python -m venv "$RUNNER_TEMP/poetry-venv"
+          "$RUNNER_TEMP/poetry-venv/bin/pip" install poetry==2.4.1
+          echo "$RUNNER_TEMP/poetry-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Run the command-table and temp-debug-log guards
-        # conftest.py imports `models`, so pytest must run from python-bridge/.
-        working-directory: python-bridge
-        run: python -m pytest tests/test_executor_command_table.py tests/test_no_temp_debug_logs.py tests/test_event_path_no_temp_writes.py tests/test_single_xlib_owner.py -q
+      - name: Cache the bridge venv
+        uses: actions/cache@v4
+        with:
+          path: qontinui-runner/python-bridge/.venv
+          key: bridge-test-venv-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-py312-${{ hashFiles('qontinui-runner/python-bridge/poetry.lock') }}
+
+      - name: Install from the lock
+        working-directory: qontinui-runner/python-bridge
+        env:
+          POETRY_VIRTUALENVS_IN_PROJECT: "true"
+        run: poetry sync --no-interaction
+
+      - name: Assert the venv matches poetry.lock
+        working-directory: qontinui-runner/python-bridge
+        run: |
+          poetry check --lock
+          poetry run python ../scripts/ci/assert-venv-matches-lock.py poetry.lock
+
+      - name: Run the lock-conformance script tests
+        working-directory: qontinui-runner
+        run: python-bridge/.venv/bin/python -m pytest scripts/ci/test_assert_venv_matches_lock.py -q
+
+      # The whole suite. test_executor_command_table.py reads src-tauri/src, hence
+      # the full checkout; conftest.py imports `models`, so run from python-bridge/.
+      # xvfb: some tests import display-bound libraries (pyautogui family).
+      # --basetemp under runner.temp: a symlinked default temp dir produced
+      # setup errors on one box.
+      - name: Run the python-bridge suite
+        working-directory: qontinui-runner/python-bridge
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo -n apt-get update -qq && sudo -n apt-get install -y -qq xvfb || {
+              echo "::error::xvfb-run is missing and cannot be installed here (no passwordless sudo): provision xvfb on this runner pool"
+              exit 1
+            }
+          fi
+          xvfb-run -a .venv/bin/python -m pytest tests -q --basetemp "$RUNNER_TEMP/pytest-tmp"
