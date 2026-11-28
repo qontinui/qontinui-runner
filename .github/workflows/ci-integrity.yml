@@ -40,8 +40,10 @@
 #     protection rules, and the branch RULESET itself — none of which live in
 #     these files. (Job-level `env:`/`environment:` DO live here and ARE
 #     captured; an earlier revision of this list wrongly disclaimed them.)
-#   * duplicate YAML keys. `yaml.safe_load` takes last-wins while Actions
-#     rejects them, so digest equality is not equality under Actions' parser.
+#   * (no longer a gap) duplicate YAML keys. `yaml.safe_load` takes last-wins
+#     while Actions rejects them, and Python also collides keys YAML keeps apart
+#     (`on` reads as True, and True == 1 == 1.0), so a head file with any two keys
+#     of one mapping that construct equal is refused as `!DUPKEY` instead.
 #   * semantics. This computes CHANGED vs UNCHANGED, never "weaker vs
 #     stronger". Every alteration to an existing gate is treated alike and must
 #     be declared; the guard does not try to judge intent.
@@ -369,7 +371,13 @@ jobs:
                   # A 200 carrying no content is not an absence we can interpret
                   # (files over ~1MB come back this way).
                   raise RuntimeError(f"empty content for {path}@{ref}")
-              return base64.b64decode(blob).decode("utf-8", "replace")
+              return decode_blob(blob)
+
+          def decode_blob(blob):
+              """The file's text, decoded STRICTLY. A replacement-character decode
+              would let two different byte strings read as one text; invalid UTF-8
+              raises UnicodeDecodeError, which the loop below turns into `!UTF8`."""
+              return base64.b64decode(blob).decode("utf-8")
 
           def canon(o):
               """Type-preserving canonical form. `repr` is what makes it safe.
@@ -395,33 +403,348 @@ jobs:
 
           def digest(obj):
               return hashlib.sha256(repr(canon(obj)).encode()).hexdigest()[:12]
-          def uses_yaml_aliases(text):
-              """Does this document use anchors, aliases, or a merge key?
+          def uses_yaml_merge_key(text):
+              """Does this document use a YAML merge key (`<<:`, or a key tagged `!!merge`)?
 
               Digest equality only means "same gate" if OUR parser agrees with the one
-              GitHub Actions uses, and anchors are a known divergence point: PyYAML
-              RESOLVES them, so a gating file rewritten to use an anchor digests
-              identically to the plain original — while Actions, which does not support
-              them, may refuse the file outright and simply never run the gate. That is a
-              weakening that would read here as "no change at all". Verified: an
-              anchor/alias rewrite and a `<<:` merge rewrite both produced a job digest
-              identical to the plain form.
+              GitHub Actions uses. Anchors and aliases no longer diverge: Actions has
+              resolved them since 2025-09-18, as PyYAML does, so an anchored file
+              digests to exactly the jobs Actions runs, and an edit to an anchored
+              block changes the digest of EVERY job that aliases it. The merge key is
+              not documented as supported by Actions, and this guard's parser (PyYAML)
+              resolves it: if Actions does not, it may refuse the file outright and
+              never run the gate. That is a weakening that would read here as "no
+              change at all".
+              Verified: a `<<:` merge rewrite produced a job digest identical to the
+              plain form.
 
-              So we do not try to decide who is right — we refuse to certify. Checked on
-              HEAD only: base is what is already live, and tripping on it would wedge
-              every PR in the repo rather than the one proposing the change."""
+              So for a merge key we do not try to decide who is right; we refuse to
+              certify. Checked on HEAD only: base is what is already live, and
+              tripping on it would wedge every PR in the repo rather than the one
+              proposing the change."""
+              MERGE_TAG = "tag:yaml.org,2002:merge"
               try:
+                  # 1. The event stream: ANY node -- scalar, sequence or mapping --
+                  #    explicitly tagged as a merge (`!!merge`, a %TAG shorthand
+                  #    or a verbatim `!<tag:yaml.org,2002:merge>`; the parser
+                  #    expands each to the full tag), and every `<<` scalar in any
+                  #    style. An aliased merge key is caught at its anchored
+                  #    definition, which is one of these same events.
+                  node_events = (yaml.events.ScalarEvent, yaml.events.SequenceStartEvent,
+                                 yaml.events.MappingStartEvent)
                   for ev in yaml.parse(text, Loader=yaml.SafeLoader):
-                      if isinstance(ev, yaml.events.AliasEvent):
-                          return True
-                      if getattr(ev, "anchor", None):
+                      if not isinstance(ev, node_events):
+                          continue
+                      if ev.tag == MERGE_TAG:
                           return True
                       if isinstance(ev, yaml.events.ScalarEvent) and ev.value == "<<":
                           return True
+                  # 2. Exactly what PyYAML's flatten_mapping keys on: a mapping KEY
+                  #    node whose RESOLVED tag is the merge tag, whether explicit
+                  #    or implicit. Pass 1 already covers every way to get one;
+                  #    this pass checks the constructor's own predicate, so a
+                  #    resolver path pass 1 did not anticipate is still refused.
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+                  seen, stack = set(), [root] if root is not None else []
+                  while stack:
+                      node = stack.pop()
+                      if id(node) in seen:
+                          continue
+                      seen.add(id(node))
+                      if isinstance(node, yaml.MappingNode):
+                          for k, v in node.value:
+                              if k.tag == MERGE_TAG:
+                                  return True
+                              stack.extend((k, v))
+                      elif isinstance(node, yaml.SequenceNode):
+                          stack.extend(node.value)
               except Exception:
                   # Unparseable is a separate verdict, reached below.
                   return False
               return False
+
+          # The expanded-cost budget for yaml_alias_expansion_exceeds. Aliases are
+          # resolved by REFERENCE when parsed but walked IN FULL by canon(), so a
+          # ~600-byte file of nested aliases (each level aliasing the one below ten
+          # times) costs 10^levels nodes there (measured 0.02 / 0.28 / 5.3 s at 4 /
+          # 5 / 6 levels), which runs this job into its timeout or out of memory.
+          # canon() and digest() also COPY every scalar they reach, so one large
+          # scalar aliased many times is the same attack in bytes (measured: 11k
+          # aliases of a 50 KB scalar, from a 51 KB file, cost 1.7 GB RSS and
+          # 9.4 s). So each node costs 1, plus 1 per 64 bytes of a scalar's text:
+          # the budget bounds nodes AND bytes walked (100,000 units is at most
+          # ~6.4 MB of expanded scalar text). The worst case is larger than that
+          # text: canon() keys on repr(), which escapes non-printable characters,
+          # and astral non-printables inflate ~11x (`\U000xxxxx` per character);
+          # measured near the budget at ~120 MB RSS and ~2.5 s, inside this job's
+          # limits. The largest gating workflow here, ci.yml with
+          # its one shared `test-steps` anchor, costs ~2,400 units (2026-11-26);
+          # 100,000 is ~40x that, and canon() walks it in well under a second.
+          ALIAS_EXPANSION_BUDGET = 100000
+          def yaml_alias_expansion_exceeds(text):
+              """Would walking this document with its aliases expanded exceed the budget?
+
+              Composes the node graph (linear: an alias is the SAME node object, not a
+              copy) and sums each node's expanded size once, memoised by identity, so
+              this costs the size of the file, not of its expansion. A scalar costs
+              1 + len(text) // 64, so a large aliased scalar is charged for the
+              bytes canon() would copy each time it is reached. A recursive alias
+              (a node that contains itself) has no finite expansion and counts as
+              exceeding. Unparseable is a separate verdict, reached below."""
+              try:
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+              except Exception:
+                  return False
+              sizes, open_nodes = {}, set()
+              def size(node):
+                  key = id(node)
+                  if key in sizes:
+                      return sizes[key]
+                  if key in open_nodes:
+                      raise OverflowError("recursive alias")
+                  open_nodes.add(key)
+                  if isinstance(node, yaml.MappingNode):
+                      total = 1 + sum(size(k) + size(v) for k, v in node.value)
+                  elif isinstance(node, yaml.SequenceNode):
+                      total = 1 + sum(size(c) for c in node.value)
+                  else:
+                      total = 1 + len(node.value) // 64
+                  open_nodes.discard(key)
+                  sizes[key] = total
+                  return total
+              try:
+                  return root is not None and size(root) > ALIAS_EXPANSION_BUDGET
+              except (OverflowError, RecursionError):
+                  return True
+
+          # The longest scalar yaml11_divergences / yaml_duplicate_keys will BUILD
+          # (plain or explicitly tagged; untagged quoted and block scalars are
+          # strings and are not built). PyYAML's sexagesimal int construction is
+          # quadratic in its segment count (measured 0.18 / 0.64 / 2.32 s at 50 /
+          # 100 / 200 KB), so a longer one is refused instead of built. The longest
+          # such scalar in this repo's tracked .github YAML is 673 characters
+          # (2026-11-26); 4096 is ~6x that, and builds in well under a millisecond.
+          SCALAR_LENGTH_CAP = 4096
+          def yaml11_divergences(text):
+              """Scalars and line breaks that THIS guard's parser reads differently from Actions.
+
+              PyYAML implements YAML 1.1; Actions documents its workflow syntax as YAML,
+              and is assumed here to parse YAML 1.2 (its parser is not measured from this
+              repo). The two disagree on some scalars, so two spellings PyYAML digests
+              IDENTICALLY can mean different things to Actions -- the digest-equality
+              premise again, as with the merge key. Measured on the PyYAML side:
+              renaming the top-level `on:` to `yes:`, `true:`, `True:` or `ON:` keeps
+              the digest (PyYAML reads every one as the bool True); under YAML 1.2 none
+              of them is the key `on`, so the workflow would have no trigger. A value
+              respelled `yes` for `true`, `1:00` for `60` or `074` for `60` is the same
+              trick in a value.
+
+              Returned as (line, column, text), in the order the checks run:
+              1. On the raw text, first: U+0085, U+2028 or U+2029 ANYWHERE -- YAML 1.1
+                 treats them as line breaks (so they end a comment) and YAML 1.2 does
+                 not, so text after one in a comment is live to PyYAML and a comment to
+                 Actions; with last-wins duplicate keys, a hidden second value -- and a
+                 U+FEFF (byte-order mark) anywhere but offset 0.
+              2. A `%YAML` directive: it selects a YAML version, and the two parsers
+                 disagree on what a 1.1 or 1.2 document means.
+              3. A top-level key other than the plain, untagged, un-anchored `on` that
+                 PyYAML reads as True (`true:` included: both parsers read it as a
+                 bool, but it digests exactly like `on:`), and an anchored `on`.
+              Then per scalar, key or value, in the composed walk:
+              4. A plain or explicitly tagged scalar longer than SCALAR_LENGTH_CAP:
+                 refused WITHOUT being built, because building some (a sexagesimal
+                 int) is quadratic in their length.
+              5. A scalar with an explicit tag, ANY style (`!!bool "yes"`, `!!int |-`),
+                unless PyYAML builds it as a string: what Actions makes of an
+                explicit tag is not documented. The non-specific `!` tag is returned
+                unless PyYAML's value is that same text as a string (YAML 1.2 makes a
+                `!` scalar a string; PyYAML resolves `! true` as True).
+              6. A plain, untagged scalar whose type or value differs between PyYAML's
+                 resolver+constructor and the YAML 1.2 core schema (core12 below), or
+                 whose value cannot be built (a decimal over Python's digit limit).
+              ONE exemption: the top-level key `on` -- plain, untagged and carrying NO
+              anchor, so it cannot be aliased into a value somewhere else -- which PyYAML
+              reads as True and YAML 1.2 as the string "on". Untagged quoted scalars are
+              strings to both parsers and pass. PyYAML resolves no y/n bool, so `y` and
+              `n` are strings to both and are not returned.
+
+              Linear in the file: one event pass and one composed walk (aliases
+              visited once), and every scalar it builds is at most SCALAR_LENGTH_CAP
+              long. Unparseable returns [] (the !PARSE verdict is reached below)."""
+              import math, re
+
+              for ch in ("\u0085", "\u2028", "\u2029", "\ufeff"):
+                  # A BOM is allowed only as the very first character.
+                  at = text.find(ch, 1 if ch == "\ufeff" else 0)
+                  if at >= 0:
+                      line = text.count("\n", 0, at) + 1
+                      return [(line, at - text.rfind("\n", 0, at), "U+%04X" % ord(ch))]
+
+              def core12(s):
+                  # YAML 1.2.2 core schema (section 10.3.2), plain scalars only.
+                  if s in ("", "~", "null", "Null", "NULL"):
+                      return ("null", None)
+                  if s in ("true", "True", "TRUE"):
+                      return ("bool", True)
+                  if s in ("false", "False", "FALSE"):
+                      return ("bool", False)
+                  if re.fullmatch(r"[-+]?[0-9]+", s):
+                      return ("int", int(s, 10))
+                  if re.fullmatch(r"0o[0-7]+", s):
+                      return ("int", int(s[2:], 8))
+                  if re.fullmatch(r"0x[0-9a-fA-F]+", s):
+                      return ("int", int(s[2:], 16))
+                  if re.fullmatch(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?", s):
+                      return ("float", float(s))
+                  if re.fullmatch(r"[-+]?\.(inf|Inf|INF)", s):
+                      return ("float", float(s[0] + "inf") if s[0] in "+-" else float("inf"))
+                  if re.fullmatch(r"\.(nan|NaN|NAN)", s):
+                      return ("float", "nan")
+                  return ("str", s)
+
+              def typed(v):
+                  if v is None:
+                      return ("null", None)
+                  if isinstance(v, bool):
+                      return ("bool", v)
+                  if isinstance(v, int):
+                      return ("int", v)
+                  if isinstance(v, float):
+                      return ("float", "nan" if math.isnan(v) else v)
+                  if isinstance(v, str):
+                      return ("str", v)
+                  return (type(v).__name__, repr(v))
+
+              try:
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+                  # What the source said, by position: a node records neither its
+                  # written tag nor its anchor.
+                  written, directives = {}, []
+                  for ev in yaml.parse(text, Loader=yaml.SafeLoader):
+                      if isinstance(ev, yaml.events.ScalarEvent):
+                          written[(ev.start_mark.line, ev.start_mark.column)] = (ev.tag, ev.anchor)
+                      elif isinstance(ev, yaml.events.DocumentStartEvent) and ev.version is not None:
+                          directives.append((ev.start_mark.line + 1, ev.start_mark.column + 1,
+                                             "%%YAML %d.%d" % ev.version))
+              except Exception:
+                  return []
+              if root is None:
+                  return []
+              build = yaml.constructor.SafeConstructor()
+
+              def value_of(node, tag):
+                  if (node.style is None or tag is not None) and len(node.value) > SCALAR_LENGTH_CAP:
+                      return ("overlong", len(node.value))
+                  try:
+                      return typed(build.construct_object(node))
+                  except Exception:
+                      return ("unconstructable", node.value)
+
+              def where(node):
+                  return (node.start_mark.line + 1, node.start_mark.column + 1, node.value)
+
+              found = list(directives)
+              top_on = set()
+              if isinstance(root, yaml.MappingNode):
+                  for k, _ in root.value:
+                      if not isinstance(k, yaml.ScalarNode):
+                          continue
+                      tag, anchor = written.get((k.start_mark.line, k.start_mark.column), (None, None))
+                      if k.style is None and k.value == "on" and tag is None:
+                          if anchor is None:
+                              top_on.add(id(k))
+                          else:
+                              found.append(where(k))
+                          continue
+                      if value_of(k, tag) == ("bool", True):
+                          found.append(where(k))
+
+              seen, stack = set(), [root]
+              while stack:
+                  node = stack.pop()
+                  if id(node) in seen:
+                      continue
+                  seen.add(id(node))
+                  if isinstance(node, yaml.MappingNode):
+                      for k, v in node.value:
+                          stack.extend((k, v))
+                      continue
+                  if isinstance(node, yaml.SequenceNode):
+                      stack.extend(node.value)
+                      continue
+                  if id(node) in top_on:
+                      continue
+                  tag, _ = written.get((node.start_mark.line, node.start_mark.column), (None, None))
+                  mine = value_of(node, tag)
+                  # Tags first, whatever the style: `!!int "074"` is quoted.
+                  if tag == "!":
+                      if mine != ("str", node.value):
+                          found.append(where(node))
+                      continue
+                  if tag is not None:
+                      if mine[0] != "str":
+                          found.append(where(node))
+                      continue
+                  if node.style is not None:
+                      continue
+                  try:
+                      theirs = core12(node.value)
+                  except ValueError:
+                      theirs = ("unbuildable", node.value)
+                  if mine != theirs:
+                      found.append(where(node))
+              return sorted(found)
+
+          def yaml_duplicate_keys(text):
+              """Keys of one mapping that construct EQUAL: positions (line, column, text).
+
+              `yaml.safe_load` keeps the LAST of two equal keys, and Python equality
+              collides keys YAML keeps apart: the trigger key `on` reads as True, and
+              True == 1 == 1.0 == 0x1, so `on:` narrowed plus a later `1:` carrying
+              the original trigger builds the same dict as the original -- the first
+              key with the last value. A plain duplicate (`timeout-minutes: 1` then
+              `timeout-minutes: 60`) is the same last-wins digest. Actions rejects
+              duplicate keys, so either way the digest is not what Actions runs.
+              Every key is built once into a set per mapping; a key that collides,
+              a non-scalar key, or a key that cannot be built or hashed is returned.
+              A key over SCALAR_LENGTH_CAP is returned unbuilt. Linear: one composed
+              walk, aliases visited once. Unparseable returns []."""
+              try:
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+              except Exception:
+                  return []
+              if root is None:
+                  return []
+              build = yaml.constructor.SafeConstructor()
+              found, seen, stack = [], set(), [root]
+              while stack:
+                  node = stack.pop()
+                  if id(node) in seen:
+                      continue
+                  seen.add(id(node))
+                  if isinstance(node, yaml.SequenceNode):
+                      stack.extend(node.value)
+                      continue
+                  if not isinstance(node, yaml.MappingNode):
+                      continue
+                  keys = set()
+                  for k, v in node.value:
+                      stack.extend((k, v))
+                      text_of = k.value if isinstance(k, yaml.ScalarNode) else "<non-scalar key>"
+                      where = (k.start_mark.line + 1, k.start_mark.column + 1, text_of)
+                      if not isinstance(k, yaml.ScalarNode) or len(k.value) > SCALAR_LENGTH_CAP:
+                          found.append(where)
+                          continue
+                      try:
+                          key = build.construct_object(k)
+                          hash(key)
+                      except Exception:
+                          found.append(where)
+                          continue
+                      if key in keys:
+                          found.append(where)
+                      keys.add(key)
+              return sorted(found)
 
           def surface(text):
               """(workflow_surface, {job_key: job_spec}) or None if unparseable.
@@ -557,8 +880,17 @@ jobs:
               clean = " ".join(str(path).split())
               if path in WHOLE_FILE_GATES:
                   return [(kind, clean, tok) for kind, tok in file_findings(path, base_text, head_text)]
-              if head_text is not None and uses_yaml_aliases(head_text):
-                  return [("!ALIAS", clean, "-")]
+              if head_text is not None and uses_yaml_merge_key(head_text):
+                  return [("!MERGE", clean, "-")]
+              # Before surface()/digest(), which would walk every alias in full.
+              if head_text is not None and yaml_alias_expansion_exceeds(head_text):
+                  return [("!ALIASBOMB", clean, "-")]
+              # A respelling only YAML 1.1 equates (e.g. `on:` -> `yes:`).
+              if head_text is not None and yaml11_divergences(head_text):
+                  return [("!YAML11", clean, "-")]
+              # Two keys of one mapping that build equal (last-wins, True == 1).
+              if head_text is not None and yaml_duplicate_keys(head_text):
+                  return [("!DUPKEY", clean, "-")]
               b = surface(base_text)
               h = surface(head_text)
               if b is None or h is None:
@@ -583,10 +915,22 @@ jobs:
                       elif digest(spec) != digest(h_jobs[key]):
                           rows.append(("CHANGED", clean, token(clean, key)))
               return rows
+          def findings_for(path, read):
+              """Every finding row for one hit path, read through `read(path, ref)`.
+              A file that is not valid UTF-8 at either side is `!UTF8`: strictly
+              decoded it cannot be read, and a lossy decode could read two different
+              files as one text."""
+              texts = {}
+              for side, ref in (("base", os.environ["MERGE_BASE"]), ("head", os.environ["HEAD_SHA"])):
+                  try:
+                      texts[side] = read(path, ref)
+                  except UnicodeDecodeError:
+                      # The side rides in the token column, for the message below.
+                      return [("!UTF8", " ".join(str(path).split()), side)]
+              base_text, head_text = texts["base"], texts["head"]
+              return path_findings(path, base_text, head_text)
           for path in [p for p in os.environ["HIT_PATHS"].splitlines() if p.strip()]:
-              base_text = content_at(path, os.environ["MERGE_BASE"])
-              head_text = content_at(path, os.environ["HEAD_SHA"])
-              for kind, clean, tok in path_findings(path, base_text, head_text):
+              for kind, clean, tok in findings_for(path, content_at):
                   print(f"{kind}{TAB}{clean}{TAB}{tok}")
           PY
 
@@ -599,15 +943,64 @@ jobs:
             exit 1
           fi
           
-          # Anchors/aliases/merge keys: our parser resolves them and Actions does not
-          # support them, so a rewritten-but-identical-looking file could be one this
-          # repo can no longer run. We do not adjudicate that -- we decline to certify.
-          if grep -q '^!ALIAS' <<< "${FINDINGS}"; then
-            echo "::error::A gating file uses YAML anchors, aliases or a merge key at head:"
-            grep '^!ALIAS' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
-            echo "GitHub Actions does not support them, while this check RESOLVES them --"
-            echo "so an anchored rewrite can digest as unchanged while the gate stops"
-            echo "running. Write the file without anchors so it can be verified."
+          # Merge keys: our parser resolves them and Actions does not document
+          # support for them, so a rewritten-but-identical-looking file could be one
+          # this repo can no longer run. We do not adjudicate that -- we decline to
+          # certify.
+          if grep -q '^!MERGE' <<< "${FINDINGS}"; then
+            echo "::error::A gating file uses a YAML merge key (<<: or !!merge) at head:"
+            grep '^!MERGE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "Merge keys are not documented as supported by GitHub Actions, and this"
+            echo "check RESOLVES them -- so a merge-key rewrite can digest as unchanged"
+            echo "while the gate stops running. Write the mapping out (anchors and"
+            echo "aliases are fine)."
+            exit 1
+          fi
+
+          # Alias expansion past the budget: digesting the file would walk every
+          # alias in full, which a small nested-alias file makes exponential.
+          if grep -q '^!ALIASBOMB' <<< "${FINDINGS}"; then
+            echo "::error::A gating file's YAML aliases expand past the guard's budget at head:"
+            grep '^!ALIASBOMB' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "Expanded, it exceeds the expansion budget (nodes plus scalar bytes,"
+            echo "ALIAS_EXPANSION_BUDGET) or aliases itself, so it cannot be digested in"
+            echo "bounded time. Use fewer nested aliases, or do not alias a large scalar"
+            echo "many times."
+            exit 1
+          fi
+
+          # YAML 1.1 respellings: this check parses YAML 1.1 (PyYAML), Actions parses
+          # YAML 1.2, and they disagree on some plain scalars, so a respelled gate can
+          # digest as unchanged while Actions reads something else.
+          if grep -q '^!YAML11' <<< "${FINDINGS}"; then
+            echo "::error::A gating file has scalars or line breaks that YAML 1.1 and 1.2 read differently at head:"
+            grep '^!YAML11' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "This check parses YAML 1.1 and GitHub Actions is assumed to parse YAML 1.2, so a key or"
+            echo "value such as yes/no/on/off, 1:00, 074, 0b1, 6_0 or 1e3, an explicit or '!'"
+            echo "tag on a non-string, a U+0085/U+2028/U+2029 line break, a mid-file U+FEFF, a"
+            echo "%YAML directive or an over-long plain scalar means one thing"
+            echo "here and another to Actions (the top-level 'on:' key is the one exemption)."
+            echo "Write a form both read alike (true/false, 60, an untagged quoted string)."
+            exit 1
+          fi
+
+          # Duplicate keys: PyYAML keeps the last of two equal keys (and Python makes
+          # `on`/True, 1 and 1.0 equal), while Actions rejects duplicates.
+          if grep -q '^!DUPKEY' <<< "${FINDINGS}"; then
+            echo "::error::A gating file has two keys in one mapping that read as equal at head:"
+            grep '^!DUPKEY' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "This check keeps the LAST of two equal keys (and reads 'on', true, 1 and"
+            echo "1.0 as equal) while Actions rejects a duplicate, so the digest is not what"
+            echo "Actions runs. Remove the duplicate, or use a key that cannot collide."
+            exit 1
+          fi
+
+          # Invalid UTF-8: decoded with replacement characters, two different files
+          # could read as one text. Decoded strictly, it cannot be digested.
+          if grep -q '^!UTF8' <<< "${FINDINGS}"; then
+            echo "::error::A gating file is not valid UTF-8 (the side that failed is named):"
+            grep '^!UTF8' <<< "${FINDINGS}" | awk -F '\t' '{ print "  - " $2 " (at the " ($3 == "base" ? "merge base" : "PR head") ")" }'
+            echo "It cannot be decoded exactly, so it cannot be verified. Save it as UTF-8."
             exit 1
           fi
 

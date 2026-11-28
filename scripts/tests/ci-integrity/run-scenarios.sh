@@ -335,19 +335,68 @@ printf 'ci:gate-change=declared
 ' > "$FIXTURE/labels.txt"
 run_case "X7 a truncated file list is a hard error, not a pass" 1 no "cannot certify anything"
 
-# A gating file that uses YAML anchors at head cannot be certified: PyYAML
-# resolves them and Actions does not support them, so an anchored rewrite
+# A gating file that uses a YAML merge key at head cannot be certified: the
+# merge key is not documented as supported by Actions, and it is refused
+# because the guard's parser (PyYAML) resolves it, so a merge-key rewrite
 # digests as unchanged while the gate may stop running. Declaring it must not
-# help -- there is nothing trustworthy to declare against.
+# help -- there is nothing trustworthy to declare against. (Anchors and aliases
+# are certified normally: Actions resolves them as PyYAML does.)
 new_fixture
 printf '.github/workflows/ci.yml
 ' > "$FIXTURE/files.txt"
-finding '!ALIAS' ".github/workflows/ci.yml" "-"
+finding '!MERGE' ".github/workflows/ci.yml" "-"
 printf 'ci:gate-change=alters-a-gate
 ' > "$FIXTURE/labels.txt"
 printf 'Gate-Change: anything
 ' > "$FIXTURE/body.txt"
-run_case "X8 anchored gating file -> RED even when fully declared" 1 no "anchors, aliases or a merge key"
+run_case "X8 merge-key gating file -> RED even when fully declared" 1 no "uses a YAML merge key"
+
+# A gating file whose aliases expand past the guard's node budget is refused by
+# name: digesting it would walk every alias in full (exponential in the nesting).
+new_fixture
+printf '.github/workflows/ci.yml
+' > "$FIXTURE/files.txt"
+finding '!ALIASBOMB' ".github/workflows/ci.yml" "-"
+printf 'ci:gate-change=alters-a-gate
+' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: anything
+' > "$FIXTURE/body.txt"
+run_case "X8b alias-bomb gating file -> RED even when fully declared" 1 no "expand past the guard's budget"
+
+# A gating file with a plain scalar YAML 1.1 (this check) and YAML 1.2 (Actions)
+# read differently -- e.g. the trigger key respelled `yes:` -- is refused by
+# name: it can digest as unchanged while Actions never triggers it.
+new_fixture
+printf '.github/workflows/ci.yml
+' > "$FIXTURE/files.txt"
+finding '!YAML11' ".github/workflows/ci.yml" "-"
+printf 'ci:gate-change=alters-a-gate
+' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: anything
+' > "$FIXTURE/body.txt"
+run_case "X8c YAML 1.1 respelling -> RED even when fully declared" 1 no "YAML 1.1 and 1.2 read differently"
+
+# two keys of one mapping build equal (last-wins; on/True == 1): refused by name.
+new_fixture
+printf '.github/workflows/ci.yml
+' > "$FIXTURE/files.txt"
+finding '!DUPKEY' ".github/workflows/ci.yml" "-"
+printf 'ci:gate-change=alters-a-gate
+' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: anything
+' > "$FIXTURE/body.txt"
+run_case "X8d duplicate key -> RED even when fully declared" 1 no "two keys in one mapping that read as equal"
+
+# a gating file is not valid UTF-8 (a lossy decode could read two files as one): refused by name.
+new_fixture
+printf '.github/workflows/ci.yml
+' > "$FIXTURE/files.txt"
+finding '!UTF8' ".github/workflows/ci.yml" "head"
+printf 'ci:gate-change=alters-a-gate
+' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: anything
+' > "$FIXTURE/body.txt"
+run_case "X8e invalid UTF-8 -> RED even when fully declared, naming the side" 1 no ".github/workflows/ci.yml (at the PR head)"
 
 # An unreadable file count must FAIL, not skip the truncation guard. `set -e`
 # does not fire for a failing command in an `if` CONDITION, so a non-numeric
