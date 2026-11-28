@@ -2146,8 +2146,11 @@ mod tests {
     /// worktree, each a linked worktree of its own primary checkout, both under
     /// `<ws>/agent-worktrees/<agent>/`, plus an account dir.
     struct MultiWorktree {
-        _amb: crate::test_env::IsolatedAmbient,
+        // Field order is drop order: `_restore` must drop while `_amb` still
+        // holds the env lock, so the dial and worktree-root vars are put back
+        // before a concurrent fixture can take the lock and set its own.
         _restore: crate::test_env::EnvVarRestore,
+        _amb: crate::test_env::IsolatedAmbient,
         cwd: String,
         sibling: std::path::PathBuf,
         sibling_primary: std::path::PathBuf,
