@@ -149,7 +149,7 @@ export function useProjectTerminalReconcile(
           failed += 1;
           continue;
         }
-        closeTerminal(tab.id);
+        closeTerminal(tab.id, { immediate: true });
       }
     } finally {
       setMoving(false);

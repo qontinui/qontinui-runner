@@ -33,6 +33,12 @@ pub struct GeneralSettingsPayload {
     pub include_summary_step_by_default: bool,
     pub preflight_check_enabled: bool,
     pub session_auto_fix_on_failure: bool,
+    /// `Settings.report_pressure_stops` (plan
+    /// `2026-11-24-pressure-stops-record-box-stats-in-coord`). Optional on PUT:
+    /// absent leaves the stored value alone, so a client that predates the
+    /// field cannot reset it.
+    #[serde(default)]
+    pub report_pressure_stops: Option<bool>,
 }
 
 /// Agentic settings payload (compression, retry, routing).
@@ -85,6 +91,9 @@ async fn get_general_settings(
             include_summary_step_by_default: s.include_summary_step_by_default,
             preflight_check_enabled: s.preflight_check_enabled,
             session_auto_fix_on_failure: s.session_auto_fix_on_failure,
+            // `null` when the settings file could not be read authoritatively
+            // (UNKNOWN), never the placeholder default.
+            report_pressure_stops: settings::get_report_pressure_stops(),
         }
     })
     .await
@@ -109,6 +118,14 @@ async fn save_general_settings(
             s.include_summary_step_by_default = payload.include_summary_step_by_default;
             s.preflight_check_enabled = payload.preflight_check_enabled;
             s.session_auto_fix_on_failure = payload.session_auto_fix_on_failure;
+            if let Some(report) = payload.report_pressure_stops {
+                s.report_pressure_stops = report;
+            }
+        })
+        .inspect(|()| {
+            if let Some(report) = payload.report_pressure_stops {
+                crate::pressure_stop::set_enabled(report);
+            }
         })
     })
     .await

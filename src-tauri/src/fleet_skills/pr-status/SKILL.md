@@ -111,8 +111,7 @@ Three shapes:
    refused successor: <successor> (<arm>, <author_association>, refused <refused_at>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — verify content by hand
    ```
 
-   Inside either line, any field that is `null` or missing prints `?`, never a
-   guess. `successor land` is the successor's land, not proof this PR's code is
+   `successor land` is the successor's land, not proof this PR's code is
    on the base, and `content noop` alone is not equivalence: print the counts
    beside it.
 
@@ -129,6 +128,63 @@ Three shapes:
    `superseded_by_refused: []` prints nothing. `null` prints
    `refused successor: ? UNKNOWN (read failed)`, and a card with no such key
    prints `refused successor: ? UNKNOWN (older coord)`.
+
+   A `supersedes #N` declaration has three outcomes, and each has its own
+   field. `superseded_by` lists successors whose declaration coord RECORDED.
+   `superseded_by_refused` lists those it REFUSED, and names the reason in
+   `arm`. `superseded_by_pending` lists those it COULD NOT DECIDE: the
+   author-permission lookup erred, so the declaration waits for the backfill
+   to re-read it. `lookup_error` gives the cause (`budget_cooldown`,
+   `budget_paced`, `github_status_<code>` or `other`), and `backfill.state`
+   says how far that re-read has got. A `none_recorded` status beside a
+   non-empty pending list therefore means pending, not "not superseded". Print
+   one line per pending entry:
+
+   ```
+   pending successor: <successor> (lookup <lookup_error>, pending since <pending_since>, backfill <backfill>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — coord has not decided; <remedy>
+   ```
+
+   `<backfill>` is rendered from `backfill.state` as follows:
+   - `failed` or `deferred` prints as-is, followed by
+     `(<backfill.outcome>, at <backfill.at>)`.
+   - `not_attempted_or_unrecorded` prints as `? UNKNOWN (no backfill trace)`.
+   - `outside_backfill_window` prints as-is. The backfill will not re-read
+     that declaration again.
+
+   `<remedy>` depends on whether the successor has landed:
+   - When `successor_land_stamp` is `terminal` (so `successor_land` is set),
+     print `coord_declare_supersession records it if the successor is yours`.
+     That door re-checks the successor's author and its land on the server.
+   - When it is `current_head`, `superseded_head` or `terminal_uncorroborated`,
+     print the same text. Note that the door
+     decides land by its own `pr_merged` verdict, so it may still refuse. A
+     refusal naming its land check means "not landed yet".
+   - Otherwise, and when `backfill.state` is not `outside_backfill_window`,
+     print `it records on the next backfill re-read or webhook;
+     coord_declare_supersession applies only once the successor lands`.
+   - Otherwise, when it is `outside_backfill_window`, print `the backfill
+     will not re-read it; a new webhook records it, or
+     coord_declare_supersession once the successor lands`.
+
+   `superseded_by_pending: []` prints nothing. `null` prints
+   `pending successor: ? UNKNOWN (read failed)`, and a card with no such key
+   prints `pending successor: ? UNKNOWN (older coord)`.
+
+   The successor's own card answers the same question from the other side.
+   `declares_supersession` holds one entry per predecessor that its title
+   declares or the agent door recorded. Each entry has a `state` of
+   `recorded`, `refused`, `pending` or `not_recorded`. Print each entry as
+   `declares supersession of <predecessor>: <state>`, with `not_recorded`
+   printed as `not_recorded (UNKNOWN, not "nothing declared")`. `[]` means
+   neither the title nor an agent declaration names a predecessor. `null`,
+   or no such key, prints `declares supersession: ? UNKNOWN`.
+
+   On every supersession line (declared, refused, pending, declares
+   supersession), the same two rules apply:
+   - A `null` or missing field prints `?`, never a guess.
+   - A value of `backfill.state`, `lookup_error` or a `declares_supersession`
+     `state` outside the sets above prints
+     `? UNKNOWN (unrecognised <field> <value>)`.
 4. **Never cache the result in memory.** The whole point is that this read is
    always fresh and self-describing. If you want to record something durable
    about the PR, record the **narrative** (why it exists, its recurring failure

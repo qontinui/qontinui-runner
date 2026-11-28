@@ -15,9 +15,10 @@ import type { ExternalElement } from "../../types/ui-bridge-types";
  * not re-export `Scrubbed` (nor any of its minters) from a public entry point,
  * and the brand key is a module-private `unique symbol`, so a consumer can
  * neither name nor mint it. Deriving the alias from the wire type also keeps
- * this file compiling against BOTH the published `@qontinui/ui-bridge@0.22.0`
- * (where the field is a plain `string`, so this collapses to `string`) and
- * ui-bridge `main` (where it is `Scrubbed<string>`).
+ * this file compiling whichever shape the installed `@qontinui/ui-bridge`
+ * declares: a plain `string` (older releases such as 0.22.0, where this
+ * collapses to `string`) or `Scrubbed<string>` (later releases, including
+ * the current pin).
  */
 type ScrubbedString = NonNullable<DiscoveredElement["label"]>;
 
@@ -80,7 +81,7 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
     state: {
       visible: ext.visible,
       enabled: ext.enabled,
-      // `@qontinui/ui-bridge@0.24.0` (ui-bridge#166) split the disabled axis:
+      // `@qontinui/ui-bridge@0.24.0` (ui-bridge#144) split the disabled axis:
       // `enabled` stayed as the DERIVED `!(disabled || ariaDisabled)`, and the
       // two independent signals became required fields. The external wire
       // carries only the folded bit plus `accessibility.ariaDisabled`, so this
@@ -93,6 +94,13 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
       ariaDisabled: ext.accessibility?.ariaDisabled ?? false,
       disabled: !ext.enabled && !(ext.accessibility?.ariaDisabled ?? false),
       focused: ext.focused,
+      // `@qontinui/ui-bridge@0.62` made `ariaBusy` a required state field.
+      // When the source sent the element's reading it is carried through.
+      // When it did not (an older SDK, a legacy extension), `false` is an
+      // ASSUMPTION, not an observation: it matches WAI-ARIA's default for an
+      // element with no `aria-busy` attribute, but such a source may be
+      // showing a busy element it never reported.
+      ariaBusy: ext.ariaBusy ?? false,
       textContent: asScrubbed(ext.text || ext.accessibleName || ext.accessibility?.accessibleName),
       value: asScrubbed(ext.value),
       checked: ext.checked,

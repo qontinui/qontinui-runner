@@ -2157,10 +2157,16 @@ mod timeout_tests {
     /// the shape a `git` that spawns a credential/askpass helper takes. Eight
     /// seconds is comfortably longer than `COMPLETED_DRAIN_GRACE`, which is all
     /// the assertion needs.
+    ///
+    /// The child creates `marker` as its first act, so a test can time the
+    /// call from the moment the child started (see [`timed_after_child_start`])
+    /// instead of from before the spawn, whose cost on a loaded box the drain
+    /// grace does not cover.
     #[cfg(unix)]
-    fn completed_with_surviving_grandchild() -> std::process::Command {
+    fn completed_with_surviving_grandchild(marker: &std::path::Path) -> std::process::Command {
         let mut c = no_window("sh");
-        c.args(["-c", "sleep 8 & exit 0"]);
+        c.arg("-c")
+            .arg(format!("touch '{}'; sleep 8 & exit 0", marker.display()));
         c
     }
 
@@ -2196,13 +2202,15 @@ mod timeout_tests {
     fn a_completed_child_with_a_surviving_grandchild_does_not_block_forever() {
         let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let before = live_pipe_readers();
-        let started = Instant::now();
-        let out = run_with_timeout(
-            completed_with_surviving_grandchild(),
-            Duration::from_secs(20),
-        )
-        .expect("spawn");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (out, elapsed) = timed_after_child_start(&marker, || {
+            run_with_timeout(
+                completed_with_surviving_grandchild(&marker),
+                Duration::from_secs(20),
+            )
+            .expect("spawn")
+        });
 
         match out {
             TimedOutput::Completed(o) => {
@@ -2217,7 +2225,7 @@ mod timeout_tests {
         }
 
         // The whole point: bounded by the drain grace, NOT by the grandchild's
-        // 30s lifetime and NOT forever.
+        // 8s lifetime and NOT forever.
         assert!(
             elapsed < COMPLETED_DRAIN_GRACE + Duration::from_secs(3),
             "the completed path blocked for {elapsed:?} waiting on a grandchild-held pipe"

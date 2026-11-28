@@ -43,6 +43,7 @@ use crate::mcp::remote_create_reaper::{
     ClosingUnderCreateGrant, CreateCloseClaim, RemoteCreateReaper,
 };
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
+use crate::terminal::input_funnel::RelayInputProvenance;
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
 // ---------------------------------------------------------------------------
@@ -2710,8 +2711,16 @@ pub const GRANT_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
 /// re-implement: the ack belongs to whichever component performs the write.
 pub trait TerminalInputSink {
     /// Write raw bytes into the named terminal. `Err` for an unknown terminal
-    /// or a dead PTY.
-    fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String>;
+    /// or a dead PTY. `provenance` is the frame's relay stamps, recorded beside
+    /// the write in the pane's input funnel (plan
+    /// `2026-10-28-one-session-lifecycle-authority` Phase 80) — never
+    /// consulted for authority.
+    fn write_input(
+        &self,
+        terminal_id: &str,
+        bytes: &[u8],
+        provenance: RelayInputProvenance,
+    ) -> Result<(), String>;
 
     /// Would [`Self::write_input`] be accepted for `terminal_id` right now?
     /// Answers WITHOUT writing and without recording anything the phantom-turn
@@ -2727,11 +2736,16 @@ pub trait TerminalInputSink {
 pub const TERMINAL_NOT_FOUND_PREFIX: &str = "Terminal not found:";
 
 impl TerminalInputSink for crate::terminal::TerminalManager {
-    fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
+    fn write_input(
+        &self,
+        terminal_id: &str,
+        bytes: &[u8],
+        provenance: RelayInputProvenance,
+    ) -> Result<(), String> {
         match self.get(terminal_id) {
             Some(session) => session.write(
                 bytes,
-                crate::terminal::session::PtyWriteCaller::RemoteTerminalInput,
+                crate::terminal::session::PtyWriteCaller::RemoteTerminalInput(provenance),
             ),
             None => Err(format!("{TERMINAL_NOT_FOUND_PREFIX} {terminal_id}")),
         }
@@ -2876,11 +2890,16 @@ pub fn apply_terminal_input<S: TerminalInputSink, P: FnOnce() -> AcceptRemoteAtt
         }
     };
 
+    // The frame's relay stamps, kept beside the write. `remote_block` is the
+    // arm the grant gate just took, so the record says exactly which path the
+    // bytes came down.
+    let provenance = RelayInputProvenance::from_frame(data, admitted.is_some());
+
     let Some(grant) = admitted else {
         // The operator path — unchanged, no reply.
         match STANDARD.decode(input_data) {
             Ok(bytes) => {
-                if let Err(e) = sink.write_input(terminal_id, &bytes) {
+                if let Err(e) = sink.write_input(terminal_id, &bytes, provenance) {
                     warn!("Relay: failed to write to terminal {}: {}", terminal_id, e);
                 }
             }
@@ -2902,7 +2921,7 @@ pub fn apply_terminal_input<S: TerminalInputSink, P: FnOnce() -> AcceptRemoteAtt
         }
     } else {
         match STANDARD.decode(input_data) {
-            Ok(bytes) => match sink.write_input(terminal_id, &bytes) {
+            Ok(bytes) => match sink.write_input(terminal_id, &bytes, provenance) {
                 Ok(()) => InputOutcome::Accepted { bytes: bytes.len() },
                 Err(e) => InputOutcome::Refused {
                     code: input_ack_error_code(&e),
@@ -5206,15 +5225,22 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         writes: StdMutex<Vec<(String, Vec<u8>)>>,
+        provenances: StdMutex<Vec<RelayInputProvenance>>,
         probes: StdMutex<Vec<String>>,
         fail: Option<String>,
     }
 
     impl TerminalInputSink for RecordingSink {
-        fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
+        fn write_input(
+            &self,
+            terminal_id: &str,
+            bytes: &[u8],
+            provenance: RelayInputProvenance,
+        ) -> Result<(), String> {
             if let Some(e) = &self.fail {
                 return Err(e.clone());
             }
+            self.provenances.lock().unwrap().push(provenance);
             self.writes
                 .lock()
                 .unwrap()
@@ -5434,6 +5460,51 @@ mod tests {
             }
         }
         f
+    }
+
+    /// Phase 80 of plan `2026-10-28-one-session-lifecycle-authority`: every
+    /// written frame carries its relay stamps to the write, and the record
+    /// says which arm the grant gate took. `origin: user_session` counts only
+    /// on a frame with no `remote` block (NC6-2); on a remote source's frame
+    /// it is kept but reads as no operator stamp.
+    #[test]
+    fn written_input_carries_the_frames_relay_stamps_beside_it() {
+        let sink = RecordingSink::default();
+        let mut operator = input_frame(None);
+        operator["origin"] = json!("user_session");
+        operator["writer"] = json!("diag-writer");
+        apply_terminal_input(
+            &sink,
+            &RemoteAttachGrants::new(),
+            || AcceptRemoteAttach::Off,
+            &operator,
+            NOW,
+        );
+        let table = admitted_table();
+        let remote = remote_input(json!({"origin": "user_session"}));
+        apply_terminal_input(&sink, &table, || AcceptRemoteAttach::Tenant, &remote, NOW);
+        // An unstamped operator frame proves nothing.
+        apply_terminal_input(
+            &sink,
+            &RemoteAttachGrants::new(),
+            || AcceptRemoteAttach::Off,
+            &input_frame(None),
+            NOW,
+        );
+
+        let p = sink.provenances.lock().unwrap().clone();
+        assert_eq!(p.len(), 3);
+        assert!(!p[0].remote_block);
+        assert_eq!(p[0].writer.as_deref(), Some("diag-writer"));
+        assert!(p[0].user_session_stamped());
+        assert!(p[1].remote_block);
+        assert_eq!(p[1].origin.as_deref(), Some("user_session"));
+        assert!(
+            !p[1].user_session_stamped(),
+            "a remote frame's origin is not authority"
+        );
+        assert!(!p[2].user_session_stamped());
+        assert_eq!(p[2].origin, None);
     }
 
     /// (1) An accepted remote input yields exactly one ack: accepted, the
