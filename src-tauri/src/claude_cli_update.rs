@@ -79,8 +79,8 @@
 
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -134,9 +134,8 @@ impl UpdateFlag {
         }
     }
 
-    /// Test-only: production code waits on the flag ([`wait_if_updating`]),
-    /// it never polls it.
-    #[cfg(test)]
+    /// Whether an install is running right now. Spawn paths WAIT on the flag
+    /// ([`wait_if_updating`]); only the `/health` read ([`health_json`]) polls it.
     fn is_updating(&self) -> bool {
         *self.tx.borrow()
     }
@@ -538,6 +537,10 @@ pub(crate) trait CliOps {
         install: &NpmGlobalInstall,
         version: &str,
     ) -> impl Future<Output = InstallRun> + Send;
+    /// Tell coord an install did not take. [`tick`] calls it at most once per
+    /// [`ReportedTriple`]; the real implementation is best-effort and must not
+    /// block the tick.
+    fn report_did_not_take(&self, last: &LastInstall);
 }
 
 /// What the updater carries from one tick to the next.
@@ -550,6 +553,164 @@ pub(crate) struct UpdaterState {
     /// `claude --version` can no longer find it; a repair that also fails
     /// starts the ordinary [`DID_NOT_TAKE_BACKOFF`].
     pub repair: Option<NpmGlobalInstall>,
+    /// What `/health` serves as `cliUpdate` (via [`run_periodic`]).
+    pub health: CliUpdateHealth,
+    /// Which failed install coord has confirmed storing a finding for, and
+    /// which one a detached post is carrying right now. Seeded at boot from the
+    /// durable record of the last CONFIRMED report, so a restart does not post
+    /// the same failure again.
+    pub report_ledger: std::sync::Arc<ReportLedger>,
+}
+
+/// The dedup ledger for install-failure findings: ONE finding per change of
+/// `(installed, expected, exitCode)`. It is a single slot, not a set — a
+/// failure that recurs after a different one is posted again, which is the
+/// intent: the box's state changed twice.
+///
+/// `confirmed` moves only when coord confirmed STORING the finding; a post
+/// that fails, is refused, answers `posted: false` or an unreadable body
+/// releases its `in_flight` claim, so the next did-not-take tick offers the
+/// same failure again. `in_flight` stops a second post while one is pending.
+#[derive(Debug, Default)]
+pub(crate) struct ReportLedger {
+    slots: Mutex<LedgerSlots>,
+}
+
+#[derive(Debug, Default)]
+struct LedgerSlots {
+    confirmed: Option<ReportedTriple>,
+    in_flight: Option<ReportedTriple>,
+}
+
+impl ReportLedger {
+    pub(crate) fn seeded(confirmed: Option<ReportedTriple>) -> Self {
+        Self {
+            slots: Mutex::new(LedgerSlots {
+                confirmed,
+                in_flight: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerSlots> {
+        match self.slots.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Claim the right to post `t`: `false` when coord already holds it or a
+    /// post of it is pending.
+    pub(crate) fn begin(&self, t: &ReportedTriple) -> bool {
+        let mut s = self.lock();
+        if s.confirmed.as_ref() == Some(t) || s.in_flight.as_ref() == Some(t) {
+            return false;
+        }
+        s.in_flight = Some(t.clone());
+        true
+    }
+
+    /// Coord confirmed storing `t`.
+    pub(crate) fn confirmed(&self, t: &ReportedTriple) {
+        let mut s = self.lock();
+        s.confirmed = Some(t.clone());
+        if s.in_flight.as_ref() == Some(t) {
+            s.in_flight = None;
+        }
+    }
+
+    /// The post of `t` did not establish storage: release the claim.
+    pub(crate) fn failed(&self, t: &ReportedTriple) {
+        let mut s = self.lock();
+        if s.in_flight.as_ref() == Some(t) {
+            s.in_flight = None;
+        }
+    }
+}
+
+// =============================================================================
+// The outcome a reader can find without the journal
+// =============================================================================
+
+/// The `/health` `cliUpdate` body, minus the live fields (`inProgress`,
+/// `updaterRunsHere`) that [`health_json`] reads at serve time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CliUpdateHealth {
+    pub last_tick: Option<LastTick>,
+    pub last_install: Option<LastInstall>,
+}
+
+/// What the most recent tick decided and read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LastTick {
+    /// `install` or `skip`.
+    pub decision: String,
+    /// [`SkipReason::as_str`] when the tick skipped.
+    pub skip_reason: Option<String>,
+    /// The tick's own `claude --version` read — never inferred from an
+    /// install's exit code. `None` = not read or unreadable.
+    pub installed: Option<String>,
+    pub published: Option<String>,
+    pub observed_at_ms: u64,
+}
+
+/// How an install ended, judged by the version read back after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallOutcome {
+    /// The read-back is the version the install pinned.
+    Took,
+    /// A CLI is readable, but it is not the version the install pinned.
+    DidNotTake,
+    /// No CLI could be read back at all.
+    LeftUnreadable,
+}
+
+/// The most recent install this updater ran. Persisted to
+/// `cli-update-last.json` ([`last_install_path`]) so a restarted runner still
+/// serves it, marked `fromPriorProcess`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LastInstall {
+    pub outcome: InstallOutcome,
+    /// npm's exit code; `None` = timed out, could not start, or was killed.
+    pub exit_code: Option<i32>,
+    pub stderr_tail: String,
+    /// The version read back after the install (`None` = unreadable).
+    pub installed: Option<String>,
+    /// The version the install pinned.
+    pub expected: String,
+    pub attempted_at_ms: u64,
+    /// Installs in a row, this one included, that did not take; `0` after one
+    /// that took. Carried across restarts through the persisted record.
+    pub consecutive_did_not_take: u32,
+    /// `true` when this record was loaded from disk at start-up and this
+    /// process has not run an install of its own since.
+    #[serde(default)]
+    pub from_prior_process: bool,
+}
+
+impl LastInstall {
+    /// The identity a coord finding is posted once for.
+    pub(crate) fn triple(&self) -> ReportedTriple {
+        ReportedTriple {
+            installed: self.installed.clone(),
+            expected: self.expected.clone(),
+            exit_code: self.exit_code,
+        }
+    }
+}
+
+/// `(installed, expected, exitCode)` of a failed install: one coord finding
+/// per distinct triple.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReportedTriple {
+    pub installed: Option<String>,
+    pub expected: String,
+    pub exit_code: Option<i32>,
 }
 
 /// What one tick saw and did. Logged by [`run_periodic`]; asserted by tests.
@@ -566,12 +727,15 @@ pub(crate) struct TickReport {
     pub did_not_take: bool,
 }
 
-/// One tick. `now` is injected so the backoff is testable without sleeping.
+/// One tick. `now` is injected so the backoff is testable without sleeping;
+/// `wall_ms` (Unix epoch milliseconds) stamps what [`CliUpdateHealth`] serves,
+/// since an `Instant` cannot be serialised.
 pub(crate) async fn tick<O: CliOps>(
     ops: &O,
     state: &mut UpdaterState,
     flag: &UpdateFlag,
     now: Instant,
+    wall_ms: u64,
 ) -> TickReport {
     let mut inputs = TickInputs {
         opt_out_env: ops.opt_out_env(),
@@ -650,12 +814,46 @@ pub(crate) async fn tick<O: CliOps>(
         // stop leaves `bin/claude` moved aside, and `locate` cannot find it
         // after the next boot — the record is what lets that boot repair it.
         ops.record_pending_install(Some(install));
-        let run = {
+        let mut run = {
             let _held = flag.hold();
             ops.install(install, published).await
         };
+        // Everything downstream of here (the log line, `/health`, the
+        // persisted record, the coord finding) reads this tail, so it is
+        // masked once, here, whatever `CliOps::install` returned.
+        run.stderr_tail = redact_text(&run.stderr_tail);
+        let (exit_code, stderr_tail) = (run.exit_code, run.stderr_tail.clone());
         report.install = Some(run);
         report.reread = ops.installed_version(install).await;
+        let outcome = match report.reread.as_deref() {
+            Some(v) if v == published.as_str() => InstallOutcome::Took,
+            Some(_) => InstallOutcome::DidNotTake,
+            None => InstallOutcome::LeftUnreadable,
+        };
+        let failures_before = state
+            .health
+            .last_install
+            .as_ref()
+            .filter(|l| l.outcome != InstallOutcome::Took)
+            .map_or(0, |l| l.consecutive_did_not_take);
+        let last = LastInstall {
+            outcome,
+            exit_code,
+            stderr_tail,
+            installed: report.reread.clone(),
+            expected: published.clone(),
+            attempted_at_ms: wall_ms,
+            consecutive_did_not_take: if outcome == InstallOutcome::Took {
+                0
+            } else {
+                failures_before.saturating_add(1)
+            },
+            from_prior_process: false,
+        };
+        if outcome != InstallOutcome::Took && state.report_ledger.begin(&last.triple()) {
+            ops.report_did_not_take(&last);
+        }
+        state.health.last_install = Some(last);
         if report.reread.as_deref() != Some(published.as_str()) {
             report.did_not_take = true;
             if report.reread.is_none() && !is_repair {
@@ -677,6 +875,19 @@ pub(crate) async fn tick<O: CliOps>(
     if decision == Decision::Skip(SkipReason::UpToDate) {
         state.backoff_until = None;
     }
+    state.health.last_tick = Some(LastTick {
+        decision: match &decision {
+            Decision::Install { .. } => "install".to_string(),
+            Decision::Skip(_) => "skip".to_string(),
+        },
+        skip_reason: match &decision {
+            Decision::Skip(reason) => Some(reason.as_str()),
+            Decision::Install { .. } => None,
+        },
+        installed: inputs.installed.clone(),
+        published: inputs.published.clone(),
+        observed_at_ms: wall_ms,
+    });
     report
 }
 
@@ -786,13 +997,117 @@ pub(crate) fn channel_in(settings_json: &str) -> Option<String> {
     }
 }
 
+// =============================================================================
+// Serving the outcome on `/health`
+// =============================================================================
+
+/// Set once [`run_periodic`] starts, which `main.rs` does on the primary only.
+/// It observes the updater itself rather than re-deriving "primary". Because
+/// `main.rs` spawns the task during setup, a `/health` read in the first
+/// moments of a primary's start can still see `false` (`updaterRunsHere:
+/// false`) before the spawned task's first poll sets it.
+static UPDATER_RUNS_HERE: AtomicBool = AtomicBool::new(false);
+
+/// The health [`run_periodic`] published after its latest tick, or at boot
+/// the prior process's record ([`boot_health`]); `None` until either.
+fn published_health() -> &'static Mutex<Option<CliUpdateHealth>> {
+    static HEALTH: OnceLock<Mutex<Option<CliUpdateHealth>>> = OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(None))
+}
+
+fn publish_health(health: &CliUpdateHealth) {
+    let mut slot = match published_health().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(health.clone());
+}
+
+/// Pure: what `/health` serves between boot and the first tick. A record a
+/// previous process persisted is served at once, with `lastTick: null`
+/// because nothing has ticked in THIS process; with no record there is
+/// nothing known, so nothing is published and `cliUpdate` stays `null`
+/// (UNKNOWN).
+fn boot_health(prior: Option<LastInstall>) -> Option<CliUpdateHealth> {
+    prior.map(|last| CliUpdateHealth {
+        last_tick: None,
+        last_install: Some(last),
+    })
+}
+
+/// Pure: the `/health` `cliUpdate` value.
+///
+/// - `{"updaterRunsHere": false}` — no updater in this process (a secondary
+///   runner, or the updater was never started).
+/// - `null` — the updater runs here but has not ticked yet and no prior
+///   process left a record: UNKNOWN.
+/// - otherwise the last tick, the last install, and whether one is running.
+fn health_json_from(
+    runs_here: bool,
+    in_progress: bool,
+    health: Option<&CliUpdateHealth>,
+) -> serde_json::Value {
+    if !runs_here {
+        return serde_json::json!({ "updaterRunsHere": false });
+    }
+    let Some(h) = health else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "updaterRunsHere": true,
+        "inProgress": in_progress,
+        "lastTick": h.last_tick,
+        "lastInstall": h.last_install,
+    })
+}
+
+/// The `/health` `cliUpdate` block: what the runner-owned CLI updater last
+/// decided and what its last install did (plan
+/// `2026-11-26-runner-cli-updater-fails-silently-on-a-read-only-install-dir`
+/// Phase 2). Never blocks beyond one short mutex hold.
+pub fn health_json() -> serde_json::Value {
+    let health = match published_health().lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    health_json_from(
+        UPDATER_RUNS_HERE.load(Ordering::Acquire),
+        global_flag().is_updating(),
+        health.as_ref(),
+    )
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// The boot-armed periodic task: once after [`BOOT_DELAY`], then every
 /// [`TICK_INTERVAL`]. Primary runner only (see the module docs).
 pub async fn run_periodic() {
+    UPDATER_RUNS_HERE.store(true, Ordering::Release);
+    // Served at once, not after BOOT_DELAY plus the first tick: otherwise a
+    // restarted runner reads `cliUpdate: null` for minutes, and on a box whose
+    // install keeps failing the first tick installs again before the prior
+    // record (`fromPriorProcess: true`) was ever visible.
+    let last_install = load_last_install();
+    if let Some(boot) = boot_health(last_install.clone()) {
+        publish_health(&boot);
+    }
     tokio::time::sleep(BOOT_DELAY).await;
-    let ops = RealOps;
+    let ledger = std::sync::Arc::new(ReportLedger::seeded(load_reported_triple()));
+    let ops = RealOps {
+        ledger: std::sync::Arc::clone(&ledger),
+    };
     let mut state = UpdaterState {
         repair: load_pending_install(),
+        health: CliUpdateHealth {
+            last_tick: None,
+            last_install,
+        },
+        report_ledger: ledger,
         ..UpdaterState::default()
     };
     if let Some(p) = &state.repair {
@@ -802,8 +1117,21 @@ pub async fn run_periodic() {
         );
     }
     loop {
-        let report = tick(&ops, &mut state, global_flag(), Instant::now()).await;
+        let report = tick(
+            &ops,
+            &mut state,
+            global_flag(),
+            Instant::now(),
+            wall_clock_ms(),
+        )
+        .await;
         log_report(&report);
+        if report.install.is_some() {
+            if let Some(last) = &state.health.last_install {
+                persist_last_install(last);
+            }
+        }
+        publish_health(&state.health);
         tokio::time::sleep(TICK_INTERVAL).await;
     }
 }
@@ -849,6 +1177,29 @@ fn npm_child_path(prefix: &Path) -> std::ffi::OsString {
     std::env::join_paths(dirs).unwrap_or_default()
 }
 
+/// Mask credentials in install output before it leaves the process. This
+/// text is served on `/health`, persisted, and posted to coord as a
+/// tenant-wide finding, so it gets the runner's one shared sweep
+/// ([`crate::session::redact::redact_secrets`]) as defence in depth, in case
+/// install output ever carries a URL with userinfo, a `key=value` secret or a
+/// bearer token. The sweep is idempotent: masking masked text changes nothing.
+fn redact_text(text: &str) -> String {
+    String::from_utf8_lossy(&crate::session::redact::redact_secrets(text.as_bytes())).into_owned()
+}
+
+/// The last [`INSTALL_STDERR_TAIL_BYTES`] of an install's stderr, masked BEFORE the cut: a secret
+/// straddling the boundary would otherwise lose its prefix (`https://al|ice:…@`,
+/// `_authTok|en=…`) and no later sweep could recognise what is left.
+fn install_stderr_tail(stderr: &[u8]) -> String {
+    tail(
+        &crate::session::redact::redact_secrets(stderr),
+        INSTALL_STDERR_TAIL_BYTES,
+    )
+}
+
+/// How much of an install's stderr is kept (and served, persisted, reported).
+const INSTALL_STDERR_TAIL_BYTES: usize = 400;
+
 fn tail(bytes: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     let s = s.trim();
@@ -891,7 +1242,252 @@ fn load_pending_install() -> Option<NpmGlobalInstall> {
     serde_json::from_str(&text).ok()
 }
 
-struct RealOps;
+/// Where the last install's outcome is kept: `<qontinui>/runner/cli-update-last.json`.
+fn last_install_path() -> Option<PathBuf> {
+    qontinui_runner_lib::ambient::runner_dir().map(|d| d.join("cli-update-last.json"))
+}
+
+/// Where the last failed install coord CONFIRMED storing a finding for is
+/// kept: `<qontinui>/runner/cli-update-reported.json`. A separate file from
+/// [`last_install_path`] because the post that writes it runs detached from
+/// the tick that writes the other, and one file would need a shared
+/// read-modify-write between them.
+fn reported_triple_path() -> Option<PathBuf> {
+    qontinui_runner_lib::ambient::runner_dir().map(|d| d.join("cli-update-reported.json"))
+}
+
+/// The last install a previous runner process recorded, marked as such.
+fn load_last_install() -> Option<LastInstall> {
+    load_last_install_from(&last_install_path()?)
+}
+
+/// [`load_last_install`] against an explicit path — the test seam.
+fn load_last_install_from(path: &Path) -> Option<LastInstall> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut last: LastInstall = serde_json::from_str(&text).ok()?;
+    last.from_prior_process = true;
+    // A record an earlier build persisted was never masked. Mask what the
+    // sweep can still recognise: that build cut BEFORE masking, so a
+    // credential whose prefix its cut removed cannot be recognised here.
+    last.stderr_tail = redact_text(&last.stderr_tail);
+    Some(last)
+}
+
+/// Serialise `value` to `path` atomically: write a sibling temp file, then
+/// rename it over `path`, so a runner stopped mid-write leaves the previous
+/// record (or none), never a torn one that would load as nothing.
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let json = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn persist_last_install(last: &LastInstall) {
+    let Some(path) = last_install_path() else {
+        return;
+    };
+    if let Err(e) = write_json_atomic(&path, last) {
+        warn!(
+            "cli-update: could not persist the last install outcome at {}: {e}",
+            path.display()
+        );
+    }
+}
+
+fn load_reported_triple() -> Option<ReportedTriple> {
+    let text = std::fs::read_to_string(reported_triple_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn persist_reported_triple(triple: &ReportedTriple) {
+    let Some(path) = reported_triple_path() else {
+        return;
+    };
+    if let Err(e) = write_json_atomic(&path, triple) {
+        warn!(
+            "cli-update: could not record the reported install failure at {}: {e} — a later \
+             runner start may post the same finding again",
+            path.display()
+        );
+    }
+}
+
+/// The coord finding topic a failed install is filed under.
+const FINDING_TOPIC: &str = "claude-cli-reinstall-churn";
+
+/// Pure: the `POST /coord/agent-findings` body for a failed install. Shape
+/// pinned to `qontinui-coord` `findings.rs` `PostFindingBody` (no identity
+/// fields), as `coord_outside_observer::post_finding` sends it.
+fn finding_body(last: &LastInstall, device_id: &str) -> serde_json::Value {
+    let installed = last.installed.as_deref().unwrap_or("unreadable");
+    let exit = last
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "none".into());
+    let outcome = match last.outcome {
+        InstallOutcome::Took => "took",
+        InstallOutcome::DidNotTake => "did_not_take",
+        InstallOutcome::LeftUnreadable => "left_unreadable",
+    };
+    serde_json::json!({
+        "title": format!(
+            "Claude CLI update did not take on device {device_id}: installed={installed} \
+             expected={} exit={exit}",
+            last.expected
+        ),
+        "body": format!(
+            "The runner-owned Claude CLI updater (src-tauri/src/claude_cli_update.rs) ran \
+             `npm install --global {CLI_PACKAGE}@{}` and the CLI read back afterwards is \
+             {installed} (outcome {outcome}, npm exit {exit}, {} in a row). It backs off \
+             {} h and retries. stderr tail: {}\n\nPosted once per (installed, expected, \
+             exitCode) by the runner itself. GET /health data.cliUpdate on that device serves \
+             the live state.",
+            last.expected,
+            last.consecutive_did_not_take,
+            DID_NOT_TAKE_BACKOFF.as_secs() / 3600,
+            if last.stderr_tail.is_empty() { "(empty)" } else { last.stderr_tail.as_str() },
+        ),
+        "kind": "investigation",
+        "topic": FINDING_TOPIC,
+        "resource_keys": [
+            format!("claude-cli-update:{device_id}"),
+            "qontinui-runner/src-tauri/src/claude_cli_update.rs",
+        ],
+    })
+}
+
+/// What one finding post established about storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostOutcome {
+    /// 2xx with a readable body that does not say `posted: false`.
+    Confirmed,
+    /// 2xx `{"posted": false, "reason": …}`: coord.findings not provisioned.
+    NotStored(Option<String>),
+    /// 2xx whose body could not be read: storage UNKNOWN.
+    Unreadable(String),
+    /// A non-2xx answer.
+    Refused(u16),
+}
+
+/// Pure: classify coord's answer to a finding post. Only [`PostOutcome::Confirmed`]
+/// counts as stored; every other arm leaves the failure to be offered again.
+fn classify_post(status: u16, body: Result<serde_json::Value, String>) -> PostOutcome {
+    if !(200..300).contains(&status) {
+        return PostOutcome::Refused(status);
+    }
+    match body {
+        Ok(b) if b.get("posted").and_then(serde_json::Value::as_bool) == Some(false) => {
+            PostOutcome::NotStored(
+                b.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        }
+        Ok(_) => PostOutcome::Confirmed,
+        Err(e) => PostOutcome::Unreadable(e),
+    }
+}
+
+/// Carry one failed install to coord as a finding. Best-effort, one attempt,
+/// warn-and-continue. The triple is recorded (durably and in `ledger`) only
+/// once coord confirms it STORED the finding; any other outcome releases the
+/// in-flight claim, so the next did-not-take tick in this process offers it
+/// again.
+async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedger>) {
+    let triple = last.triple();
+    let device_id = qontinui_runner_lib::machine_identity::read_device_id()
+        .unwrap_or_else(|_| "unknown".to_string());
+    let body = finding_body(&last, &device_id);
+    let (base, _source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let url = format!("{}/coord/agent-findings", base.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "cli-update: reqwest client build failed; the install-failure finding is LOST \
+                 until the next did-not-take tick: {e}"
+            );
+            ledger.failed(&triple);
+            return;
+        }
+    };
+    // coord-tenant-scope(device): the finding is about this DEVICE's CLI
+    // install (resource key `claude-cli-update:<device_id>`); no session or
+    // work unit is in scope, so the default binding's device credential is the
+    // principal it belongs to — the same posture as the outside observer's
+    // unpinned findings.
+    let rb = crate::auth::attach_device_auth_for(
+        client.post(&url).json(&body),
+        crate::auth::TenantScope::Device,
+    );
+    let outcome = match rb.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            // A 2xx is not storage: coord answers 200 `{"posted": false}` when
+            // `coord.findings` is not provisioned.
+            let body = if resp.status().is_success() {
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                Err("not read: non-2xx".to_string())
+            };
+            classify_post(status, body)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "cli-update: posting the install-failure finding failed — it is LOST until the \
+                 next did-not-take tick"
+            );
+            ledger.failed(&triple);
+            return;
+        }
+    };
+    match outcome {
+        PostOutcome::Confirmed => {
+            persist_reported_triple(&triple);
+            ledger.confirmed(&triple);
+            info!("cli-update: install-failure finding posted to coord");
+        }
+        PostOutcome::NotStored(reason) => {
+            warn!(
+                reason = ?reason,
+                "cli-update: coord accepted the install-failure finding but did NOT store it — \
+                 the finding is LOST until the next did-not-take tick"
+            );
+            ledger.failed(&triple);
+        }
+        PostOutcome::Unreadable(e) => {
+            warn!(
+                error = %e,
+                "cli-update: coord answered 2xx with a body this runner could not read — storage \
+                 of the install-failure finding is NOT confirmed"
+            );
+            ledger.failed(&triple);
+        }
+        PostOutcome::Refused(status) => {
+            warn!(
+                status,
+                "cli-update: coord refused the install-failure finding — it is LOST until the \
+                 next did-not-take tick"
+            );
+            ledger.failed(&triple);
+        }
+    }
+}
+
+/// The real side effects. `ledger` is the same one the tick's
+/// [`UpdaterState::report_ledger`] holds, so the detached post can report back.
+struct RealOps {
+    ledger: std::sync::Arc<ReportLedger>,
+}
 
 impl CliOps for RealOps {
     fn opt_out_env(&self) -> Option<String> {
@@ -1031,7 +1627,27 @@ impl CliOps for RealOps {
             InstallRun {
                 exit_code: out.as_ref().and_then(|o| o.status.code()),
                 duration: started.elapsed(),
-                stderr_tail: out.map(|o| tail(&o.stderr, 400)).unwrap_or_default(),
+                stderr_tail: out
+                    .map(|o| install_stderr_tail(&o.stderr))
+                    .unwrap_or_default(),
+            }
+        }
+    }
+
+    fn report_did_not_take(&self, last: &LastInstall) {
+        // Detached: a slow or dead coord must never hold the tick (or the
+        // install flag spawns wait on) open.
+        let last = last.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(post_did_not_take(last, std::sync::Arc::clone(&self.ledger)));
+            }
+            Err(_) => {
+                warn!(
+                    "cli-update: no async runtime to post the install-failure finding from; it \
+                     is LOST until the next did-not-take tick"
+                );
+                self.ledger.failed(&last.triple());
             }
         }
     }
@@ -1262,6 +1878,10 @@ mod tests {
         config_opt_out: Option<String>,
         /// Every `record_pending_install` call, in order.
         pending: Mutex<Vec<Option<NpmGlobalInstall>>>,
+        /// What every `install` call returns.
+        install_result: InstallRun,
+        /// Every `report_did_not_take` call, in order.
+        reports: Mutex<Vec<LastInstall>>,
     }
 
     impl FakeOps {
@@ -1283,6 +1903,12 @@ mod tests {
                 asked_tags: Mutex::new(Vec::new()),
                 config_opt_out: None,
                 pending: Mutex::new(Vec::new()),
+                install_result: InstallRun {
+                    exit_code: Some(0),
+                    duration: Duration::from_millis(5),
+                    stderr_tail: String::new(),
+                },
+                reports: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1338,13 +1964,11 @@ mod tests {
         ) -> impl Future<Output = InstallRun> + Send {
             self.installs.fetch_add(1, Ordering::SeqCst);
             *self.flag_seen_during_install.lock().unwrap() = Some(self.flag.is_updating());
-            async {
-                InstallRun {
-                    exit_code: Some(0),
-                    duration: Duration::from_millis(5),
-                    stderr_tail: String::new(),
-                }
-            }
+            let run = self.install_result.clone();
+            async move { run }
+        }
+        fn report_did_not_take(&self, last: &LastInstall) {
+            self.reports.lock().unwrap().push(last.clone());
         }
     }
 
@@ -1353,7 +1977,7 @@ mod tests {
         let ops = FakeOps::new(&[Some("2.1.303"), Some("2.1.304")], Some("2.1.304"));
         let mut state = UpdaterState::default();
         let now = Instant::now();
-        let r = tick(&ops, &mut state, &ops.flag, now).await;
+        let r = tick(&ops, &mut state, &ops.flag, now, 0).await;
         assert_eq!(ops.installs.load(Ordering::SeqCst), 1);
         assert_eq!(*ops.flag_seen_during_install.lock().unwrap(), Some(true));
         assert!(!ops.flag.is_updating(), "the flag drops after the install");
@@ -1362,9 +1986,17 @@ mod tests {
         assert_eq!(r.installed.as_deref(), Some("2.1.303"));
         assert_eq!(*ops.asked_tags.lock().unwrap(), vec!["latest".to_string()]);
         assert!(state.backoff_until.is_none());
+        assert_eq!(
+            state.health.last_install.as_ref().map(|l| l.outcome),
+            Some(InstallOutcome::Took)
+        );
+        assert!(
+            ops.reports.lock().unwrap().is_empty(),
+            "an install that took is never reported to coord"
+        );
 
         // Next tick: now equal, so nothing is installed.
-        let r2 = tick(&ops, &mut state, &ops.flag, now).await;
+        let r2 = tick(&ops, &mut state, &ops.flag, now, 0).await;
         assert_eq!(r2.decision, Decision::Skip(SkipReason::UpToDate));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 1);
     }
@@ -1375,13 +2007,20 @@ mod tests {
         let ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         let mut state = UpdaterState::default();
         let now = Instant::now();
-        let r = tick(&ops, &mut state, &ops.flag, now).await;
+        let r = tick(&ops, &mut state, &ops.flag, now, 0).await;
         assert!(r.did_not_take);
         assert_eq!(ops.installs.load(Ordering::SeqCst), 1);
         assert_eq!(state.backoff_until, Some(now + DID_NOT_TAKE_BACKOFF));
 
         // Within the backoff: no install.
-        let r2 = tick(&ops, &mut state, &ops.flag, now + Duration::from_secs(3600)).await;
+        let r2 = tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            now + Duration::from_secs(3600),
+            0,
+        )
+        .await;
         assert_eq!(r2.decision, Decision::Skip(SkipReason::BackingOff));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 1);
 
@@ -1391,10 +2030,467 @@ mod tests {
             &mut state,
             &ops.flag,
             now + DID_NOT_TAKE_BACKOFF + Duration::from_secs(1),
+            0,
         )
         .await;
         assert!(matches!(r3.decision, Decision::Install { .. }));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 2);
+    }
+
+    /// Plan `2026-11-26-runner-cli-updater-fails-silently-on-a-read-only-install-dir`
+    /// Phase 2: an install npm REFUSED (exit 243, the read-only install dir on
+    /// merytshost) is served on `/health` and reported to coord once per
+    /// `(installed, expected, exitCode)`, not once per retry.
+    #[tokio::test]
+    async fn cli_update_a_failed_install_is_served_and_reported_once() {
+        let mut ops = FakeOps::new(&[Some("2.1.321")], Some("2.1.332"));
+        ops.install_result = InstallRun {
+            exit_code: Some(243),
+            duration: Duration::from_millis(5),
+            stderr_tail: "EACCES: permission denied, rename".to_string(),
+        };
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        let r = tick(&ops, &mut state, &ops.flag, now, 1_000).await;
+        assert!(r.did_not_take);
+
+        let last = state
+            .health
+            .last_install
+            .clone()
+            .expect("an install was recorded");
+        assert_eq!(last.outcome, InstallOutcome::DidNotTake);
+        assert_eq!(last.exit_code, Some(243));
+        assert_eq!(last.installed.as_deref(), Some("2.1.321"));
+        assert_eq!(last.expected, "2.1.332");
+        assert_eq!(last.stderr_tail, "EACCES: permission denied, rename");
+        assert_eq!(last.consecutive_did_not_take, 1);
+        assert!(!last.from_prior_process);
+        assert_eq!(ops.reports.lock().unwrap().len(), 1, "reported once");
+
+        // A BackingOff tick in between leaves `last_install` untouched.
+        let r2 = tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            now + Duration::from_secs(3600),
+            2_000,
+        )
+        .await;
+        assert_eq!(r2.decision, Decision::Skip(SkipReason::BackingOff));
+        assert_eq!(state.health.last_install.as_ref(), Some(&last));
+        assert_eq!(
+            state
+                .health
+                .last_tick
+                .as_ref()
+                .and_then(|t| t.skip_reason.as_deref()),
+            Some("backing-off")
+        );
+
+        // Past the backoff: the same failure again is not reported again.
+        let r3 = tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            now + DID_NOT_TAKE_BACKOFF + Duration::from_secs(1),
+            3_000,
+        )
+        .await;
+        assert!(r3.did_not_take);
+        assert_eq!(ops.installs.load(Ordering::SeqCst), 2);
+        assert_eq!(ops.reports.lock().unwrap().len(), 1, "no second report");
+        let again = state.health.last_install.clone().expect("recorded");
+        assert_eq!(again.consecutive_did_not_take, 2);
+        assert_eq!(again.attempted_at_ms, 3_000);
+
+        // Served on /health.
+        let v = health_json_from(true, false, Some(&state.health));
+        assert_eq!(v["updaterRunsHere"], true);
+        assert_eq!(v["inProgress"], false);
+        assert_eq!(v["lastInstall"]["outcome"], "did_not_take");
+        assert_eq!(v["lastInstall"]["exitCode"], 243);
+        assert_eq!(v["lastInstall"]["installed"], "2.1.321");
+        assert_eq!(v["lastInstall"]["expected"], "2.1.332");
+        assert_eq!(v["lastInstall"]["fromPriorProcess"], false);
+        assert_eq!(v["lastTick"]["decision"], "install");
+        assert_eq!(v["lastTick"]["installed"], "2.1.321");
+        assert_eq!(v["lastTick"]["observedAtMs"], 3_000);
+    }
+
+    fn failing_ops() -> FakeOps {
+        let mut ops = FakeOps::new(&[Some("2.1.321")], Some("2.1.332"));
+        ops.install_result.exit_code = Some(243);
+        ops
+    }
+
+    /// An install after which no CLI can be read back is `left_unreadable`:
+    /// served and reported like a did-not-take, and repaired next tick
+    /// instead of waiting out the 24 h backoff.
+    #[tokio::test]
+    async fn cli_update_an_install_that_leaves_no_readable_cli_is_left_unreadable() {
+        let mut ops = FakeOps::new(&[Some("2.1.321"), None], Some("2.1.332"));
+        ops.install_result.exit_code = Some(1);
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 1).await;
+        assert!(r.did_not_take);
+        let last = state.health.last_install.clone().expect("recorded");
+        assert_eq!(last.outcome, InstallOutcome::LeftUnreadable);
+        assert_eq!(last.installed, None);
+        assert_eq!(last.consecutive_did_not_take, 1);
+        assert_eq!(
+            health_json_from(true, false, Some(&state.health))["lastInstall"]["outcome"],
+            "left_unreadable"
+        );
+        let reports = ops.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "a left-unreadable install is reported");
+        assert_eq!(reports[0].outcome, InstallOutcome::LeftUnreadable);
+        assert!(state.repair.is_some(), "the next tick repairs it");
+        assert!(
+            state.backoff_until.is_none(),
+            "no 24 h backoff on a broken CLI"
+        );
+    }
+
+    /// Install stderr is masked before it reaches `/health`, the persisted
+    /// record or the coord finding.
+    #[tokio::test]
+    async fn cli_update_install_stderr_is_redacted_before_it_is_served_or_reported() {
+        // Assembled at runtime so a secret scanner reading this SOURCE never
+        // sees a credential-shaped literal.
+        let password = ["hun", "ter2"].concat();
+        let bearer = ["abcdEFGH", "12345678"].concat();
+        let stderr = format!(
+            "npm ERR! 403 GET https://alice:{password}@registry.example.test/pkg \
+             Authorization: Bearer {bearer}"
+        );
+        let mut ops = failing_ops();
+        ops.install_result.stderr_tail = stderr;
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 1).await;
+        let served = state
+            .health
+            .last_install
+            .clone()
+            .expect("recorded")
+            .stderr_tail;
+        let logged = r.install.expect("ran").stderr_tail;
+        let reported = ops.reports.lock().unwrap()[0].stderr_tail.clone();
+        for text in [&served, &logged, &reported] {
+            assert!(!text.contains(&password), "password leaked: {text}");
+            assert!(!text.contains(&bearer), "bearer token leaked: {text}");
+            assert!(
+                text.contains("registry.example.test"),
+                "context kept: {text}"
+            );
+        }
+        assert!(served.contains(crate::session::redact::MASK));
+        assert_eq!(redact_text(&served), served, "masking is idempotent");
+    }
+
+    /// The stderr tail is taken AFTER masking: a credential whose prefix the
+    /// cut would remove is masked while its prefix is still there. Each case
+    /// first proves the raw tail would leak, so the test fails if the order
+    /// is ever reversed.
+    #[test]
+    fn cli_update_a_secret_straddling_the_tail_cut_is_masked() {
+        // Assembled at runtime so a secret scanner reading this SOURCE never
+        // sees a credential-shaped literal.
+        let secret = ["hun", "ter2", "zz"].concat();
+        let cases = [
+            (
+                format!("https://alice:{secret}@registry.example.test/pkg"),
+                10,
+            ),
+            (format!("_authToken={secret}"), 8),
+        ];
+        for (fragment, keep_prefix) in cases {
+            // Put the cut `keep_prefix` bytes into `fragment` (the 3 is "end").
+            let suffix =
+                " ".repeat(INSTALL_STDERR_TAIL_BYTES - 3 - fragment.len() + keep_prefix) + "end";
+            let raw = format!("{} {fragment}{suffix}", "npm ERR! ".repeat(60));
+            let unmasked = tail(raw.as_bytes(), INSTALL_STDERR_TAIL_BYTES);
+            assert!(
+                unmasked.starts_with(fragment.get(keep_prefix..).expect("ascii fixture")),
+                "control: the raw tail starts inside the credential"
+            );
+            assert!(
+                redact_text(&unmasked).contains(&secret),
+                "control: a sweep after the cut can no longer recognise it"
+            );
+            let masked = install_stderr_tail(raw.as_bytes());
+            assert!(!masked.contains(&secret), "leaked: {masked}");
+            assert!(masked.ends_with("end"));
+        }
+    }
+
+    /// A record an earlier build persisted unmasked is served masked.
+    #[test]
+    fn cli_update_a_loaded_record_is_served_masked() {
+        let secret = ["hun", "ter2"].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli-update-last.json");
+        let last = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: format!("GET https://alice:{secret}@registry.example.test/pkg"),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 7,
+            consecutive_did_not_take: 1,
+            from_prior_process: false,
+        };
+        write_json_atomic(&path, &last).unwrap();
+        let loaded = load_last_install_from(&path).expect("loads");
+        assert!(
+            !loaded.stderr_tail.contains(&secret),
+            "{}",
+            loaded.stderr_tail
+        );
+        assert!(loaded.stderr_tail.contains("registry.example.test"));
+    }
+
+    /// A restarted runner serves the prior process's record at boot, before
+    /// any tick; with no record it serves `null` (UNKNOWN), not an empty
+    /// health.
+    #[test]
+    fn cli_update_a_prior_process_record_is_served_at_boot() {
+        assert!(boot_health(None).is_none());
+        let prior = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: "EACCES".into(),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 7,
+            consecutive_did_not_take: 3,
+            from_prior_process: true,
+        };
+        let boot = boot_health(Some(prior)).expect("published at boot");
+        let json = health_json_from(true, false, Some(&boot));
+        assert!(json["lastTick"].is_null(), "nothing ticked in this process");
+        assert_eq!(json["lastInstall"]["fromPriorProcess"], true);
+        assert_eq!(json["lastInstall"]["outcome"], "did_not_take");
+        assert_eq!(json["lastInstall"]["exitCode"], 243);
+    }
+
+    /// Review A1: a post that did not establish storage releases its claim,
+    /// so the next did-not-take tick in the SAME process offers it again; a
+    /// confirmed one is never offered again.
+    #[tokio::test]
+    async fn cli_update_an_unconfirmed_post_is_offered_again_next_tick() {
+        let ops = failing_ops();
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        tick(&ops, &mut state, &ops.flag, now, 1).await;
+        assert_eq!(ops.reports.lock().unwrap().len(), 1);
+        let triple = ops.reports.lock().unwrap()[0].triple();
+
+        // The detached post failed (or answered posted:false).
+        state.report_ledger.failed(&triple);
+        let later = now + DID_NOT_TAKE_BACKOFF + Duration::from_secs(1);
+        tick(&ops, &mut state, &ops.flag, later, 2).await;
+        assert_eq!(ops.reports.lock().unwrap().len(), 2, "offered again");
+
+        // This one is confirmed: never offered again.
+        state.report_ledger.confirmed(&triple);
+        tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            later + DID_NOT_TAKE_BACKOFF * 2,
+            3,
+        )
+        .await;
+        assert_eq!(ops.reports.lock().unwrap().len(), 2, "confirmed: not again");
+    }
+
+    #[test]
+    fn cli_update_the_ledger_blocks_a_pending_or_confirmed_triple_only() {
+        let t = |exit| ReportedTriple {
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            exit_code: Some(exit),
+        };
+        let l = ReportLedger::default();
+        assert!(l.begin(&t(243)));
+        assert!(!l.begin(&t(243)), "in flight: no double post");
+        l.failed(&t(243));
+        assert!(l.begin(&t(243)), "released after a failure");
+        l.confirmed(&t(243));
+        assert!(!l.begin(&t(243)), "confirmed");
+        assert!(l.begin(&t(1)), "a changed triple is a new finding");
+    }
+
+    /// Review A7: only a readable 2xx that does not say `posted: false` is
+    /// storage.
+    #[test]
+    fn cli_update_only_a_confirmed_post_counts_as_stored() {
+        assert_eq!(
+            classify_post(200, Ok(serde_json::json!({"id": "x"}))),
+            PostOutcome::Confirmed
+        );
+        assert_eq!(
+            classify_post(
+                200,
+                Ok(serde_json::json!({"posted": false, "reason": "no table"}))
+            ),
+            PostOutcome::NotStored(Some("no table".into()))
+        );
+        assert_eq!(
+            classify_post(503, Ok(serde_json::json!({}))),
+            PostOutcome::Refused(503)
+        );
+        assert_eq!(
+            classify_post(201, Err("eof".into())),
+            PostOutcome::Unreadable("eof".into())
+        );
+    }
+
+    #[test]
+    fn cli_update_a_persisted_install_loads_as_from_a_prior_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli-update-last.json");
+        assert!(load_last_install_from(&path).is_none(), "absent: none");
+        let last = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: "EACCES".into(),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 7,
+            consecutive_did_not_take: 2,
+            from_prior_process: false,
+        };
+        write_json_atomic(&path, &last).unwrap();
+        assert!(
+            !dir.path().join("cli-update-last.json.tmp").exists(),
+            "the temp file was renamed"
+        );
+        let loaded = load_last_install_from(&path).expect("loads");
+        assert!(loaded.from_prior_process);
+        assert_eq!(
+            LastInstall {
+                from_prior_process: false,
+                ..loaded
+            },
+            last
+        );
+        std::fs::write(&path, "{torn").unwrap();
+        assert!(load_last_install_from(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_update_an_install_that_took_resets_the_failure_count() {
+        let ops = failing_ops();
+        let mut state = UpdaterState::default();
+        let now = Instant::now();
+        tick(&ops, &mut state, &ops.flag, now, 1).await;
+        assert_eq!(
+            state
+                .health
+                .last_install
+                .as_ref()
+                .map(|l| l.consecutive_did_not_take),
+            Some(1)
+        );
+        let ok = FakeOps::new(&[Some("2.1.321"), Some("2.1.332")], Some("2.1.332"));
+        tick(&ok, &mut state, &ok.flag, now + DID_NOT_TAKE_BACKOFF * 2, 2).await;
+        let last = state.health.last_install.clone().expect("recorded");
+        assert_eq!(last.outcome, InstallOutcome::Took);
+        assert_eq!(last.consecutive_did_not_take, 0);
+        assert!(
+            ok.reports.lock().unwrap().is_empty(),
+            "the install that took after a failure is not reported"
+        );
+        assert_eq!(
+            health_json_from(true, false, Some(&state.health))["lastInstall"]
+                ["consecutiveDidNotTake"],
+            0
+        );
+    }
+
+    #[test]
+    fn cli_update_the_finding_body_names_its_topic_kind_and_keys() {
+        let last = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: "EACCES".into(),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 1,
+            consecutive_did_not_take: 1,
+            from_prior_process: false,
+        };
+        let b = finding_body(&last, "eb2155ed");
+        assert_eq!(b["kind"], "investigation");
+        assert_eq!(b["topic"], "claude-cli-reinstall-churn");
+        assert_eq!(
+            b["resource_keys"],
+            serde_json::json!([
+                "claude-cli-update:eb2155ed",
+                "qontinui-runner/src-tauri/src/claude_cli_update.rs"
+            ])
+        );
+        let title = b["title"].as_str().unwrap();
+        assert!(
+            title.contains("installed=2.1.321") && title.contains("exit=243"),
+            "{title}"
+        );
+        assert!(b["body"].as_str().unwrap().contains("EACCES"));
+    }
+
+    #[test]
+    fn cli_update_health_is_null_before_the_first_tick_and_absent_on_a_secondary() {
+        assert_eq!(
+            health_json_from(false, false, None),
+            serde_json::json!({ "updaterRunsHere": false })
+        );
+        assert!(health_json_from(true, false, None).is_null());
+    }
+
+    /// A record a previous process persisted round-trips and is served as
+    /// that process's, and a seeded report triple suppresses a repost.
+    #[tokio::test]
+    async fn cli_update_a_prior_process_failure_is_not_reported_again() {
+        let mut ops = FakeOps::new(&[Some("2.1.321")], Some("2.1.332"));
+        ops.install_result.exit_code = Some(243);
+        let prior = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: String::new(),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 1,
+            consecutive_did_not_take: 3,
+            from_prior_process: false,
+        };
+        let mut loaded: LastInstall =
+            serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
+        loaded.from_prior_process = true;
+        let v = health_json_from(
+            true,
+            false,
+            Some(&CliUpdateHealth {
+                last_tick: None,
+                last_install: Some(loaded.clone()),
+            }),
+        );
+        assert_eq!(v["lastInstall"]["fromPriorProcess"], true);
+
+        let mut state = UpdaterState {
+            health: CliUpdateHealth {
+                last_tick: None,
+                last_install: Some(loaded.clone()),
+            },
+            report_ledger: std::sync::Arc::new(ReportLedger::seeded(Some(loaded.triple()))),
+            ..UpdaterState::default()
+        };
+        tick(&ops, &mut state, &ops.flag, Instant::now(), 5).await;
+        assert!(ops.reports.lock().unwrap().is_empty());
+        let last = state.health.last_install.expect("recorded");
+        assert!(!last.from_prior_process, "this process's own install now");
+        assert_eq!(last.consecutive_did_not_take, 4);
     }
 
     #[tokio::test]
@@ -1404,7 +2500,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         ops.opt_out = Some("DISABLE_AUTOUPDATER".into());
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(
             r.decision,
             Decision::Skip(SkipReason::OptOutEnv("DISABLE_AUTOUPDATER".into()))
@@ -1415,7 +2511,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         ops.setting = Some(false);
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(r.decision, Decision::Skip(SkipReason::SettingOff));
         assert!(r.installed.is_none() && r.published.is_none());
 
@@ -1423,7 +2519,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         ops.located = None;
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(
             r.decision,
             Decision::Skip(SkipReason::UnsupportedInstallMethod)
@@ -1433,14 +2529,14 @@ mod tests {
         // Unreadable published: no install and the read is not complete.
         let ops = FakeOps::new(&[Some("2.1.303")], None);
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(r.decision, Decision::Skip(SkipReason::PublishedUnreadable));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 0);
 
         // Unreadable installed.
         let ops = FakeOps::new(&[None], Some("2.1.304"));
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(r.decision, Decision::Skip(SkipReason::InstalledUnreadable));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 0);
     }
@@ -1603,7 +2699,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         ops.config_opt_out = Some("autoUpdates=false".into());
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(
             r.decision,
             Decision::Skip(SkipReason::OptOutConfig("autoUpdates=false".into()))
@@ -1618,7 +2714,7 @@ mod tests {
     async fn cli_update_records_an_install_in_flight_and_clears_it_when_it_took() {
         let ops = FakeOps::new(&[Some("2.1.303"), Some("2.1.304")], Some("2.1.304"));
         let mut state = UpdaterState::default();
-        tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         let calls = ops.pending.lock().unwrap().clone();
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[0], ops.located, "recorded before the install");
@@ -1627,7 +2723,7 @@ mod tests {
         // An install that leaves the CLI unreadable stays recorded.
         let ops = FakeOps::new(&[Some("2.1.303"), None], Some("2.1.304"));
         let mut state = UpdaterState::default();
-        tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         let calls = ops.pending.lock().unwrap().clone();
         assert_eq!(calls.last().cloned().flatten(), ops.located);
     }
@@ -1642,7 +2738,7 @@ mod tests {
             repair: ops.located.clone(),
             ..UpdaterState::default()
         };
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(r.decision, Decision::Skip(SkipReason::UpToDate));
         assert!(state.repair.is_none());
         assert_eq!(*ops.pending.lock().unwrap(), vec![None]);
@@ -1654,7 +2750,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         ops.channel = Some("rc".into());
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(
             r.decision,
             Decision::Skip(SkipReason::NonDefaultChannel("rc".into()))
@@ -1673,7 +2769,7 @@ mod tests {
         let mut ops = FakeOps::new(&[Some("2.1.303"), Some("2.1.304")], Some("2.1.304"));
         ops.channel = Some("stable".into());
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(
             r.decision,
             Decision::Install {
@@ -1705,7 +2801,7 @@ mod tests {
     async fn cli_update_uncomparable_versions_install_nothing() {
         let ops = FakeOps::new(&[Some("2.1")], Some("2.1.304"));
         let mut state = UpdaterState::default();
-        let r = tick(&ops, &mut state, &ops.flag, Instant::now()).await;
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 0).await;
         assert_eq!(r.decision, Decision::Skip(SkipReason::VersionsUncomparable));
         assert_eq!(ops.installs.load(Ordering::SeqCst), 0);
     }
@@ -1719,13 +2815,20 @@ mod tests {
         let ops = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
         let mut state = UpdaterState::default();
         let now = Instant::now();
-        tick(&ops, &mut state, &ops.flag, now).await;
+        tick(&ops, &mut state, &ops.flag, now, 0).await;
         assert!(
             state.backoff_until.is_some(),
             "fixture: did-not-take backs off"
         );
         let ops = FakeOps::new(&[Some("2.1.304")], Some("2.1.304"));
-        tick(&ops, &mut state, &ops.flag, now + Duration::from_secs(60)).await;
+        tick(
+            &ops,
+            &mut state,
+            &ops.flag,
+            now + Duration::from_secs(60),
+            0,
+        )
+        .await;
         assert!(state.backoff_until.is_none());
     }
 
@@ -1739,7 +2842,7 @@ mod tests {
         let ops = FakeOps::new(&[Some("2.1.303"), None], Some("2.1.304"));
         let mut state = UpdaterState::default();
         let now = Instant::now();
-        let r = tick(&ops, &mut state, &ops.flag, now).await;
+        let r = tick(&ops, &mut state, &ops.flag, now, 0).await;
         assert!(r.did_not_take && r.reread.is_none());
         assert!(state.repair.is_some(), "a repair is pending");
         assert!(
@@ -1749,7 +2852,7 @@ mod tests {
 
         let mut ops2 = FakeOps::new(&[Some("2.1.304")], Some("2.1.304"));
         ops2.located = None; // `bin/claude` is gone: locate cannot find it
-        let r2 = tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL).await;
+        let r2 = tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL, 0).await;
         assert_eq!(
             r2.decision,
             Decision::Install {
@@ -1765,17 +2868,17 @@ mod tests {
         let ops = FakeOps::new(&[Some("2.1.303"), None], Some("2.1.304"));
         let mut state = UpdaterState::default();
         let now = Instant::now();
-        tick(&ops, &mut state, &ops.flag, now).await;
+        tick(&ops, &mut state, &ops.flag, now, 0).await;
         let mut ops2 = FakeOps::new(&[None], Some("2.1.304"));
         ops2.located = None;
-        tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL).await;
+        tick(&ops2, &mut state, &ops2.flag, now + TICK_INTERVAL, 0).await;
         assert_eq!(ops2.installs.load(Ordering::SeqCst), 1);
         assert!(state.repair.is_none(), "one repair, not a loop");
         assert!(state.backoff_until.is_some());
         // A readable, older CLI on a located install: only the backoff can
         // stop this tick from installing.
         let ops3 = FakeOps::new(&[Some("2.1.303")], Some("2.1.304"));
-        let r3 = tick(&ops3, &mut state, &ops3.flag, now + TICK_INTERVAL * 2).await;
+        let r3 = tick(&ops3, &mut state, &ops3.flag, now + TICK_INTERVAL * 2, 0).await;
         assert_eq!(r3.decision, Decision::Skip(SkipReason::BackingOff));
         assert_eq!(
             ops3.installs.load(Ordering::SeqCst),
