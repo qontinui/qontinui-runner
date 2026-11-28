@@ -102,7 +102,7 @@ describe("useProjectTerminalReconcile moveThem over the page's real shell integr
     await hook.moveThem();
 
     expect(fx.createTerminal).toHaveBeenCalledTimes(1);
-    expect(fx.closeTerminal).toHaveBeenCalledWith("pwsh-1");
+    expect(fx.closeTerminal).toHaveBeenCalledWith("pwsh-1", { immediate: true });
   });
 
   it("moveThem replaces a remounted pane whose ring replay ends at a covered prompt", async () => {
@@ -114,7 +114,7 @@ describe("useProjectTerminalReconcile moveThem over the page's real shell integr
 
     await hook.moveThem();
 
-    expect(fx.closeTerminal).toHaveBeenCalledWith("pwsh-1");
+    expect(fx.closeTerminal).toHaveBeenCalledWith("pwsh-1", { immediate: true });
   });
 
   it("moveThem keeps a remounted pane whose ring replay ends mid-command", async () => {
