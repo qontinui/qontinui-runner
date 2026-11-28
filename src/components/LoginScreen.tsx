@@ -11,11 +11,13 @@
  * Matches qontinui-runner's dark gaming theme with neon accents.
  */
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
-import { resolveSignInBackendUrl } from "@/lib/savedBackendUrl";
+import { resolveSignInDecision } from "@/lib/savedBackendUrl";
+import { useGateSignInFallback } from "@/hooks/useGateSignInFallback";
+import { SignInFallbackNotice } from "@/components/SignInFallbackNotice";
 import {
   NO_BROWSER_HINT,
   PendingSignInNotice,
@@ -40,6 +42,13 @@ type CognitoSignInResponse = {
  */
 type CognitoProvider = "Google" | "MicrosoftEntra" | "GitHub";
 
+/** A sign-in held back while the sign-in target is unbounded: it runs only
+ *  when the operator picks a target on `SignInFallbackNotice`. The password
+ *  path keeps the credentials it was submitted with. */
+type PendingSignIn =
+  | { kind: "hosted"; provider?: CognitoProvider }
+  | { kind: "password"; email: string; password: string };
+
 /**
  * @param storeUnreadable - `true` when the runner's on-disk credential store is
  *   present but undecryptable (a machine rename / disk move / re-image
@@ -61,6 +70,73 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
   // shows a per-button spinner.
   const [pending, setPending] = useState<CognitoProvider | "qontinui" | null>(null);
 
+  /** The Hosted-UI sign-in itself, against a decided `backendUrl`. */
+  const runHostedSignIn = useCallback(
+    async (provider: CognitoProvider | undefined, backendUrl: string) => {
+      setLoading(true);
+      setPending(provider ?? "qontinui");
+      setError("");
+      try {
+        await invoke<CognitoSignInResponse>("cognito_sign_in", {
+          backendUrl,
+          identityProvider: provider,
+        });
+        log.debug("Cognito sign-in completed — runner promoted to Tier 2");
+        // The command already promoted the runner to Tier 2; nudge tier consumers
+        // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
+        window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      } catch (err) {
+        // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+        if (!isSignInCancelled(err)) {
+          log.error("Cognito sign-in failed:", err);
+          setError(typeof err === "string" ? err : String(err));
+        }
+      } finally {
+        setLoading(false);
+        setPending(null);
+      }
+    },
+    [],
+  );
+
+  /** The direct USER_PASSWORD_AUTH sign-in, against a decided `backendUrl`. */
+  const runPasswordSignIn = useCallback(
+    async (signInEmail: string, signInPassword: string, backendUrl: string) => {
+      setPwLoading(true);
+      setError("");
+      try {
+        await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
+          email: signInEmail,
+          password: signInPassword,
+          backendUrl,
+        });
+        log.debug("Password sign-in completed — runner promoted to Tier 2");
+        // Same as the hosted-UI path: the command already promoted to Tier 2,
+        // nudge tier consumers so the gate re-evaluates immediately.
+        window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      } catch (err) {
+        log.error("Password sign-in failed:", err);
+        setError(typeof err === "string" ? err : String(err));
+      } finally {
+        setPwLoading(false);
+      }
+    },
+    [],
+  );
+
+  const runPending = useCallback(
+    (action: PendingSignIn, backendUrl: string) =>
+      action.kind === "hosted"
+        ? runHostedSignIn(action.provider, backendUrl)
+        : runPasswordSignIn(action.email, action.password, backendUrl),
+    [runHostedSignIn, runPasswordSignIn],
+  );
+
+  // An unbounded sign-in target (the saved settings could not be read, even
+  // after one re-read) starts no sign-in: the held action waits for the
+  // operator's choice on SignInFallbackNotice.
+  const fallback = useGateSignInFallback<PendingSignIn>(runPending);
+
   /**
    * Start a Hosted-UI Cognito sign-in. `provider` jumps straight into a
    * federated IdP via `identity_provider`; omitting it preserves the native
@@ -71,54 +147,36 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setLoading(true);
     setPending(provider ?? "qontinui");
     setError("");
+    fallback.clear();
 
-    try {
-      // The saved backend when the one sign-in rule honours it on a first-run
-      // ("gate") screen, else production (see savedBackendUrl.ts): the command
-      // writes the URL it signed in against back into settings.
-      const backendUrl = await resolveSignInBackendUrl("gate");
-      await invoke<CognitoSignInResponse>("cognito_sign_in", {
-        backendUrl,
-        identityProvider: provider,
-      });
-      log.debug("Cognito sign-in completed — runner promoted to Tier 2");
-      // The command already promoted the runner to Tier 2; nudge tier consumers
-      // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
-      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
-    } catch (err) {
-      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
-      if (!isSignInCancelled(err)) {
-        log.error("Cognito sign-in failed:", err);
-        setError(typeof err === "string" ? err : String(err));
-      }
-    } finally {
+    // The saved backend when the one sign-in rule honours it on a first-run
+    // ("gate") screen (see savedBackendUrl.ts): the command writes the URL it
+    // signed in against back into settings. Never rejects.
+    const decision = await resolveSignInDecision("gate");
+    if (!decision.bounded) {
+      // No sign-in is in flight: clear what was set above, so neither the
+      // button spinner nor PendingSignInNotice claims one.
       setLoading(false);
       setPending(null);
+      fallback.withhold(decision, { kind: "hosted", provider });
+      return;
     }
+    await runHostedSignIn(provider, decision.target);
   };
 
   const handlePasswordSignIn = async () => {
     log.debug("handlePasswordSignIn() called — direct Cognito USER_PASSWORD_AUTH");
     setPwLoading(true);
     setError("");
+    fallback.clear();
 
-    try {
-      const backendUrl = await resolveSignInBackendUrl("gate");
-      await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
-        email,
-        password,
-        backendUrl,
-      });
-      log.debug("Password sign-in completed — runner promoted to Tier 2");
-      // Same as the hosted-UI path: the command already promoted to Tier 2,
-      // nudge tier consumers so the gate re-evaluates immediately.
-      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
-    } catch (err) {
-      log.error("Password sign-in failed:", err);
-      setError(typeof err === "string" ? err : String(err));
-    } finally {
+    const decision = await resolveSignInDecision("gate");
+    if (!decision.bounded) {
       setPwLoading(false);
+      fallback.withhold(decision, { kind: "password", email, password });
+      return;
     }
+    await runPasswordSignIn(email, password, decision.target);
   };
 
   /**
@@ -228,6 +286,16 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             </div>
           )}
 
+          {/* The sign-in target is unbounded: ask before signing in to production. */}
+          {fallback.fallback && (
+            <SignInFallbackNotice
+              decision={fallback.fallback.decision}
+              reading={fallback.reading}
+              onSignInToProduction={() => void fallback.signInToProduction()}
+              onRetry={() => void fallback.retry()}
+            />
+          )}
+
           {/* The authorize URL, when the runner could not open a browser. */}
           <PendingSignInNotice
             active={pending !== null}
@@ -240,7 +308,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             <button
               type="button"
               onClick={() => handleSignIn("Google")}
-              disabled={loading || pwLoading}
+              disabled={loading || pwLoading || fallback.reading}
               data-testid="cognito-sign-in-google"
               className="w-full btn-secondary py-3 text-base font-semibold flex items-center justify-center gap-2"
             >
@@ -259,7 +327,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             <button
               type="button"
               onClick={() => handleSignIn("MicrosoftEntra")}
-              disabled={loading || pwLoading}
+              disabled={loading || pwLoading || fallback.reading}
               data-testid="cognito-sign-in-microsoft"
               className="w-full btn-secondary py-3 text-base font-semibold flex items-center justify-center gap-2"
             >
@@ -278,7 +346,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             <button
               type="button"
               onClick={() => handleSignIn("GitHub")}
-              disabled={loading || pwLoading}
+              disabled={loading || pwLoading || fallback.reading}
               data-testid="cognito-sign-in-github"
               className="w-full btn-secondary py-3 text-base font-semibold flex items-center justify-center gap-2"
             >
@@ -300,7 +368,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
           <button
             type="button"
             onClick={() => handleSignIn()}
-            disabled={loading || pwLoading}
+            disabled={loading || pwLoading || fallback.reading}
             data-testid="cognito-sign-in"
             className="w-full btn-primary py-3 text-base font-semibold flex items-center justify-center gap-2"
           >
@@ -331,7 +399,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             className="space-y-3"
             onSubmit={(e) => {
               e.preventDefault();
-              if (!pwLoading && !loading) void handlePasswordSignIn();
+              if (!pwLoading && !loading && !fallback.reading) void handlePasswordSignIn();
             }}
           >
             <div className="space-y-1">
@@ -344,7 +412,10 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
                 type="email"
                 autoComplete="username"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  if (fallback.fallback?.action.kind === "password") fallback.clear();
+                }}
                 disabled={pwLoading}
                 className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
                 placeholder="you@example.com"
@@ -360,7 +431,10 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
                 type="password"
                 autoComplete="current-password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (fallback.fallback?.action.kind === "password") fallback.clear();
+                }}
                 disabled={pwLoading}
                 className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
                 placeholder="••••••••"
@@ -369,7 +443,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
             <button
               id="button-sign-in-password"
               type="submit"
-              disabled={pwLoading || loading}
+              disabled={pwLoading || loading || fallback.reading}
               data-testid="cognito-sign-in-password"
               className="w-full btn-secondary py-3 text-base font-semibold flex items-center justify-center gap-2"
             >

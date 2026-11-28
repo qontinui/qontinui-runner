@@ -33,13 +33,14 @@
  * so the integration showcase can find and interact with them via id.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
+import { signInControl, useSavedBackendStatus } from "@/hooks/useSavedBackendStatus";
 import { useTenant } from "@/contexts/TenantContext";
 import {
   signInBackendUrlFrom,
@@ -116,26 +117,21 @@ export function WebIntegrationAuthBanner() {
 
   // The same `get_web_integration_status` read feeds the banner AND decides
   // the Authorize button's sign-in target (savedBackendUrl.ts, "operator"
-  // surface).
-  const [status, setStatus] = useState<(AuthBannerStatus & SavedBackendStatus) | null>(null);
-  // True while the LATEST status read failed. The banner keeps showing from
-  // the previous `status` (a failed re-read must not hide or flash it), but
-  // Authorize does not sign in while the target is unknown (the latest read
-  // failed, or it answered with a `settingsFault`): it becomes "Retry", which
-  // re-reads the status — the same rule AccountSettings applies. Guessing
-  // production instead would let `finalize_signed_in` write production over a
-  // saved custom backend. Before the FIRST read settles nothing has failed:
-  // the control is disabled under its normal label instead.
-  const [statusReadFailed, setStatusReadFailed] = useState(false);
-  // True while a Retry-triggered re-read is in flight: the control reads
-  // "Reading…" and is disabled until it settles.
-  const [retryReading, setRetryReading] = useState(false);
-  // Issue order of status reads; a read that is no longer the latest drops its result.
-  const statusReadSeq = useRef(0);
-  // The live effect run's status read, so "Retry" can re-issue it outside the
-  // effect under the same `cancelled` + issue-order guards; null once unmounted.
-  // Resolves once that read has settled (never rejects).
-  const refetchStatusRef = useRef<(() => Promise<void>) | null>(null);
+  // surface). `status` is the last SUCCESSFUL read: a failed re-read keeps it,
+  // so the banner neither hides nor flashes. Authorize does not sign in while
+  // the target is unknown (the latest read failed, or it answered with a
+  // `settingsFault`): it becomes "Retry", which re-reads the status — the same
+  // rule AccountSettings applies, from the same hook. Guessing production
+  // instead would let `finalize_signed_in` write production over a saved
+  // custom backend. Before the FIRST read settles nothing has failed: the
+  // control is disabled under its normal label instead.
+  const {
+    lastStatus: status,
+    phase: signInTargetPhase,
+    decisionStatus,
+    reading: retryReading,
+    retry: retryStatusRead,
+  } = useSavedBackendStatus<AuthBannerStatus & SavedBackendStatus>();
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -230,52 +226,6 @@ export function WebIntegrationAuthBanner() {
     label: "Switch this runner's active tenant",
     type: "button",
   });
-
-  // Subscribe-style effect: kick off the initial fetch AND register a
-  // listener for the runner's `web-integration-changed` event. setState is
-  // only called inside the async resolution / event callback, satisfying
-  // react-hooks/set-state-in-effect (which forbids synchronous setState in
-  // an effect body).
-  useEffect(() => {
-    let cancelled = false;
-
-    const fetchStatus = (): Promise<void> => {
-      // Reads overlap (mount + each `web-integration-changed`) and may settle
-      // out of order; only the most recently ISSUED read may set state, so
-      // "the latest read failed" means exactly that. A superseded effect
-      // run's listener must not bump the counter and drop the live run's read.
-      if (cancelled) return Promise.resolve();
-      const seq = ++statusReadSeq.current;
-      return invoke<AuthBannerStatus & SavedBackendStatus>("get_web_integration_status")
-        .then((next) => {
-          if (cancelled || seq !== statusReadSeq.current) return;
-          setStatus(next);
-          setStatusReadFailed(false);
-        })
-        .catch(() => {
-          // If the command isn't available (e.g. older runner build), keep
-          // the banner hidden rather than crashing — `status` stays null.
-          // A failed RE-read keeps the previous `status` for visibility but
-          // marks it stale, so Authorize no longer targets it.
-          if (cancelled || seq !== statusReadSeq.current) return;
-          setStatusReadFailed(true);
-        });
-    };
-
-    refetchStatusRef.current = fetchStatus;
-    void fetchStatus();
-    const unlisten = listen("web-integration-changed", () => void fetchStatus());
-
-    return () => {
-      cancelled = true;
-      if (refetchStatusRef.current === fetchStatus) refetchStatusRef.current = null;
-      unlisten
-        .then((fn) => fn())
-        .catch(() => {
-          /* listener cleanup is best-effort */
-        });
-    };
-  }, []);
 
   // Phase 4 (unified-devices migration): fetch `device_jwt_present` on
   // mount. The refresher may flip this from false → true under us; the
@@ -436,27 +386,24 @@ export function WebIntegrationAuthBanner() {
   //    `settingsFault` (its `backendUrl` is then a placeholder, not the saved
   //    choice). The control becomes "Retry", which re-reads the status.
   //  - KNOWN: otherwise; `signInTargetReason` says why when it is production.
-  const signInTargetLoading = status === null && !statusReadFailed;
-  const signInTargetUnknown = statusReadFailed || (status !== null && status.settingsFault != null);
   const signInTargetReason =
-    signInTargetLoading || signInTargetUnknown ? null : signInTargetExplanation(status, "operator");
+    decisionStatus === null ? null : signInTargetExplanation(decisionStatus, "operator");
 
   const handleAuthorize = useCallback(async () => {
-    // Nothing to act on while the first read or a Retry's re-read is pending.
-    if (signInTargetLoading || retryReading) return;
-    if (signInTargetUnknown) {
-      // "Retry": re-read the saved settings; a successful read restores the
-      // sign-in control, a failed one leaves it on Retry. No sign-in here.
-      setAuthorizeError(null);
-      const refetch = refetchStatusRef.current;
-      if (!refetch) return;
-      setRetryReading(true);
-      try {
-        await refetch();
-      } finally {
-        setRetryReading(false);
-      }
-      return;
+    switch (signInControl(signInTargetPhase, retryReading, authorizing)) {
+      case "wait":
+      case "reading":
+        // Nothing to act on while the first read, a Retry's re-read, or a
+        // sign-in is pending.
+        return;
+      case "retry":
+        // "Retry": re-read the saved settings; a successful read restores the
+        // sign-in control, a failed one leaves it on Retry. No sign-in here.
+        setAuthorizeError(null);
+        retryStatusRead();
+        return;
+      case "sign-in":
+        break;
     }
     setAuthorizing(true);
     setAuthorizeError(null);
@@ -467,7 +414,7 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", {
-        backendUrl: signInBackendUrlFrom(status, "operator"),
+        backendUrl: signInBackendUrlFrom(decisionStatus, "operator"),
       });
       // A retry's "did not recover" is answered by this sign-in.
       setRetryRefresh(null);
@@ -478,7 +425,7 @@ export function WebIntegrationAuthBanner() {
     } finally {
       setAuthorizing(false);
     }
-  }, [status, signInTargetLoading, signInTargetUnknown, retryReading]);
+  }, [decisionStatus, signInTargetPhase, retryReading, authorizing, retryStatusRead]);
 
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
   // future sessions only — running sessions keep their tenant), close the
@@ -577,10 +524,10 @@ export function WebIntegrationAuthBanner() {
     // saying why. Busy wins: an in-flight sign-in shows "Working…", never
     // Retry beside it.
     const signInCta = presentation.ctaAction === "cognito_sign_in";
-    const ctaReading = signInCta && retryReading && !busy;
-    const ctaLoading = signInCta && signInTargetLoading && !busy;
-    const ctaPaused = signInCta && signInTargetUnknown && !busy && !retryReading;
-    const ctaDisabled = busy || ctaLoading || ctaReading;
+    const ctaControl = signInCta ? signInControl(signInTargetPhase, retryReading, busy) : null;
+    const ctaReading = ctaControl === "reading";
+    const ctaPaused = ctaControl === "retry";
+    const ctaDisabled = busy || ctaReading || ctaControl === "wait";
     const ctaReason = signInCta ? signInTargetReason : null;
     const ctaError =
       (ctaPaused ? SIGN_IN_TARGET_UNKNOWN : null) ??
@@ -822,9 +769,10 @@ export function WebIntegrationAuthBanner() {
   // Busy wins over the unknown-target Retry, as on the credential CTA. (This
   // banner needs a status to be visible, so LOADING is normally unreachable
   // here; it is handled anyway so the rule does not depend on that.)
-  const authorizeReading = retryReading && !authorizing;
-  const authorizePaused = signInTargetUnknown && !authorizing && !retryReading;
-  const authorizeDisabled = authorizing || authorizeReading || signInTargetLoading;
+  const authorizeControl = signInControl(signInTargetPhase, retryReading, authorizing);
+  const authorizeReading = authorizeControl === "reading";
+  const authorizePaused = authorizeControl === "retry";
+  const authorizeDisabled = authorizeControl === "wait" || authorizeReading;
   const authorizeLine = authorizePaused ? SIGN_IN_TARGET_UNKNOWN : authorizeError;
 
   return (

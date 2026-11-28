@@ -379,3 +379,48 @@ describe("AccountSettings signed-out sign-in target (operator surface)", () => {
     expect(signInCalls().length).toBe(0);
   });
 });
+
+/**
+ * Call a button's React `onClick` DIRECTLY. jsdom never dispatches a click to
+ * a disabled button, so clicking one tests nothing about the handler's guard.
+ */
+async function callOnClickDirectly(button: HTMLButtonElement): Promise<void> {
+  const key = Object.keys(button).find((k) => k.startsWith("__reactProps$"));
+  expect(key).toBeDefined();
+  const props = (button as unknown as Record<string, { onClick?: (e?: unknown) => unknown }>)[key!];
+  expect(typeof props.onClick).toBe("function");
+  await act(async () => {
+    await props.onClick!();
+  });
+  await act(async () => {});
+}
+
+describe("AccountSettings sign-in handler guards (called directly, not clicked)", () => {
+  it("while the first status read is loading, the handler signs in nowhere, reads nothing, and says it is waiting", async () => {
+    statusReply = new Promise(() => {});
+    await mount();
+    const button = signInButton();
+    expect(button.disabled).toBe(true);
+    const readsBefore = statusReads();
+    await callOnClickDirectly(button);
+    expect(statusReads()).toBe(readsBefore);
+    expect(signInCalls().length).toBe(0);
+    expect(host.textContent).toContain(
+      "Waiting for the saved backend settings to load before signing in.",
+    );
+  });
+
+  it("while a Retry's re-read is in flight, the handler signs in nowhere and issues no second read", async () => {
+    statusReply = new Error("get_web_integration_status failed");
+    await mount();
+    statusReply = deferredStatus().promise;
+    await expectSignInRetry();
+    const reading = buttonLabelled("Reading…");
+    expect(reading!.disabled).toBe(true);
+    const readsBefore = statusReads();
+    await callOnClickDirectly(reading!);
+    expect(statusReads()).toBe(readsBefore);
+    expect(signInCalls().length).toBe(0);
+    expect(host.textContent).not.toContain("Waiting for the saved backend settings");
+  });
+});
