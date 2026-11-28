@@ -604,7 +604,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               for (const lbl of labels) {
                 if (
                   !isContentRedacted(lbl) &&
-                  lbl.textContent?.trim().toLowerCase().includes(label.toLowerCase())
+                  scrubbedTextContent(lbl).trim().toLowerCase().includes(label.toLowerCase())
                 ) {
                   el = lbl.htmlFor
                     ? document.getElementById(lbl.htmlFor)

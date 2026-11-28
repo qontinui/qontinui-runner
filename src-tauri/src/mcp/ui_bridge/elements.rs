@@ -4073,10 +4073,6 @@ pub async fn ui_bridge_find_handler(
     wrap_ipc_result(result)
 }
 
-// =========================================================================
-// Convenience endpoints — app-agnostic DOM interaction helpers
-// =========================================================================
-
 /// Build an IPC payload carrying only `keys` from `body`. `windowLabel` rides
 /// at the TOP level (`ui_bridge_request_sync` strips it there to pick the
 /// window); the frontend reads `payload.params`.
@@ -4470,7 +4466,7 @@ async fn ui_bridge_type_into_handler_dispatch(
     } else if let Some(lbl) = label {
         let escaped = lbl.replace('\\', "\\\\").replace('\'', "\\'");
         format!(
-            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact=\"true\"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
+            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => !l.closest('[data-bridge-redact=\"true\"]') && !l.querySelector('[data-bridge-redact=\"true\"]') && l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
             escaped.to_lowercase()
         )
     } else {
@@ -7689,5 +7685,37 @@ mod read_value_payload_tests {
         let p = read_value_ipc_payload(&json!({"selector":"#a"}));
         assert_eq!(p["windowLabel"], "");
         assert_eq!(p["params"], json!({"selector":"#a"}));
+    }
+}
+
+#[cfg(test)]
+mod text_action_helper_tests {
+    use super::{text_action_ipc_payload, validate_index_param};
+    use serde_json::json;
+
+    #[test]
+    fn payload_hoists_window_label_and_forwards_only_named_keys() {
+        let p = text_action_ipc_payload(
+            &json!({"text": "x", "tag": "b", "exact": true, "index": 3, "windowLabel": "pop"}),
+            &["text", "tag", "exact"],
+        );
+        assert_eq!(p["windowLabel"], "pop");
+        assert_eq!(p["params"], json!({"text": "x", "tag": "b", "exact": true}));
+    }
+
+    #[test]
+    fn index_must_be_a_non_negative_integer() {
+        assert!(validate_index_param(&json!({})).is_ok());
+        assert!(validate_index_param(&json!({"index": null})).is_ok());
+        assert!(validate_index_param(&json!({"index": 0})).is_ok());
+        for bad in [json!(-1), json!(1.5), json!("0"), json!(true)] {
+            let (status, body) =
+                validate_index_param(&json!({ "index": bad })).expect_err("must reject");
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                body.0.error.as_deref().unwrap_or("").contains("index"),
+                "the 400 must name index"
+            );
+        }
     }
 }

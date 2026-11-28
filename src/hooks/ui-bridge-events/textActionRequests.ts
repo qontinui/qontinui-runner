@@ -28,6 +28,15 @@ function outcome<T>(
 }
 
 /** Scroll into view, then click: what the direct HTTP handler's JS twin did. */
+/**
+ * The SDK `CSS.escape`s `tag` (it is a tag NAME), so the documented default
+ * `"*"` would select an element literally named `*` in a real browser and
+ * match nothing. `"*"` and empty both mean "any tag".
+ */
+function tagName(tag: string | undefined): string | undefined {
+  return tag && tag !== "*" ? tag : undefined;
+}
+
 function scrollAndClick(el: HTMLElement): void {
   el.scrollIntoView({ block: "center" });
   el.click();
@@ -40,7 +49,7 @@ export function runFindByTextRequest(params: {
 }): TextActionOutcome<FindByTextHit[]> {
   return outcome(
     findByTextPrimitive(params.text, {
-      tag: params.tag || undefined,
+      tag: tagName(params.tag),
       exact: params.exact ?? undefined,
     }),
   );
@@ -54,7 +63,7 @@ export function runClickByTextRequest(params: {
   return outcome(
     clickByTextPrimitive(
       params.text,
-      { tag: params.tag || undefined, exact: params.exact ?? undefined },
+      { tag: tagName(params.tag), exact: params.exact ?? undefined },
       scrollAndClick,
     ),
   );
@@ -98,7 +107,10 @@ export function scrubbedTextContent(el: HTMLElement | null | undefined): string 
 }
 
 /** An attribute read that yields `REDACTED_VALUE` inside a redaction boundary. */
-export function scrubbedAttribute(el: HTMLElement | null | undefined, name: string): string | undefined {
+export function scrubbedAttribute(
+  el: HTMLElement | null | undefined,
+  name: string,
+): string | undefined {
   const raw = el?.getAttribute(name) ?? undefined;
   if (raw === undefined || !el) return undefined;
   return isContentRedacted(el) ? REDACTED_VALUE : raw;
