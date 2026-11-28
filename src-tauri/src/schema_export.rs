@@ -145,6 +145,7 @@ pub fn export_all_schemas() -> Value {
     // inlined as anonymous defs inside ScheduledTask / ScheduledTaskType).
     add!("CatchUpPolicy", qs::CatchUpPolicy);
     add!("McpConnectionRef", qs::McpConnectionRef);
+    add!("CommandOutput", qs::CommandOutput);
     add!("SchedulerSettings", qs::SchedulerSettings);
     add!("SchedulerStatus", qs::SchedulerStatus);
     add!("NextTaskInfo", qs::NextTaskInfo);

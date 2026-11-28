@@ -277,6 +277,7 @@ mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
 mod scheduler;
+mod scheduler_command;
 mod scheduler_limit_relaunch;
 mod scheduler_probe;
 mod scheduler_remote_agent;

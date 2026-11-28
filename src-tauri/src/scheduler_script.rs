@@ -153,7 +153,16 @@ fn shell_candidates(command: &str) -> Vec<(String, Vec<String>)> {
     }
 }
 
-fn spawn_shell(command: &str, workdir: &std::path::Path) -> Result<tokio::process::Child, String> {
+fn spawn_shell(
+    command: &str,
+    workdir: &std::path::Path,
+) -> Result<
+    (
+        tokio::process::Child,
+        crate::process_helpers::ChildTreeGuard,
+    ),
+    String,
+> {
     let mut last_err = String::from("no shell candidates");
     for (program, args) in shell_candidates(command) {
         let mut cmd = crate::process_helpers::tokio_no_window(&program);
@@ -161,11 +170,9 @@ fn spawn_shell(command: &str, workdir: &std::path::Path) -> Result<tokio::proces
             .current_dir(workdir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(false);
-        crate::process_helpers::ChildTreeGuard::arm_tokio(&mut cmd);
-        match cmd.spawn() {
-            Ok(child) => return Ok(child),
+            .stderr(std::process::Stdio::piped());
+        match spawn_tree(&mut cmd) {
+            Ok(spawned) => return Ok(spawned),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 last_err = format!("{program}: {e}");
                 continue;
@@ -174,6 +181,86 @@ fn spawn_shell(command: &str, workdir: &std::path::Path) -> Result<tokio::proces
         }
     }
     Err(format!("no usable shell found ({last_err})"))
+}
+
+// ── The shared in-binary child core ─────────────────────────────────────────
+//
+// `Script` (a shell string) and `Command` (an argv, `crate::scheduler_command`)
+// are two front ends over ONE way of running an awaited child: spawned as the
+// root of a killable tree ([`spawn_tree`]), waited on under a wall-clock bound
+// that kills the WHOLE tree on expiry ([`wait_tree`]), and reported as a
+// [`ChildEnd`] that each front end classifies into its own
+// [`RemoteAgentOutcome`] wording. What each does with the child's OUTPUT is
+// the front end's business, never this core's: Script pumps it to a log file,
+// Command discards it or keeps a bounded in-memory tail.
+
+/// How an awaited scheduler child ended, before any front end words it.
+#[derive(Debug)]
+pub(crate) struct ChildEnd {
+    /// `Ok(Some(code))` exited with a code, `Ok(None)` ended by a signal (or
+    /// was killed on timeout), `Err` the wait itself failed.
+    pub status: Result<Option<i32>, String>,
+    /// The wall-clock bound expired and the tree was killed.
+    pub timed_out: bool,
+}
+
+/// Spawn `cmd` as the root of a tree [`wait_tree`] can kill whole: the
+/// child's own process group on Unix, a kill-on-close Job Object on Windows
+/// ([`crate::process_helpers::ChildTreeGuard`]). `kill_on_drop` is forced
+/// off: only the guard decides what dies, so a tree is never half-reaped.
+pub(crate) fn spawn_tree(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<(
+    tokio::process::Child,
+    crate::process_helpers::ChildTreeGuard,
+)> {
+    cmd.kill_on_drop(false);
+    crate::process_helpers::ChildTreeGuard::arm_tokio(cmd);
+    let child = cmd.spawn()?;
+    let tree = crate::process_helpers::ChildTreeGuard::attach_armed_tokio(&child);
+    Ok((child, tree))
+}
+
+/// Await `child` for at most `timeout`. On a normal exit the tree is released
+/// (a descendant the child deliberately left behind is not killed); on
+/// expiry the whole tree is killed and the run is `timed_out`. `kind` and
+/// `task_name` only label the timeout warning, which names no output.
+pub(crate) async fn wait_tree(
+    child: &mut tokio::process::Child,
+    tree: crate::process_helpers::ChildTreeGuard,
+    timeout: Duration,
+    kind: &str,
+    task_name: &str,
+) -> ChildEnd {
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(st)) => {
+            tree.disarm();
+            ChildEnd {
+                status: Ok(st.code()),
+                timed_out: false,
+            }
+        }
+        Ok(Err(e)) => {
+            drop(tree);
+            ChildEnd {
+                status: Err(e.to_string()),
+                timed_out: false,
+            }
+        }
+        Err(_elapsed) => {
+            warn!(
+                "scheduler: {kind} task '{task_name}' hit its {}s timeout — killing pid={pid:?} and its process tree",
+                timeout.as_secs()
+            );
+            drop(tree);
+            let _ = child.kill().await;
+            ChildEnd {
+                status: Ok(None),
+                timed_out: true,
+            }
+        }
+    }
 }
 
 /// The wall-clock bound for a task: unset OR zero is the default, never an
@@ -195,8 +282,7 @@ pub(crate) async fn launch(spec: ScriptSpec) -> Result<RemoteAgentLaunch, String
     let workdir = resolve_workdir(spec.working_directory.as_deref())?;
     let workdir_s = workdir.to_string_lossy().to_string();
 
-    let mut child = spawn_shell(&spec.command, &workdir)?;
-    let tree = crate::process_helpers::ChildTreeGuard::attach_armed_tokio(&child);
+    let (mut child, tree) = spawn_shell(&spec.command, &workdir)?;
     let pid = child.id();
     info!(
         "scheduler: Script task '{}' spawned pid={:?} cwd={} timeout={}s",
@@ -216,28 +302,9 @@ pub(crate) async fn launch(spec: ScriptSpec) -> Result<RemoteAgentLaunch, String
 
     let completion = Box::pin(async move {
         let pump = tokio::spawn(pump_to_log(stdout, stderr, pump_log));
-        let waited = tokio::time::timeout(timeout, child.wait()).await;
-        let (status, timed_out) = match waited {
-            Ok(Ok(st)) => {
-                tree.disarm();
-                (Ok(st.code()), false)
-            }
-            Ok(Err(e)) => {
-                drop(tree);
-                (Err(e.to_string()), false)
-            }
-            Err(_elapsed) => {
-                warn!(
-                    "scheduler: Script task '{task_name}' hit its {}s timeout — killing pid={pid:?} and its process tree",
-                    timeout.as_secs()
-                );
-                drop(tree);
-                let _ = child.kill().await;
-                (Ok(None), true)
-            }
-        };
+        let end = wait_tree(&mut child, tree, timeout, "Script", &task_name).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
-        classify_script_exit(status, timed_out, timeout)
+        classify_script_exit(end.status, end.timed_out, timeout)
     });
 
     Ok(RemoteAgentLaunch {

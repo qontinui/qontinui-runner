@@ -420,6 +420,29 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// Plan `2026-09-13-move-fleet-scheduling-into-qontinui` D5: on a degraded
+    /// database every route a scheduled `Command` task is registered, listed,
+    /// read or its switch is read through answers 503 — a POSITIVE observation
+    /// that nothing will fire — while "run now" stays reachable.
+    #[tokio::test]
+    async fn every_scheduler_db_route_answers_503_on_a_degraded_database() {
+        use qontinui_runner_lib::pg_circuit::{CauseClass, CAUSE_RUNTIME};
+        for p in [
+            "/scheduler/tasks",
+            "/scheduler/tasks/abc",
+            "/scheduler/tasks/abc/history",
+            "/scheduler/settings",
+            "/scheduler/status",
+        ] {
+            assert!(route_requires_db(p), "expected DB: {p}");
+            let r =
+                db_unavailable_response(p, Some(facts(CAUSE_RUNTIME, CauseClass::ConnectRefused)));
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{p}");
+            assert_eq!(body_json(r).await["code"], "DATABASE_UNAVAILABLE", "{p}");
+        }
+        assert!(!route_requires_db("/scheduler/tasks/abc/run"));
+    }
+
     fn facts(cause: &str, class: qontinui_runner_lib::pg_circuit::CauseClass) -> DbUnavailable {
         DbUnavailable {
             since: Some(std::time::SystemTime::UNIX_EPOCH),

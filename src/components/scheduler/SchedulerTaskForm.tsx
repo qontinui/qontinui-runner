@@ -32,6 +32,14 @@ import type {
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { readOnlyTaskType } from "./readOnlyTaskHelpers";
 import { buildRemoteAgentTask } from "./remoteAgentTaskHelpers";
+import {
+  asCommandTask,
+  buildCommandTask,
+  commandFieldsError,
+  commandFormFields,
+  COMMAND_DEFAULT_TIMEOUT_SECONDS,
+  COMMAND_MAX_TAIL_BYTES,
+} from "./commandTaskHelpers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PromptOption {
@@ -115,7 +123,14 @@ const asScriptTask = (t: unknown): ScriptTask | undefined =>
     ? (t as ScriptTask)
     : undefined;
 
-type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent" | "script" | "readonly";
+type TaskType =
+  | "workflow"
+  | "prompt"
+  | "autofix"
+  | "remote_agent"
+  | "command"
+  | "script"
+  | "readonly";
 
 const CRON_PRESETS = [
   { label: "Every minute (testing)", value: "* * * * *" },
@@ -190,6 +205,7 @@ export function SchedulerTaskForm({
   const [taskType, setTaskType] = useState<TaskType>(() => {
     if (!initTask) return "workflow";
     if (asScriptTask(initTask)) return "script";
+    if (asCommandTask(initTask)) return "command";
     if (readOnlyTaskType(initTask)) return "readonly";
     switch (initTask.task_type) {
       case "Workflow":
@@ -232,6 +248,14 @@ export function SchedulerTaskForm({
   const [forceRun, setForceRun] = useState(
     initTask?.task_type === "AutoFix" ? initTask.force_run : false,
   );
+
+  // Command state
+  const initCommand = asCommandTask(initTask);
+  const [commandFields, setCommandFields] = useState(() => commandFormFields(initCommand));
+  const setCommandField = <K extends keyof typeof commandFields>(
+    key: K,
+    value: (typeof commandFields)[K],
+  ) => setCommandFields((prev) => ({ ...prev, [key]: value }));
 
   // RemoteAgent state
   const initRemoteAgent = initTask?.task_type === "RemoteAgent" ? initTask : undefined;
@@ -430,6 +454,8 @@ export function SchedulerTaskForm({
         // the form shows them read-only and round-trips the stored task unchanged.
         if (asScriptTask(initTask)) return initTask as unknown as ScheduledTaskType;
         throw new Error("Script tasks cannot be created from this form");
+      case "command":
+        return buildCommandTask(initCommand, commandFields) as unknown as ScheduledTaskType;
       case "readonly":
         // A task type the form has no editor for (e.g. Watcher): round-trip it unchanged.
         if (readOnlyTaskType(initTask)) return initTask as unknown as ScheduledTaskType;
@@ -571,6 +597,8 @@ export function SchedulerTaskForm({
     switch (taskType) {
       case "script":
         return asScriptTask(initTask) !== undefined;
+      case "command":
+        return commandFieldsError(commandFields) === undefined;
       case "readonly":
         return readOnlyTaskType(initTask) !== undefined;
       case "workflow":
@@ -858,6 +886,19 @@ export function SchedulerTaskForm({
             />
             <span className="text-sm">Remote agent</span>
           </label>
+          <label
+            className="flex items-center gap-2"
+            title="Run a program directly (no shell, no AI session)"
+          >
+            <input
+              type="radio"
+              name="taskType"
+              checked={taskType === "command"}
+              onChange={() => setTaskType("command")}
+              className="text-primary"
+            />
+            <span className="text-sm">Command</span>
+          </label>
         </div>
 
         {taskType === "workflow" && (
@@ -1085,9 +1126,142 @@ export function SchedulerTaskForm({
               Script task (read-only here): the runner runs this command directly, with no AI
               session. Success is exit code 0.
             </p>
-            <pre className="whitespace-pre-wrap rounded bg-black/20 p-2">{asScriptTask(initTask)?.command}</pre>
-            <div>Working directory: {asScriptTask(initTask)?.working_directory ?? "(runner default)"}</div>
+            <pre className="whitespace-pre-wrap rounded bg-black/20 p-2">
+              {asScriptTask(initTask)?.command}
+            </pre>
+            <div>
+              Working directory: {asScriptTask(initTask)?.working_directory ?? "(runner default)"}
+            </div>
             <div>Timeout: {asScriptTask(initTask)?.timeout_seconds || 600}s</div>
+          </div>
+        )}
+
+        {taskType === "command" && (
+          <div className="space-y-3" data-testid="command-task-editor">
+            <p className="text-sm text-text-secondary">
+              Runs the program directly with these arguments: no shell, so no quoting, pipes or
+              variables, and no AI session. Success is exit code 0. Wrap it in an interpreter
+              yourself (e.g. program <code>bash</code>, arguments <code>-c</code> and a script) if
+              you need shell syntax.
+            </p>
+            <div>
+              <label htmlFor="command-program" className="block text-sm font-medium mb-1">
+                Program *
+              </label>
+              <input
+                id="command-program"
+                type="text"
+                value={commandFields.program}
+                onChange={(e) => setCommandField("program", e.target.value)}
+                placeholder="A name on the runner's PATH, or an absolute path"
+                required={taskType === "command"}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm font-mono"
+              />
+            </div>
+            <div>
+              <label htmlFor="command-args" className="block text-sm font-medium mb-1">
+                Arguments (one per line)
+              </label>
+              <textarea
+                id="command-args"
+                value={commandFields.argsText}
+                onChange={(e) => setCommandField("argsText", e.target.value)}
+                placeholder={"plan\n-detailed-exitcode"}
+                rows={4}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 resize-y text-sm font-mono"
+              />
+            </div>
+            <div>
+              <label htmlFor="command-working-directory" className="block text-sm font-medium mb-1">
+                Working directory
+              </label>
+              <input
+                id="command-working-directory"
+                type="text"
+                value={commandFields.workingDirectory}
+                onChange={(e) => setCommandField("workingDirectory", e.target.value)}
+                placeholder="Leave blank for the runner's project root"
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+              />
+            </div>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={commandFields.detach}
+                onChange={(e) => setCommandField("detach", e.target.checked)}
+                className="text-primary"
+              />
+              <span className="text-sm">
+                Detach: start it and record the run as launched (its exit is not observed). It keeps
+                running after the runner exits — except where the runner is a Linux systemd service,
+                whose stop or restart ends it too
+              </span>
+            </label>
+            {commandFields.detach ? (
+              <p className="text-xs text-text-secondary" data-testid="command-detach-note">
+                A detached command is not awaited, so no timeout applies and none of its output is
+                kept.
+              </p>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="command-timeout" className="block text-sm font-medium mb-1">
+                      Timeout (seconds)
+                    </label>
+                    <input
+                      id="command-timeout"
+                      type="number"
+                      min={1}
+                      value={commandFields.timeoutSeconds}
+                      onChange={(e) => setCommandField("timeoutSeconds", e.target.value)}
+                      placeholder={String(COMMAND_DEFAULT_TIMEOUT_SECONDS)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="command-output" className="block text-sm font-medium mb-1">
+                      Output
+                    </label>
+                    <select
+                      id="command-output"
+                      value={commandFields.outputMode}
+                      onChange={(e) =>
+                        setCommandField(
+                          "outputMode",
+                          e.target.value === "Discard" ? "Discard" : "Tail",
+                        )
+                      }
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    >
+                      <option value="Tail">Keep the end of stderr (on failure)</option>
+                      <option value="Discard">Discard all output</option>
+                    </select>
+                  </div>
+                </div>
+                {commandFields.outputMode === "Tail" && (
+                  <div>
+                    <label htmlFor="command-tail-bytes" className="block text-sm font-medium mb-1">
+                      Stderr bytes to keep (1-{COMMAND_MAX_TAIL_BYTES})
+                    </label>
+                    <input
+                      id="command-tail-bytes"
+                      type="number"
+                      min={1}
+                      max={COMMAND_MAX_TAIL_BYTES}
+                      value={commandFields.tailBytes}
+                      onChange={(e) => setCommandField("tailBytes", e.target.value)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                    />
+                  </div>
+                )}
+              </>
+            )}
+            {commandFieldsError(commandFields) && (
+              <p className="text-xs text-destructive" data-testid="command-task-error">
+                {commandFieldsError(commandFields)}
+              </p>
+            )}
           </div>
         )}
 

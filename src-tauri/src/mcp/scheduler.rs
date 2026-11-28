@@ -266,29 +266,28 @@ pub(crate) fn refuse_untrusted_probe(
     }
 }
 
-/// The command-bearing fields of a `Script` task, or `None` for any other
-/// task type. `ScheduledTaskType` is not `PartialEq`, so the echo test in
-/// [`refuse_untrusted_script`] compares these.
-fn script_parts(
-    task: &crate::scheduler::ScheduledTaskType,
-) -> Option<(&str, Option<&str>, Option<u64>)> {
+/// A command-bearing task (`Script` or `Command`) as a comparable value, or
+/// `None` for any other task type. `ScheduledTaskType` is not `PartialEq`, so
+/// the echo test in [`refuse_untrusted_script`] compares its serialized form —
+/// every field, so changing any one of them is a change.
+fn script_parts(task: &crate::scheduler::ScheduledTaskType) -> Option<serde_json::Value> {
     match task {
-        crate::scheduler::ScheduledTaskType::Script {
-            command,
-            working_directory,
-            timeout_seconds,
-        } => Some((
-            command.as_str(),
-            working_directory.as_deref(),
-            *timeout_seconds,
-        )),
+        crate::scheduler::ScheduledTaskType::Script { .. }
+        | crate::scheduler::ScheduledTaskType::Command { .. } => {
+            // Fails CLOSED: a value that cannot be serialized is gated (never
+            // `None`) and equals nothing, so it is never an "unchanged echo".
+            Some(serde_json::to_value(task).unwrap_or_else(|e| {
+                serde_json::json!({ "unserializable": e.to_string(), "nonce": uuid::Uuid::new_v4().to_string() })
+            }))
+        }
         _ => None,
     }
 }
 
-/// Refuse a `Script` task the requester may not set — the same gate, for the
-/// same reason, as [`refuse_untrusted_probe`]: a `Script` task's `command` is
-/// run by `sh -c` as this device's user, so writing one is command execution,
+/// Refuse a `Script` or `Command` task the requester may not set — the same
+/// gate, for the same reason, as [`refuse_untrusted_probe`]: a `Script` task's
+/// `command` is run by `sh -c` and a `Command` task's argv is exec'd, both as
+/// this device's user, so writing one is command execution,
 /// and the two task-write routes admit a Foreign browser origin under the
 /// default route policy. Only a NonBrowser or FirstParty caller may create a
 /// `Script` task or change one; an absent principal is UNKNOWN and refused.
@@ -304,16 +303,55 @@ pub(crate) fn refuse_untrusted_script(
     let Some(requested) = requested.and_then(script_parts) else {
         return Ok(());
     };
-    if existing.and_then(script_parts) == Some(requested) {
+    if existing.and_then(script_parts).as_ref() == Some(&requested) {
         return Ok(());
     }
     match principal.map(|p| p.class) {
         Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
         class => Err(format!(
-            "a Script task runs a command as this device's user; only a non-browser caller \
-             or the runner's own UI may create or change one (requester class: {})",
+            "a Script or Command task runs a command as this device's user; only a \
+             non-browser caller or the runner's own UI may create or change one \
+             (requester class: {})",
             class.map(OriginClass::as_str).unwrap_or("unknown")
         )),
+    }
+}
+
+/// Create/update validation of a `Command` task (plan
+/// `2026-09-13-move-fleet-scheduling-into-qontinui` D2): a blank `program` or
+/// an out-of-range `Tail` is `400`; a command line the current security
+/// policy denies is `403`, naming the denial and the `security.default_profile`
+/// setting — the LOUD path a human sees at registration. The executor checks
+/// the policy again at every fire (`scheduler_command::launch`). Any other
+/// task type passes.
+pub(crate) fn refuse_invalid_command(
+    task: &crate::scheduler::ScheduledTaskType,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    if !matches!(task, crate::scheduler::ScheduledTaskType::Command { .. }) {
+        return Ok(());
+    }
+    // The structural checks first: a malformed task is refused without
+    // reading the live security settings.
+    command_refusal_response(
+        crate::scheduler_command::command_shape_error(task).map_or(Ok(()), Err),
+    )?;
+    let (policy, profile) = crate::scheduler_command::current_policy();
+    command_refusal_response(crate::scheduler_command::validate_command_task(
+        task, &policy, &profile,
+    ))
+}
+
+/// [`refuse_invalid_command`]'s status mapping, pure for its test.
+fn command_refusal_response(
+    verdict: Result<(), crate::scheduler_command::CommandTaskRefusal>,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::scheduler_command::CommandTaskRefusal;
+    match verdict {
+        Ok(()) => Ok(()),
+        Err(CommandTaskRefusal::Invalid(e)) => Err((StatusCode::BAD_REQUEST, Json(api_error(e)))),
+        Err(CommandTaskRefusal::PolicyDenied(e)) => {
+            Err((StatusCode::FORBIDDEN, Json(api_error(e))))
+        }
     }
 }
 
@@ -372,6 +410,7 @@ pub async fn create_scheduled_task(
 
     refuse_untrusted_script(principal.as_ref().map(|p| &p.0), Some(&request.task), None)
         .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    refuse_invalid_command(&request.task)?;
     refuse_bad_timezone(request.timezone.as_deref())?;
 
     if let Some(conditions) = &request.conditions {
@@ -510,6 +549,7 @@ pub async fn update_scheduled_task(
             Some(&scheduled_task.task),
         )
         .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+        refuse_invalid_command(&task)?;
         scheduled_task.task = task;
     }
     if let Some(skip_if_completed) = request.skip_if_completed {
@@ -918,6 +958,7 @@ pub async fn upsert_managed_task(
         existing.as_ref().map(|t| &t.task),
     )
     .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    refuse_invalid_command(&request.task)?;
     if let Some(conditions) = &request.conditions {
         refuse_untrusted_probe(
             principal.as_ref().map(|p| &p.0),
@@ -1210,6 +1251,96 @@ mod tests {
             refuse_untrusted_script(Some(&trusted), Some(&stored), Some(&other)).is_err(),
             "turning a stored task into a Script is a change"
         );
+    }
+
+    fn command(program: &str) -> crate::scheduler::ScheduledTaskType {
+        crate::scheduler::ScheduledTaskType::Command {
+            program: program.into(),
+            args: vec!["plan".into()],
+            working_directory: None,
+            timeout_seconds: None,
+            output: qontinui_types::scheduler::CommandOutput::Discard,
+            detach: false,
+        }
+    }
+
+    /// A Command task is command execution exactly as a Script is: the same
+    /// requester gate, and an unchanged echo of the stored one passes.
+    #[test]
+    fn a_command_task_is_gated_like_a_script() {
+        let c = command("terraform");
+        let foreign = principal(OriginClass::Foreign);
+        assert!(refuse_untrusted_script(Some(&foreign), Some(&c), None).is_err());
+        assert!(
+            refuse_untrusted_script(Some(&principal(OriginClass::NonBrowser)), Some(&c), None)
+                .is_ok()
+        );
+        assert!(refuse_untrusted_script(Some(&foreign), Some(&c), Some(&c)).is_ok());
+        assert!(
+            refuse_untrusted_script(Some(&foreign), Some(&command("bash")), Some(&c)).is_err(),
+            "changing the program is a change"
+        );
+    }
+
+    /// A malformed Command is 400; a policy-denied one is 403 naming the denial.
+    #[test]
+    fn command_refusals_map_to_400_and_403() {
+        use crate::scheduler_command::CommandTaskRefusal;
+        assert!(command_refusal_response(Ok(())).is_ok());
+        let (status, _) =
+            command_refusal_response(Err(CommandTaskRefusal::Invalid("blank".into()))).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, Json(body)) = command_refusal_response(Err(CommandTaskRefusal::PolicyDenied(
+            "policy denied: x (security.default_profile = \"strict\")".into(),
+        )))
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body = serde_json::to_string(&body).unwrap();
+        assert!(body.contains("policy denied: x"), "{body}");
+        assert!(body.contains("security.default_profile"), "{body}");
+        // A blank program through the real validator is a 400.
+        assert_eq!(
+            refuse_invalid_command(&command("  ")).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        // Non-Command tasks are not this gate's business.
+        assert!(refuse_invalid_command(&script("exit 0")).is_ok());
+    }
+
+    /// Every task-write handler validates a Command BEFORE persisting.
+    #[test]
+    fn every_task_write_handler_validates_a_command_before_persisting() {
+        let src = include_str!("scheduler.rs");
+        for (handler, write) in [
+            (
+                "pub async fn create_scheduled_task(",
+                "pg.insert_scheduled_task(",
+            ),
+            (
+                "pub async fn update_scheduled_task(",
+                ".update_scheduled_task(&scheduled_task,",
+            ),
+            (
+                "pub async fn upsert_managed_task(",
+                ".upsert_managed_scheduled_task(",
+            ),
+        ] {
+            let (_, body) = src.split_once(handler).expect(handler);
+            // Only this handler's own body: a match past its end (another
+            // handler, or this test's own literals) would prove nothing.
+            let (body, _) = body
+                .split_once("\npub async fn ")
+                .or_else(|| body.split_once("\n#[cfg(test)]"))
+                .expect("the handler's end");
+            let (before_gate, _) = body
+                .split_once("refuse_invalid_command(")
+                .expect("validation call");
+            let (before_persist, _) = body.split_once(write).expect("persist call");
+            assert!(
+                before_gate.len() < before_persist.len(),
+                "{handler} must validate before {write}"
+            );
+        }
     }
 
     /// Both write handlers gate a Script task on the requester BEFORE persisting.
