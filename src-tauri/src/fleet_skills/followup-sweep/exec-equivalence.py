@@ -331,8 +331,9 @@ CREDENTIAL
   A coord bearer is staged by lib/stage-coord-bearer.sh, which sources
   lib/coord-tenant-credential.sh (a byte-identical copy of the fleet's
   tenant-proof library): $COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the
-  local runner's mint, then coord's anonymous mint -- each source selected only
-  when it is fresh and claims the tenant asked for. code_paths are read under
+  local runner's mint, coord's per-binding door, then coord's anonymous mint --
+  each source selected only when it is fresh and claims the tenant asked for.
+  code_paths are read under
   the tenant PROVEN to own the origin repo; the Python route is auth-only, so
   without code_paths to read any staged tenant credential serves it. The bearer
   never reaches argv, and is sent only to an https or loopback coord. bash is

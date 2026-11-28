@@ -1235,8 +1235,9 @@ rb_read() {
 }
 rb_read
 # Coord refused the local runner's token: forget it (the library then refuses
-# the runner rung for this tenant) and re-stage ONCE, which reaches the mint --
-# the same retry the library's own walkers make.
+# the runner rung for this tenant) and re-stage ONCE, which reaches the
+# per-binding door, then the mint -- the same retry the library's own walkers
+# make.
 if [ "$RB_CODE" = 401 ] && [[ "$BEARER_SRC" == runner* ]]; then
   ctc_drop_runner_token "$READ_TENANT" "coord answered 401 to the local runner's token for tenant $READ_TENANT"
   RB_SRC2="$(ctc_stage_for_tenant "$READ_TENANT")"
