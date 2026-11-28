@@ -1576,8 +1576,8 @@ mod tests {
 
         let pre = pre.with_add_dirs(&[sibling.as_str()]);
         assert_eq!(pre.add_dir_trust().len(), 1);
-        let body =
-            serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None)).unwrap();
+        let body = serde_json::to_value(SpawnStalledBody::new(&pre, Duration::from_secs(1), None))
+            .unwrap();
         assert!(body.get("pane_closed").is_none(), "{body}");
         assert!(body.get("transcript_location_known").is_none(), "{body}");
         let row = &body["add_dir_trust"][0];
@@ -1631,7 +1631,11 @@ mod tests {
         let all = [
             (StallCloseOutcome::NotAttempted, "not_attempted", false),
             (StallCloseOutcome::Closed, "closed", true),
-            (StallCloseOutcome::ClosedStartedAcross, "closed_started_across", true),
+            (
+                StallCloseOutcome::ClosedStartedAcross,
+                "closed_started_across",
+                true,
+            ),
             (StallCloseOutcome::FailedPaneHeld, "failed_pane_held", false),
             (StallCloseOutcome::FailedPaneGone, "failed_pane_gone", false),
             (StallCloseOutcome::UnknownHeld, "unknown_held", false),
@@ -1641,8 +1645,14 @@ mod tests {
             assert_eq!(serde_json::to_value(outcome).unwrap(), token);
             assert_eq!(outcome.closed_by_runner(), closed, "{token}");
         }
-        assert_eq!(serde_json::to_value(TerminalStallKind::Active).unwrap(), "active");
-        assert_eq!(serde_json::to_value(TerminalStallKind::Quiet).unwrap(), "quiet");
+        assert_eq!(
+            serde_json::to_value(TerminalStallKind::Active).unwrap(),
+            "active"
+        );
+        assert_eq!(
+            serde_json::to_value(TerminalStallKind::Quiet).unwrap(),
+            "quiet"
+        );
     }
 
     /// A sibling that is not a linked worktree has no primary-checkout reading
@@ -1654,7 +1664,11 @@ mod tests {
         let row = add_dir_trust_precondition(primary.to_str().unwrap(), acct.to_str());
         assert_eq!(row.explicit_trust, None);
         assert_eq!(row.project_key, workspace_trust::project_key(&primary));
-        assert!(matches!(row.trust, TrustVerdict::Untrusted { .. }), "{:?}", row.trust);
+        assert!(
+            matches!(row.trust, TrustVerdict::Untrusted { .. }),
+            "{:?}",
+            row.trust
+        );
     }
 
     // ------------------------------------------------------------ exp decode

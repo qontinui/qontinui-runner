@@ -7985,8 +7985,7 @@ async fn run_gate_continuation_inner(
         };
         // A registered pane's gate is the registry exit path's: with no
         // dispatch to settle, there is nothing for a hold task to do.
-        let needs_task =
-            matches!(hold, UnobservedStart::Held { .. }) || dispatch.is_some();
+        let needs_task = matches!(hold, UnobservedStart::Held { .. }) || dispatch.is_some();
         if needs_task {
             let session = bindable_session(&result);
             tokio::spawn(async move {
@@ -8734,8 +8733,7 @@ async fn run_continuation_terminal(
         // [`continuation_attempt_step`].
         let transcripts =
             continuation_transcripts(selected_config_dir.as_deref(), workdir, &pinned_session_id);
-        let settled =
-            await_continuation_start(&terminal_manager, &terminal_id, &transcripts).await;
+        let settled = await_continuation_start(&terminal_manager, &terminal_id, &transcripts).await;
         if let Some(stalled) = &settled.stalled {
             let (silent, pid, facts) = terminal_stall_report(stalled, settled.close);
             report_spawn_stalled(agent_id, &preconditions, silent, pid, Some(facts)).await;
@@ -8759,10 +8757,7 @@ async fn run_continuation_terminal(
             }
         }
         match step {
-            AttemptStep::NotRetried {
-                reason,
-                ctx: held,
-            } => {
+            AttemptStep::NotRetried { reason, ctx: held } => {
                 // The operator closed the pane inside the window (its close
                 // already released the claim, and reopening what the operator
                 // closed would be wrong), or the runner's own close of a
@@ -9117,7 +9112,9 @@ const CONTINUATION_CHILD_SUSPECT_READS: u32 = 3;
 /// absent is `Dead`, and anything else `Suspect`. `is_tracked_alive` itself is
 /// unchanged: it answers `false` on a read failure, which its reaper callers
 /// rely on, and that `false` is exactly why it alone cannot end a hold.
-fn read_continuation_child(child: crate::process_capture::process_tree::PidWithSpawnedAt) -> ChildReading {
+fn read_continuation_child(
+    child: crate::process_capture::process_tree::PidWithSpawnedAt,
+) -> ChildReading {
     if crate::process_capture::health::is_tracked_alive(
         child,
         crate::process_capture::health::proc_boot_time(),
@@ -9826,10 +9823,7 @@ async fn await_continuation_start_within(
         let stalled_evidence = |kind| StalledEvidence {
             waited: elapsed,
             quiet_for: obs.quiet_for,
-            pid: session
-                .as_ref()
-                .and_then(|s| s.child_pid())
-                .map(i64::from),
+            pid: session.as_ref().and_then(|s| s.child_pid()).map(i64::from),
             last_output: pane_last_output(),
             kind,
             child: None,
@@ -9986,9 +9980,9 @@ where
         + 'static,
 {
     if transcripts.read() == TranscriptRead::Present {
-        return StalledClose::Settled(Box::new(SettledStart::plain(
-            ContinuationStart::Started { pty_alive: true },
-        )));
+        return StalledClose::Settled(Box::new(SettledStart::plain(ContinuationStart::Started {
+            pty_alive: true,
+        })));
     }
     let pane = terminal_manager.get(terminal_id);
     if let Some(now) = pane.as_ref().map(|s| s.total_bytes_produced()) {
@@ -10035,7 +10029,9 @@ where
     let child_alive = match observed {
         Some(_) => None,
         // Alive unless AFFIRMATIVELY gone: a read failure is not a death.
-        None => evidence.child.map(|c| read_continuation_child(c) != ChildReading::Dead),
+        None => evidence
+            .child
+            .map(|c| read_continuation_child(c) != ChildReading::Dead),
     };
     StalledClose::Settled(Box::new(settle_stalled_close(
         terminal_manager,
@@ -10046,7 +10042,6 @@ where
         child_alive,
     )))
 }
-
 
 /// A stalled child's identity read before the close: its pid with the
 /// creation time from a FRESH process snapshot. A stale snapshot, one that
@@ -10280,9 +10275,7 @@ fn continuation_attempt_step(
             if close != StallCloseOutcome::UnknownHeld {
                 return AttemptStep::NotRetried { reason, ctx };
             }
-            let pane = terminal_manager
-                .get(terminal_id)
-                .filter(|s| s.is_alive());
+            let pane = terminal_manager.get(terminal_id).filter(|s| s.is_alive());
             // A live pane keeps its own context (where the settle put it back).
             let ctx = match (&pane, ctx) {
                 (Some(p), Some(c)) => {
@@ -25126,11 +25119,7 @@ mod tests {
         );
         // Before the window ends it is still pending, however quiet.
         assert_eq!(
-            classify_continuation_start(
-                quiet,
-                b.window - std::time::Duration::from_millis(1),
-                b
-            ),
+            classify_continuation_start(quiet, b.window - std::time::Duration::from_millis(1), b),
             StartTick::Pending
         );
     }
@@ -25255,7 +25244,11 @@ mod tests {
     /// dir, cwd, probe)`.
     fn known_absent_transcripts(
         sid: &str,
-    ) -> (tempfile::TempDir, tempfile::TempDir, ContinuationTranscripts) {
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContinuationTranscripts,
+    ) {
         let acct = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let t = continuation_transcripts(
@@ -25296,7 +25289,8 @@ mod tests {
     #[tokio::test]
     async fn a_parked_continuation_is_closed_and_reported_stalled_never_started() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "parked");
         let settled =
@@ -25324,10 +25318,15 @@ mod tests {
             "{reason}"
         );
         assert!(!reason.contains('\n'), "{reason}");
-        assert!(ContinuationOutcome::SpawnFailed.matches_recorded(&format!("spawn_failed: {reason}")));
+        assert!(
+            ContinuationOutcome::SpawnFailed.matches_recorded(&format!("spawn_failed: {reason}"))
+        );
         // The condition-check reading reports it as well.
         let cc = condition_check_failure_reason(&settled).unwrap();
-        assert!(cc.starts_with("condition-check never started — no transcript"), "{cc}");
+        assert!(
+            cc.starts_with("condition-check never started — no transcript"),
+            "{cc}"
+        );
     }
 
     /// A pane still producing output at the window's end is NOT closed: it is
@@ -25335,7 +25334,8 @@ mod tests {
     #[tokio::test]
     async fn a_chattering_continuation_pane_at_the_window_end_is_not_closed() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-111111111111");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-111111111111");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "chatty");
         let chatter = {
@@ -25353,10 +25353,16 @@ mod tests {
             await_continuation_start_within(&tm, "chatty", &transcripts, bounds(100, 2_000, 4_000))
                 .await;
         chatter.abort();
-        assert_eq!(settled.start, ContinuationStart::Started { pty_alive: true });
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
         let stalled = settled.stalled.expect("the stall is reported");
         assert_eq!(stalled.kind, StallKind::Active);
-        assert!(tm.get("chatty").is_some(), "never closed while producing output");
+        assert!(
+            tm.get("chatty").is_some(),
+            "never closed while producing output"
+        );
         assert_eq!(settled.close, StallCloseOutcome::NotAttempted);
         pane.set_alive_for_test(false);
     }
@@ -25366,7 +25372,8 @@ mod tests {
     #[tokio::test]
     async fn a_continuation_pane_that_goes_quiet_is_closed_before_the_ceiling() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-222222222222");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-222222222222");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "settles");
         let chatter = {
@@ -25378,13 +25385,9 @@ mod tests {
                 }
             })
         };
-        let settled = await_continuation_start_within(
-            &tm,
-            "settles",
-            &transcripts,
-            bounds(100, 150, 10_000),
-        )
-        .await;
+        let settled =
+            await_continuation_start_within(&tm, "settles", &transcripts, bounds(100, 150, 10_000))
+                .await;
         chatter.abort();
         pane.set_alive_for_test(false);
         assert!(
@@ -25412,7 +25415,10 @@ mod tests {
         let settled =
             await_continuation_start_within(&tm, "unlocated", &transcripts, bounds(100, 50, 2_000))
                 .await;
-        assert_eq!(settled.start, ContinuationStart::Started { pty_alive: true });
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
         let stalled = settled.stalled.expect("the stall is still reported");
         assert!(!stalled.transcript_location_known());
         assert!(tm.get("unlocated").is_some(), "never closed on UNKNOWN");
@@ -25425,7 +25431,8 @@ mod tests {
     #[tokio::test]
     async fn a_transcript_present_at_the_close_keeps_the_pane_and_reads_started() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-000000000000");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-000000000000");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "late");
         write_transcript(&transcripts);
@@ -25435,7 +25442,10 @@ mod tests {
         else {
             panic!("a transcript settles it");
         };
-        assert_eq!(settled.start, ContinuationStart::Started { pty_alive: true });
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
         assert!(settled.stalled.is_none());
         assert!(tm.get("late").is_some());
         pane.set_alive_for_test(false);
@@ -25458,9 +25468,15 @@ mod tests {
             stall_evidence(),
             None,
         );
-        assert_eq!(settled.start, ContinuationStart::Started { pty_alive: false });
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: false }
+        );
         assert!(settled.closed_by_runner());
-        assert!(settled.ctx.is_some(), "the context comes back to the caller");
+        assert!(
+            settled.ctx.is_some(),
+            "the context comes back to the caller"
+        );
         match continuation_attempt_step(settled, 1, &tm, "gone") {
             AttemptStep::Started { pty_alive, ctx } => {
                 assert!(!pty_alive);
@@ -25492,7 +25508,10 @@ mod tests {
         let held =
             settle_stalled_close(&tm, "held", err(), Some(test_ctx()), stall_evidence(), None);
         assert_eq!(held.start, ContinuationStart::Started { pty_alive: true });
-        assert!(held.ctx.is_none(), "the context went back onto the live pane");
+        assert!(
+            held.ctx.is_none(),
+            "the context went back onto the live pane"
+        );
         assert!(
             pane.take_isolated_edit_ctx().is_some(),
             "a running claude keeps its claim"
@@ -25524,7 +25543,10 @@ mod tests {
         assert!(settled.ctx.is_some());
         match continuation_attempt_step(settled, 1, &tm, "unknown") {
             AttemptStep::NotRetried { reason, ctx } => {
-                assert!(reason.starts_with("never started — no transcript after 90s"), "{reason}");
+                assert!(
+                    reason.starts_with("never started — no transcript after 90s"),
+                    "{reason}"
+                );
                 assert!(reason.contains("did not complete"), "{reason}");
                 assert!(ctx.is_some(), "the context goes to the remover");
             }
@@ -25539,7 +25561,8 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_close_task_leaves_the_context_on_the_live_pane() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-333333333333");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-333333333333");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "panics");
         pane.set_isolated_edit_ctx(test_ctx());
@@ -25589,7 +25612,8 @@ mod tests {
     #[tokio::test]
     async fn a_close_that_removes_the_pane_then_panics_with_the_child_alive_is_held() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-555555555555");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-555555555555");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "half-closed");
         pane.set_isolated_edit_ctx(test_ctx());
@@ -25614,9 +25638,15 @@ mod tests {
         else {
             panic!("a quiet pane's close is attempted");
         };
-        assert!(tm.get("half-closed").is_none(), "the close removed the pane");
+        assert!(
+            tm.get("half-closed").is_none(),
+            "the close removed the pane"
+        );
         assert_eq!(settled.close, StallCloseOutcome::UnknownHeld);
-        assert!(settled.ctx.is_some(), "no pane to put it on: the context comes back");
+        assert!(
+            settled.ctx.is_some(),
+            "no pane to put it on: the context comes back"
+        );
         match continuation_attempt_step(*settled, 1, &tm, "half-closed") {
             AttemptStep::HeldUnknown {
                 ctx,
@@ -25657,9 +25687,18 @@ mod tests {
     fn an_unknown_close_is_held_unless_the_child_is_proven_dead() {
         let tm = crate::terminal::TerminalManager::new();
         let pane = live_fixture_pane(&tm, "running");
-        let settled =
-            settle_stalled_close(&tm, "running", None, Some(test_ctx()), stall_evidence(), None);
-        assert!(settled.ctx.is_none(), "the context went back onto the live pane");
+        let settled = settle_stalled_close(
+            &tm,
+            "running",
+            None,
+            Some(test_ctx()),
+            stall_evidence(),
+            None,
+        );
+        assert!(
+            settled.ctx.is_none(),
+            "the context went back onto the live pane"
+        );
         match continuation_attempt_step(settled, 1, &tm, "running") {
             AttemptStep::HeldUnknown {
                 reason,
@@ -25673,7 +25712,10 @@ mod tests {
             }
             _ => panic!("a live held pane after an unknown close is held, never released"),
         }
-        assert!(pane.take_isolated_edit_ctx().is_some(), "its claim stays with the pane");
+        assert!(
+            pane.take_isolated_edit_ctx().is_some(),
+            "its claim stays with the pane"
+        );
 
         pane.set_alive_for_test(false);
         let unknown_pid = settle_stalled_close(&tm, "running", None, None, stall_evidence(), None);
@@ -25720,7 +25762,8 @@ mod tests {
     #[tokio::test]
     async fn a_close_that_does_not_return_on_a_dead_child_is_unknown_gone() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-777777777777");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-777777777777");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "dead-child");
         let evidence = StalledEvidence {
@@ -25768,15 +25811,17 @@ mod tests {
         };
         let (_a, _c, started) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-121212121212");
         write_transcript(&started);
-        let (_, effects) =
-            run_unobserved_hold(held(started), false, true, ms(500), ms(5), |_| ChildReading::Dead)
-                .await;
+        let (_, effects) = run_unobserved_hold(held(started), false, true, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
         assert_eq!(effects, vec![HoldEffect::ConsumeDispatch]);
 
         let (_d, _e, absent) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-131313131313");
-        let (end, effects) =
-            run_unobserved_hold(held(absent), false, true, ms(30), ms(5), |_| ChildReading::Alive)
-                .await;
+        let (end, effects) = run_unobserved_hold(held(absent), false, true, ms(30), ms(5), |_| {
+            ChildReading::Alive
+        })
+        .await;
         assert_eq!(end, UnobservedHoldEnd::BoundReached);
         assert_eq!(effects, vec![HoldEffect::ReleaseDispatch]);
     }
@@ -25789,7 +25834,8 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "registered");
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-141414141414");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-141414141414");
         write_transcript(&transcripts);
         let hold = UnobservedStart::Registered {
             child: some_child(),
@@ -25806,7 +25852,10 @@ mod tests {
             |_| ChildReading::Dead,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(!task.is_finished(), "never settled under a live pane, bound or not");
+        assert!(
+            !task.is_finished(),
+            "never settled under a live pane, bound or not"
+        );
         pane.set_alive_for_test(false);
         let (end, effects) = task.await.unwrap();
         assert_eq!(end, UnobservedHoldEnd::ChildExited);
@@ -25823,7 +25872,8 @@ mod tests {
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "gone-pane");
         pane.set_alive_for_test(false);
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-161616161616");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-161616161616");
         let hold = UnobservedStart::Registered {
             child: some_child(),
             transcripts,
@@ -25865,9 +25915,15 @@ mod tests {
         assert_eq!(fresh.spawned_at_unix, 1_700_000_000);
         assert_eq!(fresh.spawned_at_ft, Some(42));
         let stale = identity_from::<String>(77, Ok(snapshot(true)));
-        assert_eq!((stale.pid, stale.spawned_at_unix, stale.spawned_at_ft), (77, 0, None));
+        assert_eq!(
+            (stale.pid, stale.spawned_at_unix, stale.spawned_at_ft),
+            (77, 0, None)
+        );
         let failed = identity_from(77, Err("task panicked".to_string()));
-        assert_eq!((failed.pid, failed.spawned_at_unix, failed.spawned_at_ft), (77, 0, None));
+        assert_eq!(
+            (failed.pid, failed.spawned_at_unix, failed.spawned_at_ft),
+            (77, 0, None)
+        );
     }
 
     /// A2 / S3: when a held gate's child exits, the transcript is RE-READ:
@@ -25888,27 +25944,38 @@ mod tests {
 
         let (_a, _c, started) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-999999999999");
         write_transcript(&started);
-        let (_, effects) =
-            run_unobserved_hold(held(started), true, false, ms(500), ms(5), |_| ChildReading::Dead)
-                .await;
+        let (_, effects) = run_unobserved_hold(held(started), true, false, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
         assert_eq!(effects.len(), 2, "{effects:?}");
-        assert_eq!(effects[0], HoldEffect::Gate(ContinuationOutcome::Spawned, None));
+        assert_eq!(
+            effects[0],
+            HoldEffect::Gate(ContinuationOutcome::Spawned, None)
+        );
         match &effects[1] {
             HoldEffect::GateWorkUnreported {
                 detail,
                 terminal_id,
             } => {
-                assert!(detail.starts_with("exit=unknown code=none after="), "{detail}");
+                assert!(
+                    detail.starts_with("exit=unknown code=none after="),
+                    "{detail}"
+                );
                 assert!(detail.ends_with("terminal=held-pane"), "{detail}");
-                assert_eq!(terminal_id, "held-pane", "the real terminal id, not a placeholder");
+                assert_eq!(
+                    terminal_id, "held-pane",
+                    "the real terminal id, not a placeholder"
+                );
             }
             other => panic!("expected the work_unreported fallback, got {other:?}"),
         }
 
         let (_d, _e, absent) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-aaaaaaaaaaaa");
-        let (_, effects) =
-            run_unobserved_hold(held(absent), true, false, ms(500), ms(5), |_| ChildReading::Dead)
-                .await;
+        let (_, effects) = run_unobserved_hold(held(absent), true, false, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
         assert_eq!(effects.len(), 1, "{effects:?}");
         match &effects[0] {
             HoldEffect::Gate(ContinuationOutcome::SpawnFailed, Some(d)) => {
@@ -25921,10 +25988,15 @@ mod tests {
             unobserved_hold_effects(UnobservedHoldEnd::BoundReached, true, true, false, "x", "t"),
             vec![HoldEffect::Gate(ContinuationOutcome::Spawned, None)]
         );
-        assert!(
-            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, false, true, false, "x", "t")
-                .is_empty()
-        );
+        assert!(unobserved_hold_effects(
+            UnobservedHoldEnd::BoundReached,
+            false,
+            true,
+            false,
+            "x",
+            "t"
+        )
+        .is_empty());
     }
 
     /// S6 / A4: a pid that is alive but was REUSED (a different start time
@@ -25936,8 +26008,12 @@ mod tests {
     async fn a_reused_pid_with_a_different_start_time_ends_the_hold() {
         let me = std::process::id();
         let snapshot = crate::process_capture::process_table::snapshot_blocking();
-        let real = crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(me, &snapshot);
-        assert!(real.spawned_at_unix > 0, "this process's start time is readable");
+        let real =
+            crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(me, &snapshot);
+        assert!(
+            real.spawned_at_unix > 0,
+            "this process's start time is readable"
+        );
         assert_eq!(read_continuation_child(real), ChildReading::Alive);
         let reused = crate::process_capture::process_tree::PidWithSpawnedAt {
             pid: me,
@@ -25962,7 +26038,8 @@ mod tests {
     #[tokio::test]
     async fn an_unobserved_condition_check_holds_its_secrets_until_the_hold_ends() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-151515151515");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-151515151515");
         let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen_released_while_held =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -25996,17 +26073,24 @@ mod tests {
             !seen_released_while_held.load(std::sync::atomic::Ordering::SeqCst),
             "the secrets were released while the child was still held"
         );
-        assert!(released.load(std::sync::atomic::Ordering::SeqCst), "released at the end");
-        assert!(failure.unwrap().starts_with("condition-check never started"));
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "released at the end"
+        );
+        assert!(failure
+            .unwrap()
+            .starts_with("condition-check never started"));
     }
 
     /// A3: an unobserved condition check is reported errored only when its
     /// child exited with no transcript.
     #[test]
     fn an_unobserved_condition_check_errors_only_on_a_transcriptless_exit() {
-        assert!(unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, false)
-            .unwrap()
-            .starts_with("condition-check never started"));
+        assert!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, false)
+                .unwrap()
+                .starts_with("condition-check never started")
+        );
         assert_eq!(
             unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, true),
             None
@@ -26025,7 +26109,8 @@ mod tests {
         let id = format!("unobserved-{}", uuid::Uuid::new_v4());
         let pane = live_fixture_pane(&tm, &id);
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-666666666666");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-666666666666");
         let hold = unobserved_start_hold(
             &tm,
             AnchorReservation::none(),
@@ -26036,7 +26121,10 @@ mod tests {
             None,
             &transcripts,
         );
-        assert!(matches!(hold, UnobservedStart::Registered { child: None, .. }));
+        assert!(matches!(
+            hold,
+            UnobservedStart::Registered { child: None, .. }
+        ));
         let registered = lock_recover(continuation_sessions(), "continuation_sessions")
             .live
             .remove(&id)
@@ -26136,7 +26224,8 @@ mod tests {
     #[tokio::test]
     async fn output_since_the_stalled_verdict_cancels_the_close() {
         let _amb = crate::test_env::isolated_ambient();
-        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-444444444444");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-444444444444");
         let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
         let pane = live_fixture_pane(&tm, "woke");
         let at_verdict = pane.total_bytes_produced();
@@ -26153,7 +26242,10 @@ mod tests {
             StalledClose::OutputMoved(now) => assert_eq!(now, at_verdict + 8),
             StalledClose::Settled(s) => panic!("closed a pane that produced output: {:?}", s.start),
         }
-        assert!(tm.get("woke").is_some(), "never closed while producing output");
+        assert!(
+            tm.get("woke").is_some(),
+            "never closed while producing output"
+        );
         pane.set_alive_for_test(false);
     }
 
@@ -26176,9 +26268,14 @@ mod tests {
         let (silent, pid, facts) = terminal_stall_report(&ev, StallCloseOutcome::NotAttempted);
         assert_eq!(silent, ev.quiet_for);
         assert_eq!(pid, Some(7));
-        let body = serde_json::to_value(spawn_stalled_body(&pre, silent, pid, Some(facts))).unwrap();
+        let body =
+            serde_json::to_value(spawn_stalled_body(&pre, silent, pid, Some(facts))).unwrap();
         assert_eq!(body["silent_secs"], 0, "{body}");
-        assert_eq!(body["waited_secs"], CONTINUATION_STALL_CEILING.as_secs(), "{body}");
+        assert_eq!(
+            body["waited_secs"],
+            CONTINUATION_STALL_CEILING.as_secs(),
+            "{body}"
+        );
         assert_eq!(body["stall_kind"], "active");
         assert_eq!(body["close_outcome"], "not_attempted");
         assert_eq!(body["pane_closed"], false);
@@ -26198,8 +26295,14 @@ mod tests {
         };
         match continuation_attempt_step(settled, 1, &tm, "closed-pane") {
             AttemptStep::Retry { ctx, detail } => {
-                assert!(ctx.is_some(), "the retry inherits the stalled pane's context");
-                assert!(detail.starts_with("never started — no transcript"), "{detail}");
+                assert!(
+                    ctx.is_some(),
+                    "the retry inherits the stalled pane's context"
+                );
+                assert!(
+                    detail.starts_with("never started — no transcript"),
+                    "{detail}"
+                );
             }
             _ => panic!("a stalled first attempt is retried"),
         }
