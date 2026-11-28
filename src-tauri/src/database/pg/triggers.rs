@@ -594,7 +594,6 @@ mod tests {
     /// slot and failed with `error serializing parameter 14`. This exact
     /// shape (last_triggered_at = None) must now round-trip cleanly.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn create_then_get_round_trips_with_none_last_triggered() {
         let db = PgDb::new_blocking_for_test();
         let id = unique_trigger_id("create-get-none");
@@ -635,7 +634,6 @@ mod tests {
     /// `update_trigger` must persist a fresh `updated_at` value bound as
     /// a TIMESTAMPTZ. Asserts the new timestamp advances past the original.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn update_round_trips_updated_at() {
         let db = PgDb::new_blocking_for_test();
         let id = unique_trigger_id("update-updated-at");
@@ -674,7 +672,6 @@ mod tests {
     /// `updated_at`. Exercises the post-rewrite UPDATE path that bound
     /// `now: String` to `$2::TIMESTAMPTZ`.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn set_trigger_enabled_toggles_and_advances_updated_at() {
         let db = PgDb::new_blocking_for_test();
         let id = unique_trigger_id("set-enabled");
@@ -710,7 +707,6 @@ mod tests {
     /// `record_trigger_fired` stamps `last_triggered_at`, increments
     /// `trigger_count`, and bumps `updated_at` — all in a single UPDATE.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn record_trigger_fired_increments_and_stamps() {
         let db = PgDb::new_blocking_for_test();
         let id = unique_trigger_id("record-fired");
@@ -754,7 +750,6 @@ mod tests {
     /// round-trip `triggered_at` as a `DateTime<Utc>` with no string
     /// reparse step.
     #[tokio::test]
-    #[ignore = "requires PG via DATABASE_URL"]
     async fn record_then_get_history_round_trips_triggered_at() {
         let db = PgDb::new_blocking_for_test();
         let trigger_id = unique_trigger_id("hist-roundtrip");

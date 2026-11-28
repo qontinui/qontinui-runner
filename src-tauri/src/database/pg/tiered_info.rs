@@ -2227,9 +2227,8 @@ impl PgDb {
 /// ## Why these tests must hit a real server
 ///
 /// Both failures live in the server's type resolution and the client's decode,
-/// so a test with no server proves nothing. Point `DATABASE_URL` at an
-/// **isolated scratch cluster** (never the machine-shared one) and run with
-/// `--ignored`.
+/// so a test with no server proves nothing. They run on the bundled-Postgres
+/// test harness (`PgDb::new_for_test`), one fresh database per test.
 #[cfg(test)]
 mod numeric_aggregate_pg_tests {
     use super::PgDb;
@@ -2240,11 +2239,6 @@ mod numeric_aggregate_pg_tests {
     /// before each run.
     const WINDOW_LO: &str = "2019-03-01T00:00:00Z";
     const WINDOW_HI: &str = "2019-04-01T00:00:00Z";
-
-    fn db_url() -> String {
-        std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at an ISOLATED scratch cluster")
-    }
 
     fn epoch_ms(rfc3339: &str) -> i64 {
         chrono::DateTime::parse_from_rfc3339(rfc3339)
@@ -2265,8 +2259,7 @@ mod numeric_aggregate_pg_tests {
     {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
         rt.block_on(async {
-            let db =
-                std::sync::Arc::new(PgDb::new(&db_url()).await.expect("connect to scratch PG"));
+            let db = PgDb::new_for_test().await;
             f(&db).await
         })
     }
@@ -2435,7 +2428,6 @@ mod numeric_aggregate_pg_tests {
     /// "Good". The counts are still asserted at zero because they are the
     /// measured half of the same payload.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_over_an_empty_window_is_unknown_not_zero_seven() {
         run(|db| {
             Box::pin(async move {
@@ -2494,7 +2486,6 @@ mod numeric_aggregate_pg_tests {
     /// `ui_bridge_events` empty — this fixture is the real shape, not a
     /// contrived one.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_with_stalls_but_no_interactions_reports_unknown_and_the_real_count() {
         run(|db| {
             Box::pin(async move {
@@ -2551,7 +2542,6 @@ mod numeric_aggregate_pg_tests {
     /// 0.30*0.7 + 0.25*0.5 + 0.25*0.8 + 0.20 = 0.21 + 0.125 + 0.20 + 0.20
     /// = 0.735.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_over_populated_data_computes_the_declared_fields() {
         run(|db| {
             Box::pin(async move {
@@ -2627,7 +2617,6 @@ mod numeric_aggregate_pg_tests {
     /// because no interaction is seeded, so the rate is correctly `null` — the
     /// count is the measured fact this test is about.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_stall_window_keeps_rows_from_the_cutoffs_own_calendar_day() {
         run(|db| {
             Box::pin(async move {
@@ -2655,7 +2644,6 @@ mod numeric_aggregate_pg_tests {
     /// route's `?days=` boundary is worth pinning anyway: a row exactly ON the
     /// cutoff is inside (`>=`), one a millisecond before is not.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_interaction_window_is_inclusive_of_the_cutoff_instant() {
         run(|db| {
             Box::pin(async move {
@@ -2687,7 +2675,6 @@ mod numeric_aggregate_pg_tests {
     /// Seeding one failing automation row with an `error_type` must therefore
     /// produce exactly one recommendation that deserializes cleanly.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn recommendations_reach_the_caller_as_the_declared_shape() {
         run(|db| {
             Box::pin(async move {
@@ -2741,7 +2728,6 @@ mod numeric_aggregate_pg_tests {
     /// `AVG(tra.duration_ms)` defect on a second route, and panicked the same
     /// way with no matching rows.
     #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn performance_dashboard_survives_a_window_with_no_matching_runs() {
         run(|db| {
             Box::pin(async move {

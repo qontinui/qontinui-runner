@@ -21,7 +21,7 @@ use serde_json::Value;
 /// then assert on its contents (`spec_api::proposals::tests::pg`,
 /// `flywheel_e2e_tests`): run concurrently, one test's TRUNCATE wipes the row
 /// another just inserted.
-#[cfg(all(test, feature = "pg_integration_tests"))]
+#[cfg(test)]
 pub(crate) static SPEC_PROPOSALS_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 

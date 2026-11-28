@@ -993,11 +993,7 @@ mod tests {
     /// three methods to the plain `get_user_skill` turns this red. The row,
     /// and any fork a regression wrote, are deleted whether or not the
     /// assertions pass.
-    ///
-    /// `#[ignore]` to match the `database/pg/*` convention. Run with:
-    /// `cargo test -p qontinui-runner database::pg::skills::tests::every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored -- --ignored`
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL); user_skills table"]
     async fn every_rewrite_refuses_a_stored_playbook_row_and_leaves_it_as_stored() {
         use futures::FutureExt;
 
