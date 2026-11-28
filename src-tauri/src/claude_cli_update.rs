@@ -1231,7 +1231,14 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Re
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, json)?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        // Durable before the rename publishes it: a crash after the rename
+        // must not expose a renamed-but-empty file.
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, path)
 }
 
@@ -1248,15 +1255,25 @@ fn persist_last_install(last: &LastInstall) {
 }
 
 fn load_reported_triple() -> Option<ReportedTriple> {
-    let text = std::fs::read_to_string(reported_triple_path()?).ok()?;
+    load_reported_triple_from(&reported_triple_path()?)
+}
+
+/// [`load_reported_triple`] against an explicit path — the test seam.
+fn load_reported_triple_from(path: &Path) -> Option<ReportedTriple> {
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// [`persist_reported_triple`] against an explicit path — the test seam.
+fn persist_reported_triple_to(path: &Path, triple: &ReportedTriple) -> std::io::Result<()> {
+    write_json_atomic(path, triple)
 }
 
 fn persist_reported_triple(triple: &ReportedTriple) {
     let Some(path) = reported_triple_path() else {
         return;
     };
-    if let Err(e) = write_json_atomic(&path, triple) {
+    if let Err(e) = persist_reported_triple_to(&path, triple) {
         warn!(
             "cli-update: could not record the reported install failure at {}: {e} — a later \
              runner start may post the same finding again",
@@ -1309,6 +1326,28 @@ fn finding_body(last: &LastInstall, device_id: &str) -> serde_json::Value {
     })
 }
 
+/// Releases a post's in-flight claim on [`ReportLedger`] when dropped, unless
+/// [`InFlightClaim::disarm`] ran after coord confirmed storage.
+struct InFlightClaim {
+    ledger: std::sync::Arc<ReportLedger>,
+    triple: ReportedTriple,
+    armed: bool,
+}
+
+impl InFlightClaim {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ledger.failed(&self.triple);
+        }
+    }
+}
+
 /// What one finding post established about storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PostOutcome {
@@ -1348,6 +1387,13 @@ fn classify_post(status: u16, body: Result<serde_json::Value, String>) -> PostOu
 /// again.
 async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedger>) {
     let triple = last.triple();
+    // Every exit that does not confirm storage — an early return, a panic, or
+    // this future being dropped mid-await — releases the in-flight claim.
+    let claim = InFlightClaim {
+        ledger: std::sync::Arc::clone(&ledger),
+        triple: triple.clone(),
+        armed: true,
+    };
     let device_id = qontinui_runner_lib::machine_identity::read_device_id()
         .unwrap_or_else(|_| "unknown".to_string());
     let body = finding_body(&last, &device_id);
@@ -1363,7 +1409,6 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
                 "cli-update: reqwest client build failed; the install-failure finding is LOST \
                  until the next did-not-take tick: {e}"
             );
-            ledger.failed(&triple);
             return;
         }
     };
@@ -1396,7 +1441,6 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
                 "cli-update: posting the install-failure finding failed — it is LOST until the \
                  next did-not-take tick"
             );
-            ledger.failed(&triple);
             return;
         }
     };
@@ -1404,6 +1448,7 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
         PostOutcome::Confirmed => {
             persist_reported_triple(&triple);
             ledger.confirmed(&triple);
+            claim.disarm();
             info!("cli-update: install-failure finding posted to coord");
         }
         PostOutcome::NotStored(reason) => {
@@ -1412,7 +1457,6 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
                 "cli-update: coord accepted the install-failure finding but did NOT store it — \
                  the finding is LOST until the next did-not-take tick"
             );
-            ledger.failed(&triple);
         }
         PostOutcome::Unreadable(e) => {
             warn!(
@@ -1420,7 +1464,6 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
                 "cli-update: coord answered 2xx with a body this runner could not read — storage \
                  of the install-failure finding is NOT confirmed"
             );
-            ledger.failed(&triple);
         }
         PostOutcome::Refused(status) => {
             warn!(
@@ -1428,7 +1471,6 @@ async fn post_did_not_take(last: LastInstall, ledger: std::sync::Arc<ReportLedge
                 "cli-update: coord refused the install-failure finding — it is LOST until the \
                  next did-not-take tick"
             );
-            ledger.failed(&triple);
         }
     }
 }
@@ -2110,6 +2152,51 @@ mod tests {
         l.confirmed(&t(243));
         assert!(!l.begin(&t(243)), "confirmed");
         assert!(l.begin(&t(1)), "a changed triple is a new finding");
+    }
+
+    /// A dropped (or panicked) post releases its claim; a disarmed one keeps
+    /// the confirmation.
+    #[test]
+    fn cli_update_a_dropped_post_releases_its_in_flight_claim() {
+        let t = ReportedTriple {
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            exit_code: Some(243),
+        };
+        let ledger = std::sync::Arc::new(ReportLedger::default());
+        assert!(ledger.begin(&t));
+        drop(InFlightClaim {
+            ledger: std::sync::Arc::clone(&ledger),
+            triple: t.clone(),
+            armed: true,
+        });
+        assert!(ledger.begin(&t), "released by the drop");
+
+        let claim = InFlightClaim {
+            ledger: std::sync::Arc::clone(&ledger),
+            triple: t.clone(),
+            armed: true,
+        };
+        ledger.confirmed(&t);
+        claim.disarm();
+        assert!(!ledger.begin(&t), "confirmed stays confirmed");
+    }
+
+    #[test]
+    fn cli_update_the_reported_triple_round_trips_through_its_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli-update-reported.json");
+        assert!(load_reported_triple_from(&path).is_none(), "absent: none");
+        let t = ReportedTriple {
+            installed: None,
+            expected: "2.1.332".into(),
+            exit_code: Some(243),
+        };
+        persist_reported_triple_to(&path, &t).unwrap();
+        assert_eq!(load_reported_triple_from(&path), Some(t));
+        assert!(!dir.path().join("cli-update-reported.json.tmp").exists());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_reported_triple_from(&path).is_none());
     }
 
     /// Review A7: only a readable 2xx that does not say `posted: false` is
