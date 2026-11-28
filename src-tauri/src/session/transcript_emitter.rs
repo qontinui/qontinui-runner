@@ -43,9 +43,7 @@
 //!    (`coord_sync::push_record`) re-checks the same verdict and ACKs-and-drops
 //!    a chunk queued before a flip to `off`, so a backlog never leaves after
 //!    the switch closes. Coord still refuses on ingest (and enforces its
-//!    warm/cold quotas) as a second line, never as the switch. NOT
-//!    `session_coordination_enabled`, which is the unrelated Phase 10
-//!    dual-write flag.
+//!    warm/cold quotas) as a second line, never as the switch.
 //! 3. **Per-session** — redaction, which ALWAYS runs. Workflow runs have no
 //!    coord-native [`super::Intent`] carrying a per-session opt-out (the
 //!    registrar binding is a plain id ↔ id index), so every transcript byte

@@ -5,7 +5,7 @@
 //!
 //! - [`crate::terminal::TerminalManager`] (PTY-backed shell sessions)
 //! - [`crate::claude_session::ClaudeSession`] (Claude CLI subprocesses)
-//! - Workflow sessions (`unified_workflow_executor` + `project.sessions`)
+//! - Workflow sessions (`unified_workflow_executor` + `task_runs`)
 //!
 //! Plan §D1 makes them one [`Session`] lifecycle with a typed
 //! [`SessionKind`] discriminator. The transport for each kind lives under
@@ -71,7 +71,6 @@ pub mod coord_transport_rung; // WHICH transport rung carried a coord call — t
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 #[cfg(test)]
 pub(crate) mod drain_probe; // Loopback coord that fails a test when a response body is left unread (lifecycle plan Phase 85)
-pub mod dual_write;
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
@@ -961,7 +960,7 @@ fn stamp_session_tenant(mut intent: Intent) -> Intent {
 ///   exists to separate.
 ///
 /// The id space matters here and is not uniform. Registry ids are what
-/// `SessionRegistry::register_external` mints and what
+/// `SessionRegistry::register_external_with_lineage` mints and what
 /// `TerminalSession::coord_session_id` carries, so the auto-response reporters
 /// resolve. The claim path's `agent_session_id` is a looser space — some
 /// callers pass an orchestration `task_run_id`, some pass `None` for an
@@ -1199,31 +1198,19 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Register a coord-native mirror of an **externally-owned** session
-    /// (plan §Phase 10 dual-write). Unlike [`SessionRegistry::start`],
-    /// this does NOT spawn a transport — the real PTY / CLI subprocess is
-    /// owned and torn down by the legacy `terminal_create` /
-    /// `claude_session` path. The mirror exists purely so the dashboard
-    /// renders the session from `coord.sessions` during the dual-write
-    /// window.
+    /// Register a coord-native record of an **externally-owned** session.
+    /// Unlike [`SessionRegistry::start`], this does NOT spawn a transport —
+    /// the real PTY / CLI subprocess is owned and torn down by the
+    /// `terminal_*` / `claude_session` path. The record exists purely so the
+    /// dashboard renders the session from `coord.sessions`.
     ///
     /// Validates the intent, writes a `Started` outbox row (which the
     /// drain loop pushes to coord), and inserts a record backed by the
-    /// no-op [`transport::ExternalTransport`]. Closing the mirror (by id)
+    /// no-op [`transport::ExternalTransport`]. Closing the record (by id)
     /// records a `Closed` event but never touches the operator's real
     /// terminal.
     ///
-    /// Called only when the cutover flag is ON (see
-    /// [`coord_sync::CoordSync::mirror_legacy_session`]); with the flag
-    /// off this is never reached.
-    pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
-        self.register_external_with_lineage(intent, None, None)
-    }
-
-    /// [`SessionRegistry::register_external`] with an explicit lineage claim.
-    ///
-    /// Two optional stamps, both `None` on the plain mirror path (so that call
-    /// is byte-identical to what it was):
+    /// Two optional lineage stamps; pass `None` for either to keep the default:
     ///
     /// - `parent_session_id` — the coord session this one CONTINUES. Threaded
     ///   into the `Started` outbox payload, which the drain loop's
@@ -1556,7 +1543,7 @@ impl SessionRegistry {
     ///
     /// ## Why this exists
     ///
-    /// [`Self::register_external`] always allocates a new `uuid_v7`, so a
+    /// [`Self::register_external_with_lineage`] always allocates a new `uuid_v7`, so a
     /// pane that re-launches across restarts orphans its old `coord.sessions`
     /// row and accumulates duplicates. Resuming re-activates the EXISTING
     /// row via a PATCH (`state=active` + `heartbeat`) — coord already
@@ -1574,7 +1561,7 @@ impl SessionRegistry {
     ///   return `persisted_id`. The session id is unchanged across the
     ///   restart — no duplicate.
     /// - **404 / 410** → the row was GC'd (or never existed). Fall back to a
-    ///   fresh [`Self::register_external`] (new id, `Started` POST) so the
+    ///   fresh [`Self::register_external_with_lineage`] (new id, `Started` POST) so the
     ///   pane is never left without a coord session, and return the NEW id.
     ///   The caller persists the new id over the stale one.
     /// - **transport error / 5xx** (coord temporarily unreachable) → resume
@@ -1623,7 +1610,7 @@ impl SessionRegistry {
     ) -> Result<Uuid, SessionError> {
         intent.validate()?;
         // Stamp before the probe, for the same reason `start_inner` and
-        // `register_external` stamp: the resumed record must carry a tenant, and
+        // `register_external_with_lineage` stamp: the resumed record must carry a tenant, and
         // the probe's bearer is selected from it. Unstamped, a resumed session
         // was the one session shape whose in-memory record held `tenant_id:
         // None`, which also made `record_session_tenant`'s registry arm return
@@ -1721,7 +1708,7 @@ impl SessionRegistry {
 
     /// Re-insert the in-memory mirror record for a resumed session under the
     /// persisted id, and emit a `StateChange` (→ PATCH `state=active`) so
-    /// the drain loop reconciles coord. Mirrors [`Self::register_external`]'s
+    /// the drain loop reconciles coord. Mirrors [`Self::register_external_with_lineage`]'s
     /// record shape but reuses `persisted_id` and emits `StateChange`
     /// instead of `Started`.
     fn insert_resumed_record(
@@ -2820,12 +2807,15 @@ mod tests {
     }
 
     #[test]
-    fn register_external_does_not_spawn_transport() {
-        // Phase 10 dual-write: the mirror must NOT start a transport —
-        // the real process is owned by the legacy path. We assert the
-        // FakeTransport's `start` counter stays at zero across a mirror.
+    fn register_external_with_lineage_does_not_spawn_transport() {
+        // An externally-owned session must NOT start a transport — the real
+        // process is owned by the `terminal_*` / `claude_session` path. We
+        // assert the FakeTransport's `start` counter stays at zero across
+        // the registration.
         let (reg, _fx) = make_registry();
-        let id = reg.register_external(shell_intent()).unwrap();
+        let id = reg
+            .register_external_with_lineage(shell_intent(), None, None)
+            .unwrap();
         let desc = reg.describe(id).unwrap();
         assert_eq!(desc.kind, SessionKind::TerminalShell);
         assert_eq!(desc.state, SessionState::Active);
@@ -2838,7 +2828,9 @@ mod tests {
         // Closing the mirror records a Closed event and never errors —
         // the no-op ExternalTransport's close is a clean Ok(()).
         let (reg, _fx) = make_registry();
-        let id = reg.register_external(shell_intent()).unwrap();
+        let id = reg
+            .register_external_with_lineage(shell_intent(), None, None)
+            .unwrap();
         reg.close_by_id(id).unwrap();
         let again = reg.describe(id).unwrap();
         assert_eq!(again.state, SessionState::Closed);
@@ -2966,7 +2958,9 @@ mod tests {
         let (reg, _fx) = make_registry();
         let mut intent = shell_intent();
         intent.purpose = "x".into();
-        let err = reg.register_external(intent).unwrap_err();
+        let err = reg
+            .register_external_with_lineage(intent, None, None)
+            .unwrap_err();
         assert!(matches!(err, SessionError::Intent(_)));
     }
 

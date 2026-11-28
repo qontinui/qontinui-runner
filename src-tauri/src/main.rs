@@ -2646,8 +2646,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Plan 2026-05-22-coord-native-session-coordination Phase 2 — the unified
     // Session primitive's PTY/Claude-CLI transports reach this manager via
     // `app.state::<Arc<TerminalManager>>()` inside `.setup(...)` so it stays
-    // shared with the legacy `terminal_*` Tauri commands until Phase 9
-    // collapses both paths.
+    // shared with the `terminal_*` Tauri commands — by design, since those
+    // became coord-native in place (`commands/terminal/coord_wiring.rs`).
     let terminal_manager = Arc::new(terminal::TerminalManager::new());
 
     // Create shared AppState for both Tauri and MCP API
@@ -3040,8 +3040,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checkpoints::checkpoint_list_active,
             commands::checkpoints::checkpoint_save,
             commands::checkpoints::checkpoint_status,
-            commands::checkpoints::session_create,
-            commands::checkpoints::session_update_status,
             commands::checkpoints::setting_get,
             commands::checkpoints::setting_set,
             commands::checkpoints::settings_get_all,
@@ -5804,9 +5802,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     automation_stack::run_periodic().await;
                 });
 
-                // Plan §Phase 3/7/10 — start the coord-sync background loops
-                // (drain, heartbeat, Phase 7 handoff receiver, Phase 10
-                // cutover-flag poll). `.setup()` runs synchronously with no
+                // Plan §Phase 3/7 — start the coord-sync background loops
+                // (drain, heartbeat, Phase 7 handoff receiver, remote attach
+                // and create polls). `.setup()` runs synchronously with no
                 // ambient Tokio reactor, so these helpers' internal
                 // `tokio::spawn` panics ("there is no reactor running, must be
                 // called from the context of a Tokio 1.x runtime"). Wrap the
@@ -5817,15 +5815,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
                 //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
                 //   GET, materializing each handoff_request as a child session.
-                //   Phase 10 flag-poll always spawns and re-reads the
-                //   machine.json `active_tenant_id` every tick (unpinned →
-                //   it asks coord nothing), so a tenant switch is followed
-                //   without a restart; dual-write stays off until that
-                //   tenant's `session_coordination_enabled` flips.
-                //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
-                //   DEVICE-scoped surface — it polls the PINNED tenant's
-                //   policy and presents that tenant's own device-JWT slot
-                //   (`tenant_policy_scope`).
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
@@ -5846,7 +5835,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Phase 3b).
                     let _create_poll =
                         session::create::start_poll_task(loop_registry.clone());
-                    let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);
                 // The AppHandle (set above) and the SessionRegistry (just

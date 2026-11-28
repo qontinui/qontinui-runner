@@ -91,8 +91,7 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
 /// consumer with `timing` `live` or `next_start`. Two surfaces are
 /// `next_start`, read once at startup: the coord-mcp nonce restore and the
-/// boot reconcile's on-disk nonce adoption. The dual-write gate is `live`: its
-/// flag poll re-reads the pin each tick.
+/// boot reconcile's on-disk nonce adoption.
 /// `data.existing_sessions` counts this process's device coord-mcp keys, live
 /// AND graced (an evicted key keeps serving for the grace TTL): those pinned
 /// at creation keep their tenant, and those that were unpinned follow the new
@@ -321,8 +320,7 @@ mod tests {
 
     /// The per-surface effect report: every surface names a timing of `live`
     /// or `next_start` and a non-empty evidence locator, both timings occur,
-    /// the two startup readers are the ones classified `next_start` (the
-    /// dual-write gate is `live`), and the
+    /// the two startup readers are the ones classified `next_start`, and the
     /// running-session census carries both counts.
     #[tokio::test]
     async fn put_reports_per_surface_effect_timing_and_a_session_census() {
@@ -363,21 +361,6 @@ mod tests {
             ],
             "exactly the startup readers are next_start"
         );
-        let gate = surfaces
-            .iter()
-            .find(|s| s["surface"] == "session_coordination_dual_write_gate")
-            .expect("the dual-write gate is a reported surface");
-        assert_eq!(
-            gate["timing"], "live",
-            "the dual-write flag poll re-reads the pin each tick, so a PUT reaches it live"
-        );
-        assert!(
-            gate["evidence"].as_array().is_some_and(|e| e
-                .iter()
-                .any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
-            "the gate's reader is the flag poll loop: {gate}"
-        );
-
         let existing = &data["existing_sessions"];
         for group in ["pinned_at_creation", "follows_machine_pin"] {
             assert!(existing[group]["count"].is_u64(), "{group}.count");

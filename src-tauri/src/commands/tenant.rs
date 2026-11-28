@@ -6,7 +6,7 @@
 //!
 //! `machine.json::active_tenant_id` is the **default for NEW sessions and
 //! for device-level surfaces** (heartbeat, census, backstop, maintenance,
-//! doctor, flag-poll) — NOT "the only tenant this device serves". A device
+//! doctor) — NOT "the only tenant this device serves". A device
 //! holds N concurrent tenant bindings (`paired_user.json` v2 +
 //! `coord.tenant_devices`); each session records its own tenant at
 //! creation (spawn input, else this default).
@@ -15,11 +15,10 @@
 //! PINNED at creation keeps its tenant, but one frozen UNPINNED (the normal
 //! single-tenant shape, and a restored/adopted nonce with no recorded tenant)
 //! re-reads the machine pin on every request (`coord_mcp::decide_session_tenant`
-//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. The
-//! dual-write gate follows a switch within one flag-poll interval, because its
-//! poll re-reads the pin each tick. Only the coord-mcp nonce restore and the
-//! boot-time on-disk nonce adoption read the pin once at startup, so they see
-//! a switch only at the next runner start. [`PIN_SURFACES`] is the
+//! rows 2-4), so an unpinned -> pinned switch moves running sessions too.
+//! Only the coord-mcp nonce restore and the boot-time on-disk nonce
+//! adoption read the pin once at startup, so they see a switch only at the
+//! next runner start. [`PIN_SURFACES`] is the
 //! per-consumer table; `PUT /tenant/active` reports it with a live count.
 //!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)
@@ -250,7 +249,7 @@ pub(crate) struct PinSurface {
 ///
 /// Partly guarded by `commands::tenant::tests::every_pin_reader_is_classified`,
 /// which scans `src-tauri/src` (inline test modules excluded) for each DIRECT
-/// call or path reference to `resolve_tenant_pin`, `resolve_active_tenant_id`,
+/// call or path reference to `resolve_tenant_pin`,
 /// `active_tenant_uuid`, `active_tenant_id_str` and `machine_pin_tenant`, and
 /// requires the enclosing function to be named here or in
 /// [`PIN_READER_EXCLUSIONS`].
@@ -386,14 +385,6 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  fleet-policy poll (≤ 45 s)",
     },
     PinSurface {
-        surface: "session_coordination_dual_write_gate",
-        timing: PinTiming::Live,
-        readers: &["session/coord_sync.rs::run_flag_poll_loop"],
-        detail: "the flag poll re-reads the pin each tick, so a switch takes effect within about \
-                 one QONTINUI_SESSION_FLAG_POLL_SECS interval (default 60s), plus at most one \
-                 fetch already in flight for the previous tenant",
-    },
-    PinSurface {
         surface: "coord_mcp_nonce_restore",
         timing: PinTiming::NextStart,
         readers: &["coord_mcp.rs::restore_proxy_nonces_from"],
@@ -416,10 +407,6 @@ pub(crate) const PIN_READER_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "ambient.rs::active_tenant_uuid",
         "the accessor itself; classified at its callers",
-    ),
-    (
-        "session/dual_write.rs::resolve_active_tenant_id",
-        "a delegate to resolve_tenant_pin; every caller is scanned and classified",
     ),
     (
         "coord_doctor.rs::read_active_tenant_id_from_machine_json",
@@ -1125,7 +1112,6 @@ mod tests {
     /// The pin-reading spellings the guard looks for.
     const PIN_READER_TOKENS: &[&str] = &[
         "resolve_tenant_pin",
-        "resolve_active_tenant_id",
         "active_tenant_uuid",
         "active_tenant_id_str",
         "machine_pin_tenant",
@@ -1356,8 +1342,8 @@ mod tests {
             "resolve_tenant_pin"
         ));
         assert!(uses_token(
-            ".or_else(crate::x::resolve_active_tenant_id)",
-            "resolve_active_tenant_id"
+            ".or_else(crate::x::resolve_tenant_pin)",
+            "resolve_tenant_pin"
         ));
         assert!(uses_token("doc.active_tenant_uuid()", "active_tenant_uuid"));
         assert!(!uses_token(
@@ -1374,8 +1360,8 @@ mod tests {
         ));
         assert!(!uses_token("resolve_tenant_pins()", "resolve_tenant_pin"));
         assert!(!uses_token(
-            r#"        "session/dual_write.rs::resolve_active_tenant_id","#,
-            "resolve_active_tenant_id"
+            r#"        "ambient.rs::active_tenant_uuid","#,
+            "active_tenant_uuid"
         ));
         assert_eq!(
             fn_name_on("    pub(crate) async fn foo_bar(x: u8) {").as_deref(),

@@ -123,7 +123,7 @@ export interface TenantContextValue {
    * `src-tauri/src/commands/tenant.rs`'s module doc is the authority for that
    * key's full meaning — it is the default for new sessions AND for
    * device-level surfaces (heartbeat, census, backstop, maintenance,
-   * doctor, flag-poll). This TS
+   * doctor). This TS
    * symbol is named for the only half the frontend uses.
    *
    * `null` while loading, or when the operator hasn't paired yet.

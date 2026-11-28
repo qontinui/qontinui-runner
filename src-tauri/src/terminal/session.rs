@@ -1599,7 +1599,7 @@ pub struct TerminalSession {
     output_tx: broadcast::Sender<String>,
     /// Server-side cell grid produced by the VT parser tee in the reader thread.
     grid: Arc<Mutex<Grid>>,
-    /// Coord-native session id, set after `register_external()` wires this
+    /// Coord-native session id, set after `register_external_with_lineage()` wires this
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
@@ -2149,7 +2149,7 @@ impl TerminalSession {
         })?;
 
         // Coord mirror identity, populated by `terminal_create` after
-        // `register_external` returns. Declared HERE (ahead of the reader
+        // `register_external_with_lineage` returns. Declared HERE (ahead of the reader
         // thread) rather than beside the waiter below because the reader needs
         // a clone for the OSC 9999 agent-status sideband: a payload for a
         // terminal with no coord mirror has nowhere to go and is dropped.
@@ -2533,7 +2533,7 @@ impl TerminalSession {
         // close the coord session mirror immediately (vs. leaving it for
         // coord's stale→closed watcher; see coord_sync plan A3). Both are
         // populated AFTER spawn by
-        // `terminal_create` once `register_external` returns the coord id,
+        // `terminal_create` once `register_external_with_lineage` returns the coord id,
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn. (`coord_session_id` itself is
         // declared above the reader thread, which also needs a clone of it.)
@@ -4844,7 +4844,7 @@ impl TerminalSession {
         self.output_tx.subscribe()
     }
 
-    /// Set the coord-native session id after `register_external()` wires
+    /// Set the coord-native session id after `register_external_with_lineage()` wires
     /// this terminal into the coordinator's session plane.
     ///
     /// Also stamps the bind order ([`Self::coord_binding`]), so the newest

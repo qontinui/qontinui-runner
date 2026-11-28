@@ -37,9 +37,9 @@ pub enum TransportHandle {
     /// transport just records the `task_run_id` for log/observation
     /// hookups.
     Workflow { task_run_id: String },
-    /// Externally-owned session (plan §Phase 10 dual-write). The real
-    /// process is owned by the legacy path; this handle carries the
-    /// legacy id purely for cross-referencing in the dashboard. No
+    /// Externally-owned session: the real process (a `terminal_create` PTY
+    /// or `claude_session` subprocess) is owned by that path, and this
+    /// handle is pure dashboard bookkeeping (see [`ExternalTransport`]). No
     /// transport op touches the underlying process.
     External,
     /// A tab attached to a terminal on ANOTHER device (plan
@@ -201,11 +201,11 @@ where
 /// lifecycle.
 pub type DynTransport = Arc<dyn Transport>;
 
-/// No-op transport for **externally-owned** sessions (plan §Phase 10
-/// dual-write). The underlying process — a legacy `terminal_create` PTY
-/// or `claude_session` subprocess — is owned and torn down by the legacy
-/// path; the coord-native mirror created via
-/// [`super::SessionRegistry::register_external`] is pure bookkeeping for
+/// No-op transport for **externally-owned** sessions. The underlying
+/// process — a `terminal_create` PTY or `claude_session` subprocess — is
+/// owned and torn down by that path (coord-native by design, see
+/// `transport/pty.rs`); the coord-native record created via
+/// [`super::SessionRegistry::register_external_with_lineage`] is pure bookkeeping for
 /// the dashboard. All [`Transport`] ops are no-ops: nothing to spawn,
 /// nothing to write, nothing to tear down (close is idempotent and never
 /// touches the real process — closing the mirror must not kill the
@@ -215,7 +215,7 @@ pub struct ExternalTransport;
 
 impl Transport for ExternalTransport {
     fn start(&self, _intent: &Intent) -> Result<TransportHandle, TransportError> {
-        // register_external never calls start (the real process is
+        // register_external_with_lineage never calls start (the real process is
         // already running). Defined for trait completeness; returns an
         // external handle so a misuse is observable rather than panicking.
         Ok(TransportHandle::External)

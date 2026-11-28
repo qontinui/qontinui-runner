@@ -106,8 +106,8 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// which reads `AuthManager::get_access_token()` per call (no caching, since
 /// the JWT has a short TTL) and is NEVER fatal: an unpaired runner / empty
 /// keychain / IO error all collapse to "send anonymously" — exactly the
-/// pre-Phase-P2 behavior. Pre-pairing callers (credential-helper setup, the
-/// tenant-policy poll, early handoff catch-up) thus keep working before any
+/// pre-Phase-P2 behavior. Pre-pairing callers (credential-helper setup,
+/// early handoff catch-up) thus keep working before any
 /// token exists; coord 401/403 once it gates is a retry-after-auth signal,
 /// not a fatal error.
 ///
@@ -115,7 +115,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// auth-coverage metric, so these reads now count toward the same
 /// unpaired→paired dogfood signal the write path reports.
 pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Callers adopt it one at a time as each establishes its own class: the tenant-policy poll (`session/coord_sync.rs::fetch_session_coordination_flag`) is the first, per plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3.
+    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for`. Callers adopt it one at a time as each establishes its own class (plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3).
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
@@ -161,9 +161,6 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// tenant's credential). This is the seam census E1 names as the resolution
 /// for [`coord_get`]'s 21 cross-class callers — each states its own scope here
 /// instead of inheriting one helper's guess.
-/// First adopter: `session/coord_sync.rs::fetch_session_coordination_flag`,
-/// the `/tenant-policy` poll, whose query names a tenant that coord requires
-/// to EQUAL the presented token's claim.
 ///
 /// **Takes `crate::auth::TenantScope`, not `qontinui_runner_lib::auth`'s**,
 /// unlike the three unparameterized helpers above — and the reason is NOT a
@@ -176,8 +173,7 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// SEPARATE STATICS. `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the
 /// coverage counters), `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and
 /// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
-/// helper through `crate::auth` puts the attach in the SAME copy as the
-/// `crate::auth::presented_tenant` call that diagnoses its refusals and as
+/// helper through `crate::auth` puts the attach in the SAME copy as
 /// the rest of this copy's `attach_device_auth*` call sites — the large
 /// majority of them, spread across three dozen modules — so the latch that
 /// says "already warned" and the counter that says "N of M authed" are the
