@@ -5,7 +5,7 @@
 //! [`qontinui_code_graph`] crate, which is filesystem-persistence-free. This
 //! module:
 //!   1. Re-exports the crate's public API so existing caller paths like
-//!      `crate::workflow_generation::code_graph::{CodeGraph, BlastRadius, ...}`
+//!      `crate::mcp::code_semantics::code_graph::{CodeGraph, BlastRadius, ...}`
 //!      keep resolving unchanged.
 //!   2. Owns the runner-side persistence (`PersistedCodeGraph` save/load via
 //!      [`crate::paths::get_code_graph_path`]) — the only filesystem coupling.
@@ -16,7 +16,7 @@
 //!      since you cannot add inherent methods to the foreign `CodeGraph` type).
 
 // Re-export the crate's full public API so existing caller paths like
-// `crate::workflow_generation::code_graph::{CodeGraph, BlastRadius, ...}` keep
+// `crate::mcp::code_semantics::code_graph::{CodeGraph, BlastRadius, ...}` keep
 // resolving. This glob also brings `CodeGraph`, `FileFingerprint`,
 // `IncrementalInput`, `compute_fingerprints`, `repo_hash`, etc. into this
 // module's scope for the runner-only persistence code below.

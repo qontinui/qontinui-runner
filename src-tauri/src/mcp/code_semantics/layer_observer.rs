@@ -819,7 +819,7 @@ edges = [ { from_glob = "src/database/**", to_layer = "service", reason = "persi
                     continue;
                 }
             };
-            let graph = crate::workflow_generation::code_graph::CodeGraph::build(dir);
+            let graph = crate::mcp::code_semantics::code_graph::CodeGraph::build(dir);
             let edges = crate::mcp::code_semantics::module_graph::cross_module_edges(&graph);
             let layer_of = label_from_manifest(&edges, &manifest);
             let env = make_gate_envelope("layer_drift", name, &edges, &layer_of, &manifest);

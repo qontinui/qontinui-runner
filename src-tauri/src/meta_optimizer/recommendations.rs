@@ -329,7 +329,7 @@ async fn apply_rule_create_async(
         }
     };
 
-    let input = crate::workflow_generation::rules::InsertRuleInput {
+    let input = crate::generation_rules::InsertRuleInput {
         agent: payload.agent.clone(),
         section: payload.section.clone(),
         rule_number,
@@ -358,7 +358,7 @@ async fn apply_rule_update_async(pg_db: &Arc<PgDb>, recommended_value: &str) -> 
         .rule_id
         .ok_or_else(|| "rule_update payload missing 'rule_id'".to_string())?;
 
-    let input = crate::workflow_generation::rules::UpdateRuleInput {
+    let input = crate::generation_rules::UpdateRuleInput {
         title: Some(payload.title),
         content: Some(payload.content),
         condition: payload.condition,
@@ -494,7 +494,7 @@ fn apply_rule_create(
         })?,
     };
 
-    let input = crate::workflow_generation::rules::InsertRuleInput {
+    let input = crate::generation_rules::InsertRuleInput {
         agent: payload.agent.clone(),
         section: payload.section.clone(),
         rule_number,
@@ -524,7 +524,7 @@ fn apply_rule_update(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), S
         .rule_id
         .ok_or_else(|| "rule_update payload missing 'rule_id'".to_string())?;
 
-    let input = crate::workflow_generation::rules::UpdateRuleInput {
+    let input = crate::generation_rules::UpdateRuleInput {
         title: Some(payload.title),
         content: Some(payload.content),
         condition: payload.condition,
@@ -695,7 +695,7 @@ async fn rollback_rule_async(
             })?
     };
 
-    let input = crate::workflow_generation::rules::UpdateRuleInput {
+    let input = crate::generation_rules::UpdateRuleInput {
         title: None,
         content: None,
         condition: None,
@@ -804,7 +804,7 @@ fn rollback_rule(
         })?
     };
 
-    let input = crate::workflow_generation::rules::UpdateRuleInput {
+    let input = crate::generation_rules::UpdateRuleInput {
         title: None,
         content: None,
         condition: None,

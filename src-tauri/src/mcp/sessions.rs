@@ -175,6 +175,23 @@ fn initial_prompt_for(
     }
 }
 
+/// The `AiSessionContext` a coord-spawned session runs under.
+///
+/// A spawned session is not part of any workflow phase: it carries no phase and
+/// no iteration, and its name is the requested `task_name` verbatim (plan
+/// `2026-11-19-delete-the-runner-ai-workflow-loop-engine` Phase 1 — it used to
+/// be built as a setup-phase session, named "`<name> - Setup`").
+/// `pinned_config_dir` is the per-request account override, when one resolved.
+fn spawned_session_context(
+    task_run_id: &str,
+    task_name: &str,
+    pinned_config_dir: Option<String>,
+) -> AiSessionContext {
+    let mut session_ctx = AiSessionContext::for_session(task_run_id, task_name);
+    session_ctx.pinned_config_dir = pinned_config_dir;
+    session_ctx
+}
+
 /// Resolve the caller's requested `cwd` into the directory the spawned session
 /// should start in.
 ///
@@ -350,10 +367,11 @@ async fn spawn_session(
     let initial_prompt =
         initial_prompt_for(slash_command, req.args.as_deref(), req.prompt.as_deref());
 
-    let mut session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
-    if let Some(ref resolved) = resolved_account {
-        session_ctx.pinned_config_dir = Some(resolved.config_dir.clone());
-    }
+    let session_ctx = spawned_session_context(
+        &task_run_id,
+        &req.task_name,
+        resolved_account.as_ref().map(|r| r.config_dir.clone()),
+    );
 
     let dispatched = slash_command.is_some();
     let role_for_response = req.role.clone();
@@ -2072,6 +2090,28 @@ fn transcript_coverage_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coord-spawned session is named exactly what was requested — no
+    /// " - Setup" suffix, no phase tag, no iteration — and its session id is the
+    /// task run id. This is the context `create_session` hands to
+    /// `ClaudeSession::spawn`.
+    #[test]
+    fn spawned_session_name_is_verbatim() {
+        let trid = "0b7c6a52-6f0e-4a8e-9a43-3f1d2c5e7a10";
+        let ctx = spawned_session_context(trid, "Fix the flaky merge test", None);
+        assert_eq!(ctx.session_name, "Fix the flaky merge test");
+        assert!(!ctx.session_name.contains("Setup"), "{}", ctx.session_name);
+        assert_eq!(ctx.phase(), None);
+        assert_eq!(ctx.iteration(), None);
+        assert_eq!(ctx.session_id, trid);
+        assert_eq!(ctx.task_run_id(), trid);
+        assert!(ctx.to_json().get("phase").is_none());
+        assert_eq!(ctx.pinned_config_dir, None);
+
+        let pinned = spawned_session_context(trid, "x", Some("/cfg/acct".to_string()));
+        assert_eq!(pinned.pinned_config_dir.as_deref(), Some("/cfg/acct"));
+        assert_eq!(pinned.session_name, "x");
+    }
 
     // =========================================================================
     // POST /sessions/{id}/finish — the response contract

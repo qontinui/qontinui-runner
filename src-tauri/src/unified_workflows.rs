@@ -580,8 +580,8 @@ pub fn workflow_to_stage_config(
     index: usize,
     total_stages: usize,
     include_preflight: bool,
-) -> crate::unified_workflow_executor::StageConfig {
-    use crate::unified_workflow_executor::{
+) -> crate::step_executor::StageConfig {
+    use crate::step_executor::step_conversion::{
         convert_all_json_steps_with_phase, convert_json_steps_with_phase,
         extract_prompt_steps_with_phase,
     };
@@ -601,7 +601,7 @@ pub fn workflow_to_stage_config(
     let comp_prompt =
         extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
 
-    crate::unified_workflow_executor::StageConfig {
+    crate::step_executor::StageConfig {
         id: workflow.id.clone(),
         name: workflow.name.clone(),
         index,
@@ -636,8 +636,8 @@ pub fn stage_to_stage_config(
     log_watch_enabled: bool,
     health_check_enabled: bool,
     health_check_urls: &[HealthCheckUrl],
-) -> crate::unified_workflow_executor::StageConfig {
-    use crate::unified_workflow_executor::{
+) -> crate::step_executor::StageConfig {
+    use crate::step_executor::step_conversion::{
         convert_all_json_steps_with_phase, convert_json_steps_with_phase,
         extract_prompt_steps_with_phase,
     };
@@ -658,7 +658,7 @@ pub fn stage_to_stage_config(
     let comp_auto = convert_json_steps_with_phase(&stage.completion_steps, 0, Some("completion"));
     let comp_prompt = extract_prompt_steps_with_phase(&stage.completion_steps, Some("completion"));
 
-    crate::unified_workflow_executor::StageConfig {
+    crate::step_executor::StageConfig {
         id: stage.id.clone(),
         name: stage.name.clone(),
         index,

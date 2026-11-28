@@ -171,7 +171,7 @@
       "reason": "`tsc --version` resolution for a typecheck scope. Runs on the operator/agent-initiated typecheck path, not a timer, and only after `find_tsc` has already located the binary on disk."
     },
     {
-      "site": "src-tauri/src/mcp/trace_verification.rs::extract_video_frames",
+      "site": "src-tauri/src/mcp/ai_session_media.rs::extract_video_frames",
       "waits": [
         "ffmpeg"
       ],

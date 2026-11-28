@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 
 use super::scope::{self, Scope};
 use super::{scope_project_dir, Envelope};
+use crate::mcp::code_semantics::code_graph::{BlastRadius, CodeGraph, ResolutionKind};
 use crate::mcp::types::ApiState;
-use crate::workflow_generation::code_graph::{BlastRadius, CodeGraph, ResolutionKind};
 use crate::workflow_generation::import_resolver::ImportResolver;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -815,7 +815,7 @@ fn empty_graph() -> CodeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow_generation::code_graph::{ExportNode, FileNode, ImportEdge};
+    use crate::mcp::code_semantics::code_graph::{ExportNode, FileNode, ImportEdge};
 
     fn file(path: &str, lang: &str) -> FileNode {
         FileNode {

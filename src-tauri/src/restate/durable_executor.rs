@@ -26,7 +26,7 @@ pub use crate::unified_workflow_executor::types::PhaseResult;
 /// with. An unparseable `ui_bridge` step fails the batch naming the step
 /// (`StepsJsonError::UnparseableStep`) — it is never dropped.
 fn parse_batch_steps(steps_json: &str) -> Result<Vec<ExecutionStepConfig>, String> {
-    crate::unified_workflow_executor::step_conversion::parse_steps_json(steps_json)
+    crate::step_executor::step_conversion::parse_steps_json(steps_json)
         .map_err(|e| format!("Step deserialization failed: {e}"))
 }
 

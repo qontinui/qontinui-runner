@@ -702,8 +702,8 @@ impl PgDb {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<crate::reflection::unified_search::UnifiedSearchResult>, String> {
-        use crate::reflection::unified_search::UnifiedSearchResult;
+    ) -> Result<Vec<crate::memory::graph::unified_search::UnifiedSearchResult>, String> {
+        use crate::memory::graph::unified_search::UnifiedSearchResult;
 
         let conn = self
             .pool
@@ -1099,5 +1099,120 @@ impl PgDb {
             "unique_skills_failed": auto_disabled,
             "top_skills": top,
         }))
+    }
+}
+
+/// The two reads the `/graph/detect-patterns` and `/graph/similar-errors`
+/// endpoints make. They lived in `pg/reflection.rs` until plan
+/// `2026-11-19-delete-the-runner-ai-workflow-loop-engine` Phase 1; neither
+/// touches a reflection-fix row.
+impl PgDb {
+    /// PG equivalent of cross_run_learning::post_run_analysis (simplified)
+    /// Returns (patterns_detected, rules_disabled, fixes_auto_applied)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
+    pub async fn post_run_analysis(
+        &self,
+        workflow_name: &str,
+        _task_run_id: &str,
+    ) -> Result<(u32, u32, u32), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+
+        // Detect recurring findings (simplified: count finding signatures with 3+ occurrences)
+        let patterns: i64 = conn
+            .query_one(
+                r#"SELECT COUNT(DISTINCT trf.signature_hash)
+                   FROM task_run_findings trf
+                   INNER JOIN task_runs tr ON tr.id = trf.task_run_id
+                   WHERE tr.workflow_name = $1
+                     AND trf.signature_hash IS NOT NULL
+                   GROUP BY trf.signature_hash
+                   HAVING COUNT(*) >= 3"#,
+                &[&workflow_name],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+
+        // Count patterns from cross_run_patterns table
+        let pattern_count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM cross_run_patterns WHERE workflow_name = $1 AND is_active = true",
+                &[&workflow_name],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(patterns);
+
+        Ok((pattern_count as u32, 0, 0))
+    }
+
+    /// PG equivalent of fuzzy_matching::find_similar_errors (text-only, ILIKE based)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
+    pub async fn find_similar_errors(
+        &self,
+        error_description: &str,
+        min_similarity: f64,
+        limit: usize,
+    ) -> Result<Vec<crate::memory::graph::fuzzy_matching::SimilarError>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+
+        // Use ILIKE for basic text matching since PG trigram extension may not be installed
+        let search_term = format!(
+            "%{}%",
+            crate::str_utils::truncate_str(error_description, 50)
+        );
+        let limit_i64 = (limit * 2) as i64; // fetch more, then filter by similarity
+
+        let rows = conn
+            .query(
+                r#"SELECT id, signature_hash, message
+                   FROM error_events
+                   WHERE message ILIKE $1
+                     AND status != 'resolved'
+                   ORDER BY last_seen_at DESC
+                   LIMIT $2"#,
+                &[&search_term, &limit_i64],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG find_similar_errors", &e))?;
+
+        let mut results = Vec::new();
+        for row in &rows {
+            let id: String = row.get(0);
+            let sig: String = row.get(1);
+            let msg: String = row.get(2);
+            let sim =
+                crate::memory::graph::fuzzy_matching::trigram_similarity(error_description, &msg);
+            if sim >= min_similarity {
+                results.push(crate::memory::graph::fuzzy_matching::SimilarError {
+                    error_id: id,
+                    signature_hash: sig,
+                    message: msg,
+                    similarity: sim,
+                });
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        Ok(results)
     }
 }

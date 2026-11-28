@@ -224,7 +224,7 @@ pub async fn author_candidate_with_executor(
 
 /// Re-exported from [`crate::spec_api::slug`], which owns both directions of
 /// the pathname ↔ spec-id mapping so they cannot drift apart. It also has to
-/// live outside this module: `spec_authoring` is behind the `spec-authoring`
+/// live outside this module: `spec_api::authoring` is behind the `spec-authoring`
 /// feature, while `state_discovery::capture` needs the same slug on every
 /// build.
 pub(crate) use crate::spec_api::slug::pathname_to_spec_id;

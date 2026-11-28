@@ -107,6 +107,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/step_executor/handlers/ui_bridge.rs` | `UiBridgeHandler::execute` | `.unwrap_or("http://localhost:3001");` | 1 | unreviewed |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"State Recv-Q Send-Q Local Address:Port Peer Address:Port\\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\nLISTEN 0 128 *:443 *:*\\...` | 1 | unreviewed |
 | `src/unified_workflow_executor/phase_helpers.rs` | `compute_embedding_sync` | `.post("http://127.0.0.1:8001/api/embeddings/compute-text")` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. |
+| `src/validation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed — Moved key, not a new assumption: the same row stood unreviewed under src/workflow_generation/structured_output.rs until plan 2026-11-19-delete-the-runner-ai-workflow-loop-engine Phase 1 moved the file verbatim (R100) to src/validation/. Not yet triaged; unreviewed count unchanged. |
 | `src/workflow_generation/discovery_tools.rs` | `execute_test_api` | `test_urls.push(format!("http://localhost:8000{}", endpoint));` | 1 | unreviewed |
 | `src/workflow_generation/evaluation/mod.rs` | `detect_target_family` | `if json.contains("localhost:1420") \|\| json.contains("localhost:3001") {` | 1 | unreviewed |
 | `src/workflow_generation/generator.rs` | `generate_workflow` | `let targets_web = stage_json.contains("localhost:3001")` | 1 | unreviewed |
@@ -120,7 +121,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/meta_workflow.rs` | `build_specification_meta_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/meta_workflow.rs` | `build_verification_review_prompt` | `15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420) AND verifies interactive UI behavior...` | 1 | unreviewed |
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
-| `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
 ## `supervisor_dependency` (57 rows)
 

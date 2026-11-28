@@ -1,7 +1,7 @@
 //! PostgreSQL step_type_knowledge CRUD operations (raw SQL).
 
 use super::PgDb;
-use crate::workflow_generation::step_type_knowledge::{
+use crate::step_registry::step_type_knowledge::{
     InsertKnowledgeInput, ListKnowledgeQuery, StepTypeKnowledge, UpdateKnowledgeInput,
 };
 use chrono::Utc;

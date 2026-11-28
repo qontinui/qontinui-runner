@@ -905,3 +905,10 @@ note = "Reads one thread's kernel state and wait reason for the wedge-diagnostic
 reviewed = [
     "cfg(windows)-only fn `thread_state` has no cfg(not(windows)) sibling in this file",
 ]
+
+[[disposition]]
+class = "dev_ports"
+file = "src/validation/structured_output.rs"
+symbol = "detect_backend"
+disposition = "unreviewed"
+note = "Moved key, not a new assumption: the same row stood unreviewed under src/workflow_generation/structured_output.rs until plan 2026-11-19-delete-the-runner-ai-workflow-loop-engine Phase 1 moved the file verbatim (R100) to src/validation/. Not yet triaged; unreviewed count unchanged."

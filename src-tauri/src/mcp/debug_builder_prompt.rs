@@ -1,7 +1,7 @@
 //! Debug endpoint: assembled Builder recognition prompt (no LLM).
 //!
 //! Phase B1 observability: the wrapper manifest (built by
-//! `workflow_generation::wrapper_manifest::build_manifest`) is unit-tested
+//! `mcp::wrapper_manifest::build_manifest`) is unit-tested
 //! and the formatter is unit-tested, but until this endpoint existed there
 //! was no way to confirm the manifest actually appears in a Builder's
 //! assembled recognition prompt during a real generation run without
@@ -100,8 +100,7 @@ pub async fn debug_builder_prompt_handler(
     // are bytes-for-bytes what the Builder would see when generating a
     // workflow from the same brief at the same instant.
     let port = runner_api_port(&state.app_state);
-    let manifest =
-        crate::workflow_generation::wrapper_manifest::build_manifest(&state.app_state, port).await;
+    let manifest = crate::mcp::wrapper_manifest::build_manifest(&state.app_state, port).await;
 
     let manifest_len = manifest.len();
     let wrapper_count = count_wrapper_bullets(&manifest);

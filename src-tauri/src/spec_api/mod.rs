@@ -21,6 +21,12 @@
 
 pub mod apps;
 pub mod auth_injection;
+// Stream E (Flywheel) — coverage-growth loop. Gated behind the
+// `spec-authoring` Cargo feature, as it was under workflow_generation/.
+#[cfg(feature = "spec-authoring")]
+pub mod authoring;
+#[cfg(feature = "spec-authoring")]
+pub mod coverage;
 pub mod distinctness;
 pub mod events;
 pub mod handlers;

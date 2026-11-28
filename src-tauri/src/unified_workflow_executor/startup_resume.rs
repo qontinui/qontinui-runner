@@ -9,6 +9,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::step_executor::extract_workflow_id_from_task_id;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
@@ -480,7 +481,7 @@ pub async fn resume_interrupted_workflows(
                             let total_stages = normalized_stages.len();
 
                             // Convert each stage to StageConfig
-                            let stages: Vec<super::StageConfig> = normalized_stages
+                            let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
                                 .iter()
                                 .enumerate()
                                 .map(|(idx, stage)| {
@@ -700,7 +701,7 @@ pub async fn resume_interrupted_workflows(
                             let total_stages = normalized_stages.len();
 
                             // Convert each stage to StageConfig
-                            let stages: Vec<super::StageConfig> = normalized_stages
+                            let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
                                 .iter()
                                 .enumerate()
                                 .map(|(idx, stage)| {
@@ -865,30 +866,4 @@ pub async fn resume_interrupted_workflows(
     }
 
     processed_count
-}
-
-// ---------------------------------------------------------------------------
-// extract_workflow_id_from_task_id
-// ---------------------------------------------------------------------------
-
-/// Extract workflow ID from task_run.id (format: unified-workflow-{uuid}-{timestamp})
-pub fn extract_workflow_id_from_task_id(task_id: &str) -> Option<String> {
-    // Format: unified-workflow-{uuid part 1}-{uuid part 2}-{uuid part 3}-{uuid part 4}-{uuid part 5}-{timestamp}
-    // Example: unified-workflow-12345678-1234-5678-1234-567812345678-20250101120000
-    if !task_id.starts_with("unified-workflow-") {
-        return None;
-    }
-
-    let parts: Vec<&str> = task_id.split('-').collect();
-    // "unified" = 0, "workflow" = 1, then 5 UUID parts, then timestamp
-    if parts.len() >= 7 {
-        // UUID is parts 2-6 (indices 2,3,4,5,6)
-        let uuid = format!(
-            "{}-{}-{}-{}-{}",
-            parts[2], parts[3], parts[4], parts[5], parts[6]
-        );
-        Some(uuid)
-    } else {
-        None
-    }
 }

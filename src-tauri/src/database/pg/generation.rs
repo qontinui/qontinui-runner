@@ -3,9 +3,7 @@
 //! Provides CRUD for the `generation_rules` table using raw SQL.
 
 use super::PgDb;
-use crate::workflow_generation::rules::{
-    GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
-};
+use crate::generation_rules::{GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput};
 use tracing::{info, warn};
 
 #[expect(
@@ -429,8 +427,8 @@ impl PgDb {
     /// Insert a new generation rule (PG version matching the SQLite insert_rule).
     pub async fn insert_rule(
         &self,
-        input: &crate::workflow_generation::rules::InsertRuleInput,
-    ) -> Result<crate::workflow_generation::rules::GenerationRule, String> {
+        input: &crate::generation_rules::InsertRuleInput,
+    ) -> Result<crate::generation_rules::GenerationRule, String> {
         self.upsert_rule(input).await
     }
 

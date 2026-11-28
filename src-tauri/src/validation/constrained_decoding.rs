@@ -9,7 +9,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::schema_registry;
-use crate::workflow_generation::structured_output::ConstrainedDecodingBackend;
+use crate::validation::structured_output::ConstrainedDecodingBackend;
 
 // ============================================================================
 // Constrained Decoding Payload

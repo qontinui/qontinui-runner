@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
-use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
-use crate::reflection::{
+use crate::memory::graph::{
     fuzzy_matching, graph_engine::KnowledgeGraph, graph_types::GraphSummary, unified_search,
 };
+use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
 
 use crate::database::types::{Observation, ObservationSearchResult};
 
@@ -694,7 +694,7 @@ async fn ui_failure_chain_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<UiFailureChainQuery>,
 ) -> Result<
-    Json<ApiResponse<Vec<crate::reflection::graph_types::GraphPath>>>,
+    Json<ApiResponse<Vec<crate::memory::graph::graph_types::GraphPath>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let element_id = query.element_id;

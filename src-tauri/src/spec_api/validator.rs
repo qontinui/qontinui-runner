@@ -195,7 +195,7 @@ fn gate_round_trip(ir: &IrPageSpec) -> Result<(), ValidatorError> {
 /// `QONTINUI_SPEC_COVERAGE_FLOOR` (default `0.80`). Denominator floored at
 /// 1 so a degenerate IR (no reachable states) doesn't divide by zero.
 pub(crate) fn gate_coverage(ir: &IrPageSpec) -> Result<f64, ValidatorError> {
-    use crate::workflow_generation::coverage::{coverage_of, generate_regression_suite};
+    use crate::spec_api::coverage::{coverage_of, generate_regression_suite};
     let suite = generate_regression_suite(ir);
     let report = coverage_of(ir, &suite);
     let floor: f64 = std::env::var("QONTINUI_SPEC_COVERAGE_FLOOR")

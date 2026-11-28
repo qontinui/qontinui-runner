@@ -36,10 +36,10 @@ use super::{
     DispatchRoute, LEGACY_STRING_DISPATCH,
 };
 use crate::step_executor::handlers::HandlerRegistry;
-use crate::step_executor::ExecutionStepConfig;
-use crate::unified_workflow_executor::step_conversion::{
+use crate::step_executor::step_conversion::{
     convert_json_steps_with_phase, parse_step_value, parse_steps_json, StepsJsonError,
 };
+use crate::step_executor::ExecutionStepConfig;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -959,7 +959,7 @@ fn unparseable_ui_bridge_step_fails_visibly() {
     assert!(parse_step_value(&bad).is_err());
     for steps in [
         convert_json_steps_with_phase(std::slice::from_ref(&bad), 0, Some("setup")),
-        crate::unified_workflow_executor::step_conversion::convert_all_json_steps_with_phase(
+        crate::step_executor::step_conversion::convert_all_json_steps_with_phase(
             std::slice::from_ref(&bad),
             0,
             Some("setup"),

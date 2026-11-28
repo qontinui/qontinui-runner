@@ -421,7 +421,7 @@ pub async fn post_execute(
                         .into_response();
                 }
             };
-            crate::workflow_generation::spec_authoring::AuthoringMode::FullPage { pathname }
+            crate::spec_api::authoring::AuthoringMode::FullPage { pathname }
         }
         "patch" => {
             let existing_spec_id = match row.spec_id.clone() {
@@ -468,7 +468,7 @@ pub async fn post_execute(
                             .into_response();
                     }
                 };
-            crate::workflow_generation::spec_authoring::AuthoringMode::Patch {
+            crate::spec_api::authoring::AuthoringMode::Patch {
                 existing_spec_id,
                 drift,
             }
@@ -493,35 +493,31 @@ pub async fn post_execute(
     // integration time, an unresolved import here means the sibling's PR
     // hasn't landed yet.
     let app_state_for_validator = app_state.clone();
-    let outcome = match crate::workflow_generation::spec_authoring::author_candidate(
-        pg_db.clone(),
-        app_state,
-        &app_id,
-        mode,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            let reason = authoring_error_reason(&e);
-            let detail = authoring_error_detail(&e);
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &detail)
-                .await;
-            metric_executed_inc("authoring-failed");
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": false,
-                    "proposalId": row.id,
-                    "outcome": "authoring-failed",
-                    "reason": reason,
-                    "detail": detail,
-                })),
-            )
-                .into_response();
-        }
-    };
+    let outcome =
+        match crate::spec_api::authoring::author_candidate(pg_db.clone(), app_state, &app_id, mode)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let reason = authoring_error_reason(&e);
+                let detail = authoring_error_detail(&e);
+                let _ = pg_db
+                    .update_proposal_status_with_error(&row.id, "failed", &detail)
+                    .await;
+                metric_executed_inc("authoring-failed");
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": false,
+                        "proposalId": row.id,
+                        "outcome": "authoring-failed",
+                        "reason": reason,
+                        "detail": detail,
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Step 8 — three-gate validator (distinctness → round-trip → coverage →
     // b-green). On Err, surface as `validator-rejected` + persist the
@@ -644,10 +640,8 @@ pub async fn post_execute(
         .into_response()
 }
 
-fn authoring_error_reason(
-    e: &crate::workflow_generation::spec_authoring::AuthoringError,
-) -> &'static str {
-    use crate::workflow_generation::spec_authoring::AuthoringError::*;
+fn authoring_error_reason(e: &crate::spec_api::authoring::AuthoringError) -> &'static str {
+    use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
         EmptyArtifact => "empty-artifact",
@@ -662,10 +656,8 @@ fn authoring_error_reason(
     }
 }
 
-fn authoring_error_detail(
-    e: &crate::workflow_generation::spec_authoring::AuthoringError,
-) -> String {
-    use crate::workflow_generation::spec_authoring::AuthoringError::*;
+fn authoring_error_detail(e: &crate::spec_api::authoring::AuthoringError) -> String {
+    use crate::spec_api::authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { pathname } => {
             format!("no discovery artifact for pathname={}", pathname)
@@ -1116,7 +1108,7 @@ fn mint_proposal_id() -> String {
 /// routing is best-effort).
 ///
 /// Sibling-module symmetry: keeps the slug shape identical to the
-/// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
+/// `pathname_to_spec_id` helper owned by `spec_api::authoring`.
 /// If the sibling makes that helper `pub(crate)`, this should be deleted in
 /// favor of calling it directly.
 #[expect(
@@ -1210,7 +1202,7 @@ mod tests {
     /// unable to enter ANY artifact — was told to re-derive forever.
     #[test]
     fn only_the_stale_artifact_diagnosis_prescribes_a_re_derive() {
-        use crate::workflow_generation::spec_authoring::AuthoringError;
+        use crate::spec_api::authoring::AuthoringError;
 
         let stale = AuthoringError::NoActiveStates {
             page_label: "account-billing".into(),
@@ -1250,7 +1242,7 @@ mod tests {
     /// click around the UI — for every page at once, and it would never help.
     #[test]
     fn only_the_never_observed_diagnosis_prescribes_visiting_the_page() {
-        use crate::workflow_generation::spec_authoring::AuthoringError;
+        use crate::spec_api::authoring::AuthoringError;
 
         let never = AuthoringError::NoPageObservations {
             page_label: "specs".into(),

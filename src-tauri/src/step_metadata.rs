@@ -7,8 +7,8 @@
 
 use crate::execution_context::ExecutionContext;
 use crate::runtime_env::ExecutionContextExt;
+use crate::step_registry::WorkflowPhase;
 use crate::step_types::StepType;
-use crate::unified_workflow_executor::WorkflowPhase;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -214,7 +214,7 @@ impl StepMetadata {
 
     /// Generate and set a unique step ID based on context.
     pub fn with_generated_step_id(mut self) -> Self {
-        let phase = self.context.phase.as_str();
+        let phase = self.phase().as_str();
         let iter_part = self
             .context
             .iteration
@@ -315,8 +315,15 @@ impl StepMetadata {
     }
 
     /// Get the phase.
+    ///
+    /// Step metadata is only ever built for a step of a workflow phase (the
+    /// `setup` / `verification` / `agentic` / `completion` constructors), so
+    /// its context is always phased. An unphased context (a spawned or ad-hoc
+    /// AI session, `ExecutionContext::unphased`) carries no steps.
     pub fn phase(&self) -> WorkflowPhase {
-        self.context.phase
+        self.context
+            .phase
+            .expect("StepMetadata is built only from a phased ExecutionContext")
     }
 
     /// Get the iteration (if any).
@@ -329,7 +336,7 @@ impl StepMetadata {
         if let Some(ref id) = self.step_id {
             id.clone()
         } else {
-            let phase = self.context.phase.as_str();
+            let phase = self.phase().as_str();
             let iter_part = self
                 .context
                 .iteration
@@ -355,7 +362,7 @@ impl StepMetadata {
                 "step_type": self.step_type.as_str(),
                 "step_name": self.step_name,
                 "step_index": self.step_index,
-                "phase": self.context.phase.as_str(),
+                "phase": self.phase().as_str(),
             });
 
             if let Some(iteration) = self.context.iteration {

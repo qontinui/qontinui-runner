@@ -7,5 +7,6 @@ pub mod dag_runtime;
 pub mod dag_schema;
 pub mod dag_sync;
 pub mod fresh_context;
+pub mod panic_guard;
 pub mod sub_workflow;
 pub mod variable_engine;

@@ -923,7 +923,7 @@ mod tests {
     fn observation_insert_stamps_app_id_and_validates_it_in_one_statement() {
         // Shape guard, in the spirit of
         // `page_query_is_bounded_by_artifact_ids_not_by_time` in
-        // `workflow_generation::spec_authoring`. There is no sqlx in this repo
+        // `spec_api::authoring`. There is no sqlx in this repo
         // — every statement is a runtime-parsed string, so a wrong column name
         // or arity compiles clean and fails only as a `warn!` on a
         // fire-and-forget path. This test is the only pre-PG verification of

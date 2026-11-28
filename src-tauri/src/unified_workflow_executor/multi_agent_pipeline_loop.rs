@@ -204,7 +204,7 @@ impl PipelineShared {
 
     /// Mirror of `LoopController::is_task_stopped`.
     fn is_task_stopped(&self, execution_id: &str) -> bool {
-        let task_id_to_check = super::types::get_parent_task_id(execution_id);
+        let task_id_to_check = crate::step_executor::get_parent_task_id(execution_id);
         // PG-primary: use block_on to call async PG from sync context
         let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pg = self.pg_db.clone();

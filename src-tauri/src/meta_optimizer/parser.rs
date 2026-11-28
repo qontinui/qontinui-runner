@@ -873,7 +873,7 @@ pub fn save_parsed_recommendations(
 
                 let mut too_similar = false;
                 for (rejected_variant_id, rejected_content) in &rejected_prompts {
-                    let similarity = crate::reflection::fuzzy_matching::trigram_similarity(
+                    let similarity = crate::memory::graph::fuzzy_matching::trigram_similarity(
                         &rec.rewritten_prompt,
                         rejected_content,
                     );

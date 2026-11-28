@@ -16,7 +16,7 @@ use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::super::output_parser;
-use super::super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
+use super::super::types::{AgenticOutcome, LoopConfig};
 use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
     decode_journalled_ai_output, execute_prompt_response_mode, extract_and_preread_failure_files,
@@ -24,6 +24,7 @@ use super::{
     record_phase_token_usage, record_phase_token_usage_with_cache,
     record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
 };
+use crate::step_executor::get_parent_task_id;
 
 // =============================================================================
 // Agentic Phase Executor

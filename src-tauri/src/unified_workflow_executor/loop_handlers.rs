@@ -29,9 +29,10 @@ use super::loop_handlers_decisions::compensation_applies;
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{
-    get_parent_task_id, step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig,
-    LoopResult, NodeTelemetry, PhaseResult, StepResultRecord,
+    step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig, LoopResult,
+    NodeTelemetry, PhaseResult, StepResultRecord,
 };
+use crate::step_executor::get_parent_task_id;
 
 use super::loop_controller::{emit_and_persist_phase_result, LoopController};
 

@@ -72,7 +72,7 @@ fn convert_refetched_step(
     );
 
     // Normalize canonical keys, then deserialize.
-    use crate::unified_workflow_executor::step_conversion::{
+    use crate::step_executor::step_conversion::{
         failing_step, fallback_refused, parse_step_value, StepConversionError,
     };
     let err = match parse_step_value(step) {
@@ -1125,7 +1125,7 @@ pub async fn generate_unified_workflow_async(
         let total_stages = normalized_stages.len();
 
         // Convert each stage to StageConfig
-        let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+        let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
             .iter()
             .enumerate()
             .map(|(idx, stage)| {
@@ -1508,7 +1508,7 @@ pub async fn run_unified_workflow(
     let total_stages = normalized_stages.len();
 
     // Convert each stage to StageConfig
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+    let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
         .iter()
         .enumerate()
         .map(|(idx, stage)| {
@@ -1831,7 +1831,7 @@ pub async fn run_unified_workflow(
     let file_registry = Some(state.app_state.file_registry_manager.clone());
     let file_lock = Some(state.app_state.file_lock_manager.clone());
 
-    crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
+    crate::workflow::panic_guard::spawn_sequence_with_panic_guard(
         execution_id_for_guard,
         workflow_name_for_guard,
         url_lock,
@@ -2101,7 +2101,7 @@ pub async fn execute_inline_workflow(
     let total_stages = normalized_stages.len();
 
     // Convert each stage to StageConfig
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+    let stages: Vec<crate::step_executor::StageConfig> = normalized_stages
         .iter()
         .enumerate()
         .map(|(idx, stage)| {
@@ -2644,7 +2644,7 @@ pub async fn run_composed_workflow(
         .flat_map(|w| w.normalize_to_stages().into_iter().map(move |s| (s, w)))
         .collect();
     let total = all_normalized_stages.len();
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = all_normalized_stages
+    let stages: Vec<crate::step_executor::StageConfig> = all_normalized_stages
         .iter()
         .enumerate()
         .map(|(idx, (stage, workflow))| {
@@ -2686,7 +2686,7 @@ pub async fn run_composed_workflow(
     let file_lock_for_composed = Some(state.app_state.file_lock_manager.clone());
 
     // Use panic-safe spawning to ensure task is marked as failed on panic
-    crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
+    crate::workflow::panic_guard::spawn_sequence_with_panic_guard(
         execution_id_for_guard,
         sequence_name_for_guard,
         url_lock_for_composed,
@@ -3109,8 +3109,7 @@ mod tests {
         assert!(msg.contains("invalid type: string \"soon\""), "{msg}");
         // It survives the execution_steps_json round-trip the refetch writes.
         let json = serde_json::to_string(&vec![esc.clone()]).unwrap();
-        let back =
-            crate::unified_workflow_executor::step_conversion::parse_steps_json(&json).unwrap();
+        let back = crate::step_executor::step_conversion::parse_steps_json(&json).unwrap();
         assert_eq!(back[0].conversion_error.as_deref(), Some(msg));
     }
 

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use crate::ai_provider::{run_structured_prompt, StructuredPrompt};
 use crate::ai_router::TaskContext;
-use crate::workflow_generation::code_graph::CodeGraph;
+use crate::mcp::code_semantics::code_graph::CodeGraph;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // The pure module-edge derivation now lives in the shared crate (coord needs it for
 // its merge gate). Re-exported here so existing `module_graph::{cross_module_edges,
@@ -119,7 +119,7 @@ pub(super) fn summarize_modules(graph: &CodeGraph) -> Vec<ModuleSummary> {
                 }
             }
             None => {
-                use crate::workflow_generation::code_graph::ResolutionKind;
+                use crate::mcp::code_semantics::code_graph::ResolutionKind;
                 // Only count honestly-external specifiers as external packages;
                 // an `Unresolved` internal-looking edge is a coverage hole, not a
                 // package signal, so it is deliberately dropped here.
@@ -318,7 +318,7 @@ pub(super) fn extract_json(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow_generation::code_graph::{
+    use crate::mcp::code_semantics::code_graph::{
         ExportNode, FileNode, ImportEdge, ResolutionKind,
     };
 

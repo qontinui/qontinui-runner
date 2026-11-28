@@ -167,8 +167,8 @@ impl TrackerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_registry::WorkflowPhase;
     use crate::step_types::StepType;
-    use crate::unified_workflow_executor::WorkflowPhase;
 
     #[test]
     fn test_tracker_lifecycle() {
