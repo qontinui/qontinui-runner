@@ -1319,6 +1319,65 @@ pub fn terminal_session_record_open(
     origin: Option<String>,
     provider: Option<String>,
 ) -> Result<CommandResponse, String> {
+    record_session_open(
+        &store,
+        SessionRecordOpenArgs {
+            claude_session_id,
+            config_dir,
+            working_dir,
+            page_id,
+            zone_index,
+            title,
+            terminal_id,
+            origin,
+            provider,
+        },
+    )
+}
+
+/// The arguments of [`terminal_session_record_open`], as one value — what the
+/// webview passes as the command's camelCase args and what the tauri invoke
+/// proxy (`mcp::tauri_proxy`, `"terminal_session_record_open"`) deserializes
+/// from its JSON `args`. Unknown keys are refused rather than dropped, so a
+/// misspelled `configDir` cannot record a row with no account.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionRecordOpenArgs {
+    pub claude_session_id: String,
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub page_id: Option<String>,
+    pub zone_index: i32,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub terminal_id: String,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// [`terminal_session_record_open`]'s body, callable without `tauri::State` —
+/// the Tauri command and the invoke proxy both enter here, so a headless
+/// driver's pane gets exactly the provisional row the webview writes.
+pub(crate) fn record_session_open(
+    store: &Arc<SessionLifecycleStore>,
+    args: SessionRecordOpenArgs,
+) -> Result<CommandResponse, String> {
+    let SessionRecordOpenArgs {
+        claude_session_id,
+        config_dir,
+        working_dir,
+        page_id,
+        zone_index,
+        title,
+        terminal_id,
+        origin,
+        provider,
+    } = args;
     // Blank identity fields are refused before anything is written — the same
     // guard the seed-lifecycle fixture door applies. See the helper for why,
     // and for why `config_dir` is deliberately not among them.
@@ -1379,11 +1438,11 @@ pub fn terminal_session_record_open(
     store.record_open(record);
     // The verified-resume re-assert of a boot restore lands here: adopt a
     // resumed gate continuation into this generation (plan 2026-10-03 D3).
-    adopt_restored_continuation(&store, &session_id);
+    adopt_restored_continuation(store, &session_id);
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(record_open_confirmation_report(&store, &session_id)),
+        data: Some(record_open_confirmation_report(store, &session_id)),
     })
 }
 
@@ -2337,8 +2396,57 @@ pub async fn terminal_migrate_session_account(
     claude_session_id: String,
     target_config_dir: Option<String>,
 ) -> Result<CommandResponse, String> {
+    migrate_session_account(
+        &app,
+        &store,
+        &claude_session_id,
+        target_config_dir,
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+    )
+    .await
+}
+
+/// [`terminal_migrate_session_account`]'s body, callable without
+/// `tauri::State` — the Tauri command and the tauri invoke proxy
+/// (`mcp::tauri_proxy`, `"terminal_migrate_session_account"`) both enter here,
+/// so a headless driver runs the operator migration, not a second path. Its
+/// duration is the command's (see there: up to ~17 minutes). `origin` is the
+/// caller's: the webview's command passes `OperatorTerminal`, the proxy
+/// `Unknown` (see [`run_session_migration`]).
+pub(crate) async fn migrate_session_account(
+    app: &tauri::AppHandle,
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    target_config_dir: Option<String>,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<CommandResponse, String> {
+    let plan = plan_session_migration(store, claude_session_id, target_config_dir)?;
+    run_session_migration(app, plan, origin).await
+}
+
+/// What [`plan_session_migration`] resolved: the session's row and the two
+/// accounts, before anything is moved or recorded.
+#[derive(Debug)]
+pub(crate) struct SessionMigrationPlan {
+    pub record: TerminalSessionRecord,
+    pub src: String,
+    pub dst: String,
+    /// The caller named `dst`, so the handoff ledger does not hold it yet.
+    pub explicit_target: bool,
+}
+
+/// The refusals a migration answers before it touches anything: an unknown
+/// session, an unknown current account, a target that is not a configured
+/// `claude_config_dir`, no usable auto-picked target, or a target equal to the
+/// source. Side-effect free — the handoff is recorded by
+/// [`run_session_migration`].
+pub(crate) fn plan_session_migration(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    target_config_dir: Option<String>,
+) -> Result<SessionMigrationPlan, String> {
     let record = store
-        .get(&claude_session_id)
+        .get(claude_session_id)
         .ok_or_else(|| format!("unknown session: {claude_session_id}"))?;
     let src = record
         .config_dir
@@ -2361,6 +2469,43 @@ pub async fn terminal_migrate_session_account(
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
+    Ok(SessionMigrationPlan {
+        record,
+        src,
+        dst,
+        explicit_target,
+    })
+}
+
+/// Carry out a resolved [`SessionMigrationPlan`]: record the handoff, migrate,
+/// and answer the command's payload.
+///
+/// `origin` labels the replacement pane's spawn (the focus coalescer,
+/// `intent.spawn_origin`, `is_autonomous`), so a caller passes its own: the
+/// webview's command `OperatorTerminal`, the invoke proxy `Unknown` — the same
+/// split the two `terminal_create` doors make.
+///
+/// No coord device-drain check, deliberately, on either door. A drain
+/// withholds NEW work from a device; a migration moves a session that is
+/// already live here onto another account and closes the old pane only once
+/// the new one is proven, so the device's session count does not grow. The
+/// automatic token-exhaustion migration (`account_migration::handle_usage_limit_hint`'s
+/// `migrate_session_off_runtime` call, `SpawnOrigin::Respawn`) is the precedent
+/// and is not drain-gated either; the doors that ARE (`session::respawn`,
+/// `session::resume_door`) start a session that is not running on this device.
+/// Deferring a migration would leave a token-exhausted session stuck instead.
+pub(crate) async fn run_session_migration(
+    app: &tauri::AppHandle,
+    plan: SessionMigrationPlan,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<CommandResponse, String> {
+    let SessionMigrationPlan {
+        record,
+        src,
+        dst,
+        explicit_target,
+    } = plan;
+    let claude_session_id = record.claude_session_id.clone();
     // A picked target is already in the handoff ledger; an explicit one is not.
     if explicit_target {
         crate::ai_provider::record_handoff(&dst);
@@ -2372,11 +2517,7 @@ pub async fn terminal_migrate_session_account(
     // (the new pane closed), unless the old pane is read to host no CLI — then
     // the new pane keeps the session.
     let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
-        &app,
-        &record,
-        &src,
-        &dst,
-        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+        app, &record, &src, &dst, origin,
     )
     .await
     .map_err(|e| {

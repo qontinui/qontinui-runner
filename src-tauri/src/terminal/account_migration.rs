@@ -1708,8 +1708,10 @@ pub(crate) fn spawn_resumed_pane(
         // record (same row, new terminal/account/zone) + verification arm.
         claude_session_id: Some(spec.claude_session_id.to_string()),
         zone_index: Some(spec.zone_index),
-        // A resume preserves the original session's nature (operator or
-        // autonomous); don't force the agent identity onto an unknown session.
+        // The caller's `origin` (`spawn_origin` below) decides whether the
+        // resumed pane reads operator or autonomous — the webview's command
+        // passes OperatorTerminal, a proxied migration Unknown, the automatic
+        // one Respawn. Don't force the agent identity onto an unknown session.
         inject_agent_git_identity: false,
         // Carried, not re-claimed: an account migration moves the SAME session
         // to a new PTY, so the gate it was spawned for is still the gate it

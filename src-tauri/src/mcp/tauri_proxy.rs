@@ -49,6 +49,13 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3) — the
     // door a headless harness / UI Bridge drives.
     "remote_session_end",
+    // The headless forced-migration run (plan
+    // `2026-11-26-terminal-migration-never-loses-a-session-has-no-forced-migration-run`,
+    // Phase 2a): the operator migration, and the provisional lifecycle row it
+    // looks the session up by — which the proxied `terminal_create` does not
+    // write (only the webview's `terminal_session_record_open` call does).
+    "terminal_session_record_open",
+    "terminal_migrate_session_account",
 ];
 
 // ============================================================================
@@ -248,15 +255,8 @@ pub async fn tauri_invoke_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<TauriInvokeRequest>,
 ) -> Result<(StatusCode, Json<TauriInvokeResponse>), (StatusCode, Json<ForbiddenResponse>)> {
-    if !ALLOWED_PROXIED_COMMANDS.contains(&req.command.as_str()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ForbiddenResponse {
-                error: "command not in safelist",
-                command: req.command,
-                allowed: ALLOWED_PROXIED_COMMANDS,
-            }),
-        ));
+    if let Some(refusal) = safelist_refusal(&req.command) {
+        return Err(refusal);
     }
 
     info!(command = %req.command, "tauri_proxy: dispatching command");
@@ -266,6 +266,22 @@ pub async fn tauri_invoke_handler(
     // release its isolated context's claims under the terminal it opened.
     let response = crate::spawn_off_worker::run_detached(dispatch(state, req)).await;
     Ok((response.status.unwrap_or(StatusCode::OK), Json(response)))
+}
+
+/// The handler's 403 for a command outside [`ALLOWED_PROXIED_COMMANDS`];
+/// `None` admits it to [`dispatch`].
+fn safelist_refusal(command: &str) -> Option<(StatusCode, Json<ForbiddenResponse>)> {
+    if ALLOWED_PROXIED_COMMANDS.contains(&command) {
+        return None;
+    }
+    Some((
+        StatusCode::FORBIDDEN,
+        Json(ForbiddenResponse {
+            error: "command not in safelist",
+            command: command.to_string(),
+            allowed: ALLOWED_PROXIED_COMMANDS,
+        }),
+    ))
 }
 
 // ============================================================================
@@ -558,6 +574,38 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             TauriInvokeResponse::ok(serde_json::json!({ "terminals": terminals }))
         }
 
+        // ── session lifecycle / account migration ────────────────────────────
+        "terminal_session_record_open" => match lifecycle_store(&state.app_handle) {
+            Ok(store) => proxy_session_record_open(&store, req.args),
+            Err(e) => e,
+        },
+
+        "terminal_migrate_session_account" => {
+            let store = match lifecycle_store(&state.app_handle) {
+                Ok(store) => store,
+                Err(e) => return e,
+            };
+            let plan = match proxy_plan_session_migration(&store, req.args) {
+                Ok(plan) => plan,
+                Err(refusal) => return refusal,
+            };
+            // No timeout here, deliberately: the migration resolves only once
+            // the resumed CLI is proven alive or given up on, which can take
+            // ~11-17 minutes (`terminal_migrate_session_account`'s doc). The
+            // router imposes none either (no `TimeoutLayer` in
+            // `mcp_api::create_router`; `axum::serve` sets no request deadline),
+            // and `run_detached` in the handler keeps the migration running
+            // to its end if the caller's own HTTP timeout gives up first.
+            command_response(
+                crate::commands::terminal::run_session_migration(
+                    &state.app_handle,
+                    plan,
+                    PROXY_MIGRATION_ORIGIN,
+                )
+                .await,
+            )
+        }
+
         "remote_session_end" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -729,6 +777,85 @@ pub(crate) async fn proxy_terminal_created(
     )
     .await;
     TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+}
+
+// ============================================================================
+// terminal_session_record_open / terminal_migrate_session_account
+// ============================================================================
+
+/// The managed lifecycle store, or the invoke error a boot-ordering fault
+/// answers (`state()` would panic the request instead).
+fn lifecycle_store(
+    app: &tauri::AppHandle,
+) -> Result<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>, TauriInvokeResponse>
+{
+    app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| TauriInvokeResponse::err("session lifecycle store is not initialised"))
+}
+
+/// A `CommandResponse` result as the invoke answer, the shape the
+/// `check_accounts_usage` arm answers: `{success, message, data}` in `data`.
+fn command_response(
+    result: Result<crate::commands::CommandResponse, String>,
+) -> TauriInvokeResponse {
+    match result {
+        Ok(cmd) => TauriInvokeResponse::ok(serde_json::json!({
+            "success": cmd.success,
+            "message": cmd.message,
+            "data": cmd.data,
+        })),
+        Err(e) => TauriInvokeResponse::err(e),
+    }
+}
+
+/// The `terminal_session_record_open` arm's whole body after the store is in
+/// hand: the webview's own command
+/// ([`crate::commands::terminal::record_session_open`]) over the same camelCase
+/// args. Unknown keys are a `bad args` error, never silently dropped.
+pub(crate) fn proxy_session_record_open(
+    store: &Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    args: Value,
+) -> TauriInvokeResponse {
+    match serde_json::from_value::<crate::commands::terminal::SessionRecordOpenArgs>(args) {
+        Ok(a) => command_response(crate::commands::terminal::record_session_open(store, a)),
+        Err(e) => TauriInvokeResponse::err(format!("bad args: {}", e)),
+    }
+}
+
+/// The spawn origin the proxied migration's replacement pane carries. This is
+/// an HTTP door any local process reaches, so its caller's reason is
+/// unnamed, exactly as on the proxied `terminal_create`: `Unknown`, which is
+/// autonomous (fail closed), never the webview's `OperatorTerminal`.
+const PROXY_MIGRATION_ORIGIN: crate::coord_drain_state::SpawnOrigin =
+    crate::coord_drain_state::SpawnOrigin::Unknown;
+
+/// The arguments of the proxied `terminal_migrate_session_account` command.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MigrateSessionAccountArgs {
+    claude_session_id: String,
+    #[serde(default)]
+    target_config_dir: Option<String>,
+}
+
+/// The `terminal_migrate_session_account` arm up to the migration itself: its
+/// args, then the command's own refusals
+/// ([`crate::commands::terminal::plan_session_migration`]) as invoke errors.
+/// What it returns is what the arm hands to
+/// [`crate::commands::terminal::run_session_migration`].
+pub(crate) fn proxy_plan_session_migration(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    args: Value,
+) -> Result<crate::commands::terminal::SessionMigrationPlan, TauriInvokeResponse> {
+    let a = serde_json::from_value::<MigrateSessionAccountArgs>(args)
+        .map_err(|e| TauriInvokeResponse::err(format!("bad args: {}", e)))?;
+    crate::commands::terminal::plan_session_migration(
+        store,
+        &a.claude_session_id,
+        a.target_config_dir,
+    )
+    .map_err(TauriInvokeResponse::err)
 }
 
 /// The `remote_interactivity_probe` trigger a headless proxy caller may run:
@@ -972,5 +1099,302 @@ mod terminal_create_coord_wiring_tests {
             .unwrap_or_else(|| panic!("coord-session must be non-null: {body}"));
         let coord = uuid::Uuid::parse_str(coord).expect("a uuid");
         assert_eq!(tm.get(&id).unwrap().coord_session_id(), Some(coord));
+    }
+}
+
+#[cfg(test)]
+mod session_migration_proxy_tests {
+    //! Plan `2026-11-26-terminal-migration-never-loses-a-session-has-no-forced-migration-run`
+    //! Phase 2a: the headless forced-migration run reaches the operator
+    //! migration and the lifecycle record-open through this proxy.
+    //!
+    //! [`dispatch`] needs an `ApiState`, whose `AppHandle` no unit test can
+    //! build (this crate has no `tauri::test` mock), so these enter at the arms'
+    //! bodies — [`safelist_refusal`] (the handler's 403),
+    //! [`proxy_session_record_open`] and [`proxy_plan_session_migration`] —
+    //! with a source pin that [`dispatch`] routes each name to them.
+    use super::*;
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+    const MIGRATE: &str = "terminal_migrate_session_account";
+    const RECORD_OPEN: &str = "terminal_session_record_open";
+
+    fn store() -> (tempfile::TempDir, Arc<SessionLifecycleStore>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        (dir, Arc::new(store))
+    }
+
+    fn record_open(store: &Arc<SessionLifecycleStore>, csid: &str, config_dir: &str) {
+        let reply = proxy_session_record_open(
+            store,
+            serde_json::json!({
+                "claudeSessionId": csid,
+                "configDir": config_dir,
+                "workingDir": "/tmp/repo",
+                "zoneIndex": 0,
+                "terminalId": "term-proxy-1",
+            }),
+        );
+        assert!(reply.success, "{:?}", reply.error);
+    }
+
+    #[test]
+    fn both_commands_are_safelisted_so_the_proxy_no_longer_answers_403() {
+        for command in [MIGRATE, RECORD_OPEN] {
+            assert!(ALLOWED_PROXIED_COMMANDS.contains(&command), "{command}");
+            assert!(
+                safelist_refusal(command).is_none(),
+                "{command} must reach dispatch, not the 403"
+            );
+        }
+        let (status, Json(body)) =
+            safelist_refusal("terminal_definitely_not_proxied").expect("still refused");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.error, "command not in safelist");
+    }
+
+    /// The safelist admits a name; only a `dispatch` arm makes it do anything
+    /// other than the "not implemented" fallthrough. Pinned on the source,
+    /// since `dispatch` itself cannot run without an `AppHandle`.
+    #[test]
+    fn dispatch_routes_each_command_to_its_arm_body() {
+        let src = include_str!("tauri_proxy.rs");
+        let (_, dispatch_src) = src.split_once("async fn dispatch(").expect("dispatch");
+        let (dispatch_src, _) = dispatch_src.split_once("\n}\n").expect("end of dispatch");
+        // Each arm's text runs from its label to the NEXT arm label (or the
+        // end of `dispatch`), so a call in a later arm cannot satisfy it.
+        let next_arm = regex::Regex::new(r#"\n\s*(?:"[a-z_]+"|_) =>"#).expect("static pattern");
+        let arm_body = |command: &str| -> &str {
+            let label = format!("\"{command}\" =>");
+            let (_, rest) = dispatch_src
+                .split_once(&label)
+                .unwrap_or_else(|| panic!("no dispatch arm for {command}"));
+            let end = next_arm.find(rest).map_or(rest.len(), |m| m.start());
+            rest.get(..end)
+                .expect("a regex match ends on a char boundary")
+        };
+        for (command, call) in [
+            (RECORD_OPEN, "proxy_session_record_open("),
+            (MIGRATE, "proxy_plan_session_migration("),
+            (MIGRATE, "run_session_migration("),
+            (MIGRATE, "PROXY_MIGRATION_ORIGIN"),
+        ] {
+            assert!(
+                arm_body(command).contains(call),
+                "{command}'s arm must use {call}"
+            );
+        }
+        assert!(
+            !arm_body(MIGRATE).contains("OperatorTerminal"),
+            "the proxied migration must not label its spawn an operator's"
+        );
+    }
+
+    /// Review finding 1: the proxied migration's replacement pane is not an
+    /// operator spawn — the focus coalescer, `intent.spawn_origin` and
+    /// `is_autonomous` all read this.
+    #[test]
+    fn the_proxied_migration_spawns_under_a_non_operator_origin() {
+        use crate::coord_drain_state::SpawnOrigin;
+        assert_eq!(PROXY_MIGRATION_ORIGIN, SpawnOrigin::Unknown);
+        assert!(PROXY_MIGRATION_ORIGIN.is_autonomous());
+        assert_ne!(PROXY_MIGRATION_ORIGIN, SpawnOrigin::OperatorTerminal);
+    }
+
+    /// Point the machine-global roster (`claude-accounts.json`) inside the
+    /// fixture. `IsolatedAmbient` does not capture `XDG_CONFIG_HOME`, so the
+    /// returned guard restores it; bind it AFTER the fixture so it drops first.
+    /// Not on macOS, where `dirs::config_dir` ignores `XDG_CONFIG_HOME`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn pin_roster_inside(amb: &crate::test_env::IsolatedAmbient) -> crate::test_env::EnvVarRestore {
+        let restore = crate::test_env::EnvVarRestore::capture(&["XDG_CONFIG_HOME"]);
+        std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
+        let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
+        assert!(
+            roster.starts_with(amb.dir()),
+            "the roster escaped the fixture: {}",
+            roster.display()
+        );
+        restore
+    }
+
+    #[test]
+    fn a_proxied_record_open_writes_the_lifecycle_row() {
+        let (_dir, store) = store();
+        assert!(store.get("csid-proxy-1").is_none());
+
+        let reply = proxy_session_record_open(
+            &store,
+            serde_json::json!({
+                "claudeSessionId": "csid-proxy-1",
+                "configDir": "/accounts/a",
+                "zoneIndex": 2,
+                "terminalId": "term-proxy-1",
+            }),
+        );
+        assert!(reply.success, "{:?}", reply.error);
+        let data = reply.data.expect("payload");
+        assert_eq!(data["success"], true);
+        // The command's own WRITTEN-vs-BOUND report rides through.
+        assert_eq!(data["data"]["recorded"], true, "{data}");
+        assert_eq!(data["data"]["confirmed"], false, "{data}");
+
+        let row = store.get("csid-proxy-1").expect("the row is in the store");
+        assert_eq!(row.config_dir.as_deref(), Some("/accounts/a"));
+        assert_eq!(row.terminal_id, "term-proxy-1");
+        assert_eq!(row.zone_index, 2);
+        assert_eq!(row.page_id, "default");
+    }
+
+    #[test]
+    fn a_proxied_record_open_refuses_bad_args_and_writes_nothing() {
+        let (_dir, store) = store();
+        // A snake_case key is an unknown field, never a silently dropped one.
+        let misspelled = proxy_session_record_open(
+            &store,
+            serde_json::json!({
+                "claudeSessionId": "csid-x",
+                "config_dir": "/accounts/a",
+                "zoneIndex": 0,
+                "terminalId": "term-x",
+            }),
+        );
+        assert!(!misspelled.success);
+        assert!(
+            misspelled
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("bad args:"),
+            "{:?}",
+            misspelled.error
+        );
+        // The command's own blank-identity guard answers through the proxy.
+        let blank = proxy_session_record_open(
+            &store,
+            serde_json::json!({
+                "claudeSessionId": "csid-y",
+                "zoneIndex": 0,
+                "terminalId": "  ",
+            }),
+        );
+        assert!(!blank.success);
+        assert!(
+            blank
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("terminalId must be non-empty"),
+            "{:?}",
+            blank.error
+        );
+        assert!(store.get("csid-x").is_none());
+        assert!(store.get("csid-y").is_none());
+    }
+
+    #[test]
+    fn a_proxied_migration_of_an_unknown_session_is_the_commands_refusal() {
+        let (_dir, store) = store();
+        let refusal = proxy_plan_session_migration(
+            &store,
+            serde_json::json!({
+                "claudeSessionId": "csid-never-recorded",
+                "targetConfigDir": "/accounts/b",
+            }),
+        )
+        .expect_err("no row → refused");
+        assert!(!refusal.success);
+        assert_eq!(refusal.status, None, "an invoke error, not a 403");
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("unknown session: csid-never-recorded")
+        );
+    }
+
+    #[test]
+    fn a_proxied_migration_refuses_bad_args() {
+        let (_dir, store) = store();
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({ "claude_session_id": "csid" }),
+        ] {
+            let refusal =
+                proxy_plan_session_migration(&store, args.clone()).expect_err("bad args → refused");
+            assert!(
+                refusal
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with("bad args:"),
+                "{args}: {:?}",
+                refusal.error
+            );
+        }
+    }
+
+    /// A row recorded through the proxy is the row the proxied migration finds:
+    /// with an explicit target that is not a configured account, the refusal is
+    /// the not-configured one, past the lookup.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_proxied_migration_finds_the_proxied_row_and_refuses_an_unconfigured_target() {
+        let amb = crate::test_env::isolated_ambient();
+        let _xdg = pin_roster_inside(&amb);
+        let (dir, store) = store();
+        record_open(&store, "csid-proxy-2", "/accounts/a");
+        let unconfigured = dir.path().join("never-configured").display().to_string();
+
+        let refusal = proxy_plan_session_migration(
+            &store,
+            serde_json::json!({
+                "claudeSessionId": "csid-proxy-2",
+                "targetConfigDir": unconfigured,
+            }),
+        )
+        .expect_err("unconfigured target → refused");
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some(format!("'{unconfigured}' is not a configured claude_config_dir").as_str())
+        );
+    }
+
+    /// The roster is written inside the fixture (the path is checked first,
+    /// as `commands::ai_settings`'s roster tests do), so a target equal to the
+    /// session's own configured account reaches the equals refusal; a
+    /// different configured target yields a plan.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_proxied_migration_onto_the_sessions_own_account_is_refused() {
+        let amb = crate::test_env::isolated_ambient();
+        let _xdg = pin_roster_inside(&amb);
+        let a = amb.dir().join("acct-a").display().to_string();
+        let b = amb.dir().join("acct-b").display().to_string();
+        let dirs = vec![a.clone(), b.clone()];
+        crate::claude_accounts::update(move |r| r.claude_config_dirs = dirs).expect("write roster");
+
+        let (_dir, store) = store();
+        record_open(&store, "csid-proxy-3", &a);
+
+        let same = proxy_plan_session_migration(
+            &store,
+            serde_json::json!({ "claudeSessionId": "csid-proxy-3", "targetConfigDir": a }),
+        )
+        .expect_err("same account → refused");
+        assert_eq!(
+            same.error.as_deref(),
+            Some("target account equals the session's current account")
+        );
+
+        let plan = proxy_plan_session_migration(
+            &store,
+            serde_json::json!({ "claudeSessionId": "csid-proxy-3", "targetConfigDir": b }),
+        )
+        .expect("a configured other account plans");
+        assert_eq!(plan.src, a);
+        assert_eq!(plan.dst, b);
+        assert!(plan.explicit_target);
+        assert_eq!(plan.record.claude_session_id, "csid-proxy-3");
     }
 }
