@@ -8412,6 +8412,21 @@ mod tests {",
                      {:?} into it is what hides this box from build_dispatcher: {json}",
                     role
                 );
+                // The agent count is now optional on the wire: the Agent role
+                // leaves it to coord's derivation, the Build role must still
+                // assert an explicit 0, or coord would derive a non-zero agent
+                // cap for a build box.
+                match role {
+                    MachineRole::Agent => assert!(
+                        json.get("max_concurrent_agents").is_none(),
+                        "the Agent role leaves max_concurrent_agents to coord: {json}"
+                    ),
+                    MachineRole::Build => assert_eq!(
+                        json.get("max_concurrent_agents"),
+                        Some(&serde_json::json!(0)),
+                        "the Build role must publish an explicit 0: {json}"
+                    ),
+                }
             }
         }
     }
