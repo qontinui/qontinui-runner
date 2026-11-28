@@ -282,7 +282,9 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 /// runner (`holder_disabled`, `holder_spawn_failed` with its `kind`),
 /// `unprotected_cgroup` a holder that dies with the runner's unit, and
 /// `cgroup_unknown` an adopted holder whose cgroup could not be read. A remote
-/// mirror carries none of the three keys.
+/// mirror carries none of the three keys, and neither does a local pane whose
+/// process has exited (its waiter recorded an exit code), so a missing key does
+/// not by itself mean the pane is remote.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TerminalListEntry {
