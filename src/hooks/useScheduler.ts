@@ -39,6 +39,8 @@ interface UseSchedulerReturn {
   loadSettings: () => Promise<void>;
   loadStatus: () => Promise<void>;
   createTask: (request: CreateScheduledTaskRequest) => Promise<ScheduledTask | null>;
+  /** Try every request and resolve to the ones not created; `error` names each reason. */
+  createTasks: (requests: CreateScheduledTaskRequest[]) => Promise<CreateScheduledTaskRequest[]>;
   updateTask: (id: string, request: UpdateScheduledTaskRequest) => Promise<ScheduledTask | null>;
   deleteTask: (id: string) => Promise<boolean>;
   runTaskNow: (id: string) => Promise<boolean>;
@@ -162,6 +164,38 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       } finally {
         setLoading(false);
       }
+    },
+    [],
+  );
+
+  /**
+   * Create several tasks. One refusal does not stop the rest, and the single
+   * `error` is set once at the end, because a `createTask` per request would
+   * clear each earlier reason.
+   */
+  const createTasks = useCallback(
+    async (requests: CreateScheduledTaskRequest[]): Promise<CreateScheduledTaskRequest[]> => {
+      setLoading(true);
+      setError(null);
+      const refused: CreateScheduledTaskRequest[] = [];
+      const reasons: string[] = [];
+      for (const request of requests) {
+        try {
+          const result = await apiRequest<ScheduledTask>("POST", "/scheduler/tasks", request);
+          if (result) {
+            setTasks((prev) => [...prev, result]);
+          } else {
+            refused.push(request);
+            reasons.push(`${request.name}: no task returned`);
+          }
+        } catch (err) {
+          refused.push(request);
+          reasons.push(`${request.name}: ${describeThrown(err, "Failed to create task")}`);
+        }
+      }
+      if (reasons.length > 0) setError(reasons.join("; "));
+      setLoading(false);
+      return refused;
     },
     [],
   );
@@ -366,6 +400,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
     loadSettings,
     loadStatus,
     createTask,
+    createTasks,
     updateTask,
     deleteTask,
     runTaskNow,
