@@ -814,10 +814,14 @@ pub(crate) async fn tick<O: CliOps>(
         // stop leaves `bin/claude` moved aside, and `locate` cannot find it
         // after the next boot — the record is what lets that boot repair it.
         ops.record_pending_install(Some(install));
-        let run = {
+        let mut run = {
             let _held = flag.hold();
             ops.install(install, published).await
         };
+        // Everything downstream of here (the log line, `/health`, the
+        // persisted record, the coord finding) reads this tail, so it is
+        // masked once, here, whatever `CliOps::install` returned.
+        run.stderr_tail = redact_text(&run.stderr_tail);
         let (exit_code, stderr_tail) = (run.exit_code, run.stderr_tail.clone());
         report.install = Some(run);
         report.reread = ops.installed_version(install).await;
@@ -846,10 +850,8 @@ pub(crate) async fn tick<O: CliOps>(
             },
             from_prior_process: false,
         };
-        if outcome != InstallOutcome::Took {
-            if state.report_ledger.begin(&last.triple()) {
-                ops.report_did_not_take(&last);
-            }
+        if outcome != InstallOutcome::Took && state.report_ledger.begin(&last.triple()) {
+            ops.report_did_not_take(&last);
         }
         state.health.last_install = Some(last);
         if report.reread.as_deref() != Some(published.as_str()) {
@@ -1006,8 +1008,8 @@ pub(crate) fn channel_in(settings_json: &str) -> Option<String> {
 /// false`) before the spawned task's first poll sets it.
 static UPDATER_RUNS_HERE: AtomicBool = AtomicBool::new(false);
 
-/// The health [`run_periodic`] published after its latest tick; `None` until
-/// the first tick.
+/// The health [`run_periodic`] published after its latest tick, or at boot
+/// the prior process's record ([`boot_health`]); `None` until either.
 fn published_health() -> &'static Mutex<Option<CliUpdateHealth>> {
     static HEALTH: OnceLock<Mutex<Option<CliUpdateHealth>>> = OnceLock::new();
     HEALTH.get_or_init(|| Mutex::new(None))
@@ -1021,11 +1023,24 @@ fn publish_health(health: &CliUpdateHealth) {
     *slot = Some(health.clone());
 }
 
+/// Pure: what `/health` serves between boot and the first tick. A record a
+/// previous process persisted is served at once, with `lastTick: null`
+/// because nothing has ticked in THIS process; with no record there is
+/// nothing known, so nothing is published and `cliUpdate` stays `null`
+/// (UNKNOWN).
+fn boot_health(prior: Option<LastInstall>) -> Option<CliUpdateHealth> {
+    prior.map(|last| CliUpdateHealth {
+        last_tick: None,
+        last_install: Some(last),
+    })
+}
+
 /// Pure: the `/health` `cliUpdate` value.
 ///
 /// - `{"updaterRunsHere": false}` — no updater in this process (a secondary
 ///   runner, or the updater was never started).
-/// - `null` — the updater runs here but has not ticked yet: UNKNOWN.
+/// - `null` — the updater runs here but has not ticked yet and no prior
+///   process left a record: UNKNOWN.
 /// - otherwise the last tick, the last install, and whether one is running.
 fn health_json_from(
     runs_here: bool,
@@ -1073,6 +1088,14 @@ fn wall_clock_ms() -> u64 {
 /// [`TICK_INTERVAL`]. Primary runner only (see the module docs).
 pub async fn run_periodic() {
     UPDATER_RUNS_HERE.store(true, Ordering::Release);
+    // Served at once, not after BOOT_DELAY plus the first tick: otherwise a
+    // restarted runner reads `cliUpdate: null` for minutes, and on a box whose
+    // install keeps failing the first tick installs again before the prior
+    // record (`fromPriorProcess: true`) was ever visible.
+    let last_install = load_last_install();
+    if let Some(boot) = boot_health(last_install.clone()) {
+        publish_health(&boot);
+    }
     tokio::time::sleep(BOOT_DELAY).await;
     let ledger = std::sync::Arc::new(ReportLedger::seeded(load_reported_triple()));
     let ops = RealOps {
@@ -1082,7 +1105,7 @@ pub async fn run_periodic() {
         repair: load_pending_install(),
         health: CliUpdateHealth {
             last_tick: None,
-            last_install: load_last_install(),
+            last_install,
         },
         report_ledger: ledger,
         ..UpdaterState::default()
@@ -1154,6 +1177,29 @@ fn npm_child_path(prefix: &Path) -> std::ffi::OsString {
     std::env::join_paths(dirs).unwrap_or_default()
 }
 
+/// Mask credentials in install output before it leaves the process. This
+/// text is served on `/health`, persisted, and posted to coord as a
+/// tenant-wide finding, so it gets the runner's one shared sweep
+/// ([`crate::session::redact::redact_secrets`]) as defence in depth, in case
+/// install output ever carries a URL with userinfo, a `key=value` secret or a
+/// bearer token. The sweep is idempotent: masking masked text changes nothing.
+fn redact_text(text: &str) -> String {
+    String::from_utf8_lossy(&crate::session::redact::redact_secrets(text.as_bytes())).into_owned()
+}
+
+/// The last [`INSTALL_STDERR_TAIL_BYTES`] of an install's stderr, masked BEFORE the cut: a secret
+/// straddling the boundary would otherwise lose its prefix (`https://al|ice:…@`,
+/// `_authTok|en=…`) and no later sweep could recognise what is left.
+fn install_stderr_tail(stderr: &[u8]) -> String {
+    tail(
+        &crate::session::redact::redact_secrets(stderr),
+        INSTALL_STDERR_TAIL_BYTES,
+    )
+}
+
+/// How much of an install's stderr is kept (and served, persisted, reported).
+const INSTALL_STDERR_TAIL_BYTES: usize = 400;
+
 fn tail(bytes: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     let s = s.trim();
@@ -1220,6 +1266,10 @@ fn load_last_install_from(path: &Path) -> Option<LastInstall> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut last: LastInstall = serde_json::from_str(&text).ok()?;
     last.from_prior_process = true;
+    // A record an earlier build persisted was never masked. Mask what the
+    // sweep can still recognise: that build cut BEFORE masking, so a
+    // credential whose prefix its cut removed cannot be recognised here.
+    last.stderr_tail = redact_text(&last.stderr_tail);
     Some(last)
 }
 
@@ -1577,7 +1627,9 @@ impl CliOps for RealOps {
             InstallRun {
                 exit_code: out.as_ref().and_then(|o| o.status.code()),
                 duration: started.elapsed(),
-                stderr_tail: out.map(|o| tail(&o.stderr, 400)).unwrap_or_default(),
+                stderr_tail: out
+                    .map(|o| install_stderr_tail(&o.stderr))
+                    .unwrap_or_default(),
             }
         }
     }
@@ -1934,6 +1986,14 @@ mod tests {
         assert_eq!(r.installed.as_deref(), Some("2.1.303"));
         assert_eq!(*ops.asked_tags.lock().unwrap(), vec!["latest".to_string()]);
         assert!(state.backoff_until.is_none());
+        assert_eq!(
+            state.health.last_install.as_ref().map(|l| l.outcome),
+            Some(InstallOutcome::Took)
+        );
+        assert!(
+            ops.reports.lock().unwrap().is_empty(),
+            "an install that took is never reported to coord"
+        );
 
         // Next tick: now equal, so nothing is installed.
         let r2 = tick(&ops, &mut state, &ops.flag, now, 0).await;
@@ -2064,6 +2124,156 @@ mod tests {
         ops
     }
 
+    /// An install after which no CLI can be read back is `left_unreadable`:
+    /// served and reported like a did-not-take, and repaired next tick
+    /// instead of waiting out the 24 h backoff.
+    #[tokio::test]
+    async fn cli_update_an_install_that_leaves_no_readable_cli_is_left_unreadable() {
+        let mut ops = FakeOps::new(&[Some("2.1.321"), None], Some("2.1.332"));
+        ops.install_result.exit_code = Some(1);
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 1).await;
+        assert!(r.did_not_take);
+        let last = state.health.last_install.clone().expect("recorded");
+        assert_eq!(last.outcome, InstallOutcome::LeftUnreadable);
+        assert_eq!(last.installed, None);
+        assert_eq!(last.consecutive_did_not_take, 1);
+        assert_eq!(
+            health_json_from(true, false, Some(&state.health))["lastInstall"]["outcome"],
+            "left_unreadable"
+        );
+        let reports = ops.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "a left-unreadable install is reported");
+        assert_eq!(reports[0].outcome, InstallOutcome::LeftUnreadable);
+        assert!(state.repair.is_some(), "the next tick repairs it");
+        assert!(
+            state.backoff_until.is_none(),
+            "no 24 h backoff on a broken CLI"
+        );
+    }
+
+    /// Install stderr is masked before it reaches `/health`, the persisted
+    /// record or the coord finding.
+    #[tokio::test]
+    async fn cli_update_install_stderr_is_redacted_before_it_is_served_or_reported() {
+        // Assembled at runtime so a secret scanner reading this SOURCE never
+        // sees a credential-shaped literal.
+        let password = ["hun", "ter2"].concat();
+        let bearer = ["abcdEFGH", "12345678"].concat();
+        let stderr = format!(
+            "npm ERR! 403 GET https://alice:{password}@registry.example.test/pkg \
+             Authorization: Bearer {bearer}"
+        );
+        let mut ops = failing_ops();
+        ops.install_result.stderr_tail = stderr;
+        let mut state = UpdaterState::default();
+        let r = tick(&ops, &mut state, &ops.flag, Instant::now(), 1).await;
+        let served = state
+            .health
+            .last_install
+            .clone()
+            .expect("recorded")
+            .stderr_tail;
+        let logged = r.install.expect("ran").stderr_tail;
+        let reported = ops.reports.lock().unwrap()[0].stderr_tail.clone();
+        for text in [&served, &logged, &reported] {
+            assert!(!text.contains(&password), "password leaked: {text}");
+            assert!(!text.contains(&bearer), "bearer token leaked: {text}");
+            assert!(
+                text.contains("registry.example.test"),
+                "context kept: {text}"
+            );
+        }
+        assert!(served.contains(crate::session::redact::MASK));
+        assert_eq!(redact_text(&served), served, "masking is idempotent");
+    }
+
+    /// The stderr tail is taken AFTER masking: a credential whose prefix the
+    /// cut would remove is masked while its prefix is still there. Each case
+    /// first proves the raw tail would leak, so the test fails if the order
+    /// is ever reversed.
+    #[test]
+    fn cli_update_a_secret_straddling_the_tail_cut_is_masked() {
+        // Assembled at runtime so a secret scanner reading this SOURCE never
+        // sees a credential-shaped literal.
+        let secret = ["hun", "ter2", "zz"].concat();
+        let cases = [
+            (
+                format!("https://alice:{secret}@registry.example.test/pkg"),
+                10,
+            ),
+            (format!("_authToken={secret}"), 8),
+        ];
+        for (fragment, keep_prefix) in cases {
+            // Put the cut `keep_prefix` bytes into `fragment` (the 3 is "end").
+            let suffix =
+                " ".repeat(INSTALL_STDERR_TAIL_BYTES - 3 - fragment.len() + keep_prefix) + "end";
+            let raw = format!("{} {fragment}{suffix}", "npm ERR! ".repeat(60));
+            let unmasked = tail(raw.as_bytes(), INSTALL_STDERR_TAIL_BYTES);
+            assert!(
+                unmasked.starts_with(fragment.get(keep_prefix..).expect("ascii fixture")),
+                "control: the raw tail starts inside the credential"
+            );
+            assert!(
+                redact_text(&unmasked).contains(&secret),
+                "control: a sweep after the cut can no longer recognise it"
+            );
+            let masked = install_stderr_tail(raw.as_bytes());
+            assert!(!masked.contains(&secret), "leaked: {masked}");
+            assert!(masked.ends_with("end"));
+        }
+    }
+
+    /// A record an earlier build persisted unmasked is served masked.
+    #[test]
+    fn cli_update_a_loaded_record_is_served_masked() {
+        let secret = ["hun", "ter2"].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli-update-last.json");
+        let last = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: format!("GET https://alice:{secret}@registry.example.test/pkg"),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 7,
+            consecutive_did_not_take: 1,
+            from_prior_process: false,
+        };
+        write_json_atomic(&path, &last).unwrap();
+        let loaded = load_last_install_from(&path).expect("loads");
+        assert!(
+            !loaded.stderr_tail.contains(&secret),
+            "{}",
+            loaded.stderr_tail
+        );
+        assert!(loaded.stderr_tail.contains("registry.example.test"));
+    }
+
+    /// A restarted runner serves the prior process's record at boot, before
+    /// any tick; with no record it serves `null` (UNKNOWN), not an empty
+    /// health.
+    #[test]
+    fn cli_update_a_prior_process_record_is_served_at_boot() {
+        assert!(boot_health(None).is_none());
+        let prior = LastInstall {
+            outcome: InstallOutcome::DidNotTake,
+            exit_code: Some(243),
+            stderr_tail: "EACCES".into(),
+            installed: Some("2.1.321".into()),
+            expected: "2.1.332".into(),
+            attempted_at_ms: 7,
+            consecutive_did_not_take: 3,
+            from_prior_process: true,
+        };
+        let boot = boot_health(Some(prior)).expect("published at boot");
+        let json = health_json_from(true, false, Some(&boot));
+        assert!(json["lastTick"].is_null(), "nothing ticked in this process");
+        assert_eq!(json["lastInstall"]["fromPriorProcess"], true);
+        assert_eq!(json["lastInstall"]["outcome"], "did_not_take");
+        assert_eq!(json["lastInstall"]["exitCode"], 243);
+    }
+
     /// Review A1: a post that did not establish storage releases its claim,
     /// so the next did-not-take tick in the SAME process offers it again; a
     /// confirmed one is never offered again.
@@ -2189,6 +2399,10 @@ mod tests {
         let last = state.health.last_install.clone().expect("recorded");
         assert_eq!(last.outcome, InstallOutcome::Took);
         assert_eq!(last.consecutive_did_not_take, 0);
+        assert!(
+            ok.reports.lock().unwrap().is_empty(),
+            "the install that took after a failure is not reported"
+        );
         assert_eq!(
             health_json_from(true, false, Some(&state.health))["lastInstall"]
                 ["consecutiveDidNotTake"],
