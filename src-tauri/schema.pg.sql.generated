@@ -17780,7 +17780,6 @@ CREATE TABLE project.pr_watch_state (
     last_review_status text DEFAULT 'pending'::text NOT NULL,
     auto_resume_count integer DEFAULT 0 NOT NULL,
     max_auto_resumes integer DEFAULT 10 NOT NULL,
-    github_token text DEFAULT ''::text NOT NULL,
     auto_resume_enabled boolean DEFAULT true NOT NULL,
     completed_at timestamp with time zone,
     completion_reason text,
