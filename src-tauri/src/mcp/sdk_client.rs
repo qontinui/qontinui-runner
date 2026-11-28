@@ -3220,10 +3220,14 @@ async fn handle_clipboard_read(State(state): State<Arc<ApiState>>) -> Json<serde
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
-    // Clipboard is a system resource — read directly via arboard, not through the SDK app
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            let text = clipboard.get_text().ok();
+    // Clipboard is a system resource — read directly via arboard, not through
+    // the SDK app, through the shared instance (see `SYSTEM_CLIPBOARD`).
+    let read = crate::commands::clipboard::run_system_clipboard(
+        crate::commands::clipboard::system_clipboard_read_text,
+    )
+    .await;
+    match read {
+        Ok(text) => {
             let has_text = text.is_some();
             Json(serde_json::json!({
                 "success": true,
@@ -3253,31 +3257,36 @@ async fn handle_clipboard_write(
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    let html = body.get("html").and_then(|v| v.as_str());
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let html = body
+        .get("html")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let has_html = html.is_some();
 
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            let result = if let Some(html_content) = html {
-                clipboard.set_html(html_content, Some(text))
-            } else {
-                clipboard.set_text(text)
-            };
-            match result {
-                Ok(()) => Json(serde_json::json!({
-                    "success": true,
-                    "data": {
-                        "written": true,
-                        "formats": if html.is_some() { vec!["text/html", "text/plain"] } else { vec!["text/plain"] },
-                    }
-                })),
-                Err(e) => Json(
-                    serde_json::json!({ "success": false, "error": format!("Clipboard write failed: {}", e) }),
-                ),
+    // The shared instance, not a fresh one: a dropped instance takes the
+    // content with it on Linux (see `SYSTEM_CLIPBOARD`).
+    let result = crate::commands::clipboard::run_system_clipboard(move || {
+        crate::commands::clipboard::with_system_clipboard(|clipboard| match &html {
+            Some(html_content) => clipboard.set_html(html_content.as_str(), Some(text.as_str())),
+            None => clipboard.set_text(text.as_str()),
+        })
+    })
+    .await;
+    match result {
+        Ok(()) => Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "written": true,
+                "formats": if has_html { vec!["text/html", "text/plain"] } else { vec!["text/plain"] },
             }
-        }
+        })),
         Err(e) => Json(
-            serde_json::json!({ "success": false, "error": format!("Clipboard init failed: {}", e) }),
+            serde_json::json!({ "success": false, "error": format!("Clipboard write failed: {}", e) }),
         ),
     }
 }
