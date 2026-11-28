@@ -251,7 +251,7 @@ pub(super) fn reset_last_good_pull_for_test() {
     }
 }
 
-/// Record a pull coord answered and hand it back. Every 2xx [`fetch_pull`]
+/// Record a pull coord answered and hand it back, with the time recorded. Every 2xx [`fetch_pull`]
 /// gets goes through here, from both takers.
 fn accept_pull(
     device_id: Uuid,
@@ -259,7 +259,7 @@ fn accept_pull(
     pull: ReclaimPull,
     taker: PullTaker,
     now: chrono::DateTime<chrono::Utc>,
-) -> (Uuid, ReclaimPull) {
+) -> (Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>) {
     accept_pull_into(&LAST_GOOD_PULL, device_id, coord_base, pull, taker, now)
 }
 
@@ -272,7 +272,7 @@ fn accept_pull_into(
     pull: ReclaimPull,
     taker: PullTaker,
     now: chrono::DateTime<chrono::Utc>,
-) -> (Uuid, ReclaimPull) {
+) -> (Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>) {
     let recorded = LastGoodPull {
         device_id,
         coord_base: coord_base.to_string(),
@@ -284,7 +284,7 @@ fn accept_pull_into(
         Ok(mut g) => *g = Some(recorded),
         Err(e) => warn!("worktree_reclaim: last-good pull store poisoned, not recorded: {e}"),
     }
-    (device_id, pull)
+    (device_id, pull, now)
 }
 
 /// A snapshot of the background poller's health.
@@ -1718,11 +1718,13 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
 /// the same cleared set without needing the silent path armed.
 ///
 /// `timeout` bounds the whole request; `taker` labels the pull when it is
-/// recorded as the last-good one ([`accept_pull`]), which every 2xx is.
+/// recorded as the last-good one ([`accept_pull`]), which every 2xx is. The
+/// returned time is the `taken_at` that record carries, so a caller labels
+/// the pull with the same timestamp the store holds.
 pub(super) async fn fetch_pull(
     timeout: Duration,
     taker: PullTaker,
-) -> Result<Option<(Uuid, ReclaimPull)>, String> {
+) -> Result<Option<(Uuid, ReclaimPull, chrono::DateTime<chrono::Utc>)>, String> {
     let device_id = match super::census::load_device_id_pub() {
         Some(id) => id,
         None => {
@@ -1812,7 +1814,8 @@ fn latch_coord_live(coord_ever_live: bool, outcome: &TickOutcome) -> bool {
 pub async fn tick_once() -> Result<TickOutcome, String> {
     // The longer poller timeout: nobody waits on this pull, and the survey
     // answers from it ([`last_good_pull`]) while coord is too slow for 15 s.
-    let Some((_device_id, pull)) = fetch_pull(poller_pull_timeout(), PullTaker::Poller).await?
+    let Some((_device_id, pull, _taken_at)) =
+        fetch_pull(poller_pull_timeout(), PullTaker::Poller).await?
     else {
         return Ok(TickOutcome::Skipped);
     };
@@ -3130,7 +3133,7 @@ pub(in crate::agent_worktree) mod tests {
         let dev = Uuid::from_u128(7);
         let now = chrono::Utc::now();
 
-        let (id, pull) = accept_pull_into(
+        let (id, pull, taken_at) = accept_pull_into(
             &store,
             dev,
             "https://coord.example.test",
@@ -3140,6 +3143,8 @@ pub(in crate::agent_worktree) mod tests {
         );
         assert_eq!(id, dev);
         assert!(pull.remove_armed);
+        // The caller gets the SAME timestamp the store recorded.
+        assert_eq!(taken_at, now);
         let got = store.read().unwrap().clone().expect("recorded");
         assert_eq!(got.taker, PullTaker::Poller);
         assert_eq!(got.device_id, dev);

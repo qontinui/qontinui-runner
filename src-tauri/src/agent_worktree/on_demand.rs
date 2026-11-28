@@ -130,18 +130,50 @@ impl PullSource {
     }
 }
 
-/// Where a coord pull came from, and when coord answered it.
+/// Where a coord pull came from, when coord answered it, and how old it was
+/// when the survey SELECTED it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullProvenance {
     pub source: PullSource,
     pub taken_at: chrono::DateTime<chrono::Utc>,
+    /// Age in seconds at selection — `0` for a live pull. Measured where the
+    /// age bound is checked ([`choose_pull`]), never again after the survey's
+    /// census wait and ownership walk: a snapshot admitted at the bound must
+    /// not be REPORTED past it, or a consumer that trusts only age ≤ 600
+    /// reads an admitted decision as over-age.
+    pub age_secs: u64,
+}
+
+impl PullProvenance {
+    /// A pull made for this request; `taken_at` is what [`reclaim::fetch_pull`]
+    /// recorded.
+    fn live(taken_at: chrono::DateTime<chrono::Utc>) -> Self {
+        PullProvenance {
+            source: PullSource::Live,
+            taken_at,
+            age_secs: 0,
+        }
+    }
+
+    /// A reused last-good pull, aged as [`choose_pull`] measured it.
+    fn of_snapshot(snap: &reclaim::LastGoodPull, age_secs: u64) -> Self {
+        PullProvenance {
+            source: PullSource::of_snapshot(snap.taker),
+            taken_at: snap.taken_at,
+            age_secs,
+        }
+    }
 }
 
 /// What [`choose_pull`] decided.
 #[derive(Debug, Clone)]
 enum PullChoice {
-    /// Serve this in-bound last-good pull; make no coord request.
-    Snapshot(reclaim::LastGoodPull),
+    /// Serve this in-bound last-good pull; make no coord request. `age_secs`
+    /// is its age at selection, in `0..=COORD_PULL_STALE_AFTER_SECS`.
+    Snapshot {
+        snap: reclaim::LastGoodPull,
+        age_secs: u64,
+    },
     /// Make a live pull.
     Live,
 }
@@ -171,7 +203,10 @@ fn choose_pull(
     if age < 0 || age as u64 > COORD_PULL_STALE_AFTER_SECS {
         return PullChoice::Live;
     }
-    PullChoice::Snapshot(snap)
+    PullChoice::Snapshot {
+        snap,
+        age_secs: age as u64,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +968,9 @@ pub struct Survey {
     pub coord_pull_source: Option<PullSource>,
     /// RFC3339 time coord answered that pull. `null` when there is no pull.
     pub coord_pull_taken_at: Option<String>,
-    /// Age of that pull in seconds at answer time — `0` for a live pull.
-    /// `null` when there is no pull.
+    /// Age of that pull in seconds when the survey SELECTED it — `0` for a
+    /// live pull — so a snapshot admitted at the 600 s bound is never reported
+    /// past it. `null` when there is no pull.
     pub coord_pull_age_secs: Option<u64>,
     /// Health of the BACKGROUND POLLER — the executor. A subsystem's health
     /// signal must report on its OUTPUT, not on the inputs of whoever asked.
@@ -1108,19 +1144,21 @@ pub async fn survey(query: SurveyQuery, policy: PullPolicy) -> Result<Survey, St
     let now_at_choice = chrono::Utc::now();
     let current_device = census::load_device_id_pub();
     let current_base = qontinui_runner_lib::profiles::connected_coord_base();
+    // LiveOnly (`reclaim_now`, the removal path) never reads the store at all.
+    let last_good = match policy {
+        PullPolicy::SnapshotFirst => reclaim::last_good_pull(),
+        PullPolicy::LiveOnly => None,
+    };
     let choice = choose_pull(
         policy,
-        reclaim::last_good_pull(),
+        last_good,
         current_device.zip(current_base.as_deref()),
         now_at_choice,
     );
     let coord_half = async {
         match choice {
-            PullChoice::Snapshot(snap) => {
-                let provenance = PullProvenance {
-                    source: PullSource::of_snapshot(snap.taker),
-                    taken_at: snap.taken_at,
-                };
+            PullChoice::Snapshot { snap, age_secs } => {
+                let provenance = PullProvenance::of_snapshot(&snap, age_secs);
                 Ok(Some((snap.device_id, snap.pull, provenance)))
             }
             PullChoice::Live => reclaim::fetch_pull(
@@ -1129,12 +1167,8 @@ pub async fn survey(query: SurveyQuery, policy: PullPolicy) -> Result<Survey, St
             )
             .await
             .map(|o| {
-                o.map(|(id, p)| {
-                    let provenance = PullProvenance {
-                        source: PullSource::Live,
-                        taken_at: chrono::Utc::now(),
-                    };
-                    (id, std::sync::Arc::new(p), provenance)
+                o.map(|(id, p, taken_at)| {
+                    (id, std::sync::Arc::new(p), PullProvenance::live(taken_at))
                 })
             }),
         }
@@ -1241,7 +1275,9 @@ fn assemble_survey(
     let pull = pull.map(|(p, _)| p);
     let coord_reachable = pull.is_some();
     let remove_armed = pull.is_some_and(|p| p.remove_armed);
-    let coord_pull_age_secs = provenance.map(|p| (now - p.taken_at).num_seconds().max(0) as u64);
+    // The age measured at selection, not against `now`: see
+    // [`PullProvenance::age_secs`].
+    let coord_pull_age_secs = provenance.map(|p| p.age_secs);
     let coord_pull_source = provenance.map(|p| p.source);
     let coord_pull_taken_at = provenance.map(|p| p.taken_at.to_rfc3339());
     let pull_clause = coord_pull_clause(coord_pull_source, coord_pull_age_secs);
@@ -1375,7 +1411,9 @@ fn coord_pull_clause(source: Option<PullSource>, age_secs: Option<u64>) -> Strin
             format!("Coord decision: an earlier on-demand pull from {age} ago.")
         }
         None => {
-            "Coord decision: none — coord was not reached, so nothing is reclaimable.".to_string()
+            // Neutral: this arm covers both a failed pull and an unconfigured
+            // device / coord base (no request made); `coord_error` says which.
+            "Coord decision: none, so nothing is reclaimable.".to_string()
         }
     }
 }
@@ -4349,6 +4387,7 @@ mod tests {
         let provenance = PullProvenance {
             source: PullSource::PollerSnapshot,
             taken_at: now - chrono::Duration::seconds(599),
+            age_secs: 599,
         };
         let census = snapshot_of(Vec::new(), now, chrono::Duration::seconds(30));
         let s = assemble_survey(
@@ -4382,10 +4421,7 @@ mod tests {
     fn a_live_pull_is_labelled_live_with_age_zero() {
         let now = chrono::Utc::now();
         let pull = pull_with(Vec::new());
-        let provenance = PullProvenance {
-            source: PullSource::Live,
-            taken_at: now,
-        };
+        let provenance = PullProvenance::live(now);
         let s = assemble_survey(
             None,
             Some((&pull, &provenance)),
@@ -4416,7 +4452,7 @@ mod tests {
                 Some((device(), SNAP_BASE)),
                 now
             ),
-            PullChoice::Snapshot(_)
+            PullChoice::Snapshot { .. }
         ));
     }
 
@@ -4460,7 +4496,7 @@ mod tests {
                 Some((device(), SNAP_BASE)),
                 now
             ),
-            PullChoice::Snapshot(_)
+            PullChoice::Snapshot { .. }
         ));
     }
 
@@ -4579,7 +4615,7 @@ mod tests {
     fn an_on_demand_snapshot_is_labelled_on_demand_never_poller() {
         let now = chrono::Utc::now();
         let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::OnDemand, now, 20);
-        let PullChoice::Snapshot(snap) = choose_pull(
+        let PullChoice::Snapshot { snap, age_secs } = choose_pull(
             PullPolicy::SnapshotFirst,
             Some(snap),
             Some((device(), SNAP_BASE)),
@@ -4587,10 +4623,7 @@ mod tests {
         ) else {
             panic!("a 20 s on-demand snapshot is in bound");
         };
-        let provenance = PullProvenance {
-            source: PullSource::of_snapshot(snap.taker),
-            taken_at: snap.taken_at,
-        };
+        let provenance = PullProvenance::of_snapshot(&snap, age_secs);
         let s = assemble_survey(
             None,
             Some((snap.pull.as_ref(), &provenance)),
@@ -4610,5 +4643,57 @@ mod tests {
             serde_json::to_value(PullSource::of_snapshot(reclaim::PullTaker::Poller)).unwrap(),
             "poller_snapshot"
         );
+    }
+
+    /// (A1) A snapshot admitted AT the bound is reported with the age measured
+    /// at selection, never past 600 — even when the survey assembles its answer
+    /// 15 s later, after the census wait and the ownership walk.
+    #[test]
+    fn a_snapshot_admitted_at_the_bound_is_never_reported_past_600() {
+        let chosen_at = chrono::Utc::now();
+        let snap = last_good(
+            device(),
+            SNAP_BASE,
+            reclaim::PullTaker::Poller,
+            chosen_at,
+            600,
+        );
+        let PullChoice::Snapshot { snap, age_secs } = choose_pull(
+            PullPolicy::SnapshotFirst,
+            Some(snap),
+            Some((device(), SNAP_BASE)),
+            chosen_at,
+        ) else {
+            panic!("a 600 s snapshot is in bound");
+        };
+        assert_eq!(age_secs, 600);
+        let provenance = PullProvenance::of_snapshot(&snap, age_secs);
+        let assembled_at = chosen_at + chrono::Duration::seconds(15);
+        let s = assemble_survey(
+            None,
+            Some((snap.pull.as_ref(), &provenance)),
+            Some(snap.device_id),
+            None,
+            false,
+            None,
+            assembled_at,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
+        assert!(s.coord_reachable);
+        assert_eq!(s.coord_pull_age_secs, Some(600));
+        let wire = serde_json::to_value(&s).expect("survey serializes");
+        assert_eq!(wire["coord_pull_age_secs"], 600);
+        assert_eq!(wire["coord_pull_source"], "poller_snapshot");
+    }
+
+    /// (A5) No decision reads neutrally: the arm covers an unconfigured
+    /// device as well as a failed pull, so it must not claim coord was tried.
+    #[test]
+    fn no_coord_decision_is_worded_neutrally() {
+        let clause = coord_pull_clause(None, None);
+        assert_eq!(clause, "Coord decision: none, so nothing is reclaimable.");
+        assert!(!clause.contains("not reached"));
     }
 }
