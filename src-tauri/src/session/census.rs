@@ -34,7 +34,7 @@
 //! | `account` | config-dir basename minus `.claude-`; `default` for `.claude` |
 //! | `last_acted_at` | `timestamp` of the last `user`/`assistant` line in the tail of `<config_dir>/projects/*/<session_id>.jsonl`, else registry `statusUpdatedAt`, else null — NEVER the file mtime (it moves with no new turn: coord finding `124c0ce9`) |
 //! | `tmux_pane` | Linux `/proc/<pid>/environ` `TMUX_PANE`, else the registry `tmux` locator's `%N` suffix |
-//! | `runner_hosted` | THIS runner hosts it (the session-message poller's own predicate, [`crate::mcp::session_message_poller::runner_hosts`]) OR its NEAREST supervising process — the first `qontinui-runner` or `claude` ancestor — is a runner ([`runner_ancestor`]); a `claude` nested inside another session's tool call is not runner-hosted |
+//! | `runner_hosted` | THIS runner hosts it (the session-message poller's own predicate, [`crate::mcp::session_message_poller::runner_hosts`]) OR its pid is the claude anchor of one of THIS runner's live PTYs ([`Probes::own_pty_anchor`], every OS) OR its NEAREST supervising process — the first `qontinui-runner` or `claude` ancestor — is a runner ([`runner_ancestor`]); a `claude` nested inside another session's tool call is not runner-hosted |
 //!
 //! `pid_alive` is always `true` here: [`read_live_sessions`] drops a registry
 //! row whose pid is not in the live process table (a crashed process cannot
@@ -50,8 +50,21 @@
 //! spot on Linux. The walk stops at the first `claude` ancestor too: a session
 //! started from a tool call inside a runner-hosted session has a runner above
 //! it but no pusher of its own. On other OSes ancestry is not read ([`ANCESTRY_SUPPORTED`]):
-//! `runner_hosted` is this runner's predicate alone and a live, unhosted
-//! session still reports `no_pusher` — the pre-ancestry behaviour.
+//! `runner_hosted` is this runner's predicate and its pid probe alone, and a
+//! live session neither answers for still reports `no_pusher`.
+//!
+//! ## Why a pid probe, not only the id predicate
+//!
+//! The id predicate answers "would a message to THIS id route?". A pane whose
+//! claude runs another id than its lifecycle record is keyed by (an account
+//! shortcut typed into a pinned pane, before the reconcile re-keys it) fails
+//! it, although this runner owns the pane. The pid probe asks the pid-exact
+//! question instead — is the row's pid the claude anchor of one of our PTYs —
+//! with the same anchor resolution the provider-row read uses
+//! ([`crate::session::reconcile::claude_anchor_terminals`]). A row it matches
+//! is hosted here; one the id predicate also misses is
+//! [`LocalVerdict::LiveHereUnbound`], which the poller reports as
+//! `session_id_unbound`, never as `no_pusher`.
 //!
 //! ## Failure posture
 //!
@@ -106,6 +119,12 @@ pub struct CensusRow {
     /// ancestor? `None` = not read (non-Linux) or unreadable mid-walk.
     #[serde(skip)]
     pub runner_ancestor: Option<bool>,
+    /// Local only, never posted: the terminal of THIS runner whose claude
+    /// anchor is this row's pid, when a message to the row's session id would
+    /// NOT route there (the pane's record is keyed by another id). `None`
+    /// otherwise.
+    #[serde(skip)]
+    pub here_unbound_terminal: Option<String>,
     /// Where THIS runner shows the session — `terminal_id`, `page_id`,
     /// `page_name`, `page_window`, flattened into the row — for a
     /// `runner_hosted` row whose terminal is here; absent otherwise
@@ -416,6 +435,9 @@ pub struct Probes<'a> {
     pub tmux_pane_of: &'a dyn Fn(u32) -> Option<String>,
     pub read_stat: &'a dyn Fn(u32) -> Option<(String, u32)>,
     pub is_runner_hosted: &'a dyn Fn(&str) -> bool,
+    /// The terminal of THIS runner whose live PTY's claude anchor is this pid,
+    /// if any — pid-exact, on every OS.
+    pub own_pty_anchor: &'a dyn Fn(u32) -> Option<String>,
     /// Could this live pid's image host Claude Code
     /// ([`super::claude_session_registry::may_host_claude`])? Decides whether an
     /// UNREADABLE registry record names a possibly-live session (the read is
@@ -426,6 +448,8 @@ pub struct Probes<'a> {
 /// Project one registry row into a census row.
 fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> CensusRow {
     let runner_ancestor = runner_ancestor(s.pid, probes.read_stat);
+    let id_hosted = (probes.is_runner_hosted)(&s.session_id);
+    let own_terminal = (probes.own_pty_anchor)(s.pid);
     CensusRow {
         session_id: s.session_id.clone(),
         pid: s.pid,
@@ -455,8 +479,9 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
         last_acted_at: last_acted_at(config_dir, &s.session_id)
             .map(rfc3339)
             .or_else(|| s.status_updated_at.and_then(ms_to_rfc3339)),
-        runner_hosted: (probes.is_runner_hosted)(&s.session_id) || runner_ancestor == Some(true),
+        runner_hosted: id_hosted || own_terminal.is_some() || runner_ancestor == Some(true),
         runner_ancestor,
+        here_unbound_terminal: own_terminal.filter(|_| !id_hosted),
         // Filled after the build, from the terminal layout
         // (`session_placement::apply_placements`).
         placement: None,
@@ -532,6 +557,10 @@ pub enum LocalVerdict {
     NotLive,
     /// Live, and hosted by a runner — this one, or another on the device.
     LiveUnderARunner,
+    /// Live in one of THIS runner's own PTYs (its pid is the pane's claude
+    /// anchor), but a message to this id does not route there: the pane's
+    /// lifecycle record is keyed by another id.
+    LiveHereUnbound,
     /// Live, and no runner on the device hosts it: nothing can push to it.
     LiveUnhosted,
 }
@@ -543,11 +572,14 @@ pub enum LocalVerdict {
 struct Presence {
     any_runner: bool,
     any_unknown: bool,
+    here_unbound: bool,
 }
 
 /// The verdict for a live session. Pure, so both OS arms are tested anywhere.
 fn presence_verdict(p: Presence, ancestry_supported: bool) -> LocalVerdict {
-    if p.any_runner {
+    if p.here_unbound {
+        LocalVerdict::LiveHereUnbound
+    } else if p.any_runner {
         LocalVerdict::LiveUnderARunner
     } else if ancestry_supported && p.any_unknown {
         LocalVerdict::Unknown
@@ -560,6 +592,9 @@ fn presence_verdict(p: Presence, ancestry_supported: bool) -> LocalVerdict {
 struct LocalCensus {
     taken: Instant,
     live: HashMap<String, Presence>,
+    /// Session id -> the terminal of this runner its claude runs in, for every
+    /// [`LocalVerdict::LiveHereUnbound`] session.
+    here_unbound: HashMap<String, String>,
 }
 
 fn local_census() -> &'static Mutex<Option<LocalCensus>> {
@@ -570,14 +605,34 @@ fn local_census() -> &'static Mutex<Option<LocalCensus>> {
 /// Record a freshly built snapshot as this device's local census.
 pub fn remember(snapshot: &CensusSnapshot, taken: Instant) {
     let mut live: HashMap<String, Presence> = HashMap::new();
+    let mut here_unbound: HashMap<String, String> = HashMap::new();
     for r in snapshot.sessions.iter().filter(|r| r.pid_alive) {
         let p = live.entry(r.session_id.clone()).or_default();
         p.any_runner |= r.runner_hosted;
         p.any_unknown |= r.runner_ancestor.is_none();
+        if let Some(terminal_id) = &r.here_unbound_terminal {
+            p.here_unbound = true;
+            here_unbound.insert(r.session_id.clone(), terminal_id.clone());
+        }
     }
     if let Ok(mut g) = local_census().lock() {
-        *g = Some(LocalCensus { taken, live });
+        *g = Some(LocalCensus {
+            taken,
+            live,
+            here_unbound,
+        });
     }
+}
+
+/// The terminal of THIS runner a [`LocalVerdict::LiveHereUnbound`] session's
+/// claude runs in, from a fresh census. `None` for any other verdict.
+pub fn local_unbound_terminal(session_id: &str, now: Instant) -> Option<String> {
+    let g = local_census().lock().ok()?;
+    let c = g.as_ref()?;
+    if now.saturating_duration_since(c.taken) > CENSUS_STALE_AFTER {
+        return None;
+    }
+    c.here_unbound.get(session_id).cloned()
 }
 
 /// What the runner's own census says about `session_id`. A missing or stale
@@ -767,6 +822,34 @@ impl HostedSubstrate {
         )
     }
 
+    /// Claude anchor pid -> terminal id, for every live PTY of THIS runner,
+    /// with the anchor resolution the provider-row read uses. Empty before the
+    /// terminal manager is up, or when the look's snapshot is unknown.
+    async fn claude_anchor_terminals(&self) -> HashMap<u32, String> {
+        let Some(terminals) = &self.terminals else {
+            return HashMap::new();
+        };
+        let live: Vec<crate::session::reconcile::LivePty> = terminals
+            .list()
+            .into_iter()
+            .map(|i| crate::session::reconcile::LivePty {
+                terminal_id: i.id,
+                pid: i.pid,
+                working_dir: i.working_dir,
+                page_id: i.page_id,
+                title: i.title,
+                ai_pid: None,
+                ai_start_unix: None,
+            })
+            .collect();
+        let roots: Vec<u32> = live.iter().filter_map(|p| p.pid).collect();
+        if roots.is_empty() {
+            return HashMap::new();
+        }
+        let look = crate::terminal::graceful_exit::PaneLook::take(&roots).await;
+        crate::session::reconcile::claude_anchor_terminals(&live, &look)
+    }
+
     fn hosts(&self, id: &str) -> bool {
         match (&self.sessions, &self.lifecycle) {
             (Some(sm), Some(store)) => crate::mcp::session_message_poller::runner_hosts(
@@ -795,10 +878,12 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
     };
     let taken = Instant::now();
     let substrate = HostedSubstrate::from_app(app);
+    let anchors = substrate.claude_anchor_terminals().await;
     // Every account home's registry, every transcript tail, every /proc read:
     // filesystem work, so it runs on the blocking pool, never on an async worker.
     let built = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let hosted = |id: &str| substrate.hosts(id);
+        let own_anchor = |pid: u32| anchors.get(&pid).cloned();
         let may_host = super::claude_session_registry::may_host_claude(&snap);
         let mut built = build_snapshot(
             &crate::terminal::transcript::find_claude_config_dirs(),
@@ -809,6 +894,7 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
                 tmux_pane_of: &tmux_pane_of_pid,
                 read_stat: &read_proc_stat,
                 is_runner_hosted: &hosted,
+                own_pty_anchor: &own_anchor,
                 may_host_claude: &may_host,
             },
         );
@@ -963,11 +1049,15 @@ mod tests {
     fn not_hosted(_: &str) -> bool {
         false
     }
+    fn no_anchor(_: u32) -> Option<String> {
+        None
+    }
     fn no_probes() -> Probes<'static> {
         Probes {
             tmux_pane_of: &no_pane,
             read_stat: &no_stat,
             is_runner_hosted: &not_hosted,
+            own_pty_anchor: &no_anchor,
             may_host_claude: &|_| true,
         }
     }
@@ -1070,6 +1160,7 @@ mod tests {
                     _ => None,
                 },
                 is_runner_hosted: &|sid| sid == SID_B,
+                own_pty_anchor: &no_anchor,
                 may_host_claude: &|_| true,
             },
         )
@@ -1334,6 +1425,7 @@ mod tests {
                     _ => None,
                 },
                 is_runner_hosted: &|_| false,
+                own_pty_anchor: &no_anchor,
                 may_host_claude: &|_| true,
             },
         )
@@ -1357,20 +1449,77 @@ mod tests {
         clear_local_census_for_test();
     }
 
+    /// The pid probe: a row whose pid is the claude anchor of one of this
+    /// runner's PTYs reads `runner_hosted: true` with no ancestry and no id
+    /// match, and is remembered as `LiveHereUnbound` with its terminal. A row
+    /// the id predicate also answers for is hosted and NOT unbound. An
+    /// unmatched row with no ancestry stays unhosted.
+    #[test]
+    fn a_row_whose_pid_is_a_pty_anchor_here_is_runner_hosted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-iris");
+        registry_row(&a, 100, SID_A, "");
+        registry_row(&a, 200, SID_B, "");
+        registry_row(&a, 300, SID_DEAD, "");
+        let live: HashSet<u32> = [100, 200, 300].into_iter().collect();
+        let snap = build_snapshot(
+            &[a],
+            &live,
+            Utc::now(),
+            None,
+            &Probes {
+                tmux_pane_of: &no_pane,
+                read_stat: &no_stat,
+                is_runner_hosted: &|sid| sid == SID_B,
+                own_pty_anchor: &|pid| match pid {
+                    100 => Some("term-a".to_string()),
+                    200 => Some("term-b".to_string()),
+                    _ => None,
+                },
+                may_host_claude: &|_| true,
+            },
+        )
+        .unwrap();
+        let row = |sid: &str| snap.sessions.iter().find(|r| r.session_id == sid).unwrap();
+        assert!(row(SID_A).runner_hosted);
+        assert_eq!(row(SID_A).here_unbound_terminal.as_deref(), Some("term-a"));
+        assert!(row(SID_B).runner_hosted);
+        assert_eq!(row(SID_B).here_unbound_terminal, None);
+        assert!(!row(SID_DEAD).runner_hosted);
+        let posted = serde_json::to_value(row(SID_A)).unwrap();
+        assert!(posted.get("here_unbound_terminal").is_none(), "local only");
+    }
+
     #[test]
     fn presence_verdict_claims_unhosted_only_without_any_runner() {
         let runner = Presence {
             any_runner: true,
             any_unknown: true,
+            here_unbound: false,
         };
         let unknown = Presence {
             any_runner: false,
             any_unknown: true,
+            here_unbound: false,
         };
         let clear = Presence {
             any_runner: false,
             any_unknown: false,
+            here_unbound: false,
         };
+        // A pane this runner owns whose id does not route: on every OS, and
+        // ahead of the runner-hosted answer the same row also gives.
+        let here_unbound = Presence {
+            any_runner: true,
+            any_unknown: true,
+            here_unbound: true,
+        };
+        for supported in [true, false] {
+            assert_eq!(
+                presence_verdict(here_unbound, supported),
+                LocalVerdict::LiveHereUnbound
+            );
+        }
         for supported in [true, false] {
             assert_eq!(
                 presence_verdict(runner, supported),
@@ -1587,6 +1736,7 @@ mod tests {
                 last_acted_at: None,
                 runner_hosted: false,
                 runner_ancestor: Some(true),
+                here_unbound_terminal: None,
                 placement: None,
             }],
         };

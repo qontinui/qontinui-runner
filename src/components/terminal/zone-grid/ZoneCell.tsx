@@ -36,6 +36,7 @@ import { SuggestionChip } from "../suggestions";
 import { ZoneHoverActions } from "../ZoneHoverActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TenantBadge, tenantBadgeRendersWithoutSession } from "../TenantBadge";
+import { PendingMessagesBadge } from "../PendingMessagesBadge";
 import { ZonePromptsPanel } from "../ZonePromptsPanel";
 import { SessionReviewPanel, SessionReviewToggle } from "../SessionReviewPanel";
 import { reviewBadgeState } from "../sessionReviewView";
@@ -801,6 +802,10 @@ function ZoneCellInner({
                 zoneIndex={zoneIdx}
               />
               <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
+              {/* The pending coord-message chip at parity with `ZoneLabel`:
+                  a one-terminal page has no ZoneLabel, so without it the
+                  layout most operators run never showed the badge. */}
+              {!tab.remote && <PendingMessagesBadge terminalId={tab.id} zoneIndex={zoneIdx} />}
               {promptsAvailable && (
                 <button
                   onClick={(e) => {

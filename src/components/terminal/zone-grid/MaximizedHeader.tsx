@@ -13,6 +13,7 @@ import type { TerminalTab } from "../useTerminalManager";
 import { TabTitle } from "../displayTitle";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TenantBadge } from "../TenantBadge";
+import { PendingMessagesBadge } from "../PendingMessagesBadge";
 import { MAXIMIZED_HEADER_HEIGHT_PX } from "./constants";
 
 /** Neighbour navigation within the maximized view. */
@@ -69,6 +70,8 @@ export function MaximizedHeader({
         zoneIndex={zoneIdx}
       />
       <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
+      {/* Pending coord messages, at parity with the zone header. */}
+      {!tab.remote && <PendingMessagesBadge terminalId={tab.id} zoneIndex={zoneIdx} />}
       {onTogglePrompts && (
         <button
           onClick={(e) => {

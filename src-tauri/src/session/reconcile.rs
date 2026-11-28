@@ -84,10 +84,12 @@ use crate::terminal::graceful_exit::PaneLook;
 use qontinui_runner_lib::session_archive::discovery::config_dir_compare_key;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
-/// The per-tick repair that writes a record's `config_dir` from its own pane's
-/// provider row (D2 of plan
-/// `2026-11-16-boot-reconcile-reverts-a-migrated-sessions-config-dir-so-the-next-migration-carries-a-stale-transcript`).
-pub mod config_dir_repair;
+/// The per-tick repair that writes a record's identity — its `config_dir`, and
+/// its session id when the pane runs another — from its own pane's provider row
+/// (D2 of plan
+/// `2026-11-16-boot-reconcile-reverts-a-migrated-sessions-config-dir-so-the-next-migration-carries-a-stale-transcript`;
+/// the re-key: plan `2026-11-27-coord-message-to-cross-account-pane-never-pushed`).
+pub mod identity_repair;
 
 /// One live PTY the reconcile considers, projected from
 /// [`crate::terminal::manager::TerminalManager::list`].
@@ -348,7 +350,7 @@ pub fn decide_bind_for_live_pty(
 /// reconcile re-wrote a session migrated to `.claude-erik` back to `~/.claude`
 /// (roster index 0), and the next migration carried that root's stale copy.
 /// Which root a live session runs under is pid-exact evidence, the pane's
-/// provider row, which [`config_dir_repair`] applies from the next tick on (a
+/// provider row, which [`identity_repair`] applies from the next tick on (a
 /// record this tick wrote is past that tick's pre-evidence snapshot).
 ///
 /// Spellings of one root (separators, a trailing slash, Windows case) are one
@@ -1221,7 +1223,7 @@ pub fn refresh_titles_pass(
 /// STRICT [`provider_row_validity`](crate::session::claude_activity::provider_row_validity)
 /// verdict for each live PTY's claude anchor pid. Computed once per tick (off
 /// the async executor) and handed to the bind pass's rung-2 pre-emption, to
-/// the coord re-key and to [`config_dir_repair`], so all three read the same
+/// the coord re-key and to [`identity_repair`], so all three read the same
 /// answer.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProviderRows {
@@ -1387,6 +1389,17 @@ fn anchor_live_ptys(live: &[LivePty], look: &PaneLook) -> Vec<LivePty> {
         }
     }
     out
+}
+
+/// Claude anchor pid -> terminal id for every live PTY in `live` whose anchor
+/// resolves from `look` ([`anchor_live_ptys`], the resolution the provider-row
+/// read uses). The session census's pid-exact "is this claude one of our
+/// panes?" probe.
+pub fn claude_anchor_terminals(live: &[LivePty], look: &PaneLook) -> HashMap<u32, String> {
+    anchor_live_ptys(live, look)
+        .into_iter()
+        .filter_map(|p| Some((p.ai_pid?, p.terminal_id)))
+        .collect()
 }
 
 /// Run ONE reconcile/bind pass against an ALREADY-TAKEN process snapshot: resolve
@@ -3137,7 +3150,7 @@ mod tests {
     /// B, and neither this tick's repair nor the next one writes A.
     #[test]
     fn a_settle_window_bind_from_the_old_pane_leaves_the_row_and_its_config_dir() {
-        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds, PreEvidenceSnapshot};
+        use super::identity_repair::{repair_identities, AnchorArgvIds, PreEvidenceSnapshot};
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(rec_under("d1-c", "term-new", ROOT_B, true));
@@ -3174,9 +3187,9 @@ mod tests {
                 },
             ]
         );
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         // The next tick's repair, from a fresh snapshot.
-        assert!(repair_config_dirs(
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -3289,9 +3302,9 @@ mod tests {
         store: &SessionLifecycleStore,
         sid: &str,
         pre: TerminalSessionRecord,
-    ) -> super::config_dir_repair::PreEvidenceSnapshot {
+    ) -> super::identity_repair::PreEvidenceSnapshot {
         store.record_open(pre);
-        let snapshot = super::config_dir_repair::PreEvidenceSnapshot::take(store);
+        let snapshot = super::identity_repair::PreEvidenceSnapshot::take(store);
 
         // The migration, after the snapshot: the row moves to the new pane.
         store.record_open(rec_under(sid, "term-new", ROOT_B, true));
@@ -3335,7 +3348,7 @@ mod tests {
     /// the record now holds B, so the compare-and-set does.
     #[test]
     fn a_boot_bind_that_moves_a_migrated_row_does_not_let_the_repair_write_the_old_account() {
-        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds};
+        use super::identity_repair::{repair_identities, AnchorArgvIds};
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let pre = TerminalSessionRecord {
@@ -3345,7 +3358,7 @@ mod tests {
         let snapshot = boot_replay(&store, "d1-boot", pre);
 
         let rows = ProviderRows::from_pairs([old_pane_row_a("d1-boot")]);
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         assert_eq!(
             store.get("d1-boot").unwrap().config_dir.as_deref(),
             Some(ROOT_B)
@@ -3360,7 +3373,7 @@ mod tests {
     /// guard keeps B.
     #[test]
     fn the_tick_after_a_boot_replay_does_not_write_the_old_account() {
-        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds, PreEvidenceSnapshot};
+        use super::identity_repair::{repair_identities, AnchorArgvIds, PreEvidenceSnapshot};
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let boot_snapshot = boot_replay(
@@ -3370,7 +3383,7 @@ mod tests {
         );
         let boot_rows = ProviderRows::from_pairs([old_pane_row_a("d1-tick")]);
         let boot_argv = AnchorArgvIds::from_pairs([("term-old", "d1-tick")]);
-        assert!(repair_config_dirs(&store, &boot_snapshot, &boot_rows, &boot_argv).is_empty());
+        assert!(repair_identities(&store, &boot_snapshot, &boot_rows, &boot_argv).is_empty());
 
         // The next tick: both panes are live and anchored.
         let rows = ProviderRows::from_pairs([
@@ -3379,7 +3392,7 @@ mod tests {
         ]);
         let argv = AnchorArgvIds::from_pairs([("term-old", "d1-tick"), ("term-new", "d1-tick")]);
         let snapshot = PreEvidenceSnapshot::take(&store);
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &argv).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &argv).is_empty());
         assert_eq!(
             store.get("d1-tick").unwrap().config_dir.as_deref(),
             Some(ROOT_B)

@@ -61,6 +61,7 @@ import { ZoneLabel } from "./ZoneLabel";
 import { SessionReviewToggle } from "../SessionReviewPanel";
 import {
   HEADER_FIXED_ITEMS_PX,
+  HEADER_LOCAL_FIXED_ITEMS_PX,
   HEADER_REMOTE_FLOORS_PX,
   HEADER_TRUNCATING_FLOORS_PX,
   headerControlsMinPx,
@@ -152,14 +153,16 @@ describe("zone header row against headerControlsMinPx", () => {
     const children = Array.from(row.children);
     const fixed = children.filter(holdsWidth);
     const rest = children.filter((el) => !holdsWidth(el));
-    expect(fixed).toHaveLength(Object.keys(HEADER_FIXED_ITEMS_PX).length);
+    // A local tab also carries the local-only items (the pending-messages chip
+    // renders its `?` here: no poll view has arrived in the test).
+    const fixedItems =
+      Object.keys(HEADER_FIXED_ITEMS_PX).length + Object.keys(HEADER_LOCAL_FIXED_ITEMS_PX).length;
+    expect(fixed).toHaveLength(fixedItems);
     for (const el of rest) expect(truncates(el), el.outerHTML.slice(0, 120)).toBe(true);
     expect(rest).toHaveLength(Object.keys(HEADER_TRUNCATING_FLOORS_PX).length);
     // One gap per adjacent pair of the items the table budgets.
-    expect(children).toHaveLength(
-      Object.keys(HEADER_FIXED_ITEMS_PX).length + Object.keys(HEADER_TRUNCATING_FLOORS_PX).length,
-    );
-    expect(headerControlsMinPx()).toBe(280);
+    expect(children).toHaveLength(fixedItems + Object.keys(HEADER_TRUNCATING_FLOORS_PX).length);
+    expect(headerControlsMinPx()).toBe(316);
   });
 
   it("a remote tab's row adds only truncating items, each budgeted", async () => {

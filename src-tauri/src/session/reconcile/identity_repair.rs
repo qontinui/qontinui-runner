@@ -1,6 +1,8 @@
-//! Repair a record's `config_dir` from the pane's own provider row (plan
+//! Repair a record's identity — its `config_dir`, and its session id — from
+//! the pane's own provider row (plan
 //! `2026-11-16-boot-reconcile-reverts-a-migrated-sessions-config-dir-so-the-next-migration-carries-a-stale-transcript`,
-//! D2).
+//! D2; the re-key: plan
+//! `2026-11-27-coord-message-to-cross-account-pane-never-pushed`, item 1).
 //!
 //! ## Why this exists
 //!
@@ -19,6 +21,22 @@
 //! confirmed rows included, and writes that answer onto the record through the
 //! sticky identity overlay, together with the account label and wrapper derived
 //! from the same dir, so the three cannot disagree.
+//!
+//! ## The re-key
+//!
+//! The same row also says WHICH session the pane runs. A pane spawned with a
+//! pinned `--session-id` whose claude was then started under another account
+//! (an account shortcut typed into the pane) runs a different id than its
+//! record is keyed by. The coord row and the session registry follow the
+//! provider id; the lifecycle record did not, so the session-message poller,
+//! which resolves `to_session` through the record, never found the pane and
+//! every coord message to the live id stayed pending. When a valid row on a
+//! terminal names a session no open record on that terminal is keyed by, and
+//! exactly one open record sits on that terminal, that record is re-keyed to
+//! the row's id ([`SessionLifecycleStore::rekey_identity_if_unchanged`]), with
+//! the row's grade (`observed`, confirmed) and its config dir in the same
+//! write. Every guard below applies to it too, plus one: an id that already
+//! keys another open record is never re-keyed onto (logged once per pair).
 //!
 //! ## Guards
 //!
@@ -60,7 +78,7 @@ use super::{ProviderRows, SessionBoundPayload};
 use crate::process_capture::process_tree::{command_lines_for_pids, parse_session_id_from_cmdline};
 use crate::session::past_sessions::account_from_config_dir;
 use crate::session::session_lifecycle_store::{
-    IdentityCas, SessionIdentityUpdate, SessionLifecycleStore,
+    IdentityCas, RekeyOutcome, SessionIdentityUpdate, SessionLifecycleStore,
 };
 use qontinui_runner_lib::session_archive::discovery::config_dir_compare_key;
 
@@ -84,6 +102,17 @@ impl PreEvidenceSnapshot {
                 .collect(),
         }
     }
+
+    /// The open records on each terminal, as `(session id, config dir)`.
+    fn by_terminal(&self) -> HashMap<&str, Vec<(&str, Option<&str>)>> {
+        let mut out: HashMap<&str, Vec<(&str, Option<&str>)>> = HashMap::new();
+        for (session_id, (terminal_id, dir)) in &self.by_session {
+            out.entry(terminal_id.as_str())
+                .or_default()
+                .push((session_id.as_str(), dir.as_deref()));
+        }
+        out
+    }
 }
 
 /// The session id each live pane's claude anchor was started with, read
@@ -92,7 +121,7 @@ impl PreEvidenceSnapshot {
 #[derive(Debug, Clone)]
 pub enum AnchorArgvIds {
     /// The command-line read failed: whether another pane runs a session is
-    /// UNKNOWN, so [`repair_config_dirs`] writes nothing this tick.
+    /// UNKNOWN, so [`repair_identities`] writes nothing this tick.
     Unknown,
     /// Terminal id -> the session id its anchor's argv names. A terminal whose
     /// argv names no id, or whose anchor had exited (a dead pid is absent from
@@ -106,7 +135,7 @@ impl AnchorArgvIds {
     /// no record is a repair candidate this tick, so a settled fleet pays
     /// nothing.
     pub async fn read(snapshot: &PreEvidenceSnapshot, rows: &ProviderRows) -> Self {
-        if plan_repairs(snapshot, rows).is_empty() {
+        if plan_repairs(snapshot, rows).is_empty() && plan_rekeys(snapshot, rows).is_empty() {
             return Self::Known(HashMap::new());
         }
         let mut terminals_by_pid: HashMap<u32, Vec<String>> = HashMap::new();
@@ -155,12 +184,16 @@ impl AnchorArgvIds {
     }
 }
 
-/// One `config_dir` correction the pass wrote (for logging, the tab-stamp
-/// event and tests).
+/// One identity correction the pass wrote (for logging, the tab-stamp event
+/// and tests): a `config_dir` repair, or a re-key (which carries the dir too).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigDirRepair {
+pub struct IdentityRepair {
     pub terminal_id: String,
+    /// The session id the record is keyed by after the write.
     pub session_id: String,
+    /// The id the record was keyed by before a re-key; `None` for a
+    /// `config_dir`-only repair.
+    pub rekeyed_from: Option<String>,
     /// The value the record held before the repair (`None` = unknown).
     pub from: Option<String>,
     /// The dir the pane's provider row was read from.
@@ -205,7 +238,7 @@ fn plan_repairs<'a>(
             continue;
         };
         if row_session != session_id {
-            continue; // the pane runs another session: the coord re-key's case
+            continue; // the pane runs another session: `plan_rekeys`' case
         }
         if terminals_by_session
             .get(row_session)
@@ -232,32 +265,113 @@ fn plan_repairs<'a>(
     out
 }
 
+/// A re-key the snapshot and the valid rows alone call for, before the argv
+/// guard and the compare-and-set.
+struct PlannedRekey<'a> {
+    old_id: &'a str,
+    new_id: &'a str,
+    terminal_id: &'a str,
+    from: Option<&'a str>,
+    to: &'a str,
+}
+
+/// Every terminal whose valid row names a session that no open record on that
+/// terminal is keyed by, where exactly ONE open record sits on the terminal
+/// (two would leave which one the pane runs ambiguous), no other terminal's
+/// valid row names the row's session (the overlap guard), and no open record
+/// anywhere is already keyed by it (the occupied guard, logged once per pair).
+fn plan_rekeys<'a>(
+    snapshot: &'a PreEvidenceSnapshot,
+    rows: &'a ProviderRows,
+) -> Vec<PlannedRekey<'a>> {
+    let mut terminals_by_session: HashMap<&str, usize> = HashMap::new();
+    for (_, session_id, _) in rows.valid() {
+        *terminals_by_session.entry(session_id).or_default() += 1;
+    }
+    if terminals_by_session.is_empty() {
+        return Vec::new();
+    }
+    let by_terminal = snapshot.by_terminal();
+    let mut out = Vec::new();
+    for (terminal_id, new_id, row_dir) in rows.valid() {
+        let Some(records) = by_terminal.get(terminal_id) else {
+            continue; // no open record on the pane: the bind pass's case
+        };
+        if records.iter().any(|(sid, _)| *sid == new_id) {
+            continue; // already keyed by the live id: at most a dir repair
+        }
+        let [(old_id, from)] = records.as_slice() else {
+            continue; // two open records on one pane: which one runs is unknown
+        };
+        if terminals_by_session.get(new_id).copied().unwrap_or(0) > 1 {
+            continue; // the overlap guard
+        }
+        if let Some((other_terminal, _)) = snapshot.by_session.get(new_id) {
+            note_occupied(old_id, new_id, other_terminal);
+            continue; // the occupied guard
+        }
+        let Some(to) = row_dir.to_str() else {
+            continue;
+        };
+        out.push(PlannedRekey {
+            old_id,
+            new_id,
+            terminal_id,
+            from: *from,
+            to,
+        });
+    }
+    out
+}
+
+/// Log, at `info!` and ONCE per `(old id, new id)` pair, that a re-key was
+/// refused because the pane's live id already keys another record.
+fn note_occupied(old_id: &str, new_id: &str, other_terminal: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert((old_id.to_string(), new_id.to_string())))
+        .unwrap_or(false);
+    if first {
+        tracing::info!(
+            record_session = %old_id,
+            provider_session = %new_id,
+            other_terminal = %other_terminal,
+            "session reconcile: re-key refused — the pane's live session id already keys another record"
+        );
+    }
+}
+
 /// Correct every open record whose `config_dir` disagreed, at `snapshot` time,
-/// with its own pane's valid provider row this tick. Returns the corrections
-/// that landed.
+/// with its own pane's valid provider row this tick, and re-key every record
+/// whose pane's valid row names another session ([`plan_rekeys`]). Returns the
+/// corrections that landed.
 ///
 /// Fail-open: no valid rows, a record that changed since `snapshot`, a session
 /// another live pane's argv names, an UNKNOWN argv read, or a dir that is not
 /// valid UTF-8 writes nothing.
-pub fn repair_config_dirs(
+pub fn repair_identities(
     store: &SessionLifecycleStore,
     snapshot: &PreEvidenceSnapshot,
     rows: &ProviderRows,
     argv: &AnchorArgvIds,
-) -> Vec<ConfigDirRepair> {
+) -> Vec<IdentityRepair> {
     if let Ok(mut log) = repair_log().lock() {
         log.retain_sessions(|sid| snapshot.by_session.contains_key(sid));
     }
     let planned = plan_repairs(snapshot, rows);
-    if planned.is_empty() {
+    let rekeys = plan_rekeys(snapshot, rows);
+    if planned.is_empty() && rekeys.is_empty() {
         return Vec::new();
     }
     let argv_ids = match argv {
         AnchorArgvIds::Known(ids) => ids,
         AnchorArgvIds::Unknown => {
             tracing::debug!(
-                candidates = planned.len(),
-                "session reconcile: config_dir repair skipped — the anchors' command lines could not be read"
+                candidates = planned.len() + rekeys.len(),
+                "session reconcile: identity repair skipped — the anchors' command lines could not be read"
             );
             return Vec::new();
         }
@@ -292,9 +406,10 @@ pub fn repair_config_dirs(
         match store.update_identity_if_unchanged(session_id, terminal_id, from, &update) {
             IdentityCas::Written(rec) => {
                 note_repair(terminal_id, session_id, from, to);
-                out.push(ConfigDirRepair {
+                out.push(IdentityRepair {
                     terminal_id: terminal_id.to_string(),
                     session_id: session_id.to_string(),
+                    rekeyed_from: None,
                     from: from.map(str::to_string),
                     to: to.to_string(),
                     origin: rec.origin.clone().unwrap_or_default(),
@@ -311,12 +426,75 @@ pub fn repair_config_dirs(
             IdentityCas::NoChange | IdentityCas::Missing | IdentityCas::Unavailable => {}
         }
     }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for PlannedRekey {
+        old_id,
+        new_id,
+        terminal_id,
+        from,
+        to,
+    } in rekeys
+    {
+        if argv_ids
+            .iter()
+            .any(|(t, sid)| t != terminal_id && (sid == new_id || sid == old_id))
+        {
+            tracing::debug!(
+                terminal_id = %terminal_id,
+                record_session = %old_id,
+                provider_session = %new_id,
+                "session reconcile: re-key skipped — another live pane's argv names one of the two sessions"
+            );
+            continue; // the argv guard
+        }
+        let account = account_from_config_dir(Some(to));
+        let update = SessionIdentityUpdate {
+            config_dir: Some(to.to_string()),
+            account_label: Some(account.label),
+            account_wrapper: Some(account.wrapper),
+            ..Default::default()
+        };
+        match store.rekey_identity_if_unchanged(old_id, new_id, terminal_id, from, &update, now_ms)
+        {
+            RekeyOutcome::Rekeyed(rec) => {
+                // `rekey_session`'s contract: launch-failure liveness is keyed
+                // by id, so the new id is noted alive here.
+                crate::terminal::launch_failure::registry().note_alive(new_id, now_ms);
+                tracing::info!(
+                    terminal_id = %terminal_id,
+                    from_session = %old_id,
+                    to_session = %new_id,
+                    config_dir = %to,
+                    "session reconcile: re-keyed the lifecycle record to the pane's provider session id"
+                );
+                out.push(IdentityRepair {
+                    terminal_id: terminal_id.to_string(),
+                    session_id: new_id.to_string(),
+                    rekeyed_from: Some(old_id.to_string()),
+                    from: from.map(str::to_string),
+                    to: to.to_string(),
+                    origin: rec.origin.clone().unwrap_or_default(),
+                    confirmed: rec.confirmed_at.is_some(),
+                });
+            }
+            RekeyOutcome::Occupied => note_occupied(old_id, new_id, terminal_id),
+            RekeyOutcome::Stale => {
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    record_session = %old_id,
+                    "session reconcile: re-key skipped — the record changed after this tick's pre-evidence snapshot"
+                );
+            }
+            RekeyOutcome::Missing | RekeyOutcome::Unavailable => {}
+        }
+    }
     out
 }
 
 /// The `session-bound` tab-stamp payloads for the repairs that landed, each
 /// carrying the repaired config dir. Pure; the caller emits.
-pub fn repair_bound_payloads(repairs: &[ConfigDirRepair]) -> Vec<SessionBoundPayload> {
+pub fn repair_bound_payloads(repairs: &[IdentityRepair]) -> Vec<SessionBoundPayload> {
     repairs
         .iter()
         .map(|r| SessionBoundPayload {
@@ -325,9 +503,10 @@ pub fn repair_bound_payloads(repairs: &[ConfigDirRepair]) -> Vec<SessionBoundPay
             config_dir: r.to.clone(),
             origin: r.origin.clone(),
             confirmed: r.confirmed,
-            // Inferred by the runner from the provider's file, not reported by
-            // the provider about itself.
-            provider_reported: false,
+            // A dir repair is inferred by the runner. A re-key carries the id
+            // Claude Code wrote about itself into its own registry row for
+            // this pane's pid, so it may correct the id the tab holds.
+            provider_reported: r.rekeyed_from.is_some(),
         })
         .collect()
 }
@@ -393,7 +572,9 @@ mod tests {
     use super::*;
     use crate::process_capture::process_tree::ProcessSnapshot;
     use crate::session::claude_activity::ProviderRowValidity;
-    use crate::session::session_lifecycle_store::{ORIGIN_AUTHORITATIVE, UNZONED_ZONE_INDEX};
+    use crate::session::session_lifecycle_store::{
+        ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, UNZONED_ZONE_INDEX,
+    };
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -450,7 +631,7 @@ mod tests {
         open_confirmed(&store, "cfgrep-own", "term-1", ROOT_A);
         let rows = ProviderRows::from_pairs([valid("term-1", "cfgrep-own", ROOT_B)]);
 
-        let repairs = repair_config_dirs(
+        let repairs = repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -459,9 +640,10 @@ mod tests {
 
         assert_eq!(
             repairs,
-            vec![ConfigDirRepair {
+            vec![IdentityRepair {
                 terminal_id: "term-1".to_string(),
                 session_id: "cfgrep-own".to_string(),
+                rekeyed_from: None,
                 from: Some(ROOT_A.to_string()),
                 to: ROOT_B.to_string(),
                 origin: ORIGIN_AUTHORITATIVE.to_string(),
@@ -478,7 +660,7 @@ mod tests {
         );
 
         // The next tick, with the same row, has nothing to repair.
-        assert!(repair_config_dirs(
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -506,7 +688,7 @@ mod tests {
         open_confirmed(&store, "cfgrep-moved", "term-2", ROOT_A);
         open_confirmed(&store, "cfgrep-redir", "term-1b", ROOT_C);
 
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         let moved = store.get("cfgrep-moved").unwrap();
         assert_eq!(
             (moved.terminal_id.as_str(), moved.config_dir.as_deref()),
@@ -519,16 +701,14 @@ mod tests {
     }
 
     /// A valid row on ANOTHER terminal naming the record's session says nothing
-    /// about where the record's own pane runs it, and a row on the record's own
-    /// pane naming a different session is the coord re-key's case. Neither
-    /// moves the record.
+    /// about where the record's own pane runs it: it moves nothing.
     #[test]
-    fn a_row_on_another_terminal_or_for_another_session_moves_nothing() {
+    fn a_row_on_another_terminal_moves_nothing() {
         let (_d, store) = store();
         open_confirmed(&store, "cfgrep-other", "term-1", ROOT_A);
 
         let rows = ProviderRows::from_pairs([valid("term-2", "cfgrep-other", ROOT_B)]);
-        assert!(repair_config_dirs(
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -538,20 +718,199 @@ mod tests {
         assert_eq!(
             store.get("cfgrep-other").unwrap().config_dir.as_deref(),
             Some(ROOT_A)
+        );
+    }
+
+    /// The defect of plan `2026-11-27-coord-message-to-cross-account-pane-never-pushed`:
+    /// the record keeps the spawn-pinned id while its own pane's valid row
+    /// names the id the pane's claude actually runs, under another account.
+    /// The record is re-keyed to the row's id, with the row's dir, account and
+    /// grade in the same write, and the payload may correct the tab's id.
+    #[test]
+    fn a_row_naming_another_session_on_the_records_own_pane_rekeys_the_record() {
+        let (_d, store) = store();
+        store.record_open(bind_record(
+            &live("term-1", 1),
+            "rekey-pinned",
+            ROOT_A,
+            ORIGIN_AUTHORITATIVE,
+            false,
+            UNZONED_ZONE_INDEX,
+        ));
+        let rows = ProviderRows::from_pairs([valid("term-1", "rekey-live", ROOT_B)]);
+
+        let repairs = repair_identities(
+            &store,
+            &PreEvidenceSnapshot::take(&store),
+            &rows,
+            &AnchorArgvIds::none(),
         );
 
-        let rows = ProviderRows::from_pairs([valid("term-1", "someone-else", ROOT_B)]);
-        assert!(repair_config_dirs(
+        assert_eq!(
+            repairs,
+            vec![IdentityRepair {
+                terminal_id: "term-1".to_string(),
+                session_id: "rekey-live".to_string(),
+                rekeyed_from: Some("rekey-pinned".to_string()),
+                from: Some(ROOT_A.to_string()),
+                to: ROOT_B.to_string(),
+                origin: ORIGIN_OBSERVED.to_string(),
+                confirmed: true,
+            }]
+        );
+        assert!(store.get("rekey-pinned").is_none());
+        let rec = store.get("rekey-live").unwrap();
+        assert_eq!(rec.terminal_id, "term-1");
+        assert_eq!(rec.config_dir.as_deref(), Some(ROOT_B));
+        assert_eq!(rec.account_label.as_deref(), Some("paktis"));
+        assert!(rec.confirmed_at.is_some());
+        assert!(repair_bound_payloads(&repairs)[0].provider_reported);
+
+        // The next tick has nothing left to do.
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
             &AnchorArgvIds::none()
         )
         .is_empty());
-        assert_eq!(
-            store.get("cfgrep-other").unwrap().config_dir.as_deref(),
-            Some(ROOT_A)
+    }
+
+    /// The identity source is the account dir the pane's claude ACTUALLY runs
+    /// under, read from disk (manual-test-loop iteration 2): the record names
+    /// the runner's dir (`.claude-support`) and a pinned id, the runner's dir
+    /// holds only a stale row for an earlier holder of the anchor pid, and the
+    /// live row sits in `.claude-ben/sessions/<pid>.json`. The real reader
+    /// ([`read_provider_rows`], every discovered dir) finds the live row, and
+    /// the record is re-keyed to its id under `.claude-ben`.
+    #[test]
+    fn a_pane_under_another_config_dir_is_rekeyed_from_that_dirs_provider_row() {
+        use crate::session::claude_activity::read_provider_rows;
+
+        const PID: u32 = 3_999_917;
+        const CREATED: i64 = 1_795_762_191;
+        let homes = tempdir().unwrap();
+        let support = homes.path().join(".claude-support");
+        let ben = homes.path().join(".claude-ben");
+        // A Windows-domain row: its FILETIME `procStart` is checked against the
+        // anchor's creation time on every OS.
+        let write_row = |dir: &PathBuf, sid: &str, started: i64| {
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            let row = serde_json::json!({
+                "pid": PID,
+                "sessionId": sid,
+                "pidDomain": "win32:test",
+                "procStart": ((started + 11_644_473_600) * 10_000_000).to_string(),
+            });
+            std::fs::write(
+                dir.join("sessions").join(format!("{PID}.json")),
+                row.to_string(),
+            )
+            .unwrap();
+        };
+        write_row(&support, "rk-dir-pinned", CREATED - 3_600);
+        write_row(&ben, "rk-dir-live", CREATED);
+        let (support_str, ben_str) = (support.to_str().unwrap(), ben.to_str().unwrap());
+
+        let (_d, store) = store();
+        store.record_open(bind_record(
+            &live("term-1", PID),
+            "rk-dir-pinned",
+            support_str,
+            ORIGIN_AUTHORITATIVE,
+            true,
+            UNZONED_ZONE_INDEX,
+        ));
+        let snapshot = PreEvidenceSnapshot::take(&store);
+        let mut verdicts =
+            read_provider_rows(&[support.clone(), ben.clone()], &[(PID, Some(CREATED))]);
+        let rows = ProviderRows::from_entries([(
+            "term-1".to_string(),
+            (PID, Some(CREATED)),
+            verdicts.remove(&PID).unwrap(),
+        )]);
+
+        let repairs = repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none());
+
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(repairs[0].session_id, "rk-dir-live");
+        assert_eq!(repairs[0].rekeyed_from.as_deref(), Some("rk-dir-pinned"));
+        assert_eq!(repairs[0].from.as_deref(), Some(support_str));
+        assert_eq!(repairs[0].to, ben_str);
+        assert!(store.get("rk-dir-pinned").is_none());
+        let rec = store.get("rk-dir-live").unwrap();
+        assert_eq!(rec.terminal_id, "term-1");
+        assert_eq!(rec.config_dir.as_deref(), Some(ben_str));
+    }
+
+    /// The re-key's guards: an overlap-window row (two panes' valid rows name
+    /// the live id), a live id that already keys another open record, two
+    /// open records on the pane, and another pane's argv naming either id
+    /// each re-key nothing.
+    #[test]
+    fn the_rekey_is_refused_under_each_guard() {
+        // Overlap.
+        let (_d, store) = store();
+        open_confirmed(&store, "rk-overlap", "term-1", ROOT_A);
+        let rows = ProviderRows::from_pairs([
+            valid("term-1", "rk-overlap-live", ROOT_B),
+            valid("term-2", "rk-overlap-live", ROOT_C),
+        ]);
+        assert!(repair_identities(
+            &store,
+            &PreEvidenceSnapshot::take(&store),
+            &rows,
+            &AnchorArgvIds::none()
+        )
+        .is_empty());
+        assert!(store.get("rk-overlap").is_some());
+
+        // Occupied: the live id keys an open record on another pane.
+        let (_d, store) = fresh_store();
+        open_confirmed(&store, "rk-occ", "term-1", ROOT_A);
+        open_confirmed(&store, "rk-occ-live", "term-9", ROOT_B);
+        let rows = ProviderRows::from_pairs([valid("term-1", "rk-occ-live", ROOT_B)]);
+        assert!(repair_identities(
+            &store,
+            &PreEvidenceSnapshot::take(&store),
+            &rows,
+            &AnchorArgvIds::none()
+        )
+        .is_empty());
+        assert!(store.get("rk-occ").is_some());
+        assert_eq!(store.get("rk-occ-live").unwrap().terminal_id, "term-9");
+
+        // Two open records on the pane: which one it runs is unknown.
+        // `record_open` supersedes a sibling on the same terminal, so the
+        // second record is put into the snapshot the guard reads directly.
+        let (_d, store) = fresh_store();
+        open_confirmed(&store, "rk-two-a", "term-1", ROOT_A);
+        let mut snapshot = PreEvidenceSnapshot::take(&store);
+        snapshot.by_session.insert(
+            "rk-two-b".to_string(),
+            ("term-1".to_string(), Some(ROOT_A.to_string())),
         );
+        let rows = ProviderRows::from_pairs([valid("term-1", "rk-two-live", ROOT_B)]);
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert!(store.get("rk-two-a").is_some());
+
+        // Another pane's argv names the record's id or the live id.
+        for other in ["rk-argv", "rk-argv-live"] {
+            let (_d, store) = fresh_store();
+            open_confirmed(&store, "rk-argv", "term-1", ROOT_A);
+            let rows = ProviderRows::from_pairs([valid("term-1", "rk-argv-live", ROOT_B)]);
+            let argv = AnchorArgvIds::from_pairs([("term-2", other)]);
+            assert!(
+                repair_identities(&store, &PreEvidenceSnapshot::take(&store), &rows, &argv)
+                    .is_empty(),
+                "{other}"
+            );
+            assert!(store.get("rk-argv").is_some(), "{other}");
+        }
+    }
+
+    fn fresh_store() -> (tempfile::TempDir, SessionLifecycleStore) {
+        store()
     }
 
     /// The overlap guard: an account migration's settle window keeps the old
@@ -567,7 +926,7 @@ mod tests {
             valid("term-old", "cfgrep-overlap", ROOT_C),
         ]);
 
-        assert!(repair_config_dirs(
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -595,14 +954,14 @@ mod tests {
         let both =
             AnchorArgvIds::from_pairs([("term-old", "cfgrep-argv"), ("term-new", "cfgrep-argv")]);
         let snapshot = PreEvidenceSnapshot::take(&store);
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &both).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &both).is_empty());
         assert_eq!(
             store.get("cfgrep-argv").unwrap().config_dir.as_deref(),
             Some(ROOT_B)
         );
 
         let own_only = AnchorArgvIds::from_pairs([("term-old", "cfgrep-argv")]);
-        let repairs = repair_config_dirs(&store, &snapshot, &rows, &own_only);
+        let repairs = repair_identities(&store, &snapshot, &rows, &own_only);
         assert_eq!(repairs.len(), 1, "{repairs:?}");
         assert_eq!(
             store.get("cfgrep-argv").unwrap().config_dir.as_deref(),
@@ -619,7 +978,7 @@ mod tests {
         let rows = ProviderRows::from_pairs([valid("term-1", "cfgrep-unknown", ROOT_B)]);
 
         let snapshot = PreEvidenceSnapshot::take(&store);
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::Unknown).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::Unknown).is_empty());
         assert_eq!(
             store.get("cfgrep-unknown").unwrap().config_dir.as_deref(),
             Some(ROOT_A)
@@ -649,7 +1008,7 @@ mod tests {
             valid("term-2", "cfgrep-backslash", ROOT_B),
         ]);
 
-        assert!(repair_config_dirs(
+        assert!(repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,
@@ -703,9 +1062,10 @@ mod tests {
     /// repaired dir, never the empty "unknown".
     #[test]
     fn a_landed_repair_becomes_a_session_bound_payload_with_its_new_dir() {
-        let payloads = repair_bound_payloads(&[ConfigDirRepair {
+        let payloads = repair_bound_payloads(&[IdentityRepair {
             terminal_id: "term-1".to_string(),
             session_id: "cfgrep-pay".to_string(),
+            rekeyed_from: None,
             from: Some(ROOT_A.to_string()),
             to: ROOT_B.to_string(),
             origin: ORIGIN_AUTHORITATIVE.to_string(),
@@ -760,7 +1120,7 @@ mod tests {
             &index,
             &cmdlines,
         );
-        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert!(repair_identities(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         assert_eq!(
             store.get("cfgrep-compose").unwrap().config_dir,
             None,
@@ -768,7 +1128,7 @@ mod tests {
         );
 
         // Tick 2.
-        let repairs = repair_config_dirs(
+        let repairs = repair_identities(
             &store,
             &PreEvidenceSnapshot::take(&store),
             &rows,

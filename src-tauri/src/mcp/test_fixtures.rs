@@ -166,6 +166,9 @@ use uuid::Uuid;
 
 use super::types::ApiState;
 
+pub mod pending_message_seam;
+use pending_message_seam::{open_bound_terminal_handler, seed_pending_message_handler};
+
 // =============================================================================
 // Test session storage
 // =============================================================================
@@ -1275,9 +1278,12 @@ async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
     // later session-info read lying about its provenance. Teardown clears it
     // with the same one call that drops the injected fakes.
     crate::commands::session_info::set_forced_identity_evidence(None);
+    // The seam panes (`/open-bound-terminal`) and the injected coord messages
+    // (`/seed-pending-message`): each pane is closed with its record.
+    let (cleared_panes, cleared_messages) = pending_message_seam::clear_all();
     emit_injected_changed(
         "clear",
-        cleared_count + cleared_errors + cleared_transcripts,
+        cleared_count + cleared_errors + cleared_transcripts + cleared_panes + cleared_messages,
     );
     Json(ClearSessionsResponse {
         success: true,
@@ -3126,6 +3132,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/test/append-transcript-record",
             post(append_transcript_record_handler),
         )
+        .route(
+            "/ui-bridge/test/open-bound-terminal",
+            post(open_bound_terminal_handler),
+        )
+        .route(
+            "/ui-bridge/test/seed-pending-message",
+            post(seed_pending_message_handler),
+        )
 }
 
 // =============================================================================
@@ -3305,6 +3319,8 @@ mod tests {
             "/ui-bridge/test/coord-mcp/seed-agent-token",
             "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
             "/ui-bridge/test/append-transcript-record",
+            "/ui-bridge/test/open-bound-terminal",
+            "/ui-bridge/test/seed-pending-message",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),

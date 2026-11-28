@@ -54,6 +54,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   HEADER_FIXED_ITEMS_PX,
+  HEADER_LOCAL_FIXED_ITEMS_PX,
   HEADER_ROW_GAP_PX,
   HEADER_TRUNCATING_FLOORS_PX,
   ZoneHoverActions,
@@ -254,7 +255,7 @@ describe("header reserve for the hover overlay", () => {
  */
 describe("narrow zones collapse the hover cluster", () => {
   it("the collapse width is left padding + the header's minimum + the full reserve", () => {
-    expect(headerControlsMinPx()).toBe(280);
+    expect(headerControlsMinPx()).toBe(316);
     expect(headerControlsMinPx(true)).toBe(346);
     // The hover padding replaces only the row's right `px-2`; the left 8 stays.
     expect(ZONE_HOVER_COLLAPSE_BELOW_PX).toBe(
@@ -292,7 +293,7 @@ describe("narrow zones collapse the hover cluster", () => {
     // Known limit (headerReserve.ts): with every item present the row still
     // needs this much beside the collapsed cluster.
     const allPresent = 8 + headerControlsMinPx() - hidden + ZONE_HEADER_COLLAPSED_RESERVE_PX;
-    expect(allPresent).toBe(268);
+    expect(allPresent).toBe(304);
     expect(8 + headerControlsMinPx(true) - hidden + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(
       356,
     );
@@ -303,7 +304,9 @@ describe("narrow zones collapse the hover cluster", () => {
       HEADER_TRUNCATING_FLOORS_PX.nonDurable +
       HEADER_TRUNCATING_FLOORS_PX.reviewBadge +
       (HEADER_FIXED_ITEMS_PX.labelSlot - 6) +
-      3 * HEADER_ROW_GAP_PX;
+      // A typical pane has nothing pending, so no pending-messages chip.
+      HEADER_LOCAL_FIXED_ITEMS_PX.pendingMessages +
+      4 * HEADER_ROW_GAP_PX;
     const withBadge = allPresent - optional;
     expect(withBadge).toBe(216);
     expect(withBadge - HEADER_TRUNCATING_FLOORS_PX.tenantBadge - HEADER_ROW_GAP_PX).toBe(192);

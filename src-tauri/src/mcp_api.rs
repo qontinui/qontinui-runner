@@ -13821,6 +13821,14 @@ pub fn create_router(
         // `/health` answers a much richer and much more blockable question.
         .route("/livez", get(livez))
         .route("/health", get(health))
+        // The session-message poller's last tick, per terminal: each pending
+        // coord message this runner could not push, with its block reason
+        // (the zone header's pending-message badge reads the same view from
+        // the poller's Tauri event).
+        .route(
+            "/session-messages/pending-view",
+            get(crate::mcp::session_message_poller::pending_view_handler),
+        )
         // What can this binary actually DO here? `/health` says WHAT this
         // binary is (`gitSha`, `buildId`, `buildDrift`); this says which RUNG
         // answered for each capability it delivers, so a development build's

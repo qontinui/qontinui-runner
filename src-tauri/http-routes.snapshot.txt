@@ -423,6 +423,7 @@ GET /screenshots/list list_screenshots_endpoint
 GET /security/audit/events get_audit_events
 GET /security/audit/summary get_audit_summary
 GET /session-briefing session_briefing_handler
+GET /session-messages/pending-view pending_view_handler
 GET /session-repository list_handler
 GET /session-repository/unfinished unfinished_handler
 GET /session-repository/{id} detail_handler
@@ -1719,8 +1720,10 @@ POST /ui-bridge/test/force-identity-evidence force_identity_evidence_handler
 POST /ui-bridge/test/inject-errors inject_errors_handler
 POST /ui-bridge/test/inject-session inject_session_handler
 POST /ui-bridge/test/list-lifecycle-open list_lifecycle_open_handler
+POST /ui-bridge/test/open-bound-terminal open_bound_terminal_handler
 POST /ui-bridge/test/seed-error-scenario seed_error_scenario_handler
 POST /ui-bridge/test/seed-lifecycle-store seed_lifecycle_store_handler
+POST /ui-bridge/test/seed-pending-message seed_pending_message_handler
 POST /ui-bridge/test/seed-terminal-scenario seed_scenario_handler
 POST /ui-bridge/vision/analyze vision_analyze_handler
 POST /ui-bridge/vision/annotate vision_annotate_handler

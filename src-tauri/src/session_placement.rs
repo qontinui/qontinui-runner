@@ -260,6 +260,7 @@ mod tests {
             last_acted_at: None,
             runner_hosted,
             runner_ancestor: None,
+            here_unbound_terminal: None,
             placement: None,
         }
     }

@@ -143,6 +143,17 @@ export const HEADER_FIXED_ITEMS_PX = {
 } as const;
 
 /**
+ * Width-holding row items a LOCAL tab adds (a remote tab's row has none of
+ * them): `pendingMessages`, the `PendingMessagesBadge` chip — `px-1` (8) +
+ * `w-2.5` icon (10) + `gap-0.5` (2) + the `text-[8px]` mono count or `?`
+ * (budgeted two digits, 10). It is absent while the pane has nothing pending,
+ * so the budget is the row with it present.
+ */
+export const HEADER_LOCAL_FIXED_ITEMS_PX = {
+  pendingMessages: 30,
+} as const;
+
+/**
  * The row items that truncate, with the width each keeps once truncated: its
  * horizontal padding or margin (`nonDurable` and `reviewBadge` `px-1`,
  * `totalOutput` `ml-1`), or its icon (`tenantBadge`, `min-w-[18px]`, only on a
@@ -184,11 +195,13 @@ export const HEADER_ROW_GAP_PX = 6;
  * hover reserve; `headerReserve.ts` adds those to get the width below which the
  * hover cluster collapses.
  *
- * `remote` adds a remote tab's `RemoteTabControls` items.
+ * `remote` adds a remote tab's `RemoteTabControls` items in place of the
+ * local-only ones.
  */
 export function headerControlsMinPx(remote = false): number {
   const widths: number[] = [
     ...Object.values(HEADER_FIXED_ITEMS_PX),
+    ...(remote ? [] : Object.values(HEADER_LOCAL_FIXED_ITEMS_PX)),
     ...Object.values(HEADER_TRUNCATING_FLOORS_PX),
     ...(remote ? Object.values(HEADER_REMOTE_FLOORS_PX) : []),
   ];
