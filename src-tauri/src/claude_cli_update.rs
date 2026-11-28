@@ -187,6 +187,46 @@ fn global_flag() -> &'static UpdateFlag {
     FLAG.get_or_init(UpdateFlag::new)
 }
 
+/// Test-only: the PROCESS-WIDE flag held "install in progress", for tests that
+/// pin a production caller's wait on [`wait_if_updating`] (which reads the
+/// global, so an injectable [`UpdateFlag`] cannot reach it).
+///
+/// Holders are serialized through one async lock: a second holder's guard
+/// dropping would otherwise lower the flag under the first. Other tests that
+/// merely WAIT on the global are only delayed while a hold lasts, never failed.
+#[cfg(test)]
+pub(crate) struct GlobalFlagHold {
+    // Field order is drop order: the flag is lowered before the lock frees.
+    in_progress: Option<InProgressGuard<'static>>,
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl GlobalFlagHold {
+    /// Lower the flag (the install "ends"); every waiter is released.
+    pub(crate) fn release(&mut self) {
+        self.in_progress.take();
+    }
+}
+
+/// Test-only: raise the process-wide flag until the returned hold is released
+/// or dropped. See [`GlobalFlagHold`].
+#[cfg(test)]
+pub(crate) async fn hold_global_flag_for_test() -> GlobalFlagHold {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let serial = SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let flag = global_flag();
+    let in_progress = Some(flag.hold());
+    assert!(flag.is_updating(), "the global flag reads in-progress");
+    GlobalFlagHold {
+        in_progress,
+        _serial: serial,
+    }
+}
+
 /// What [`wait_if_updating`] observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateWait {
