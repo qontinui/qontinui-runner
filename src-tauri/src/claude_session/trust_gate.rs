@@ -1814,26 +1814,20 @@ pub fn pre_accept_for_account_sync(
     pre_accept_for_spawn_sync(cwd, &trust.verdict, config_dir, config_dir, surface)
 }
 
-fn finish(
-    cwd: &str,
-    trust: &TrustVerdict,
-    config_dir: Option<&str>,
-    child_config_dir: Option<&str>,
-    coord: CoordRowLookup,
-    dial: DialResolution,
-    surface: SpawnSurface,
-) -> TrustGateReport {
-    let (posture, posture_rule) = posture_for(&dial);
-    let write_target = config_file_for(config_dir);
-    let child_reads = config_file_for(child_config_dir);
-    let roots = agent_worktree_roots();
-    let project_key = workspace_trust::project_key(Path::new(cwd));
-    // The primary checkout verified from both ends of git's worktree link. The
-    // `parent` that conjunct 2 is asked about was parsed off the worktree's
-    // editable `.git` line, so it only counts when it IS this verified primary.
-    let verified_primary = verified_primary_checkout(Path::new(cwd));
-
-    let read_parent = |key: &str| match (&write_target, &verified_primary) {
+/// Conjunct 2's reading of the parent repo `key`, shared by [`finish`] and
+/// [`finish_add_dir_sibling`] so the two cannot disagree about what counts as
+/// a human grant.
+///
+/// `verified_primary` is the primary checkout verified from both ends of git's
+/// worktree link ([`verified_primary_checkout`]); the `key` conjunct 2 is asked
+/// about was parsed off the worktree's editable `.git` line, so it only counts
+/// when it IS that verified primary.
+fn parent_trust_reading(
+    write_target: Option<&Path>,
+    verified_primary: &Result<(PathBuf, String), String>,
+    key: &str,
+) -> TrustVerdict {
+    match (write_target, verified_primary) {
         (_, Err(reason)) => TrustVerdict::Unknown {
             reason: format!("the primary checkout could not be verified: {reason}"),
         },
@@ -1855,7 +1849,30 @@ fn finish(
         (None, _) => TrustVerdict::Unknown {
             reason: "no account config file resolved".to_string(),
         },
-    };
+    }
+}
+
+fn finish(
+    cwd: &str,
+    trust: &TrustVerdict,
+    config_dir: Option<&str>,
+    child_config_dir: Option<&str>,
+    coord: CoordRowLookup,
+    dial: DialResolution,
+    surface: SpawnSurface,
+) -> TrustGateReport {
+    let (posture, posture_rule) = posture_for(&dial);
+    let write_target = config_file_for(config_dir);
+    let child_reads = config_file_for(child_config_dir);
+    let roots = agent_worktree_roots();
+    let project_key = workspace_trust::project_key(Path::new(cwd));
+    // The primary checkout verified from both ends of git's worktree link. The
+    // `parent` that conjunct 2 is asked about was parsed off the worktree's
+    // editable `.git` line, so it only counts when it IS this verified primary.
+    let verified_primary = verified_primary_checkout(Path::new(cwd));
+
+    let read_parent =
+        |key: &str| parent_trust_reading(write_target.as_deref(), &verified_primary, key);
     let (conjuncts, parent) = derive_conjuncts(
         Path::new(cwd),
         &coord,
@@ -2006,6 +2023,319 @@ fn finish(
         write_outcome,
         primary_checkout_write_outcome,
     }
+}
+
+// =============================================================================
+// `--add-dir` siblings
+// =============================================================================
+
+/// What the gate derived for ONE `--add-dir` sibling of a spawn, flat enough to
+/// log and to assert on.
+#[derive(Debug, Clone, Serialize)]
+pub struct SiblingTrustReport {
+    /// The `--add-dir` directory as the launch named it.
+    pub sibling: String,
+    /// The `projects` key the CLI consults for this sibling — the PRIMARY
+    /// checkout's for a linked worktree, the sibling's own git root otherwise.
+    /// `None` when it could not be established (an unverifiable worktree link).
+    pub consulted_key: Option<String>,
+    pub account_config_file: Option<String>,
+    pub conjuncts: Conjuncts,
+    pub dial: DialResolution,
+    pub posture: EnforcementPosture,
+    pub surface: SpawnSurface,
+    /// `AlreadyTrusted` (nothing written), `Grant` (the consulted key was
+    /// written), or `Withhold` / `SpawnBlocked` (it was not, and the sibling
+    /// will raise the CLI's add-dir dialog).
+    pub decision: TrustGateDecision,
+    pub write_outcome: Option<String>,
+}
+
+/// Rule: the sibling's `.git` is a file whose worktree link could not be
+/// verified from both ends, so its primary checkout — the key the CLI consults —
+/// is unknown, and no dial may mint trust for a key the runner cannot name.
+const RULE_SIBLING_PRIMARY_UNVERIFIED: &str = "add-dir-sibling-primary-checkout-unverified";
+
+/// Rule: the dial permits an underived mint, but the primary-checkout mint's own
+/// guards ([`mints_primary_checkout_trust`]: coord-worktree and pinned-config
+/// conjuncts) did not hold, so nothing the CLI consults was written.
+const RULE_SIBLING_MINT_NOT_PERMITTED: &str = "add-dir-sibling-primary-checkout-mint-not-permitted";
+
+/// Rule: the mint was permitted and attempted, and the account file still does
+/// not carry the key (an IO failure, or a write the trust module skipped).
+const RULE_SIBLING_WRITE_DID_NOT_LAND: &str = "add-dir-sibling-trust-write-did-not-land";
+
+/// A sibling whose trust did not land: a refusal on a PTY (where the CLI's
+/// add-dir dialog would hang the session with nobody to answer it), a
+/// withholding degradation on a `--print` child.
+fn sibling_trust_not_landed(
+    rule: &'static str,
+    failed: Vec<String>,
+    surface: SpawnSurface,
+) -> TrustGateDecision {
+    match surface {
+        SpawnSurface::InteractivePty => TrustGateDecision::SpawnBlocked { rule, failed },
+        SpawnSurface::NonInteractive => TrustGateDecision::Withhold { rule, failed },
+    }
+}
+
+/// **The `--add-dir` entry point.** Derive workspace trust for one `--add-dir`
+/// sibling of a spawn whose account is RESOLVED to `config_dir` (`None` = the
+/// ambient default), before the child execs.
+///
+/// Claude Code raises a per-session "Adding a new directory … Yes, add it"
+/// dialog at startup for every `--add-dir` directory whose PRIMARY checkout
+/// (`.git` → `gitdir` → `commondir`, the same derivation as explicit trust,
+/// [`mints_primary_checkout_trust`]) the account has not trusted. Measured on
+/// CLI 2.1.332 (plan
+/// `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`
+/// Phase 0): the dialog appears iff the pinned account lacks the first
+/// untrusted sibling's primary key — so a key at the sibling worktree's own
+/// path is not NEEDED to clear it (whether such a key alone would clear it was
+/// not measured) — and an unattended PTY parks on it forever.
+///
+/// So the key gated here is the one the CLI consults, and only that key is
+/// written — never the sibling worktree's own:
+///
+/// - the consulted key already reads trusted (a human grant or an earlier
+///   runner mint — the CLI does not distinguish them) → `AlreadyTrusted`,
+///   nothing written;
+/// - the sibling is a linked worktree whose link does not verify (a forged or
+///   foreign `gitdir`) → refused at EVERY dial: the runner cannot name the key
+///   the CLI will consult, so it must not mint one;
+/// - otherwise the same matrix the spawn cwd gets ([`decide`] →
+///   [`promote_for_surface`] → [`annotate_unread_dial`]) at the tenant's dial,
+///   and the write itself is the cwd arm's primary-checkout mint, under the
+///   same guards ([`mints_primary_checkout_trust`]) and the same
+///   runner-minted stamp. The guards apply to the consulted KEY however it was
+///   reached: a sibling that is itself a primary checkout (named directly, not
+///   through a linked worktree) is put through them too, so its key is minted
+///   on no weaker terms than when a linked worktree leads to it — and since it
+///   is not an allocated worktree, conjunct 1 does not hold for it and nothing
+///   is minted;
+/// - a grant that does not LAND (the mint's guards fail, or the write fails)
+///   is a refusal on [`SpawnSurface::InteractivePty`], rendered by
+///   [`TrustGateDecision::refusal`] so [`is_spawn_blocked_refusal`] classifies
+///   it, exactly as the cwd arm refuses.
+///
+/// Synchronous for the PTY seam: the dial is PEEKED and coord's ledger is not
+/// consulted, so conjunct 1 falls to its locally observable arm, as on
+/// [`pre_accept_for_account_sync`].
+pub fn pre_accept_add_dir_sibling_sync(
+    sibling: &str,
+    config_dir: Option<&str>,
+    surface: SpawnSurface,
+) -> SiblingTrustReport {
+    finish_add_dir_sibling(sibling, config_dir, peek_dial(), surface)
+}
+
+fn finish_add_dir_sibling(
+    sibling: &str,
+    config_dir: Option<&str>,
+    dial: DialResolution,
+    surface: SpawnSurface,
+) -> SiblingTrustReport {
+    let (posture, posture_rule) = posture_for(&dial);
+    let config_file = config_file_for(config_dir);
+    let sibling_path = Path::new(sibling);
+    let verified_primary = verified_primary_checkout(sibling_path);
+    let coord = CoordRowLookup::Unavailable {
+        reason: "no async context on this spawn path; coord ledger not consulted".to_string(),
+    };
+    let (conjuncts, parent) = derive_conjuncts(
+        sibling_path,
+        &coord,
+        &agent_worktree_roots(),
+        config_file.as_deref(),
+        config_file.as_deref(),
+        |key| parent_trust_reading(config_file.as_deref(), &verified_primary, key),
+    );
+    // A linked worktree is one whose git root holds `.git` as a FILE — read
+    // directly rather than off `parent`, which is `None` for an unparseable
+    // `.git` line and would let a malformed link pass as a primary checkout.
+    let is_linked_worktree =
+        workspace_trust::git_root(sibling_path).is_some_and(|root| root.join(".git").is_file());
+    let report = |consulted_key: Option<String>,
+                  decision: TrustGateDecision,
+                  write_outcome: Option<String>,
+                  conjuncts: Conjuncts| SiblingTrustReport {
+        sibling: sibling.to_string(),
+        consulted_key,
+        account_config_file: config_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        conjuncts,
+        dial: dial.clone(),
+        posture,
+        surface,
+        decision,
+        write_outcome,
+    };
+
+    let consulted_key = match (&verified_primary, is_linked_worktree) {
+        (Ok((_, key)), _) => key.clone(),
+        (Err(reason), true) => {
+            let decision = sibling_trust_not_landed(
+                RULE_SIBLING_PRIMARY_UNVERIFIED,
+                vec![format!(
+                    "add-dir sibling {sibling}: its primary checkout could not be verified \
+                     ({reason}), so the key the CLI consults is unknown and nothing was minted"
+                )],
+                surface,
+            );
+            warn!(
+                sibling = %sibling,
+                parent_repo = parent.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
+                reason = %reason,
+                rule = RULE_SIBLING_PRIMARY_UNVERIFIED,
+                surface = ?surface,
+                decision = decision.label(),
+                "trust gate: add-dir sibling REFUSED — its worktree link does not verify from both \
+                 ends, so no trust is minted for it at any dial"
+            );
+            return report(None, decision, None, conjuncts);
+        }
+        // Not a linked worktree: the sibling is its own primary checkout (or no
+        // repository at all), and the CLI consults its own key.
+        (Err(_), false) => match workspace_trust::project_key(sibling_path) {
+            Some(key) => key,
+            None => {
+                let decision = sibling_trust_not_landed(
+                    RULE_SIBLING_PRIMARY_UNVERIFIED,
+                    vec![format!(
+                        "add-dir sibling {sibling}: no trust key could be derived for it (the \
+                         path does not resolve)"
+                    )],
+                    surface,
+                );
+                warn!(
+                    sibling = %sibling,
+                    surface = ?surface,
+                    decision = decision.label(),
+                    "trust gate: add-dir sibling REFUSED — no trust key could be derived for it"
+                );
+                return report(None, decision, None, conjuncts);
+            }
+        },
+    };
+
+    let verdict = match &config_file {
+        Some(file) => super::spawn_preconditions::trust_verdict_in(file, &consulted_key),
+        None => TrustVerdict::Unknown {
+            reason: "no account config file resolved".to_string(),
+        },
+    };
+    let decision = annotate_unread_dial(
+        promote_for_surface(decide(&verdict, &conjuncts, posture), surface),
+        &dial,
+    );
+    if matches!(decision, TrustGateDecision::AlreadyTrusted) {
+        debug!(
+            sibling = %sibling,
+            consulted_key = %consulted_key,
+            "trust gate: add-dir sibling already trusted — nothing written"
+        );
+        return report(Some(consulted_key), decision, None, conjuncts);
+    }
+
+    // `true` for EITHER shape: the consulted key is a primary checkout's
+    // whether a linked worktree led to it or the sibling names the checkout
+    // directly, and the same key must not be minted on weaker terms because
+    // of how the launch spelled it.
+    let mut write_outcome = None;
+    let decision = if !decision.writes_trust() {
+        decision
+    } else if !mints_primary_checkout_trust(&decision, &conjuncts, posture, true) {
+        let mut failed: Vec<String> = conjuncts
+            .failing()
+            .into_iter()
+            .map(|(c, v)| format!("{}={} ({})", c.as_str(), v.label(), v.detail()))
+            .collect();
+        failed.insert(
+            0,
+            format!(
+                "add-dir sibling {sibling}: the dial permits minting its primary checkout \
+                 {consulted_key}, but the primary-checkout mint's guards do not hold"
+            ),
+        );
+        sibling_trust_not_landed(RULE_SIBLING_MINT_NOT_PERMITTED, failed, surface)
+    } else if let Some(file) = config_file.as_deref() {
+        // Every write here is underived — the consulted key IS conjunct 2's
+        // subject, and it read untrusted — so it is stamped as the runner's own
+        // and can never be derived FROM.
+        let outcome = workspace_trust::ensure_runner_minted_trust_in(file, &consulted_key);
+        write_outcome = Some(format!("{outcome:?}"));
+        match &outcome {
+            TrustOutcome::Trusted | TrustOutcome::AlreadyTrusted => {
+                info!(
+                    sibling = %sibling,
+                    consulted_key = %consulted_key,
+                    config_file = %file.display(),
+                    outcome = ?outcome,
+                    rule = decision.rule(),
+                    dial = ?dial,
+                    posture = ?posture,
+                    posture_rule,
+                    derivation = %conjuncts.derivation(),
+                    "trust gate: GRANTED add-dir sibling trust (underived, stamped runner-minted) \
+                     on the key the CLI consults for it, before exec"
+                );
+                return report(Some(consulted_key), decision, write_outcome, conjuncts);
+            }
+            TrustOutcome::Failed(e) => sibling_trust_not_landed(
+                RULE_SIBLING_WRITE_DID_NOT_LAND,
+                vec![format!(
+                    "add-dir sibling {sibling}: writing {consulted_key} into {} FAILED: {e}",
+                    file.display()
+                )],
+                surface,
+            ),
+            TrustOutcome::Skipped(why) => sibling_trust_not_landed(
+                RULE_SIBLING_WRITE_DID_NOT_LAND,
+                vec![format!(
+                    "add-dir sibling {sibling}: writing {consulted_key} into {} was skipped ({why})",
+                    file.display()
+                )],
+                surface,
+            ),
+        }
+    } else {
+        sibling_trust_not_landed(
+            RULE_SIBLING_WRITE_DID_NOT_LAND,
+            vec![format!(
+                "add-dir sibling {sibling}: no account config file resolved to write \
+                 {consulted_key} into"
+            )],
+            surface,
+        )
+    };
+
+    match &decision {
+        TrustGateDecision::Withhold { rule, failed } => warn!(
+            sibling = %sibling,
+            consulted_key = %consulted_key,
+            rule,
+            dial = ?dial,
+            posture_rule,
+            failed = %failed.join("; "),
+            derivation = %conjuncts.derivation(),
+            "trust gate: WITHHELD add-dir sibling trust — the child proceeds without it"
+        ),
+        TrustGateDecision::SpawnBlocked { rule, failed } => warn!(
+            sibling = %sibling,
+            consulted_key = %consulted_key,
+            rule,
+            dial = ?dial,
+            posture_rule,
+            surface = ?surface,
+            failed = %failed.join("; "),
+            derivation = %conjuncts.derivation(),
+            "trust gate: SPAWN BLOCKED — trust for an add-dir sibling did not land, and the CLI \
+             would park the session on its add-dir dialog"
+        ),
+        TrustGateDecision::AlreadyTrusted | TrustGateDecision::Grant { .. } => {}
+    }
+    report(Some(consulted_key), decision, write_outcome, conjuncts)
 }
 
 /// Real-git fixtures shared by the trust tests here and in
@@ -2882,6 +3212,153 @@ THE AUTONOMY DIAL. One of:
             tier: AutonomyTier::DraftRequired,
         });
         assert!(!refusal_rests_on_unread_dial(&read), "{read}");
+    }
+
+    /// Drive the add-dir sibling core for the fixture worktree, which sits
+    /// OUTSIDE every agent-worktree root (conjunct 1 is UNKNOWN for it).
+    fn run_sibling(
+        wt: &Path,
+        acct: &str,
+        tier: AutonomyTier,
+        surface: SpawnSurface,
+    ) -> SiblingTrustReport {
+        finish_add_dir_sibling(
+            &wt.to_string_lossy(),
+            Some(acct),
+            DialResolution::Override { tier },
+            surface,
+        )
+    }
+
+    /// The permissive dial alone does not mint a sibling's primary key: the
+    /// primary-checkout mint's guards must hold too. A hand-rolled linked
+    /// worktree outside every agent-worktree root fails conjunct 1, so on a
+    /// PTY the sibling is refused under its own rule and nothing is written.
+    #[test]
+    fn a_sibling_whose_mint_guards_fail_is_refused_on_a_pty_and_nothing_written() {
+        let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::InteractivePty,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::SpawnBlocked {
+                    rule: RULE_SIBLING_MINT_NOT_PERMITTED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert_eq!(
+            r.consulted_key.as_deref(),
+            Some(workspace_trust::project_key(&primary).unwrap().as_str())
+        );
+        assert!(is_spawn_blocked_refusal(&r.decision.refusal().unwrap()));
+        assert!(r.write_outcome.is_none());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// On a `--print` child the same not-landed grant WITHHOLDS rather than
+    /// blocks: that child degrades instead of hanging on the dialog.
+    #[test]
+    fn a_sibling_whose_mint_guards_fail_withholds_on_a_print_child() {
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::Withhold {
+                    rule: RULE_SIBLING_MINT_NOT_PERMITTED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert!(r.decision.allows_spawn());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// The withholding dial: a block on a PTY, a withhold on a `--print`
+    /// child — the cwd matrix's surface mapping, applied to the sibling.
+    #[test]
+    fn a_sibling_under_a_withholding_dial_blocks_a_pty_and_withholds_a_print_child() {
+        let (_tmp, _primary, wt, _cfg, acct) = finish_fixture(serde_json::json!({}));
+        let pty = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::DraftRequired,
+            SpawnSurface::InteractivePty,
+        );
+        assert!(
+            matches!(pty.decision, TrustGateDecision::SpawnBlocked { .. }),
+            "{:?}",
+            pty.decision
+        );
+        let print = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::DraftRequired,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                print.decision,
+                TrustGateDecision::Withhold {
+                    rule: "dial-withholds-underived-mint",
+                    ..
+                }
+            ),
+            "{:?}",
+            print.decision
+        );
+    }
+
+    /// A forged sibling link withholds on a `--print` child (and names the
+    /// unverified rule) — it still never mints.
+    #[test]
+    fn a_forged_sibling_withholds_on_a_print_child_and_never_mints() {
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let (_tmp2, victim, _vwt) = linked_worktree_fixture(&[]);
+        let admin = std::fs::read_dir(victim.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_sibling(
+            &wt,
+            &acct,
+            AutonomyTier::Proceed,
+            SpawnSurface::NonInteractive,
+        );
+        assert!(
+            matches!(
+                r.decision,
+                TrustGateDecision::Withhold {
+                    rule: RULE_SIBLING_PRIMARY_UNVERIFIED,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.decision
+        );
+        assert!(r.consulted_key.is_none());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
     }
 
     /// A human-trusted primary IS a derivation source: the worktree grant is

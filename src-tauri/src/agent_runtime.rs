@@ -7889,6 +7889,11 @@ async fn run_gate_continuation_inner(
     // STARTED and had already exited by its start verdict, whose exit path is
     // fired below only after `spawned` is posted.
     let mut exited_terminal: Option<String> = None;
+    // The terminal arm's third `Ok` fact: a stalled pane whose close did not
+    // complete and whose child may still run, so no start was observed and
+    // none may be denied — no gate outcome is posted, no session bound, no
+    // dispatch acked, and the hold is kept (bounded).
+    let mut unobserved: Option<UnobservedStart> = None;
     let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
@@ -7905,6 +7910,7 @@ async fn run_gate_continuation_inner(
             .await;
             let res = res.map(|start| {
                 exited_terminal = start.exited_terminal;
+                unobserved = start.unobserved;
                 start.session_id
             });
             presentation_bindable_session(PresentationResult::Terminal(res), pinned_session_id)
@@ -7951,7 +7957,8 @@ async fn run_gate_continuation_inner(
     // above was already bound at allocate time. Same rule as the outcome's
     // id binding: only a BINDABLE session is reported — a headless child that
     // did not exit cleanly is not bound.
-    if let Some(session) = bindable_session(&result) {
+    let outcome_withheld = unobserved.is_some();
+    if let Some(session) = bindable_session(&result).filter(|_| !outcome_withheld) {
         if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
             tokio::spawn(report_session_launched(dispatch_agent, session));
         }
@@ -7959,23 +7966,35 @@ async fn run_gate_continuation_inner(
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
-        ConsumeTarget::Gate(gate_id, _) => {
-            let resolution = spawn_resolution_outcome(&result);
-            post_spawn_outcome(
-                gate_id,
-                device_id,
-                resolution.outcome,
-                resolution.detail,
-                resolution.claude_code_session_id,
-            )
-            .await
-        }
+        ConsumeTarget::Gate(gate_id, _) => match gate_outcome_to_post(&result, outcome_withheld) {
+            Some(resolution) => {
+                post_spawn_outcome(
+                    gate_id,
+                    device_id,
+                    resolution.outcome,
+                    resolution.detail,
+                    resolution.claude_code_session_id,
+                )
+                .await
+            }
+            None => error!(
+                "agent_runtime: gate={gate_id} continuation outcome WITHHELD — the stalled \
+                 pane's close did not complete and its child may still run; neither spawned \
+                 nor spawn_failed is posted while the hold lasts"
+            ),
+        },
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
         // dispatch on the next reconnect (at-least-once).
         ConsumeTarget::Dispatch(dispatch_id) => {
-            if result.is_ok() {
+            if dispatch_consume_ack(&result, outcome_withheld) {
                 post_unit_dispatch_consumed(dispatch_id, device_id).await;
+            } else if outcome_withheld {
+                info!(
+                    "agent_runtime: unit-dispatch dispatch_id={dispatch_id} start unobserved — \
+                     NOT acking consume yet; the unobserved hold settles it (consumed if its \
+                     transcript appears, its claim released if not)"
+                );
             } else {
                 warn!(
                     "agent_runtime: unit-dispatch dispatch_id={dispatch_id} spawn failed — \
@@ -7991,6 +8010,63 @@ async fn run_gate_continuation_inner(
     // coord takes `spawned → work_unreported` but refuses `spawned` over a
     // `work_unreported` that raced ahead of it. The exit path deregisters the
     // entry and posts the fallback, which a session's own report outranks.
+    if let Some(hold) = unobserved {
+        let (gate, dispatch) = match consume_target {
+            ConsumeTarget::Gate(gate_id, _) => (Some(gate_id), None),
+            ConsumeTarget::Dispatch(dispatch_id) => (None, Some(dispatch_id)),
+            ConsumeTarget::None => (None, None),
+        };
+        // A registered pane's gate is the registry exit path's: with no
+        // dispatch to settle, there is nothing for a hold task to do.
+        let needs_task = matches!(hold, UnobservedStart::Held { .. }) || dispatch.is_some();
+        if needs_task {
+            let session = bindable_session(&result);
+            tokio::spawn(async move {
+                let (_end, effects) = run_unobserved_hold(
+                    hold,
+                    gate.is_some(),
+                    dispatch.is_some(),
+                    CONTINUATION_UNOBSERVED_HOLD_BOUND,
+                    CONTINUATION_UNOBSERVED_HOLD_POLL,
+                    read_continuation_child,
+                )
+                .await;
+                for effect in effects {
+                    match (effect, gate, dispatch) {
+                        (HoldEffect::Gate(outcome, detail), Some(gate_id), _) => {
+                            let sid = (outcome == ContinuationOutcome::Spawned)
+                                .then(|| session.map(|s| s.to_string()))
+                                .flatten();
+                            post_spawn_outcome(gate_id, device_id, outcome, detail, sid).await;
+                        }
+                        (
+                            HoldEffect::GateWorkUnreported {
+                                detail,
+                                terminal_id,
+                            },
+                            Some(gate_id),
+                            _,
+                        ) => {
+                            post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail)
+                                .await;
+                        }
+                        (HoldEffect::ConsumeDispatch, _, Some(dispatch_id)) => {
+                            post_unit_dispatch_consumed(dispatch_id, device_id).await;
+                        }
+                        (HoldEffect::ReleaseDispatch, _, Some(dispatch_id)) => {
+                            info!(
+                                "agent_runtime: unobserved unit-dispatch dispatch_id={dispatch_id} \
+                                 never started; its in-process claim is released so coord's \
+                                 re-list dispatches it again"
+                            );
+                            release_dispatch_dispatch(dispatch_id);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
     if let Some(exited_terminal_id) = &exited_terminal {
         notify_continuation_terminal_exit(
             exited_terminal_id,
@@ -8340,10 +8416,16 @@ async fn run_continuation_terminal(
     // build so its per-account command can layer in. spawn_blocking: the
     // selector reads settings + cooldown state.
     let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
-    let (selected_config_dir, _config_dir_source) = {
+    let (selected_config_dir, config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
+    // The `--add-dir` siblings as the launch names them, for the stall report's
+    // per-sibling trust readings.
+    let add_dirs: Vec<String> = add_dir_args
+        .iter()
+        .filter_map(|a| a.strip_prefix("--add-dir=").map(str::to_string))
+        .collect();
 
     // Compose the spawn argv through the shared launch seam so the operator's
     // global + per-account launch flags layer onto the required autonomous
@@ -8581,6 +8663,20 @@ async fn run_continuation_terminal(
         // and leave an unattended, interactive `claude` facing the trust dialog).
         crate::claude_session::trust_gate::warm_dial().await;
 
+        // This launch's preconditions, for a `spawn_stalled` report should the
+        // start window end on a live PTY with no transcript. Taken BEFORE the
+        // create (whose trust gate may write), like the headless seam's, so the
+        // readings answer "would this spawn have faced a trust prompt?" — the
+        // cwd's, its primary checkout's, and every `--add-dir` sibling's — and
+        // the credential ladder has the window to settle. Report-only.
+        let preconditions = SpawnPreconditions::evaluate(
+            workdir,
+            None,
+            selected_config_dir.as_deref(),
+            config_dir_source.as_str(),
+        )
+        .with_add_dirs(&add_dirs);
+
         // The create is SYNCHRONOUS (ConPTY open, `CreateProcess`, coord row
         // registration). One was measured at 38 s on 2026-10-27. So it runs on the
         // blocking pool instead of holding an async worker for that whole time
@@ -8662,78 +8758,147 @@ async fn run_continuation_terminal(
         // Withhold the verdict until the session has demonstrably started (its
         // pinned transcript exists), has outlived the start window, or has died
         // without starting. See [`await_continuation_start`].
-        let transcript_paths = continuation_transcript_paths(
-            selected_config_dir.as_deref(),
-            workdir,
-            &pinned_session_id,
-        );
-        let started =
-            await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
-        match started {
-            ContinuationStart::Closed => {
-                // The operator closed the pane inside the window. Not a launch
-                // failure to retry: the close already released the worktree
-                // claim, and reopening what the operator closed would be wrong.
-                let reason = "continuation pane was closed before the session started".to_string();
+        //
+        // A live PTY with no transcript past the window is NOT a start (plan
+        // `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`,
+        // Phase 2). Known-absent and output-quiet, the runner has closed its
+        // own pane and the verdict is `Stalled`, handled below on the
+        // never-started path; on an UNKNOWN location, or a pane still
+        // producing output at the ceiling, the pane stays open and the verdict
+        // is `Started`. Either way the stall is reported first. What each
+        // verdict does next — and where its context goes — is
+        // [`continuation_attempt_step`].
+        let transcripts =
+            continuation_transcripts(selected_config_dir.as_deref(), workdir, &pinned_session_id);
+        let settled = await_continuation_start(&terminal_manager, &terminal_id, &transcripts).await;
+        if let Some(stalled) = &settled.stalled {
+            let (silent, pid, facts) = terminal_stall_report(stalled, settled.close);
+            report_spawn_stalled(agent_id, &preconditions, silent, pid, Some(facts)).await;
+        }
+        let step = continuation_attempt_step(settled, attempt, &terminal_manager, &terminal_id);
+        // A launch that recorded no turn (retry or exhausted): a pane that died
+        // within ~100 ms can exit before its coord session id was set, so its
+        // exit hook never closed the coord row. Close it here (idempotent if
+        // the hook did).
+        if matches!(
+            step,
+            AttemptStep::Retry { .. } | AttemptStep::Exhausted { .. }
+        ) {
+            if let Some(coord_id) = coord_session_id {
+                if let Err(e) = session_registry.close_by_id(coord_id) {
+                    debug!(
+                        "agent_runtime: never-started continuation coord session \
+                         {coord_id} close: {e}"
+                    );
+                }
+            }
+        }
+        match step {
+            AttemptStep::NotRetried { reason, ctx: held } => {
+                // The operator closed the pane inside the window (its close
+                // already released the claim, and reopening what the operator
+                // closed would be wrong), or the runner's own close of a
+                // stalled pane did not complete. Neither is retried, and a
+                // context still held goes to the remover, which keeps the tree.
                 warn!("agent_runtime: gate-continuation terminal_id={terminal_id}: {reason}");
+                remove_unspawned_continuation(held, true, &reason).await;
                 report_spawn_failed(agent_id, &reason, None, attempt.saturating_sub(1), None).await;
-                // door-scan: keep(post-child) the pane ran a child; its close already released the claim
+                // door-scan: keep(post-child) the pane ran a child; its close released the claim, or a held context went to the remover above
                 return Err(anyhow::anyhow!(reason));
             }
-            ContinuationStart::NeverStarted(evidence) => {
-                let detail = never_started_detail(&evidence);
-                // A pane that died within ~100 ms can exit before its coord
-                // session id was set, so its exit hook never closed the coord
-                // row. Close it here (idempotent if the hook did).
-                if let Some(coord_id) = coord_session_id {
-                    if let Err(e) = session_registry.close_by_id(coord_id) {
-                        debug!(
-                            "agent_runtime: never-started continuation coord session \
-                             {coord_id} close: {e}"
-                        );
-                    }
-                }
-                if attempt < CONTINUATION_START_MAX_ATTEMPTS {
-                    warn!(
-                        "agent_runtime: gate-continuation terminal_id={terminal_id} never started \
+            AttemptStep::Retry {
+                detail,
+                ctx: inherited,
+            } => {
+                // A launch that recorded no turn — a PTY that died without a
+                // transcript, or a live, quiet one the runner closed — cannot
+                // have done work, so the bounded retry cannot duplicate any.
+                warn!(
+                    "agent_runtime: gate-continuation terminal_id={terminal_id} never started \
                      (attempt {attempt}/{CONTINUATION_START_MAX_ATTEMPTS}): {detail} — \
                      retrying in {}s",
-                        CONTINUATION_START_RETRY_DELAY.as_secs()
-                    );
-                    // Take the worktree claim back off the dead pane so the retry
-                    // inherits it rather than the pane releasing it. The dead pane
-                    // itself is left visible (and is not killed: its pid is gone,
-                    // and a kill aimed at a dead pid can land on a reused one) — it
-                    // is the operator's evidence of what failed.
-                    ctx = terminal_manager
-                        .get(&terminal_id)
-                        .and_then(|s| s.take_isolated_edit_ctx());
-                    attempt += 1;
-                    tokio::time::sleep(CONTINUATION_START_RETRY_DELAY).await;
-                    // Re-resolve: the first resolution may itself have run
-                    // inside the reinstall window and fallen back to the bare
-                    // name.
-                    claude_bin = spawn_blocking_tracked(resolve_claude_bin)
-                        .await
-                        .unwrap_or_else(|_| claude_bin_path());
-                    // door-scan: keep(retry) the context, taken back off the dead pane, carries into the next attempt
-                    continue;
-                }
-                let reason = format!("never started ({attempt} attempts): {detail}");
+                    CONTINUATION_START_RETRY_DELAY.as_secs()
+                );
+                // The retry inherits the worktree claim: taken back off the dead
+                // pane (which is left visible, and not killed: its pid is gone,
+                // and a kill aimed at a dead pid can land on a reused one), or
+                // taken off the stalled pane before the runner closed it.
+                ctx = inherited;
+                attempt += 1;
+                tokio::time::sleep(CONTINUATION_START_RETRY_DELAY).await;
+                // Re-resolve: the first resolution may itself have run
+                // inside the reinstall window and fallen back to the bare
+                // name.
+                claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+                    .await
+                    .unwrap_or_else(|_| claude_bin_path());
+                // door-scan: keep(retry) the context, taken back off the dead or closed pane, carries into the next attempt
+                continue;
+            }
+            AttemptStep::Exhausted {
+                reason,
+                exit_code,
+                ctx: held,
+            } => {
                 warn!("agent_runtime: gate-continuation terminal_id={terminal_id} {reason}");
+                // A stalled final attempt's context was taken off the pane the
+                // runner closed, so it is held here rather than parked on a pane:
+                // the remover keeps the tree (a child ran in it) and logs that.
+                // A never-started attempt's context is still parked on its dead
+                // pane, and this is `None`.
+                remove_unspawned_continuation(held, true, &reason).await;
                 report_spawn_failed(
                     agent_id,
                     &reason,
-                    evidence.exit_code.map(i64::from),
+                    exit_code.map(i64::from),
                     attempt.saturating_sub(1),
                     None,
                 )
                 .await;
                 // `reservation` drops on this return and releases the anchor.
-                // door-scan: keep(post-child) never-started attempts ran a child in this tree; the context is parked on its pane
+                // door-scan: keep(post-child) never-started attempts ran a child in this tree; a never-started context is parked on its pane, a stalled one went to the remover above
                 return Err(anyhow::anyhow!(reason));
             }
-            ContinuationStart::Started { pty_alive } => {
+            AttemptStep::HeldUnknown {
+                reason,
+                ctx: held,
+                pane_live,
+                child,
+            } => {
+                // The runner's close of a stalled pane did not complete and its
+                // child may still be running. Post neither `spawned` (no start
+                // was observed) nor `spawn_failed` (something may be running);
+                // the stall was reported above as `close_outcome: unknown_held`.
+                // The hold is LOUD and BOUNDED: see [`hold_unobserved_start`].
+                error!(
+                    "agent_runtime: gate-continuation terminal_id={terminal_id} gate={:?} \
+                     anchor={:?} child={child:?}: {reason} — its anchor and claim are HELD, no \
+                     outcome posted, until the child exits or {}s pass",
+                    reportable_gate,
+                    payload.anchor_key,
+                    CONTINUATION_UNOBSERVED_HOLD_BOUND.as_secs()
+                );
+                let unobserved = unobserved_start_hold(
+                    &terminal_manager,
+                    reservation,
+                    &terminal_id,
+                    reportable_gate,
+                    pane_live,
+                    held,
+                    child,
+                    &transcripts,
+                );
+                // door-scan: keep(handed-back) a live pane holds the context and the registry the anchor; otherwise both ride in the returned hold
+                return Ok(TerminalStart {
+                    session_id: attempt_session_id,
+                    exited_terminal: None,
+                    unobserved: Some(unobserved),
+                });
+            }
+            AttemptStep::Started {
+                pty_alive,
+                ctx: held,
+            } => {
                 // Register in the live continuation-session registry so P3 (dedup by
                 // anchor_key) sees this session as live until
                 // its PTY exits (reaped lazily by the guard's liveness prune).
@@ -8744,6 +8909,15 @@ async fn run_continuation_terminal(
                 // observe the anchor held by neither — and the permit is consumed,
                 // so nothing of this dispatch's can touch the anchor again.
                 reservation.handed_to_registry(terminal_id.clone(), reportable_gate, None);
+                // A context is held here only when a transcript appeared across
+                // the runner's own close of a stalled pane: the session started
+                // and is gone. Its tree ran a child, so the remover keeps it.
+                remove_unspawned_continuation(
+                    held,
+                    true,
+                    "the stalled pane's session started across the runner's close",
+                )
+                .await;
                 // A session that STARTED and has already exited (at the verdict,
                 // or in the instant between the verdict and the hand-over above)
                 // ended before it was registered, so its PTY exit hook found
@@ -8776,6 +8950,7 @@ async fn run_continuation_terminal(
                 return Ok(TerminalStart {
                     session_id: attempt_session_id,
                     exited_terminal: exited.then_some(terminal_id),
+                    unobserved: None,
                 });
             }
         }
@@ -8845,7 +9020,6 @@ fn continuation_create_failure_handoff(
 }
 
 /// What a terminal continuation that STARTED reports back to its caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalStart {
     /// The Claude session id the started attempt runs under: the caller's
     /// pinned id when the first attempt started, a fresh one after a
@@ -8855,6 +9029,423 @@ struct TerminalStart {
     /// its verdict: the caller fires the exit path for it once `spawned` is
     /// posted. `None` is a session still running and registered.
     exited_terminal: Option<String>,
+    /// `Some` when the start was NOT observed and the child may still be
+    /// running (a stalled pane whose close did not complete): the caller posts
+    /// no gate outcome, binds no session, acks no dispatch, and keeps the hold.
+    unobserved: Option<UnobservedStart>,
+}
+
+/// How long a continuation whose start was never observed — a stalled pane
+/// whose close did not complete, with its child possibly still running — may
+/// hold its anchor and worktree claim with no outcome posted. Past it the hold
+/// is released with an error line: a slot held forever by a process nobody
+/// can observe is worse than a possible re-dispatch the operator was told of.
+/// Two hours outlasts any first turn, and the process table is polled every
+/// [`CONTINUATION_UNOBSERVED_HOLD_POLL`] so a child that exits ends it sooner.
+const CONTINUATION_UNOBSERVED_HOLD_BOUND: Duration = Duration::from_secs(2 * 60 * 60);
+/// How often an unobserved hold re-reads its child's pid.
+const CONTINUATION_UNOBSERVED_HOLD_POLL: Duration = Duration::from_secs(5);
+
+/// What carries an unobserved continuation's hold.
+// Built once on a rare path and moved, never copied in bulk: boxing `Held`
+// would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum UnobservedStart {
+    /// The pane is still held and alive: the live registry holds the anchor
+    /// and the pane its context; the pane's exit path reports the gate
+    /// outcome. A work-unit dispatch is settled by [`run_unobserved_hold`]
+    /// only once the PANE is gone (never while it is alive), by the
+    /// transcript rule of [`unobserved_hold_effects`].
+    Registered {
+        child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+        transcripts: ContinuationTranscripts,
+        terminal_manager: std::sync::Arc<crate::terminal::TerminalManager>,
+        terminal_id: String,
+    },
+    /// The pane is gone but the child may run: the reservation and context
+    /// are held HERE until [`run_unobserved_hold`] ends, which then re-reads
+    /// `transcripts` to decide what to report.
+    Held {
+        reservation: AnchorReservation,
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+        child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+        transcripts: ContinuationTranscripts,
+        terminal_id: String,
+    },
+}
+
+/// Settle an unobserved start's hold: a live pane goes to the registry
+/// (`handed_to_registry`, so dedup sees the anchor held and its exit path
+/// reports); a gone pane keeps the reservation and context in the returned
+/// [`UnobservedStart::Held`], released by nothing but its owner.
+#[allow(clippy::too_many_arguments)]
+fn unobserved_start_hold(
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
+    reservation: AnchorReservation,
+    terminal_id: &str,
+    gate: Option<uuid::Uuid>,
+    pane_live: bool,
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+    transcripts: &ContinuationTranscripts,
+) -> UnobservedStart {
+    if pane_live {
+        reservation.handed_to_registry(terminal_id.to_string(), gate, None);
+        // A live pane holds its own context; anything still here goes back.
+        if let Some(c) = ctx {
+            if let Some(pane) = terminal_manager.get(terminal_id) {
+                pane.set_isolated_edit_ctx(c);
+            }
+        }
+        return UnobservedStart::Registered {
+            child,
+            transcripts: transcripts.clone(),
+            terminal_manager: std::sync::Arc::clone(terminal_manager),
+            terminal_id: terminal_id.to_string(),
+        };
+    }
+    UnobservedStart::Held {
+        reservation,
+        ctx,
+        child,
+        transcripts: transcripts.clone(),
+        terminal_id: terminal_id.to_string(),
+    }
+}
+
+/// How an unobserved hold ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnobservedHoldEnd {
+    /// The child is affirmatively gone (see [`ChildReading`]).
+    ChildExited,
+    /// The bound passed with the child alive or unknown.
+    BoundReached,
+}
+
+/// One reading of a held child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildReading {
+    /// Alive as itself, or not readable as anything else (unknown counts as
+    /// alive: a hold is never ended on a guess).
+    Alive,
+    /// Affirmatively gone: no such process (`ESRCH`, or Windows'
+    /// invalid-parameter on open, or an exit code).
+    Dead,
+    /// Present but not proven to be the child: a zombie, a different start
+    /// time (a reused pid) — or a failed read, which looks the same. Ends a
+    /// hold only after [`CONTINUATION_CHILD_SUSPECT_READS`] in a row, so one
+    /// transient read failure cannot end it.
+    Suspect,
+}
+
+/// Consecutive [`ChildReading::Suspect`] readings that end a hold: a zombie or
+/// a reused pid reads suspect every time, while a transient read failure does
+/// not repeat three polls running.
+const CONTINUATION_CHILD_SUSPECT_READS: u32 = 3;
+
+/// Read a held child. Alive AS ITSELF
+/// ([`crate::process_capture::health::is_tracked_alive`], pid plus the
+/// creation time read before the close) is `Alive`; otherwise affirmatively
+/// absent is `Dead`, and anything else `Suspect`. `is_tracked_alive` itself is
+/// unchanged: it answers `false` on a read failure, which its reaper callers
+/// rely on, and that `false` is exactly why it alone cannot end a hold.
+fn read_continuation_child(
+    child: crate::process_capture::process_tree::PidWithSpawnedAt,
+) -> ChildReading {
+    if crate::process_capture::health::is_tracked_alive(
+        child,
+        crate::process_capture::health::proc_boot_time(),
+    ) {
+        return ChildReading::Alive;
+    }
+    if continuation_pid_proven_absent(child.pid) {
+        ChildReading::Dead
+    } else {
+        ChildReading::Suspect
+    }
+}
+
+/// Whether the OS affirmatively says no process has `pid` (never a read error).
+#[cfg(unix)]
+fn continuation_pid_proven_absent(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 delivers nothing; it only asks whether `pid` exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether the OS affirmatively says no process has `pid` (never a read error).
+#[cfg(windows)]
+fn continuation_pid_proven_absent(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: OpenProcess takes no pointers; a non-null handle is queried with
+    // the access asked for and closed once.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code as *mut u32);
+        CloseHandle(handle);
+        ok != 0 && code != STILL_ACTIVE
+    }
+}
+
+/// Whether the OS affirmatively says no process has `pid`: never, where it
+/// cannot be asked.
+#[cfg(not(any(unix, windows)))]
+fn continuation_pid_proven_absent(_pid: u32) -> bool {
+    false
+}
+
+/// A reader for a held child that may be unknown: an unknown child reads
+/// `Alive`, so it can only wait out the bound.
+fn continuation_child_reader(
+    child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+) -> impl FnMut() -> ChildReading {
+    move || child.map_or(ChildReading::Alive, read_continuation_child)
+}
+
+/// Wait out an unobserved hold: until `read` says `Dead`, or `Suspect`
+/// [`CONTINUATION_CHILD_SUSPECT_READS`] times in a row, or `bound` passes.
+async fn hold_unobserved_start(
+    bound: Duration,
+    poll: Duration,
+    mut read: impl FnMut() -> ChildReading,
+) -> UnobservedHoldEnd {
+    let begun = std::time::Instant::now();
+    let mut suspect = 0u32;
+    loop {
+        match read() {
+            ChildReading::Dead => return UnobservedHoldEnd::ChildExited,
+            ChildReading::Suspect => {
+                suspect += 1;
+                if suspect >= CONTINUATION_CHILD_SUSPECT_READS {
+                    return UnobservedHoldEnd::ChildExited;
+                }
+            }
+            ChildReading::Alive => suspect = 0,
+        }
+        if begun.elapsed() >= bound {
+            return UnobservedHoldEnd::BoundReached;
+        }
+        tokio::time::sleep(poll.min(bound.saturating_sub(begun.elapsed()))).await;
+    }
+}
+
+/// One thing an ended hold does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HoldEffect {
+    /// Post this outcome to the gate (`spawned` carries the session id).
+    Gate(ContinuationOutcome, Option<String>),
+    /// Post the gate's `work_unreported` exit fallback with this detail
+    /// ([`work_unreported_detail`]'s `exit=<class> …` grammar), for the pane
+    /// `terminal_id`.
+    GateWorkUnreported { detail: String, terminal_id: String },
+    /// The session started: ack the work-unit dispatch consumed and KEEP its
+    /// in-process claim, so the unit is not dispatched a second time.
+    ConsumeDispatch,
+    /// It never started: release the dispatch's in-process claim, so coord's
+    /// re-list (it was never acked) dispatches it again.
+    ReleaseDispatch,
+}
+
+/// What an ended hold does, by how it ended and whether a transcript exists
+/// NOW (re-read at the end: a child whose pane was removed may have run whole
+/// turns). A transcript is a start. For a gate (`gate`: the hold posts the
+/// gate's outcome): `spawned`, then — the child having exited without its own
+/// report reaching us — the `work_unreported` fallback with
+/// `unreported_detail`; absent at exit, `spawn_failed`; absent at the bound,
+/// nothing. For a work-unit dispatch: a start is consumed, anything else
+/// released.
+fn unobserved_hold_effects(
+    end: UnobservedHoldEnd,
+    started: bool,
+    gate: bool,
+    dispatch: bool,
+    unreported_detail: &str,
+    terminal_id: &str,
+) -> Vec<HoldEffect> {
+    let mut effects = Vec::new();
+    if gate {
+        match (end, started) {
+            (UnobservedHoldEnd::ChildExited, true) => {
+                effects.push(HoldEffect::Gate(ContinuationOutcome::Spawned, None));
+                effects.push(HoldEffect::GateWorkUnreported {
+                    detail: unreported_detail.to_string(),
+                    terminal_id: terminal_id.to_string(),
+                });
+            }
+            (UnobservedHoldEnd::ChildExited, false) => effects.push(HoldEffect::Gate(
+                ContinuationOutcome::SpawnFailed,
+                Some(
+                    "never started — no transcript, the runner's close of the stalled pane did \
+                     not complete, and its process has since exited"
+                        .to_string(),
+                ),
+            )),
+            (UnobservedHoldEnd::BoundReached, true) => {
+                effects.push(HoldEffect::Gate(ContinuationOutcome::Spawned, None));
+            }
+            (UnobservedHoldEnd::BoundReached, false) => {}
+        }
+    }
+    if dispatch {
+        effects.push(if started {
+            HoldEffect::ConsumeDispatch
+        } else {
+            HoldEffect::ReleaseDispatch
+        });
+    }
+    effects
+}
+
+/// Run an unobserved start's hold to its end and decide what it does.
+///
+/// - `Held`: waits on the child (bounded by `bound`), releases its reservation
+///   and context, and returns [`unobserved_hold_effects`] for the gate
+///   (`gate`) and/or the work-unit dispatch (`dispatch`).
+/// - `Registered`: waits while the PANE is alive (never releasing under a live
+///   pane), then on the child; only a dispatch is settled here — the gate is
+///   the registry exit path's.
+async fn run_unobserved_hold(
+    hold: UnobservedStart,
+    gate: bool,
+    dispatch: bool,
+    bound: Duration,
+    poll: Duration,
+    read_child: impl Fn(crate::process_capture::process_tree::PidWithSpawnedAt) -> ChildReading,
+) -> (UnobservedHoldEnd, Vec<HoldEffect>) {
+    let begun = std::time::Instant::now();
+    match hold {
+        UnobservedStart::Registered {
+            child,
+            transcripts,
+            terminal_manager,
+            terminal_id,
+        } => {
+            // Phase 1, unbounded: the pane is live and visible and the
+            // registry holds its anchor, so nothing is settled under it.
+            hold_unobserved_start(Duration::MAX, poll, || {
+                if terminal_manager
+                    .get(&terminal_id)
+                    .is_some_and(|s| s.is_alive())
+                {
+                    ChildReading::Alive
+                } else {
+                    ChildReading::Dead
+                }
+            })
+            .await;
+            // Phase 2, bounded exactly like `Held`: the pane is gone, and a
+            // child that lingers (or a pid read on liveness alone) must not pin
+            // the dispatch claim forever.
+            let end = hold_unobserved_start(bound, poll, || {
+                child.map_or(ChildReading::Dead, &read_child)
+            })
+            .await;
+            let started = transcripts.read() == TranscriptRead::Present;
+            info!(
+                "agent_runtime: unobserved registered continuation terminal_id={terminal_id} \
+                 settled ({end:?}, transcript present: {started}) after its pane ended"
+            );
+            (
+                end,
+                unobserved_hold_effects(end, started, false, dispatch, "", &terminal_id),
+            )
+        }
+        UnobservedStart::Held {
+            reservation,
+            ctx,
+            child,
+            transcripts,
+            terminal_id,
+        } => {
+            let end = hold_unobserved_start(bound, poll, || {
+                child.map_or(ChildReading::Alive, &read_child)
+            })
+            .await;
+            let started = transcripts.read() == TranscriptRead::Present;
+            // Both ends release the claim and the anchor.
+            drop(ctx);
+            drop(reservation);
+            match end {
+                UnobservedHoldEnd::ChildExited => warn!(
+                    "agent_runtime: unobserved continuation terminal_id={terminal_id} \
+                     child={child:?} exited (transcript present: {started}); its hold is released"
+                ),
+                UnobservedHoldEnd::BoundReached => error!(
+                    "agent_runtime: unobserved continuation terminal_id={terminal_id} \
+                     child={child:?} still not proven exited after {}s (transcript present: \
+                     {started}); its hold is RELEASED",
+                    bound.as_secs()
+                ),
+            }
+            let detail = work_unreported_detail(None, begun.elapsed(), &terminal_id);
+            (
+                end,
+                unobserved_hold_effects(end, started, gate, dispatch, &detail, &terminal_id),
+            )
+        }
+    }
+}
+
+/// What an unobserved CONDITION CHECK reports when its hold ends: the run
+/// errored only when its child exited with no transcript (the same rule as
+/// [`unobserved_hold_effects`]); a transcript means the session started and
+/// owns its own report, and at the bound nothing is claimed.
+fn unobserved_condition_check_failure(end: UnobservedHoldEnd, started: bool) -> Option<String> {
+    (end == UnobservedHoldEnd::ChildExited && !started).then(|| {
+        "condition-check never started — no transcript, the runner's close of the stalled \
+         pane did not complete, and its process has since exited"
+            .to_string()
+    })
+}
+
+/// Hold an unobserved condition check: `held` (its secrets registration) is
+/// kept through the whole hold and only then handed to `release` (which
+/// releases it at the pane's exit, so a pane still alive keeps scrubbing);
+/// returns how it ended and the failure to report, if any.
+async fn run_unobserved_condition_check<S>(
+    held: S,
+    release: impl FnOnce(S),
+    transcripts: &ContinuationTranscripts,
+    bound: Duration,
+    poll: Duration,
+    read: impl FnMut() -> ChildReading,
+) -> (UnobservedHoldEnd, Option<String>) {
+    let end = hold_unobserved_start(bound, poll, read).await;
+    let started = transcripts.read() == TranscriptRead::Present;
+    release(held);
+    (end, unobserved_condition_check_failure(end, started))
+}
+
+/// The gate outcome Step 4 posts: `None` — post nothing — while a start is
+/// unobserved and its child may be running.
+fn gate_outcome_to_post(
+    result: &anyhow::Result<Option<uuid::Uuid>>,
+    unobserved: bool,
+) -> Option<SpawnResolution> {
+    (!unobserved).then(|| spawn_resolution_outcome(result))
+}
+
+/// Whether Step 4 acks a work-unit dispatch consumed: only on a success whose
+/// start was observed, so an unobserved one is re-listed.
+fn dispatch_consume_ack(result: &anyhow::Result<Option<uuid::Uuid>>, unobserved: bool) -> bool {
+    result.is_ok() && !unobserved
 }
 
 /// How many times a gate-continuation terminal is created before a session that
@@ -8872,23 +9463,86 @@ const CONTINUATION_START_MAX_ATTEMPTS: u32 = 3;
 const CONTINUATION_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long [`await_continuation_start`] waits for a start signal before
-/// presuming a still-running PTY started. Must exceed the identity shim's own
-/// bounded resolve wait (`QONTINUI_SHIM_RESOLVE_WAIT_SECS`, default 10 s) plus
+/// ruling on a still-running PTY. Must exceed the identity shim's own bounded
+/// resolve wait (`QONTINUI_SHIM_RESOLVE_WAIT_SECS`, default 10 s) plus
 /// `claude`'s own startup, or a shim still waiting out a reinstall would be
-/// ruled "started" with nothing yet running.
-const CONTINUATION_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// ruled stalled with nothing yet running.
+///
+/// Reaching it no longer presumes a start, and a stalled pane may be CLOSED,
+/// so the window is no longer the only bar a healthy boot must clear: a close
+/// additionally needs [`CONTINUATION_STALL_QUIET`] of output silence (see
+/// [`classify_continuation_start`]). 90 s rather than the old 30 s keeps a
+/// slow boot on a saturated box (node start, SessionStart hooks) out of the
+/// stalled verdict altogether. Nothing on the success path waits for it: a
+/// session is `Started` the tick its transcript appears.
+const CONTINUATION_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long a live, transcript-less PTY must have produced NO output bytes
+/// before the runner may close it as stalled. A parked first-frame prompt
+/// draws once and then sits silent; a booting `claude`, or a pane an operator
+/// is typing into by hand, keeps producing bytes. Output ACTIVITY only — a
+/// byte count, never what the bytes say — so no screen content decides
+/// anything (served claim `perceive-no-screen-read-decides`).
+const CONTINUATION_STALL_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The hard ceiling on watching a transcript-less PTY that will not go quiet.
+/// At the ceiling it is reported stalled WITHOUT a close (the report-only arm,
+/// like an unlocated transcript): something is drawing, and closing a pane
+/// whose activity cannot be ruled out would risk ending live work.
+const CONTINUATION_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Poll cadence inside the start window.
 const CONTINUATION_START_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The four bounds of one start watch, named so a test can shrink them
+/// together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartBounds {
+    window: std::time::Duration,
+    quiet: std::time::Duration,
+    ceiling: std::time::Duration,
+    poll: std::time::Duration,
+}
+
+/// The production bounds.
+const CONTINUATION_START_BOUNDS: StartBounds = StartBounds {
+    window: CONTINUATION_START_WINDOW,
+    quiet: CONTINUATION_STALL_QUIET,
+    ceiling: CONTINUATION_STALL_CEILING,
+    poll: CONTINUATION_START_POLL,
+};
+
+/// What the transcript probe found for the pinned session.
+///
+/// Three arms, not a bool, because "no file where I looked" means two different
+/// things: proof of absence when the probe looked where the pinned account
+/// writes, and nothing at all when it does not know where that is. Only the
+/// first may close a pane (plan
+/// `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`,
+/// Phase 2: never close on UNKNOWN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRead {
+    /// The transcript exists in some probed config dir — `claude` started and
+    /// recorded the prompt. The only positive proof of a start.
+    Present,
+    /// No transcript, and the probe covers the pinned account's projects dir
+    /// for this cwd: the session has recorded no turn. Known-absent.
+    Absent,
+    /// No transcript found, but the probe does not know where this session's
+    /// transcript would land (no pinned account, or a project dir name only
+    /// Claude Code can compute). UNKNOWN — not absence.
+    Unlocated,
+}
+
 /// What one tick of the start window observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StartObservation {
-    /// The pinned session's transcript exists in some account's config dir —
-    /// `claude` started and recorded the prompt. The only positive proof.
-    transcript_present: bool,
+    transcript: TranscriptRead,
     /// The PTY child is still running.
     pty_alive: bool,
+    /// How long the PTY has produced no output bytes (since the watch began,
+    /// when it never has).
+    quiet_for: std::time::Duration,
 }
 
 /// [`classify_continuation_start`]'s verdict for one tick.
@@ -8898,11 +9552,27 @@ enum StartTick {
     Started { pty_alive: bool },
     /// The PTY is gone and no transcript was ever written: nothing ran.
     NeverStarted,
+    /// Past the window, a live PTY whose transcript is KNOWN absent has been
+    /// output-quiet for the quiet period: a process is running, has recorded
+    /// no turn, and is drawing nothing — a launch parked on a first-frame
+    /// prompt no one will answer. The one arm that may close the pane.
+    Stalled,
+    /// Past the window, a live PTY with no transcript where the probe could
+    /// look, but the probe does not know where the transcript would land. It
+    /// may be parked, or it may be running and writing elsewhere: UNKNOWN.
+    /// Reported, never closed.
+    StalledUnlocated,
+    /// At the ceiling, a live PTY whose transcript is known-absent is STILL
+    /// producing output. Reported, never closed.
+    StalledActive,
     /// Neither yet — keep watching.
     Pending,
 }
 
-/// The pure start-verdict core, unit-tested in isolation.
+/// The pure start-verdict core, unit-tested in isolation. It reads the
+/// transcript, the PTY's liveness and how long the PTY has been output-quiet —
+/// NOTHING on the screen: what a pane shows never decides a verdict (served
+/// claim `perceive-no-screen-read-decides`).
 ///
 /// - A transcript is proof of a start whatever the PTY is doing.
 /// - A dead PTY with no transcript is a session that never started. The
@@ -8911,28 +9581,39 @@ enum StartTick {
 ///   transcript is a launch that failed (`not found`, a crash, an auth death)
 ///   — and with no transcript there is no recorded turn, so a retry cannot
 ///   duplicate work.
-/// - A PTY still alive at the end of the window is PRESUMED started: something
-///   is running (a trust dialog, a slow first turn, a transcript written to a
-///   config dir the probe does not know), and a false "never started" there
-///   would double-spawn live work. Erring toward `Started` keeps today's
-///   behaviour as the floor.
+/// - A PTY still alive past the window with no transcript is NOT presumed
+///   started. Presuming it is what hid the parked gate continuations measured
+///   on 2026-11-27: of six stuck sessions, five were gate continuations held
+///   behind an "Adding new directory … one you trust?" prompt, never reporting
+///   a `work_*` outcome. It is `Stalled`
+///   when the transcript is known-absent AND the PTY has been output-quiet for
+///   `quiet`; `Pending` while it is still producing output, up to `ceiling`;
+///   `StalledActive` at the ceiling; and `StalledUnlocated` when the
+///   transcript's location is unknown.
+/// - **The double-spawn hazard stays explicit.** A false "never started" on a
+///   live session would close and retry it, duplicating its work. A slow first
+///   turn is not one: `claude` records the prompt in the transcript before the
+///   model answers, so a slow turn is `Started` (an assumption about the CLI,
+///   not a measurement — the close re-reads the transcript on both sides, and a
+///   transcript that appears across it is reported as a start, never retried).
+///   A slow BOOT, or a pane an operator is answering by hand, is still
+///   producing output, so it is not quiet and is not closed. And a transcript
+///   written to a config dir the probe does not know is the `StalledUnlocated`
+///   arm, which is reported and never closed.
 fn classify_continuation_start(
     obs: StartObservation,
     elapsed: std::time::Duration,
-    window: std::time::Duration,
+    bounds: StartBounds,
 ) -> StartTick {
-    if obs.transcript_present {
-        return StartTick::Started {
-            pty_alive: obs.pty_alive,
-        };
+    match (obs.transcript, obs.pty_alive) {
+        (TranscriptRead::Present, pty_alive) => StartTick::Started { pty_alive },
+        (_, false) => StartTick::NeverStarted,
+        _ if elapsed < bounds.window => StartTick::Pending,
+        (TranscriptRead::Unlocated, true) => StartTick::StalledUnlocated,
+        (TranscriptRead::Absent, true) if obs.quiet_for >= bounds.quiet => StartTick::Stalled,
+        (TranscriptRead::Absent, true) if elapsed < bounds.ceiling => StartTick::Pending,
+        (TranscriptRead::Absent, true) => StartTick::StalledActive,
     }
-    if !obs.pty_alive {
-        return StartTick::NeverStarted;
-    }
-    if elapsed >= window {
-        return StartTick::Started { pty_alive: true };
-    }
-    StartTick::Pending
 }
 
 /// What a never-started PTY left behind, for the `spawn_failed` detail.
@@ -8945,6 +9626,40 @@ struct NeverStartedEvidence {
     last_output: Option<String>,
 }
 
+/// Why a stalled start was not closed, or that it was — the same type the
+/// `spawn_stalled` body carries as `stall_kind`.
+use crate::claude_session::spawn_preconditions::{
+    StallCloseOutcome, TerminalStallKind as StallKind,
+};
+
+/// What a stalled start left behind: a PTY alive past the window with no
+/// transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StalledEvidence {
+    /// How long the watch ran before the verdict, with no transcript.
+    waited: std::time::Duration,
+    /// How long the PTY had produced no output at the verdict.
+    quiet_for: std::time::Duration,
+    /// The pane's root process id, for the `spawn_stalled` report.
+    pid: Option<i64>,
+    /// The pane's last non-empty output line, ANSI-stripped. REPORT DETAIL
+    /// ONLY — the verdict was decided before this was read, and nothing reads
+    /// it to decide anything.
+    last_output: Option<String>,
+    kind: StallKind,
+    /// The child's identity — pid and creation time — read just before the
+    /// runner's close (`None` until then, or with no pid): what decides
+    /// whether a close that did not return left a `claude` running.
+    child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+}
+
+impl StalledEvidence {
+    /// Whether the transcript was known-absent (every kind but `Unlocated`).
+    fn transcript_location_known(&self) -> bool {
+        self.kind != StallKind::Unlocated
+    }
+}
+
 /// The settled start verdict for one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContinuationStart {
@@ -8952,63 +9667,712 @@ enum ContinuationStart {
         pty_alive: bool,
     },
     NeverStarted(NeverStartedEvidence),
+    /// The window ended on a live, output-quiet PTY whose transcript is KNOWN
+    /// absent, and the runner closed its own never-started pane
+    /// ([`close_stalled_continuation_pane`]). No turn was recorded, so — like
+    /// `NeverStarted` — a retry cannot duplicate work.
+    Stalled(StalledEvidence),
+    /// The runner's close of a stalled pane did not return (its blocking task
+    /// panicked), so whether the pane is still up is UNKNOWN. Never retried and
+    /// never reported `spawned`: it is reported `spawn_failed`.
+    StallCloseUnknown(StalledEvidence),
     /// The manager no longer holds the pane: the operator closed it inside the
     /// window. Not retried (the close released the worktree claim).
     Closed,
 }
 
-/// Candidate transcript paths for the pinned session: the selected account's
-/// config dir first, then every account home on the machine (the same set
+/// Where a terminal continuation's pinned transcript may land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationTranscripts {
+    /// Candidate transcript paths, the pinned account's first.
+    paths: Vec<std::path::PathBuf>,
+    /// Whether `paths` holds the file the pinned account WILL write for this
+    /// cwd, so that its absence proves no turn was recorded. See
+    /// [`TranscriptRead`].
+    pinned_location_known: bool,
+}
+
+impl ContinuationTranscripts {
+    fn read(&self) -> TranscriptRead {
+        if self.paths.iter().any(|p| p.exists()) {
+            TranscriptRead::Present
+        } else if self.pinned_location_known {
+            TranscriptRead::Absent
+        } else {
+            TranscriptRead::Unlocated
+        }
+    }
+}
+
+/// The transcript probe for the pinned session: the selected account's config
+/// dir first, then every account home on the machine (the same set
 /// `create_terminal_session_backend`'s pinned-session verifier probes).
-fn continuation_transcript_paths(
+///
+/// The pinned location is KNOWN only when the spawn pinned an account (else the
+/// child inherits an ambient `CLAUDE_CONFIG_DIR` this probe does not resolve)
+/// and every spelling of the cwd it may record under names a computable project
+/// dir. The cwd is probed as given AND as its canonical path, because the CLI
+/// keys its project dir on the cwd it sees, which on a symlinked path is the
+/// resolved one.
+fn continuation_transcripts(
     selected_config_dir: Option<&str>,
     workdir: &str,
     pinned_session_id: &str,
-) -> Vec<std::path::PathBuf> {
-    selected_config_dir
+) -> ContinuationTranscripts {
+    let mut spellings = vec![workdir.to_string()];
+    if let Ok(canonical) = std::fs::canonicalize(workdir) {
+        let canonical = canonical.to_string_lossy();
+        let canonical = canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .to_string();
+        if canonical.trim_end_matches(['/', '\\']) != workdir.trim_end_matches(['/', '\\']) {
+            spellings.push(canonical);
+        }
+    }
+    let pinned_location_known = selected_config_dir.is_some()
+        && spellings
+            .iter()
+            .all(|s| crate::terminal::transcript::project_dir_is_computable(s));
+    let paths = selected_config_dir
         .map(std::path::PathBuf::from)
         .into_iter()
         .chain(crate::terminal::transcript::find_claude_config_dirs())
-        .map(|dir| {
-            crate::terminal::transcript::session_transcript_path(&dir, workdir, pinned_session_id)
+        .flat_map(|dir| {
+            spellings
+                .iter()
+                .map(|cwd| {
+                    crate::terminal::transcript::session_transcript_path(
+                        &dir,
+                        cwd,
+                        pinned_session_id,
+                    )
+                })
+                .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    ContinuationTranscripts {
+        paths,
+        pinned_location_known,
+    }
+}
+
+/// A start verdict, settled, plus what the caller must still act on.
+struct SettledStart {
+    start: ContinuationStart,
+    /// The isolated-edit context taken off a stalled pane before the runner
+    /// closed it, so a retry inherits the worktree claim instead of the close
+    /// releasing it. `None` when no pane was closed or none was parked.
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    /// `Some` whenever the watch ended on a live PTY with no transcript —
+    /// closed (`start` is [`ContinuationStart::Stalled`]), left open
+    /// (`StalledUnlocated` / `StalledActive`: `start` is
+    /// `Started { pty_alive: true }`), or a close whose outcome is unknown. The
+    /// caller reports it as `spawn_stalled`.
+    stalled: Option<StalledEvidence>,
+    /// What the runner's close of a stalled pane did
+    /// ([`StallCloseOutcome::NotAttempted`] when none was tried). A successful
+    /// close beside `Started { pty_alive: false }` means a transcript appeared
+    /// ACROSS it: the session started and the runner's close ended it, so
+    /// nothing of the session's own will report.
+    close: StallCloseOutcome,
+}
+
+impl SettledStart {
+    fn plain(start: ContinuationStart) -> Self {
+        SettledStart {
+            start,
+            ctx: None,
+            stalled: None,
+            close: StallCloseOutcome::NotAttempted,
+        }
+    }
+
+    /// The runner's own close of the pane succeeded.
+    fn closed_by_runner(&self) -> bool {
+        self.close.closed_by_runner()
+    }
 }
 
 /// Watch a freshly created continuation PTY until [`classify_continuation_start`]
-/// settles, at most [`CONTINUATION_START_WINDOW`].
+/// settles under [`CONTINUATION_START_BOUNDS`], and act on a stalled verdict.
 ///
 /// A terminal the manager no longer holds (closed by the operator inside the
 /// window) is [`ContinuationStart::Closed`] unless its transcript proves it
 /// started — never a never-started launch to retry.
 async fn await_continuation_start(
-    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
     terminal_id: &str,
-    transcript_paths: &[std::path::PathBuf],
-) -> ContinuationStart {
+    transcripts: &ContinuationTranscripts,
+) -> SettledStart {
+    await_continuation_start_within(
+        terminal_manager,
+        terminal_id,
+        transcripts,
+        CONTINUATION_START_BOUNDS,
+    )
+    .await
+}
+
+/// [`await_continuation_start`] over explicit bounds (the seam its tests drive
+/// with short ones).
+///
+/// Output quiet is tracked here, from the pane's monotonic produced-bytes
+/// counter ([`crate::terminal::session::TerminalSession::total_bytes_produced`]):
+/// the instant the count last moved, sampled each poll. A count, not content.
+///
+/// - `Stalled`: the runner closes its own pane
+///   ([`close_stalled_continuation_pane`]) and the verdict is
+///   [`ContinuationStart::Stalled`], which the caller handles on the
+///   never-started path.
+/// - `StalledUnlocated` / `StalledActive`: the pane is LEFT OPEN and the
+///   verdict is `Started { pty_alive: true }` — the floor a process that
+///   started is owed when a close cannot be justified — with the stall still
+///   returned for the report.
+async fn await_continuation_start_within(
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    transcripts: &ContinuationTranscripts,
+    bounds: StartBounds,
+) -> SettledStart {
     let begun = std::time::Instant::now();
+    let mut last_bytes: Option<u64> = None;
+    let mut last_output_at = begun;
     loop {
         let session = terminal_manager.get(terminal_id);
-        let obs = StartObservation {
-            transcript_present: transcript_paths.iter().any(|p| p.exists()),
-            pty_alive: session.as_ref().is_some_and(|s| s.is_alive()),
-        };
-        match classify_continuation_start(obs, begun.elapsed(), CONTINUATION_START_WINDOW) {
-            StartTick::Started { pty_alive } => return ContinuationStart::Started { pty_alive },
-            StartTick::NeverStarted if session.is_none() => return ContinuationStart::Closed,
-            StartTick::NeverStarted => {
-                let last_output = session.as_ref().and_then(|s| {
-                    last_output_line(&String::from_utf8_lossy(&s.get_scrollback_buffer().0))
-                });
-                return ContinuationStart::NeverStarted(NeverStartedEvidence {
-                    exit_code: session.as_ref().and_then(|s| s.exit_code()),
-                    lifetime_ms: begun.elapsed().as_millis(),
-                    last_output,
-                });
+        if let Some(bytes) = session.as_ref().map(|s| s.total_bytes_produced()) {
+            if last_bytes.is_some_and(|b| b != bytes) {
+                last_output_at = std::time::Instant::now();
             }
-            StartTick::Pending => tokio::time::sleep(CONTINUATION_START_POLL).await,
+            last_bytes = Some(bytes);
+        }
+        let elapsed = begun.elapsed();
+        let obs = StartObservation {
+            transcript: transcripts.read(),
+            pty_alive: session.as_ref().is_some_and(|s| s.is_alive()),
+            quiet_for: last_output_at.elapsed(),
+        };
+        let pane_last_output = || {
+            session.as_ref().and_then(|s| {
+                last_output_line(&String::from_utf8_lossy(&s.get_scrollback_buffer().0))
+            })
+        };
+        let stalled_evidence = |kind| StalledEvidence {
+            waited: elapsed,
+            quiet_for: obs.quiet_for,
+            pid: session.as_ref().and_then(|s| s.child_pid()).map(i64::from),
+            last_output: pane_last_output(),
+            kind,
+            child: None,
+        };
+        let report_only = |evidence: StalledEvidence, why: &str| {
+            warn!(
+                "agent_runtime: continuation terminal_id={terminal_id} is alive with no \
+                 transcript after {}s — {why}; reported stalled, the pane is left open",
+                elapsed.as_secs()
+            );
+            SettledStart {
+                start: ContinuationStart::Started { pty_alive: true },
+                ctx: None,
+                stalled: Some(evidence),
+                close: StallCloseOutcome::NotAttempted,
+            }
+        };
+        match classify_continuation_start(obs, elapsed, bounds) {
+            StartTick::Started { pty_alive } => {
+                return SettledStart::plain(ContinuationStart::Started { pty_alive })
+            }
+            StartTick::NeverStarted if session.is_none() => {
+                return SettledStart::plain(ContinuationStart::Closed)
+            }
+            StartTick::NeverStarted => {
+                return SettledStart::plain(ContinuationStart::NeverStarted(
+                    NeverStartedEvidence {
+                        exit_code: session.as_ref().and_then(|s| s.exit_code()),
+                        lifetime_ms: elapsed.as_millis(),
+                        last_output: pane_last_output(),
+                    },
+                ));
+            }
+            StartTick::Stalled => {
+                let evidence = stalled_evidence(StallKind::Quiet);
+                drop(session);
+                match close_stalled_continuation_pane(
+                    terminal_manager,
+                    terminal_id,
+                    transcripts,
+                    evidence,
+                    last_bytes,
+                )
+                .await
+                {
+                    StalledClose::Settled(settled) => return *settled,
+                    // Output arrived between the verdict's sample and the
+                    // close: not quiet after all. Keep watching; the ceiling
+                    // still bounds the watch.
+                    StalledClose::OutputMoved(bytes) => {
+                        last_bytes = Some(bytes);
+                        last_output_at = std::time::Instant::now();
+                        tokio::time::sleep(bounds.poll).await;
+                    }
+                }
+            }
+            StartTick::StalledUnlocated => {
+                return report_only(
+                    stalled_evidence(StallKind::Unlocated),
+                    "the transcript's location is UNKNOWN (never closed on UNKNOWN)",
+                );
+            }
+            StartTick::StalledActive => {
+                return report_only(
+                    stalled_evidence(StallKind::Active),
+                    "it is still producing output at the ceiling (never closed while active)",
+                );
+            }
+            StartTick::Pending => tokio::time::sleep(bounds.poll).await,
         }
     }
+}
+
+/// What the runner's blocking close of a stalled pane observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StalledCloseObservation {
+    /// [`crate::terminal::TerminalManager::close`]'s answer.
+    closed: Result<(), String>,
+    /// The transcript existed right after the close.
+    transcript_after: bool,
+}
+
+/// The close itself: the runner's own pane close on the terminal id it
+/// created — never a kill by process name — and the transcript re-read right
+/// after it. Synchronous (tree kill, thread joins, shim-dir removal), so the
+/// async caller runs it on the blocking pool.
+fn close_stalled_pane_blocking(
+    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_id: &str,
+    transcripts: &ContinuationTranscripts,
+) -> StalledCloseObservation {
+    let closed = terminal_manager.close(terminal_id);
+    StalledCloseObservation {
+        closed,
+        transcript_after: transcripts.read() == TranscriptRead::Present,
+    }
+}
+
+/// What [`close_stalled_continuation_pane`] did with a `Stalled` verdict.
+enum StalledClose {
+    /// The close was attempted (or a transcript made it unnecessary): settled.
+    Settled(Box<SettledStart>),
+    /// The pane produced output since the verdict's sample (its count now): it
+    /// is not quiet, so it was NOT closed and the watch goes on.
+    OutputMoved(u64),
+}
+
+/// Close a continuation pane the runner spawned whose watch ended `Stalled`
+/// (live, output-quiet, transcript KNOWN absent), and settle what that close
+/// means ([`settle_stalled_close`]).
+///
+/// Just before the close the transcript is read once more (present: it
+/// started in the last instant, so it is not closed and nothing is reported
+/// stalled) and the pane's produced-bytes count is re-sampled against
+/// `bytes_at_verdict` (moved: [`StalledClose::OutputMoved`], not closed). The
+/// pane's isolated-edit context is taken off it on this async side — never
+/// inside the blocking task — so a close task that panics cannot take the
+/// context down with it.
+async fn close_stalled_continuation_pane(
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    transcripts: &ContinuationTranscripts,
+    evidence: StalledEvidence,
+    bytes_at_verdict: Option<u64>,
+) -> StalledClose {
+    close_stalled_continuation_pane_with(
+        terminal_manager,
+        terminal_id,
+        transcripts,
+        evidence,
+        bytes_at_verdict,
+        |tm, id, probe| close_stalled_pane_blocking(&tm, &id, &probe),
+    )
+    .await
+}
+
+/// [`close_stalled_continuation_pane`] over an injected blocking close — the
+/// seam a test drives with a close that panics.
+async fn close_stalled_continuation_pane_with<F>(
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    transcripts: &ContinuationTranscripts,
+    evidence: StalledEvidence,
+    bytes_at_verdict: Option<u64>,
+    close: F,
+) -> StalledClose
+where
+    F: FnOnce(
+            std::sync::Arc<crate::terminal::TerminalManager>,
+            String,
+            ContinuationTranscripts,
+        ) -> StalledCloseObservation
+        + Send
+        + 'static,
+{
+    if transcripts.read() == TranscriptRead::Present {
+        return StalledClose::Settled(Box::new(SettledStart::plain(ContinuationStart::Started {
+            pty_alive: true,
+        })));
+    }
+    let pane = terminal_manager.get(terminal_id);
+    if let Some(now) = pane.as_ref().map(|s| s.total_bytes_produced()) {
+        if bytes_at_verdict.is_some_and(|b| b != now) {
+            debug!(
+                "agent_runtime: stalled continuation terminal_id={terminal_id} produced output \
+                 since its verdict; not closed, still watching"
+            );
+            return StalledClose::OutputMoved(now);
+        }
+    }
+    // The child's pid, read BEFORE the close: the close removes the pane from
+    // the manager and marks it dead before it kills anything, so after a close
+    // that did not return, the pane says nothing about whether `claude` runs.
+    let mut evidence = evidence;
+    evidence.pid = pane
+        .as_ref()
+        .and_then(|s| s.child_pid())
+        .map(i64::from)
+        .or(evidence.pid);
+    // Its creation time with it, so a later liveness read is identity, not a
+    // recycled pid. A snapshot that misses the pid records no time, which
+    // judges on liveness alone.
+    evidence.child = match evidence.pid.and_then(|p| u32::try_from(p).ok()) {
+        Some(pid) => Some(stalled_child_identity(pid, terminal_id).await),
+        None => None,
+    };
+    let ctx = pane.and_then(|s| s.take_isolated_edit_ctx());
+    let (tm, id, probe) = (
+        std::sync::Arc::clone(terminal_manager),
+        terminal_id.to_string(),
+        transcripts.clone(),
+    );
+    let observed = match spawn_blocking_tracked(move || close(tm, id, probe)).await {
+        Ok(observed) => Some(observed),
+        Err(e) => {
+            warn!(
+                "agent_runtime: stalled continuation terminal_id={terminal_id} close task \
+                 failed: {e}"
+            );
+            None
+        }
+    };
+    let child_alive = match observed {
+        Some(_) => None,
+        // Alive unless AFFIRMATIVELY gone: a read failure is not a death.
+        None => evidence
+            .child
+            .map(|c| read_continuation_child(c) != ChildReading::Dead),
+    };
+    StalledClose::Settled(Box::new(settle_stalled_close(
+        terminal_manager,
+        terminal_id,
+        observed,
+        ctx,
+        evidence,
+        child_alive,
+    )))
+}
+
+/// A stalled child's identity read before the close: its pid with the
+/// creation time from a FRESH process snapshot. A stale snapshot, one that
+/// misses the pid, or a snapshot task that failed records no creation time —
+/// never a possibly reused pid's — so liveness is then judged on the pid alone.
+async fn stalled_child_identity(
+    pid: u32,
+    terminal_id: &str,
+) -> crate::process_capture::process_tree::PidWithSpawnedAt {
+    let snapshot =
+        spawn_blocking_tracked(crate::process_capture::process_table::snapshot_blocking).await;
+    match &snapshot {
+        Ok(s) if s.stale => debug!(
+            "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot is \
+             stale; pid {pid} recorded with no creation time"
+        ),
+        Err(e) => warn!(
+            "agent_runtime: stalled continuation terminal_id={terminal_id} process snapshot task \
+             failed: {e}; pid {pid} recorded with no creation time"
+        ),
+        Ok(_) => {}
+    }
+    identity_from(pid, snapshot)
+}
+
+/// [`stalled_child_identity`]'s pure half: a FRESH snapshot gives the pid its
+/// creation time (none when the snapshot misses it); a stale snapshot or a
+/// failed snapshot task gives none — never a possibly reused pid's time.
+fn identity_from<E>(
+    pid: u32,
+    snapshot: Result<crate::process_capture::process_tree::ProcessSnapshot, E>,
+) -> crate::process_capture::process_tree::PidWithSpawnedAt {
+    match snapshot {
+        Ok(s) if !s.stale => {
+            crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(pid, &s)
+        }
+        _ => crate::process_capture::process_tree::PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: 0,
+            spawned_at_ft: None,
+        },
+    }
+}
+
+/// What a stalled pane's close settles to — pure over the manager's view, so
+/// every arm is unit-tested. `observed` is `None` when the close task did not
+/// return.
+///
+/// - closed, transcript still absent: [`ContinuationStart::Stalled`] — never
+///   started, retryable;
+/// - closed, transcript present AFTER the close: it started and the close
+///   ended it — `Started { pty_alive: false }`, so the caller reports a started
+///   session whose PTY is gone (`spawned`, then `work_unreported`) and does
+///   NOT retry it;
+/// - the close erred and the pane is gone: the operator closed it —
+///   [`ContinuationStart::Closed`], or `Started` when a transcript proves it
+///   started;
+/// - the close erred and the pane is STILL held (a poisoned sessions lock):
+///   the started floor — a pane the runner could not close is never retried
+///   on top of;
+/// - the close task did not return: [`ContinuationStart::StallCloseUnknown`],
+///   never retried and never `spawned` — `UnknownHeld` unless `child_alive`
+///   (the pre-close pid, looked up after) proves the child dead, which is
+///   `UnknownGone`.
+///
+/// In every arm where the pane is still held the context is put BACK on it, so
+/// a running `claude` never loses its claim; otherwise it is handed to the
+/// caller.
+fn settle_stalled_close(
+    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_id: &str,
+    observed: Option<StalledCloseObservation>,
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    evidence: StalledEvidence,
+    child_alive: Option<bool>,
+) -> SettledStart {
+    let held = terminal_manager.get(terminal_id);
+    let ctx = match (&held, ctx) {
+        (Some(pane), Some(c)) => {
+            pane.set_isolated_edit_ctx(c);
+            None
+        }
+        (_, c) => c,
+    };
+    let (start, close) = match observed {
+        Some(StalledCloseObservation {
+            closed: Ok(()),
+            transcript_after: true,
+        }) => (
+            ContinuationStart::Started { pty_alive: false },
+            StallCloseOutcome::ClosedStartedAcross,
+        ),
+        Some(StalledCloseObservation {
+            closed: Ok(()),
+            transcript_after: false,
+        }) => {
+            warn!(
+                "agent_runtime: continuation terminal_id={terminal_id} never started — no \
+                 transcript after {}s on a live, output-quiet pty; the runner closed its pane",
+                evidence.waited.as_secs()
+            );
+            (
+                ContinuationStart::Stalled(evidence.clone()),
+                StallCloseOutcome::Closed,
+            )
+        }
+        Some(StalledCloseObservation {
+            closed: Err(e),
+            transcript_after,
+        }) => {
+            debug!("agent_runtime: stalled continuation terminal_id={terminal_id} close: {e}");
+            let start = match (&held, transcript_after) {
+                (pane, true) => ContinuationStart::Started {
+                    pty_alive: pane.as_ref().is_some_and(|p| p.is_alive()),
+                },
+                (Some(pane), false) => ContinuationStart::Started {
+                    pty_alive: pane.is_alive(),
+                },
+                (None, false) => ContinuationStart::Closed,
+            };
+            let close = if held.is_some() {
+                StallCloseOutcome::FailedPaneHeld
+            } else {
+                StallCloseOutcome::FailedPaneGone
+            };
+            (start, close)
+        }
+        // Only a pid PROVEN dead is a child that is not running; alive or
+        // unknown, a `claude` may still be in there.
+        None => (
+            ContinuationStart::StallCloseUnknown(evidence.clone()),
+            if child_alive == Some(false) {
+                StallCloseOutcome::UnknownGone
+            } else {
+                StallCloseOutcome::UnknownHeld
+            },
+        ),
+    };
+    SettledStart {
+        start,
+        ctx,
+        stalled: Some(evidence),
+        close,
+    }
+}
+
+/// What the gate-continuation terminal does with one attempt's settled start.
+/// Every context the attempt holds travels IN the step, so the caller cannot
+/// act on a step without deciding where its context goes.
+enum AttemptStep {
+    /// Retry in a fresh pane, inheriting `ctx` (the context taken off the
+    /// stalled pane, or off the dead never-started one).
+    Retry {
+        detail: String,
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    },
+    /// Out of attempts on a launch that recorded no turn: post `spawn_failed`
+    /// with `reason`; a held `ctx` goes to the remover (a child ran in the tree).
+    Exhausted {
+        reason: String,
+        exit_code: Option<i32>,
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    },
+    /// Not retried (the operator closed the pane, or a stalled pane's close
+    /// outcome is unknown): post `spawn_failed` with `reason`; a held `ctx`
+    /// goes to the remover.
+    NotRetried {
+        reason: String,
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    },
+    /// The runner's close of a stalled pane did not complete and the pane is
+    /// STILL held and alive: a `claude` may be running in it. Not retried, not
+    /// released — the reservation goes to the live registry so dedup sees the
+    /// anchor held — and neither `spawned` nor `spawn_failed` is posted: the
+    /// stall report says what happened, and the pane's exit path reports
+    /// whatever follows. Its context was put back on the pane.
+    HeldUnknown {
+        reason: String,
+        /// The context, when the pane that would hold it is gone.
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+        /// The pane is still held and alive: the registry (and the pane's own
+        /// exit path) can carry the hold. Otherwise nothing can, and the caller
+        /// holds the reservation and context itself, bounded.
+        pane_live: bool,
+        /// The child's identity (pid and creation time), read before the close.
+        child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+    },
+    /// Started: a held `ctx` (only after a transcript appeared across the
+    /// runner's own close) goes to the remover.
+    Started {
+        pty_alive: bool,
+        ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    },
+}
+
+/// The pure per-attempt decision of [`run_continuation_terminal`], unit-tested:
+/// which attempts retry, which give up, and where the attempt's context goes.
+/// A never-started attempt's context is still parked on its dead pane, so a
+/// retry takes it back off; a stalled attempt's was already taken before the
+/// runner's close and arrives in `settled.ctx`.
+fn continuation_attempt_step(
+    settled: SettledStart,
+    attempt: u32,
+    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_id: &str,
+) -> AttemptStep {
+    let SettledStart {
+        start, ctx, close, ..
+    } = settled;
+    let (detail, exit_code) = match &start {
+        ContinuationStart::Started { pty_alive } => {
+            return AttemptStep::Started {
+                pty_alive: *pty_alive,
+                ctx,
+            }
+        }
+        ContinuationStart::Closed => {
+            return AttemptStep::NotRetried {
+                reason: "continuation pane was closed before the session started".to_string(),
+                ctx,
+            }
+        }
+        ContinuationStart::StallCloseUnknown(evidence) => {
+            let reason = format!(
+                "{}; the runner's close of the pane did not complete, so it is not retried",
+                stalled_detail_head(evidence, None)
+            );
+            // A child that may still be running (its pid alive or unknown)
+            // must keep its anchor and claim: releasing either would let coord
+            // re-dispatch on top of it. Only a pid proven dead is released.
+            if close != StallCloseOutcome::UnknownHeld {
+                return AttemptStep::NotRetried { reason, ctx };
+            }
+            let pane = terminal_manager.get(terminal_id).filter(|s| s.is_alive());
+            // A live pane keeps its own context (where the settle put it back).
+            let ctx = match (&pane, ctx) {
+                (Some(p), Some(c)) => {
+                    p.set_isolated_edit_ctx(c);
+                    None
+                }
+                (_, c) => c,
+            };
+            return AttemptStep::HeldUnknown {
+                reason,
+                ctx,
+                pane_live: pane.is_some(),
+                child: evidence.child,
+            };
+        }
+        ContinuationStart::NeverStarted(evidence) => {
+            (never_started_detail(evidence), evidence.exit_code)
+        }
+        ContinuationStart::Stalled(evidence) => (stalled_detail(evidence, None), None),
+    };
+    if attempt < CONTINUATION_START_MAX_ATTEMPTS {
+        let ctx = ctx.or_else(|| {
+            terminal_manager
+                .get(terminal_id)
+                .and_then(|s| s.take_isolated_edit_ctx())
+        });
+        return AttemptStep::Retry { detail, ctx };
+    }
+    let reason = match &start {
+        ContinuationStart::Stalled(evidence) => stalled_detail(evidence, Some(attempt)),
+        _ => format!("never started ({attempt} attempts): {detail}"),
+    };
+    AttemptStep::Exhausted {
+        reason,
+        exit_code,
+        ctx,
+    }
+}
+
+/// The condition-check reading of a settled start: `None` when a session
+/// started and owns its own report, else the `spawn_failed` reason. A
+/// transcript that appeared ACROSS the runner's own close is a session the
+/// runner ended — nothing of its own will post the run's report — so it is
+/// reported like any other non-start.
+fn condition_check_failure_reason(settled: &SettledStart) -> Option<String> {
+    if settled.closed_by_runner() && matches!(settled.start, ContinuationStart::Started { .. }) {
+        return Some(
+            "condition-check pane closed by the runner as stalled; its transcript appeared \
+             across the close"
+                .to_string(),
+        );
+    }
+    condition_check_never_started_reason(&settled.start)
+}
+
+/// A condition check whose stalled pane's close did not complete while its
+/// child may still run (`UnknownHeld`): neither started nor failed, so it is
+/// not reported at all.
+fn condition_check_may_be_running(settled: &SettledStart) -> bool {
+    settled.close == StallCloseOutcome::UnknownHeld
 }
 
 /// Characters of the pane's last output line kept in a `spawn_failed` detail.
@@ -9048,6 +10412,37 @@ fn never_started_detail(evidence: &NeverStartedEvidence) -> String {
     }
 }
 
+/// One-line `spawn_failed` detail for a stalled attempt the runner closed:
+/// `never started — no transcript after <window>`, then the attempt count when
+/// given, then the pane's last line. The verdict came from transcript absence
+/// on a live PTY; the last line is evidence for the operator only (it is where
+/// a trust prompt's text shows), and it trails so coord's 200-char cut keeps
+/// the cause.
+fn stalled_detail(evidence: &StalledEvidence, attempts: Option<u32>) -> String {
+    let mut detail = stalled_detail_head(evidence, attempts);
+    detail.push_str(&format!(
+        ": pty alive and output-quiet for {}s, the runner closed its pane",
+        evidence.quiet_for.as_secs()
+    ));
+    if let Some(line) = &evidence.last_output {
+        detail.push_str(&format!(" [last output: {line}]"));
+    }
+    detail
+}
+
+/// The cause-first head every stalled detail starts with:
+/// `never started — no transcript after <waited>s[ (<n> attempts)]`.
+fn stalled_detail_head(evidence: &StalledEvidence, attempts: Option<u32>) -> String {
+    let mut head = format!(
+        "never started — no transcript after {}s",
+        evidence.waited.as_secs()
+    );
+    if let Some(n) = attempts {
+        head.push_str(&format!(" ({n} attempts)"));
+    }
+    head
+}
+
 /// The condition-check reading of a start verdict: `None` when the session
 /// started (it owns its own report from here), else the `spawn_failed` reason.
 ///
@@ -9063,6 +10458,14 @@ fn condition_check_never_started_reason(start: &ContinuationStart) -> Option<Str
         ContinuationStart::NeverStarted(evidence) => Some(format!(
             "condition-check never started: {}",
             never_started_detail(evidence)
+        )),
+        ContinuationStart::Stalled(evidence) => Some(format!(
+            "condition-check {}",
+            stalled_detail(evidence, None)
+        )),
+        ContinuationStart::StallCloseUnknown(evidence) => Some(format!(
+            "condition-check {}; the runner's close of the pane did not complete",
+            stalled_detail_head(evidence, None)
         )),
     }
 }
@@ -9677,8 +11080,8 @@ async fn run_condition_check_terminal(
 
     // Kept for the start verdict below: the transcript probe looks in the
     // selected account's config dir first.
-    let transcript_paths =
-        continuation_transcript_paths(selected_config_dir.as_deref(), &workdir, &pinned_session_id);
+    let transcripts =
+        continuation_transcripts(selected_config_dir.as_deref(), &workdir, &pinned_session_id);
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
@@ -9766,9 +11169,73 @@ async fn run_condition_check_terminal(
             // `coord.condition_runs` row stays `running`. Same verdict as the
             // gate path; no local retry — a terminal `error` row is what lets
             // coord's scheduler dispatch the group again on its next pass.
-            let started =
-                await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
-            match condition_check_never_started_reason(&started) {
+            // A live pane with no transcript past the window is NOT taken for a
+            // start: known-absent and output-quiet, the runner has closed its
+            // pane and the verdict is `Stalled` (reported below as
+            // `spawn_failed`); on an UNKNOWN location or a pane still producing
+            // output the pane is left open and the stall is logged. No agent id
+            // exists here for a `spawn_stalled` post, so the log line is that
+            // record.
+            let settled =
+                await_continuation_start(&terminal_manager, &terminal_id, &transcripts).await;
+            if let Some(stalled) = &settled.stalled {
+                warn!(
+                    "agent_runtime: condition-check run_id={} terminal_id={terminal_id}: \
+                     spawn_stalled — alive with no transcript after {}s (kind {:?}, quiet {}s, \
+                     close {:?}, pid {:?})",
+                    payload.run_id,
+                    stalled.waited.as_secs(),
+                    stalled.kind,
+                    stalled.quiet_for.as_secs(),
+                    settled.close,
+                    stalled.pid
+                );
+            }
+            if condition_check_may_be_running(&settled) {
+                // The runner's close of a stalled pane did not complete and its
+                // child may still run: not reported failed (that would let
+                // coord re-dispatch on top of it), the run row is left as it
+                // is, and the secrets follow the pane's exit as for a start.
+                error!(
+                    "agent_runtime: condition-check run_id={} terminal_id={terminal_id}: the \
+                     runner's close of the stalled pane did not complete and its child may \
+                     still run; NOT reported failed, the run row and its secrets are held \
+                     until the child exits or {}s pass",
+                    payload.run_id,
+                    CONTINUATION_UNOBSERVED_HOLD_BOUND.as_secs()
+                );
+                // The pane may be gone, and then `release_at_pty_exit` drops the
+                // secrets at once while the child may still use them: the hold
+                // keeps them until it ends, then the run is reported errored
+                // only when the child exited with no transcript.
+                let child = settled.stalled.as_ref().and_then(|s| s.child);
+                let (transcripts, payload) = (transcripts.clone(), payload.clone());
+                let (tm, tid) = (terminal_manager.clone(), terminal_id.clone());
+                tokio::spawn(async move {
+                    let (end, failure) = run_unobserved_condition_check(
+                        held_secrets,
+                        |secrets| crate::condition_secrets::release_at_pty_exit(secrets, &tm, &tid),
+                        &transcripts,
+                        CONTINUATION_UNOBSERVED_HOLD_BOUND,
+                        CONTINUATION_UNOBSERVED_HOLD_POLL,
+                        continuation_child_reader(child),
+                    )
+                    .await;
+                    match failure {
+                        Some(reason) => {
+                            report_condition_run_failed(&payload, format!("spawn_failed: {reason}"))
+                                .await
+                        }
+                        None => warn!(
+                            "agent_runtime: condition-check run_id={} hold ended ({end:?}); its \
+                             secrets now follow the pane's exit",
+                            payload.run_id
+                        ),
+                    }
+                });
+                return Ok(());
+            }
+            match condition_check_failure_reason(&settled) {
                 None => {
                     crate::condition_secrets::release_at_pty_exit(
                         held_secrets,
@@ -12694,7 +14161,7 @@ async fn pump_subprocess(
             if flag.load(Ordering::Relaxed) {
                 return;
             }
-            report_spawn_stalled(agent_id, &pre, window, pid).await;
+            report_spawn_stalled(agent_id, &pre, window, pid, None).await;
         }))
     });
 
@@ -13087,14 +14554,63 @@ async fn report_spawn_complete(
     }
 }
 
-/// Report a spawn that produced **no output at all** inside the bounded window,
-/// carrying the cwd, the account config dir, and both preconditions.
+/// What a terminal continuation's stall reports: `(silent, pid, facts)` for
+/// [`report_spawn_stalled`]. `silent` is how long the PTY has been
+/// output-QUIET, never how long the runner waited — a pane chattering at the
+/// ceiling waited 300 s and was silent for a moment; the wait rides in the
+/// facts as `waited`.
+fn terminal_stall_report(
+    stalled: &StalledEvidence,
+    close: StallCloseOutcome,
+) -> (
+    Duration,
+    Option<i64>,
+    crate::claude_session::spawn_preconditions::TerminalStallFacts,
+) {
+    (
+        stalled.quiet_for,
+        stalled.pid,
+        crate::claude_session::spawn_preconditions::TerminalStallFacts {
+            transcript_location_known: stalled.transcript_location_known(),
+            waited: stalled.waited,
+            stall_kind: stalled.kind,
+            close_outcome: close,
+        },
+    )
+}
+
+/// The body [`report_spawn_stalled`] logs and posts (pure, so its fields are
+/// unit-tested).
+fn spawn_stalled_body(
+    preconditions: &SpawnPreconditions,
+    silent: Duration,
+    pid: Option<i64>,
+    terminal: Option<crate::claude_session::spawn_preconditions::TerminalStallFacts>,
+) -> SpawnStalledBody {
+    SpawnStalledBody::new(preconditions, silent, pid).with_terminal_facts(terminal)
+}
+
+/// Report a spawn that did not start inside the bounded window — a headless
+/// child that produced **no output at all**, or a terminal continuation alive
+/// with no transcript — carrying the cwd, the account config dir, the
+/// preconditions and, for a multi-repo launch, every `--add-dir` sibling's
+/// trust readings.
 ///
 /// Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Two
 /// deliberate properties:
 ///
-/// * **It reports; it does not act.** No kill, no signal, no restart, no change
-///   to the child. A stalled spawn stays exactly as stalled as it was.
+/// * **The report itself does not act.** No kill, no signal, no restart, no
+///   change to the child. `pane_closed` states what the CALLER already did: a
+///   gate continuation whose transcript was known-absent has had its pane
+///   closed by the runner (plan
+///   `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`,
+///   Phase 2), and the log line says so rather than claiming the child is
+///   untouched; `close_outcome` names the other arms (report-only, a failed
+///   close on a pane still held, a close whose task never returned).
+/// * **`silent` is output-quiet time, never the wait.** The headless child was
+///   silent for its whole window; a terminal stall passes `quiet_for` and the
+///   wait rides separately as `waited_secs`, so a pane still chattering at the
+///   ceiling never claims a 300 s silence.
 /// * **The `warn!` is the deliverable, not the POST.** A local structured log
 ///   line answers the question on any box, including one with no coord. The POST
 ///   is best-effort on top: coord may not have learned this route yet, so a
@@ -13106,10 +14622,29 @@ async fn report_spawn_complete(
 async fn report_spawn_stalled(
     agent_id: uuid::Uuid,
     preconditions: &SpawnPreconditions,
-    window: Duration,
+    silent: Duration,
     pid: Option<i64>,
+    terminal: Option<crate::claude_session::spawn_preconditions::TerminalStallFacts>,
 ) {
-    let body = SpawnStalledBody::new(preconditions, window, pid);
+    let body = spawn_stalled_body(preconditions, silent, pid, terminal);
+    let action = match terminal.map(|t| t.close_outcome) {
+        Some(StallCloseOutcome::Closed | StallCloseOutcome::ClosedStartedAcross) => {
+            "the runner closed its never-started pane (no transcript where the pinned account \
+             writes it, and no output for the quiet period)"
+        }
+        Some(StallCloseOutcome::UnknownHeld) => {
+            "the runner's close of the pane did not complete and its child may still run; the \
+             anchor and claim are held and no spawned/spawn_failed outcome is posted"
+        }
+        Some(StallCloseOutcome::UnknownGone) => {
+            "the runner's close of the pane did not complete and its child is gone; reported \
+             spawn_failed"
+        }
+        Some(StallCloseOutcome::FailedPaneHeld) => {
+            "the runner's close of the pane failed; the pane is still running"
+        }
+        _ => "reported only, the child is untouched",
+    };
     warn!(
         agent_id = %agent_id,
         silent_secs = body.silent_secs,
@@ -13126,9 +14661,15 @@ async fn report_spawn_stalled(
             .as_ref()
             .map_or("<not a linked worktree>", |e| e.verdict.label()),
         explicit_trust_detail = ?body.preconditions.explicit_trust,
+        add_dir_trust = ?body.preconditions.add_dir_trust,
+        pane_closed = ?body.pane_closed,
+        transcript_location_known = ?body.transcript_location_known,
+        waited_secs = ?body.waited_secs,
+        stall_kind = ?body.stall_kind,
+        close_outcome = ?body.close_outcome,
         credential = ?body.preconditions.credential,
-        "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
-         the child is untouched"
+        action,
+        "agent_runtime: spawn_stalled — the child has not started inside the window"
     );
 
     if !spawn_outcome_enrichment_enabled() {
@@ -23530,6 +25071,30 @@ mod tests {
         assert!(!is_session_work_outcome("work_completed: anything"));
     }
 
+    /// Short bounds for the tests: a window `w`, a quiet period `q`, a
+    /// ceiling `c`.
+    fn bounds(w: u64, q: u64, c: u64) -> StartBounds {
+        use std::time::Duration;
+        StartBounds {
+            window: Duration::from_millis(w),
+            quiet: Duration::from_millis(q),
+            ceiling: Duration::from_millis(c),
+            poll: Duration::from_millis(10),
+        }
+    }
+
+    fn obs_of(
+        transcript: TranscriptRead,
+        pty_alive: bool,
+        quiet_for: std::time::Duration,
+    ) -> StartObservation {
+        StartObservation {
+            transcript,
+            pty_alive,
+            quiet_for,
+        }
+    }
+
     /// The start verdict that decides between `spawned` and a never-started
     /// retry / `spawn_failed` (2026-10-01: three continuations whose PTY died
     /// in under 100 ms with `exec: claude: not found` were reported
@@ -23538,45 +25103,1334 @@ mod tests {
     #[test]
     fn continuation_start_verdict_separates_never_started_from_started() {
         use std::time::Duration;
-        let window = Duration::from_secs(30);
+        let b = CONTINUATION_START_BOUNDS;
         let early = Duration::from_millis(73);
-        let obs = |transcript_present, pty_alive| StartObservation {
-            transcript_present,
-            pty_alive,
+        let quiet = Duration::ZERO;
+        let obs = |present: bool, pty_alive| {
+            obs_of(
+                if present {
+                    TranscriptRead::Present
+                } else {
+                    TranscriptRead::Absent
+                },
+                pty_alive,
+                quiet,
+            )
         };
         // The incident: pty gone at 73 ms, no transcript — NEVER started.
         assert_eq!(
-            classify_continuation_start(obs(false, false), early, window),
+            classify_continuation_start(obs(false, false), early, b),
             StartTick::NeverStarted
         );
         // Dead and transcript-less is never-started at ANY point in the window:
         // the shim's own bounded wait can stretch a failed launch to ~10 s.
         assert_eq!(
-            classify_continuation_start(obs(false, false), Duration::from_secs(11), window),
+            classify_continuation_start(obs(false, false), Duration::from_secs(11), b),
             StartTick::NeverStarted
         );
         // A transcript is proof of a start whatever the pty is doing — and a
         // started session that already exited must say so, so its exit can
-        // still be reported.
+        // still be reported. A slow first turn is HERE: the transcript is
+        // written when the prompt is recorded, so it is `Started`, never stalled.
         assert_eq!(
-            classify_continuation_start(obs(true, true), early, window),
+            classify_continuation_start(obs(true, true), early, b),
             StartTick::Started { pty_alive: true }
         );
         assert_eq!(
-            classify_continuation_start(obs(true, false), early, window),
+            classify_continuation_start(obs(true, true), b.ceiling * 2, b),
+            StartTick::Started { pty_alive: true }
+        );
+        assert_eq!(
+            classify_continuation_start(obs(true, false), early, b),
             StartTick::Started { pty_alive: false }
         );
         // Alive, no transcript yet: keep watching inside the window...
         assert_eq!(
-            classify_continuation_start(obs(false, true), early, window),
+            classify_continuation_start(obs(false, true), early, b),
             StartTick::Pending
         );
-        // ...and PRESUME started at its end: a false never-started on a live
-        // pane would double-spawn work, so today's behaviour is the floor.
+    }
+
+    /// Phase 2 of plan
+    /// `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`:
+    /// a live, output-quiet pty with its transcript KNOWN absent past the
+    /// window is `Stalled` — not the `Started { pty_alive: true }` that hid the
+    /// five parked gate continuations among the six stuck sessions measured.
+    #[test]
+    fn a_live_quiet_pty_with_a_known_absent_transcript_past_the_window_is_stalled() {
+        let b = CONTINUATION_START_BOUNDS;
+        let quiet = obs_of(TranscriptRead::Absent, true, b.quiet);
         assert_eq!(
-            classify_continuation_start(obs(false, true), window, window),
-            StartTick::Started { pty_alive: true }
+            classify_continuation_start(quiet, b.window, b),
+            StartTick::Stalled
         );
+        assert_ne!(
+            classify_continuation_start(quiet, b.window, b),
+            StartTick::Started { pty_alive: true },
+            "a live pty is not proof of a start"
+        );
+        // Before the window ends it is still pending, however quiet.
+        assert_eq!(
+            classify_continuation_start(quiet, b.window - std::time::Duration::from_millis(1), b),
+            StartTick::Pending
+        );
+    }
+
+    /// A pane still producing output past the window — a slow boot, or one an
+    /// operator is answering by hand — is NOT closed: pending up to the
+    /// ceiling, then stalled-active (report only). Output activity is a byte
+    /// count; nothing on the screen is read.
+    #[test]
+    fn a_chattering_pty_past_the_window_is_pending_then_stalled_active_never_stalled() {
+        use std::time::Duration;
+        let b = CONTINUATION_START_BOUNDS;
+        let chattering = obs_of(
+            TranscriptRead::Absent,
+            true,
+            b.quiet - Duration::from_millis(1),
+        );
+        assert_eq!(
+            classify_continuation_start(chattering, b.window, b),
+            StartTick::Pending
+        );
+        assert_eq!(
+            classify_continuation_start(chattering, b.ceiling - Duration::from_millis(1), b),
+            StartTick::Pending
+        );
+        assert_eq!(
+            classify_continuation_start(chattering, b.ceiling, b),
+            StartTick::StalledActive
+        );
+        // Going quiet before the ceiling makes it closeable.
+        let quieted = obs_of(TranscriptRead::Absent, true, b.quiet);
+        assert_eq!(
+            classify_continuation_start(quieted, b.ceiling - Duration::from_millis(1), b),
+            StartTick::Stalled
+        );
+    }
+
+    /// Where the probe does not know where the transcript would land, absence
+    /// proves nothing: the verdict is the stalled-WITHOUT-close arm, distinct
+    /// from `Stalled`, and a transcript or a dead pty still decide as before.
+    #[test]
+    fn an_unlocated_transcript_is_stalled_unlocated_never_stalled() {
+        use std::time::Duration;
+        let b = CONTINUATION_START_BOUNDS;
+        let obs = |pty_alive| obs_of(TranscriptRead::Unlocated, pty_alive, b.quiet);
+        assert_eq!(
+            classify_continuation_start(obs(true), b.window, b),
+            StartTick::StalledUnlocated
+        );
+        assert_eq!(
+            classify_continuation_start(obs(true), Duration::from_millis(5), b),
+            StartTick::Pending
+        );
+        assert_eq!(
+            classify_continuation_start(obs(false), Duration::from_millis(5), b),
+            StartTick::NeverStarted
+        );
+    }
+
+    /// The bounds are ordered: the quiet period and window fit under the
+    /// ceiling, and the poll is far finer than the quiet period.
+    #[test]
+    fn continuation_stall_bounds_are_ordered() {
+        let b = CONTINUATION_START_BOUNDS;
+        assert!(b.window < b.ceiling);
+        assert!(b.quiet < b.ceiling);
+        assert!(b.poll * 10 < b.quiet);
+        assert_eq!(b.window, CONTINUATION_START_WINDOW);
+        assert_eq!(b.quiet, CONTINUATION_STALL_QUIET);
+        assert_eq!(b.ceiling, CONTINUATION_STALL_CEILING);
+    }
+
+    /// The probe's location is KNOWN only for a pinned account and a cwd whose
+    /// project dir is pure path arithmetic; the pinned account's path leads.
+    #[test]
+    fn continuation_transcripts_know_the_location_only_for_a_pinned_account() {
+        let _amb = crate::test_env::isolated_ambient();
+        let acct = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd_s = cwd.path().to_string_lossy().into_owned();
+        let acct_s = acct.path().to_string_lossy().into_owned();
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        let pinned = continuation_transcripts(Some(&acct_s), &cwd_s, sid);
+        assert!(pinned.pinned_location_known);
+        assert!(
+            pinned.paths[0].starts_with(acct.path().join("projects")),
+            "{:?}",
+            pinned.paths
+        );
+        assert_eq!(pinned.read(), TranscriptRead::Absent);
+        std::fs::create_dir_all(pinned.paths[0].parent().unwrap()).unwrap();
+        std::fs::write(&pinned.paths[0], "{}\n").unwrap();
+        assert_eq!(pinned.read(), TranscriptRead::Present);
+
+        let ambient = continuation_transcripts(None, &cwd_s, sid);
+        assert!(!ambient.pinned_location_known);
+
+        // A cwd whose encoded name passes Claude Code's cap carries a hash only
+        // the CLI computes: UNKNOWN, even with an account pinned.
+        let long = format!("{cwd_s}/{}", "d".repeat(240));
+        assert_eq!(
+            continuation_transcripts(Some(&acct_s), &long, sid).read(),
+            TranscriptRead::Unlocated
+        );
+    }
+
+    /// A fixture pane the manager holds, alive, PTY-less.
+    fn live_fixture_pane(
+        tm: &crate::terminal::TerminalManager,
+        id: &str,
+    ) -> std::sync::Arc<crate::terminal::session::TerminalSession> {
+        let pane = std::sync::Arc::new(crate::terminal::session::tests::make_test_session(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        pane.set_alive_for_test(true);
+        tm.insert_for_test(id, std::sync::Arc::clone(&pane));
+        pane
+    }
+
+    /// A transcript probe whose pinned location is known and empty: `(account
+    /// dir, cwd, probe)`.
+    fn known_absent_transcripts(
+        sid: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContinuationTranscripts,
+    ) {
+        let acct = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let t = continuation_transcripts(
+            Some(&acct.path().to_string_lossy()),
+            &cwd.path().to_string_lossy(),
+            sid,
+        );
+        assert_eq!(t.read(), TranscriptRead::Absent);
+        (acct, cwd, t)
+    }
+
+    fn write_transcript(t: &ContinuationTranscripts) {
+        std::fs::create_dir_all(t.paths[0].parent().unwrap()).unwrap();
+        std::fs::write(&t.paths[0], "{}\n").unwrap();
+    }
+
+    fn stall_evidence() -> StalledEvidence {
+        StalledEvidence {
+            waited: std::time::Duration::from_secs(90),
+            quiet_for: std::time::Duration::from_secs(30),
+            pid: None,
+            last_output: Some("Adding new directory: …/qontinui-web".to_string()),
+            kind: StallKind::Quiet,
+            child: None,
+        }
+    }
+
+    fn test_ctx() -> crate::agent_worktree::isolated_edit::IsolatedEditContext {
+        crate::agent_worktree::isolated_edit::IsolatedEditContext::for_test(Vec::new(), Vec::new())
+    }
+
+    /// The await-level proof: a continuation pane that stays alive, goes
+    /// output-quiet and never writes its transcript (where the pinned account
+    /// would) is CLOSED by the runner and settles `Stalled`, whose
+    /// `spawn_failed` detail reads `never started — no transcript after
+    /// <waited>` — not `Started`. Restoring the old presumed-started arm turns
+    /// this red.
+    #[tokio::test]
+    async fn a_parked_continuation_is_closed_and_reported_stalled_never_started() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "parked");
+        let settled =
+            await_continuation_start_within(&tm, "parked", &transcripts, bounds(150, 100, 2_000))
+                .await;
+        pane.set_alive_for_test(false);
+
+        let ContinuationStart::Stalled(evidence) = &settled.start else {
+            panic!("expected Stalled, got {:?}", settled.start);
+        };
+        assert!(evidence.transcript_location_known());
+        assert_eq!(evidence.kind, StallKind::Quiet);
+        assert!(
+            settled.stalled.is_some(),
+            "the stall is returned for the spawn_stalled report"
+        );
+        assert!(
+            tm.get("parked").is_none(),
+            "the runner closed its own never-started pane"
+        );
+        assert!(settled.closed_by_runner());
+        let reason = stalled_detail(evidence, Some(3));
+        assert!(
+            reason.starts_with("never started — no transcript after 0s (3 attempts)"),
+            "{reason}"
+        );
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(
+            ContinuationOutcome::SpawnFailed.matches_recorded(&format!("spawn_failed: {reason}"))
+        );
+        // The condition-check reading reports it as well.
+        let cc = condition_check_failure_reason(&settled).unwrap();
+        assert!(
+            cc.starts_with("condition-check never started — no transcript"),
+            "{cc}"
+        );
+    }
+
+    /// A pane still producing output at the window's end is NOT closed: it is
+    /// watched up to the ceiling and then reported stalled-active, left open.
+    #[tokio::test]
+    async fn a_chattering_continuation_pane_at_the_window_end_is_not_closed() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-111111111111");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "chatty");
+        let chatter = {
+            let pane = std::sync::Arc::clone(&pane);
+            tokio::spawn(async move {
+                loop {
+                    pane.produce_bytes_for_test(8);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        // The quiet period is 400x the producer's cadence, so a loaded box
+        // stalling the producer task cannot fake a quiet pane.
+        let settled =
+            await_continuation_start_within(&tm, "chatty", &transcripts, bounds(100, 2_000, 4_000))
+                .await;
+        chatter.abort();
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
+        let stalled = settled.stalled.expect("the stall is reported");
+        assert_eq!(stalled.kind, StallKind::Active);
+        assert!(
+            tm.get("chatty").is_some(),
+            "never closed while producing output"
+        );
+        assert_eq!(settled.close, StallCloseOutcome::NotAttempted);
+        pane.set_alive_for_test(false);
+    }
+
+    /// A pane that chattered and then went quiet becomes closeable once the
+    /// quiet period has passed, before the ceiling.
+    #[tokio::test]
+    async fn a_continuation_pane_that_goes_quiet_is_closed_before_the_ceiling() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-222222222222");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "settles");
+        let chatter = {
+            let pane = std::sync::Arc::clone(&pane);
+            tokio::spawn(async move {
+                for _ in 0..30 {
+                    pane.produce_bytes_for_test(8);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let settled =
+            await_continuation_start_within(&tm, "settles", &transcripts, bounds(100, 150, 10_000))
+                .await;
+        chatter.abort();
+        pane.set_alive_for_test(false);
+        assert!(
+            matches!(settled.start, ContinuationStart::Stalled(_)),
+            "{:?}",
+            settled.start
+        );
+        assert!(tm.get("settles").is_none());
+    }
+
+    /// On an UNKNOWN transcript location the pane is NEVER closed: the stall is
+    /// returned for the report and the verdict is the started floor.
+    #[tokio::test]
+    async fn a_stall_with_an_unlocated_transcript_is_reported_and_the_pane_left_open() {
+        let _amb = crate::test_env::isolated_ambient();
+        let cwd = tempfile::tempdir().unwrap();
+        let transcripts = continuation_transcripts(
+            None,
+            &cwd.path().to_string_lossy(),
+            "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff",
+        );
+        assert!(!transcripts.pinned_location_known);
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "unlocated");
+        let settled =
+            await_continuation_start_within(&tm, "unlocated", &transcripts, bounds(100, 50, 2_000))
+                .await;
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
+        let stalled = settled.stalled.expect("the stall is still reported");
+        assert!(!stalled.transcript_location_known());
+        assert!(tm.get("unlocated").is_some(), "never closed on UNKNOWN");
+        assert_eq!(settled.close, StallCloseOutcome::NotAttempted);
+        pane.set_alive_for_test(false);
+    }
+
+    /// A transcript that appears before the close means it started: the pane
+    /// is not closed and nothing is reported stalled.
+    #[tokio::test]
+    async fn a_transcript_present_at_the_close_keeps_the_pane_and_reads_started() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-000000000000");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "late");
+        write_transcript(&transcripts);
+        let StalledClose::Settled(settled) =
+            close_stalled_continuation_pane(&tm, "late", &transcripts, stall_evidence(), Some(0))
+                .await
+        else {
+            panic!("a transcript settles it");
+        };
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: true }
+        );
+        assert!(settled.stalled.is_none());
+        assert!(tm.get("late").is_some());
+        pane.set_alive_for_test(false);
+    }
+
+    /// A transcript that appears ACROSS the runner's close: it started and the
+    /// close ended it — `Started { pty_alive: false }`, closed by the runner,
+    /// and the attempt step does not retry it.
+    #[test]
+    fn a_transcript_appearing_after_the_close_is_a_started_session_never_retried() {
+        let tm = crate::terminal::TerminalManager::new();
+        let settled = settle_stalled_close(
+            &tm,
+            "gone",
+            Some(StalledCloseObservation {
+                closed: Ok(()),
+                transcript_after: true,
+            }),
+            Some(test_ctx()),
+            stall_evidence(),
+            None,
+        );
+        assert_eq!(
+            settled.start,
+            ContinuationStart::Started { pty_alive: false }
+        );
+        assert!(settled.closed_by_runner());
+        assert!(
+            settled.ctx.is_some(),
+            "the context comes back to the caller"
+        );
+        match continuation_attempt_step(settled, 1, &tm, "gone") {
+            AttemptStep::Started { pty_alive, ctx } => {
+                assert!(!pty_alive);
+                assert!(ctx.is_some(), "the held context goes to the remover");
+            }
+            _ => panic!("a session that started across the close is never retried"),
+        }
+    }
+
+    /// The close erred. With the pane gone the operator closed it (`Closed`,
+    /// context handed to the caller); with the pane still held its context is
+    /// put BACK on it and the verdict is the started floor, never a retry.
+    #[test]
+    fn a_failed_close_is_closed_when_the_pane_is_gone_and_started_when_it_is_held() {
+        let tm = crate::terminal::TerminalManager::new();
+        let err = || {
+            Some(StalledCloseObservation {
+                closed: Err("Terminal session not found: x".to_string()),
+                transcript_after: false,
+            })
+        };
+        let gone =
+            settle_stalled_close(&tm, "gone", err(), Some(test_ctx()), stall_evidence(), None);
+        assert_eq!(gone.start, ContinuationStart::Closed);
+        assert!(gone.ctx.is_some());
+        assert!(!gone.closed_by_runner());
+
+        let pane = live_fixture_pane(&tm, "held");
+        let held =
+            settle_stalled_close(&tm, "held", err(), Some(test_ctx()), stall_evidence(), None);
+        assert_eq!(held.start, ContinuationStart::Started { pty_alive: true });
+        assert!(
+            held.ctx.is_none(),
+            "the context went back onto the live pane"
+        );
+        assert!(
+            pane.take_isolated_edit_ctx().is_some(),
+            "a running claude keeps its claim"
+        );
+        pane.set_alive_for_test(false);
+    }
+
+    /// A close task that did not return on a pane that is GONE, whose child
+    /// pid is PROVEN dead: never retried, never `spawned` — a `spawn_failed`
+    /// that says the close did not complete — and the context handed in goes
+    /// to the remover.
+    #[test]
+    fn a_close_task_that_did_not_return_on_a_dead_child_is_reported_failed() {
+        let tm = crate::terminal::TerminalManager::new();
+        let settled = settle_stalled_close(
+            &tm,
+            "unknown",
+            None,
+            Some(test_ctx()),
+            stall_evidence(),
+            Some(false),
+        );
+        assert!(
+            matches!(settled.start, ContinuationStart::StallCloseUnknown(_)),
+            "{:?}",
+            settled.start
+        );
+        assert_eq!(settled.close, StallCloseOutcome::UnknownGone);
+        assert!(settled.ctx.is_some());
+        match continuation_attempt_step(settled, 1, &tm, "unknown") {
+            AttemptStep::NotRetried { reason, ctx } => {
+                assert!(
+                    reason.starts_with("never started — no transcript after 90s"),
+                    "{reason}"
+                );
+                assert!(reason.contains("did not complete"), "{reason}");
+                assert!(ctx.is_some(), "the context goes to the remover");
+            }
+            _ => panic!("an unknown close on a dead child is neither retried nor started"),
+        }
+    }
+
+    /// W3 / A2: the context survives a close task that PANICS, because it is
+    /// taken off the pane on the async side BEFORE the blocking close runs.
+    /// The injected close checks that from inside the blocking task: the
+    /// pane's context slot must already be empty when the close begins.
+    #[tokio::test]
+    async fn a_panicking_close_task_leaves_the_context_on_the_live_pane() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-333333333333");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "panics");
+        pane.set_isolated_edit_ctx(test_ctx());
+        let slot_empty_at_close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&slot_empty_at_close);
+        let StalledClose::Settled(settled) = close_stalled_continuation_pane_with(
+            &tm,
+            "panics",
+            &transcripts,
+            stall_evidence(),
+            Some(pane.total_bytes_produced()),
+            move |tm, id, _probe| {
+                let pane = tm.get(&id).expect("the pane is still held at the close");
+                match pane.take_isolated_edit_ctx() {
+                    None => seen.store(true, std::sync::atomic::Ordering::SeqCst),
+                    // Not taken yet: put it back so only the flag fails.
+                    Some(c) => pane.set_isolated_edit_ctx(c),
+                }
+                panic!("injected close-task panic")
+            },
+        )
+        .await
+        else {
+            panic!("a quiet pane's close is attempted");
+        };
+        assert!(
+            slot_empty_at_close.load(std::sync::atomic::Ordering::SeqCst),
+            "the context was taken before the blocking close ran"
+        );
+        assert!(
+            matches!(settled.start, ContinuationStart::StallCloseUnknown(_)),
+            "{:?}",
+            settled.start
+        );
+        assert_eq!(settled.close, StallCloseOutcome::UnknownHeld);
+        assert!(
+            pane.take_isolated_edit_ctx().is_some(),
+            "the context survived the panicked close, back on the still-held pane"
+        );
+        pane.set_alive_for_test(false);
+    }
+
+    /// A1: the real close removes the pane from the manager and marks it dead
+    /// before it kills anything. A close that does that and then PANICS, while
+    /// the child's pid is still alive, is `UnknownHeld`: held (pane gone, so
+    /// the context rides in the hold), never `NotRetried`, never released.
+    #[tokio::test]
+    async fn a_close_that_removes_the_pane_then_panics_with_the_child_alive_is_held() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-555555555555");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "half-closed");
+        pane.set_isolated_edit_ctx(test_ctx());
+        // A pid certainly alive for the test's duration: this process.
+        let alive_pid = i64::from(std::process::id());
+        let evidence = StalledEvidence {
+            pid: Some(alive_pid),
+            ..stall_evidence()
+        };
+        let StalledClose::Settled(settled) = close_stalled_continuation_pane_with(
+            &tm,
+            "half-closed",
+            &transcripts,
+            evidence,
+            Some(pane.total_bytes_produced()),
+            |tm, id, _probe| {
+                let _ = tm.close(&id);
+                panic!("injected panic after the pane was removed")
+            },
+        )
+        .await
+        else {
+            panic!("a quiet pane's close is attempted");
+        };
+        assert!(
+            tm.get("half-closed").is_none(),
+            "the close removed the pane"
+        );
+        assert_eq!(settled.close, StallCloseOutcome::UnknownHeld);
+        assert!(
+            settled.ctx.is_some(),
+            "no pane to put it on: the context comes back"
+        );
+        match continuation_attempt_step(*settled, 1, &tm, "half-closed") {
+            AttemptStep::HeldUnknown {
+                ctx,
+                pane_live,
+                child,
+                ..
+            } => {
+                assert!(!pane_live);
+                assert_eq!(child.map(|c| i64::from(c.pid)), Some(alive_pid));
+                match unobserved_start_hold(
+                    &tm,
+                    AnchorReservation::none(),
+                    "half-closed",
+                    None,
+                    pane_live,
+                    ctx,
+                    child,
+                    &transcripts,
+                ) {
+                    UnobservedStart::Held { ctx, child, .. } => {
+                        assert!(ctx.is_some(), "the claim is held, never released");
+                        assert_eq!(child.map(|c| i64::from(c.pid)), Some(alive_pid));
+                    }
+                    UnobservedStart::Registered { .. } => {
+                        panic!("a gone pane cannot be registered")
+                    }
+                }
+            }
+            _ => panic!("a child that may still run is held, never released"),
+        }
+    }
+
+    /// W1: an unknown close on a pane still held and ALIVE goes to the
+    /// registry (the pane keeps its context); a dead pane whose pid is unknown
+    /// is still held (nothing proves the child gone); only a pid proven dead is
+    /// `NotRetried` (posted failed, anchor released).
+    #[test]
+    fn an_unknown_close_is_held_unless_the_child_is_proven_dead() {
+        let tm = crate::terminal::TerminalManager::new();
+        let pane = live_fixture_pane(&tm, "running");
+        let settled = settle_stalled_close(
+            &tm,
+            "running",
+            None,
+            Some(test_ctx()),
+            stall_evidence(),
+            None,
+        );
+        assert!(
+            settled.ctx.is_none(),
+            "the context went back onto the live pane"
+        );
+        match continuation_attempt_step(settled, 1, &tm, "running") {
+            AttemptStep::HeldUnknown {
+                reason,
+                ctx,
+                pane_live,
+                ..
+            } => {
+                assert!(reason.contains("did not complete"), "{reason}");
+                assert!(ctx.is_none());
+                assert!(pane_live);
+            }
+            _ => panic!("a live held pane after an unknown close is held, never released"),
+        }
+        assert!(
+            pane.take_isolated_edit_ctx().is_some(),
+            "its claim stays with the pane"
+        );
+
+        pane.set_alive_for_test(false);
+        let unknown_pid = settle_stalled_close(&tm, "running", None, None, stall_evidence(), None);
+        assert!(
+            matches!(
+                continuation_attempt_step(unknown_pid, 1, &tm, "running"),
+                AttemptStep::HeldUnknown {
+                    pane_live: false,
+                    ..
+                }
+            ),
+            "a dead-looking pane with an unknown pid is still held"
+        );
+        let dead = settle_stalled_close(&tm, "running", None, None, stall_evidence(), Some(false));
+        assert!(
+            matches!(
+                continuation_attempt_step(dead, 1, &tm, "running"),
+                AttemptStep::NotRetried { .. }
+            ),
+            "a pid proven dead runs nothing: released and reported failed"
+        );
+    }
+
+    /// A dead child's pid: a short process, spawned and reaped.
+    fn reaped_child_pid() -> i64 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A5: the async side derives `child_alive` itself. A close that does not
+    /// return, on a child whose pid is DEAD (spawned and reaped), is
+    /// `UnknownGone` — released and reported failed, never held.
+    #[tokio::test]
+    async fn a_close_that_does_not_return_on_a_dead_child_is_unknown_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-777777777777");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "dead-child");
+        let evidence = StalledEvidence {
+            pid: Some(reaped_child_pid()),
+            ..stall_evidence()
+        };
+        let StalledClose::Settled(settled) = close_stalled_continuation_pane_with(
+            &tm,
+            "dead-child",
+            &transcripts,
+            evidence,
+            Some(pane.total_bytes_produced()),
+            |_tm, _id, _probe| panic!("injected close-task panic"),
+        )
+        .await
+        else {
+            panic!("a quiet pane's close is attempted");
+        };
+        assert_eq!(settled.close, StallCloseOutcome::UnknownGone);
+        pane.set_alive_for_test(false);
+    }
+
+    fn some_child() -> Option<crate::process_capture::process_tree::PidWithSpawnedAt> {
+        Some(crate::process_capture::process_tree::PidWithSpawnedAt {
+            pid: 4242,
+            spawned_at_unix: 0,
+            spawned_at_ft: None,
+        })
+    }
+
+    /// W1: a work-unit dispatch whose session STARTED (its transcript is there
+    /// when the hold ends) is acked consumed and keeps its claim — never
+    /// released, which would let coord's re-list spawn the work a second
+    /// time. Only a start that never happened releases it, at exit or bound.
+    #[tokio::test]
+    async fn an_unobserved_dispatch_that_started_is_consumed_never_released() {
+        let _amb = crate::test_env::isolated_ambient();
+        let ms = std::time::Duration::from_millis;
+        let held = |transcripts: ContinuationTranscripts| UnobservedStart::Held {
+            reservation: AnchorReservation::none(),
+            ctx: None,
+            child: some_child(),
+            transcripts,
+            terminal_id: "t".to_string(),
+        };
+        let (_a, _c, started) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-121212121212");
+        write_transcript(&started);
+        let (_, effects) = run_unobserved_hold(held(started), false, true, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
+        assert_eq!(effects, vec![HoldEffect::ConsumeDispatch]);
+
+        let (_d, _e, absent) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-131313131313");
+        let (end, effects) = run_unobserved_hold(held(absent), false, true, ms(30), ms(5), |_| {
+            ChildReading::Alive
+        })
+        .await;
+        assert_eq!(end, UnobservedHoldEnd::BoundReached);
+        assert_eq!(effects, vec![HoldEffect::ReleaseDispatch]);
+    }
+
+    /// W1: a registered (live) pane's dispatch is NOT settled while the pane
+    /// is alive — even with its child unreadable — and once the pane is gone
+    /// the transcript rule decides.
+    #[tokio::test]
+    async fn a_registered_dispatch_waits_for_its_pane_then_follows_the_transcript() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "registered");
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-141414141414");
+        write_transcript(&transcripts);
+        let hold = UnobservedStart::Registered {
+            child: some_child(),
+            transcripts,
+            terminal_manager: std::sync::Arc::clone(&tm),
+            terminal_id: "registered".to_string(),
+        };
+        let task = tokio::spawn(run_unobserved_hold(
+            hold,
+            false,
+            true,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5),
+            |_| ChildReading::Dead,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "never settled under a live pane, bound or not"
+        );
+        pane.set_alive_for_test(false);
+        let (end, effects) = task.await.unwrap();
+        assert_eq!(end, UnobservedHoldEnd::ChildExited);
+        assert_eq!(effects, vec![HoldEffect::ConsumeDispatch]);
+    }
+
+    /// W1 (round 6): once a registered pane is GONE, the hold on its child is
+    /// BOUNDED exactly like `Held`: a child that keeps reading alive (or a pid
+    /// read on liveness alone) cannot pin the dispatch claim forever. At the
+    /// bound the transcript rule decides — absent, the claim is released.
+    #[tokio::test]
+    async fn a_registered_hold_is_bounded_once_its_pane_is_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "gone-pane");
+        pane.set_alive_for_test(false);
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-161616161616");
+        let hold = UnobservedStart::Registered {
+            child: some_child(),
+            transcripts,
+            terminal_manager: std::sync::Arc::clone(&tm),
+            terminal_id: "gone-pane".to_string(),
+        };
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_unobserved_hold(
+                hold,
+                false,
+                true,
+                std::time::Duration::from_millis(30),
+                std::time::Duration::from_millis(5),
+                |_| ChildReading::Alive,
+            ),
+        )
+        .await
+        .expect("a registered hold whose pane is gone is bounded");
+        assert_eq!(settled.0, UnobservedHoldEnd::BoundReached);
+        assert_eq!(settled.1, vec![HoldEffect::ReleaseDispatch]);
+    }
+
+    /// S2 (round 6): a child's identity takes its creation time only from a
+    /// FRESH snapshot; a stale one, or a failed snapshot task, records none.
+    #[test]
+    fn a_stale_or_failed_snapshot_records_no_creation_time() {
+        let snapshot = |stale: bool| crate::process_capture::process_tree::ProcessSnapshot {
+            stale,
+            observed_at_ms: 0,
+            parent_map: Default::default(),
+            creation_times: [(77u32, 1_700_000_000i64)].into_iter().collect(),
+            names: Default::default(),
+            exe_paths: Default::default(),
+            creation_filetimes: [(77u32, 42u64)].into_iter().collect(),
+            start_ticks: Default::default(),
+        };
+        let fresh = identity_from::<String>(77, Ok(snapshot(false)));
+        assert_eq!(fresh.spawned_at_unix, 1_700_000_000);
+        assert_eq!(fresh.spawned_at_ft, Some(42));
+        let stale = identity_from::<String>(77, Ok(snapshot(true)));
+        assert_eq!(
+            (stale.pid, stale.spawned_at_unix, stale.spawned_at_ft),
+            (77, 0, None)
+        );
+        let failed = identity_from(77, Err("task panicked".to_string()));
+        assert_eq!(
+            (failed.pid, failed.spawned_at_unix, failed.spawned_at_ft),
+            (77, 0, None)
+        );
+    }
+
+    /// A2 / S3: when a held gate's child exits, the transcript is RE-READ:
+    /// present, it started (`spawned`, then the `work_unreported` fallback in
+    /// the `exit=<class>` grammar) and is never `spawn_failed`; absent, it never
+    /// started.
+    #[tokio::test]
+    async fn an_ended_hold_rereads_the_transcript_before_it_reports() {
+        let _amb = crate::test_env::isolated_ambient();
+        let ms = std::time::Duration::from_millis;
+        let held = |transcripts: ContinuationTranscripts| UnobservedStart::Held {
+            reservation: AnchorReservation::none(),
+            ctx: None,
+            child: some_child(),
+            transcripts,
+            terminal_id: "held-pane".to_string(),
+        };
+
+        let (_a, _c, started) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-999999999999");
+        write_transcript(&started);
+        let (_, effects) = run_unobserved_hold(held(started), true, false, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert_eq!(
+            effects[0],
+            HoldEffect::Gate(ContinuationOutcome::Spawned, None)
+        );
+        match &effects[1] {
+            HoldEffect::GateWorkUnreported {
+                detail,
+                terminal_id,
+            } => {
+                assert!(
+                    detail.starts_with("exit=unknown code=none after="),
+                    "{detail}"
+                );
+                assert!(detail.ends_with("terminal=held-pane"), "{detail}");
+                assert_eq!(
+                    terminal_id, "held-pane",
+                    "the real terminal id, not a placeholder"
+                );
+            }
+            other => panic!("expected the work_unreported fallback, got {other:?}"),
+        }
+
+        let (_d, _e, absent) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-aaaaaaaaaaaa");
+        let (_, effects) = run_unobserved_hold(held(absent), true, false, ms(500), ms(5), |_| {
+            ChildReading::Dead
+        })
+        .await;
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        match &effects[0] {
+            HoldEffect::Gate(ContinuationOutcome::SpawnFailed, Some(d)) => {
+                assert!(d.starts_with("never started"), "{d}")
+            }
+            other => panic!("expected spawn_failed, got {other:?}"),
+        }
+
+        assert_eq!(
+            unobserved_hold_effects(UnobservedHoldEnd::BoundReached, true, true, false, "x", "t"),
+            vec![HoldEffect::Gate(ContinuationOutcome::Spawned, None)]
+        );
+        assert!(unobserved_hold_effects(
+            UnobservedHoldEnd::BoundReached,
+            false,
+            true,
+            false,
+            "x",
+            "t"
+        )
+        .is_empty());
+    }
+
+    /// S6 / A4: a pid that is alive but was REUSED (a different start time
+    /// than the one read before the close) is not the child: it reads suspect
+    /// every time, so the hold ends, where a bare liveness check would hold it
+    /// for the whole bound. The child itself, with its real start time, reads
+    /// alive.
+    #[tokio::test]
+    async fn a_reused_pid_with_a_different_start_time_ends_the_hold() {
+        let me = std::process::id();
+        let snapshot = crate::process_capture::process_table::snapshot_blocking();
+        let real =
+            crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(me, &snapshot);
+        assert!(
+            real.spawned_at_unix > 0,
+            "this process's start time is readable"
+        );
+        assert_eq!(read_continuation_child(real), ChildReading::Alive);
+        let reused = crate::process_capture::process_tree::PidWithSpawnedAt {
+            pid: me,
+            spawned_at_unix: real.spawned_at_unix - 100_000,
+            spawned_at_ft: real.spawned_at_ft.map(|ft| ft.saturating_sub(1)),
+        };
+        assert_eq!(read_continuation_child(reused), ChildReading::Suspect);
+        assert_eq!(
+            hold_unobserved_start(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(5),
+                continuation_child_reader(Some(reused)),
+            )
+            .await,
+            UnobservedHoldEnd::ChildExited
+        );
+    }
+
+    /// S6 / A3 / S4: an unobserved condition check keeps its secrets through
+    /// the whole hold, and only then hands them to the release (which follows
+    /// the pane's exit) — never released at pane-gone while the child runs.
+    #[tokio::test]
+    async fn an_unobserved_condition_check_holds_its_secrets_until_the_hold_ends() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-151515151515");
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_released_while_held =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (r, s, n) = (
+            std::sync::Arc::clone(&released),
+            std::sync::Arc::clone(&seen_released_while_held),
+            std::sync::Arc::clone(&reads),
+        );
+        let marker = std::sync::Arc::clone(&released);
+        let (end, failure) = run_unobserved_condition_check(
+            "secrets",
+            move |_secrets| marker.store(true, std::sync::atomic::Ordering::SeqCst),
+            &transcripts,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(5),
+            move || {
+                if r.load(std::sync::atomic::Ordering::SeqCst) {
+                    s.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
+                    ChildReading::Alive
+                } else {
+                    ChildReading::Dead
+                }
+            },
+        )
+        .await;
+        assert_eq!(end, UnobservedHoldEnd::ChildExited);
+        assert!(
+            !seen_released_while_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the secrets were released while the child was still held"
+        );
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "released at the end"
+        );
+        assert!(failure
+            .unwrap()
+            .starts_with("condition-check never started"));
+    }
+
+    /// A3: an unobserved condition check is reported errored only when its
+    /// child exited with no transcript.
+    #[test]
+    fn an_unobserved_condition_check_errors_only_on_a_transcriptless_exit() {
+        assert!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, false)
+                .unwrap()
+                .starts_with("condition-check never started")
+        );
+        assert_eq!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, true),
+            None
+        );
+        assert_eq!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::BoundReached, false),
+            None
+        );
+    }
+
+    /// A5: a live held pane's hold is handed to the registry, which then holds
+    /// the anchor for that terminal id.
+    #[test]
+    fn a_live_unobserved_pane_is_handed_to_the_registry() {
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let id = format!("unobserved-{}", uuid::Uuid::new_v4());
+        let pane = live_fixture_pane(&tm, &id);
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-666666666666");
+        let hold = unobserved_start_hold(
+            &tm,
+            AnchorReservation::none(),
+            &id,
+            None,
+            true,
+            None,
+            None,
+            &transcripts,
+        );
+        assert!(matches!(
+            hold,
+            UnobservedStart::Registered { child: None, .. }
+        ));
+        let registered = lock_recover(continuation_sessions(), "continuation_sessions")
+            .live
+            .remove(&id)
+            .is_some();
+        assert!(registered, "the registry holds the unobserved pane");
+        pane.set_alive_for_test(false);
+    }
+
+    /// A5: while a start is unobserved, Step 4 posts NO gate outcome (neither
+    /// `spawned` nor `spawn_failed`) and does not ack a dispatch consumed;
+    /// otherwise it posts exactly what it always did.
+    #[test]
+    fn an_unobserved_start_posts_no_gate_outcome_and_acks_no_dispatch() {
+        let ok: anyhow::Result<Option<uuid::Uuid>> = Ok(Some(uuid::Uuid::new_v4()));
+        let err: anyhow::Result<Option<uuid::Uuid>> = Err(anyhow::anyhow!("x"));
+        assert_eq!(gate_outcome_to_post(&ok, true), None);
+        assert_eq!(gate_outcome_to_post(&err, true), None);
+        assert_eq!(
+            gate_outcome_to_post(&ok, false).map(|r| r.outcome),
+            Some(ContinuationOutcome::Spawned)
+        );
+        assert_eq!(
+            gate_outcome_to_post(&err, false).map(|r| r.outcome),
+            Some(ContinuationOutcome::SpawnFailed)
+        );
+        assert!(!dispatch_consume_ack(&ok, true));
+        assert!(dispatch_consume_ack(&ok, false));
+        assert!(!dispatch_consume_ack(&err, false));
+    }
+
+    /// A6 / W2: the hold ends on an affirmative death, and is bounded when it
+    /// never comes. A read FAILURE (suspect) does not end it unless it repeats
+    /// [`CONTINUATION_CHILD_SUSPECT_READS`] times running.
+    #[tokio::test]
+    async fn an_unobserved_hold_ends_only_on_an_affirmative_death_and_is_bounded() {
+        let ms = std::time::Duration::from_millis;
+        let script = |seq: Vec<ChildReading>| {
+            let i = std::sync::atomic::AtomicUsize::new(0);
+            move || {
+                let n = i.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *seq.get(n).unwrap_or(&ChildReading::Alive)
+            }
+        };
+        // Injected read errors between alive readings never end it.
+        let flaky = vec![
+            ChildReading::Suspect,
+            ChildReading::Alive,
+            ChildReading::Suspect,
+            ChildReading::Suspect,
+            ChildReading::Alive,
+            ChildReading::Suspect,
+        ];
+        assert_eq!(
+            hold_unobserved_start(ms(80), ms(5), script(flaky)).await,
+            UnobservedHoldEnd::BoundReached,
+            "a transient read failure must not end the hold"
+        );
+        assert_eq!(
+            hold_unobserved_start(
+                ms(2_000),
+                ms(5),
+                script(vec![ChildReading::Alive, ChildReading::Dead])
+            )
+            .await,
+            UnobservedHoldEnd::ChildExited
+        );
+        assert_eq!(
+            hold_unobserved_start(ms(2_000), ms(5), script(vec![ChildReading::Suspect; 3])).await,
+            UnobservedHoldEnd::ChildExited,
+            "a persistent suspect (zombie, reused pid) ends it"
+        );
+        assert_eq!(
+            hold_unobserved_start(ms(50), ms(5), continuation_child_reader(None)).await,
+            UnobservedHoldEnd::BoundReached,
+            "an unknown child can only wait out the bound"
+        );
+        assert!(CONTINUATION_UNOBSERVED_HOLD_POLL < CONTINUATION_UNOBSERVED_HOLD_BOUND);
+    }
+
+    /// A7: a condition check whose close did not complete while its child may
+    /// run is neither started nor failed — not reported — while one whose child
+    /// is proven dead is reported failed.
+    #[test]
+    fn a_condition_check_that_may_be_running_is_not_reported_failed() {
+        let tm = crate::terminal::TerminalManager::new();
+        let held = settle_stalled_close(&tm, "cc", None, None, stall_evidence(), Some(true));
+        assert!(condition_check_may_be_running(&held));
+        let gone = settle_stalled_close(&tm, "cc", None, None, stall_evidence(), Some(false));
+        assert!(!condition_check_may_be_running(&gone));
+        assert!(condition_check_failure_reason(&gone)
+            .unwrap()
+            .contains("did not complete"));
+    }
+
+    /// S4: output that arrives between the `Stalled` verdict's sample and the
+    /// close means the pane is not quiet — it is NOT closed.
+    #[tokio::test]
+    async fn output_since_the_stalled_verdict_cancels_the_close() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) =
+            known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-444444444444");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "woke");
+        let at_verdict = pane.total_bytes_produced();
+        pane.produce_bytes_for_test(8);
+        match close_stalled_continuation_pane(
+            &tm,
+            "woke",
+            &transcripts,
+            stall_evidence(),
+            Some(at_verdict),
+        )
+        .await
+        {
+            StalledClose::OutputMoved(now) => assert_eq!(now, at_verdict + 8),
+            StalledClose::Settled(s) => panic!("closed a pane that produced output: {:?}", s.start),
+        }
+        assert!(
+            tm.get("woke").is_some(),
+            "never closed while producing output"
+        );
+        pane.set_alive_for_test(false);
+    }
+
+    /// W2 / A3: the stall report the call site sends, built by the one mapping
+    /// it uses: a stall still chattering at the ceiling reports its short
+    /// silence as `silent_secs` and its long wait as `waited_secs` — never a
+    /// 300 s silence it did not have.
+    #[test]
+    fn a_stalled_active_report_never_claims_the_wait_as_silence() {
+        let cwd = tempfile::tempdir().unwrap();
+        let pre = SpawnPreconditions::evaluate(cwd.path().to_str().unwrap(), None, None, "manual");
+        let ev = StalledEvidence {
+            waited: CONTINUATION_STALL_CEILING,
+            quiet_for: std::time::Duration::from_millis(250),
+            pid: Some(7),
+            last_output: None,
+            kind: StallKind::Active,
+            child: None,
+        };
+        let (silent, pid, facts) = terminal_stall_report(&ev, StallCloseOutcome::NotAttempted);
+        assert_eq!(silent, ev.quiet_for);
+        assert_eq!(pid, Some(7));
+        let body =
+            serde_json::to_value(spawn_stalled_body(&pre, silent, pid, Some(facts))).unwrap();
+        assert_eq!(body["silent_secs"], 0, "{body}");
+        assert_eq!(
+            body["waited_secs"],
+            CONTINUATION_STALL_CEILING.as_secs(),
+            "{body}"
+        );
+        assert_eq!(body["stall_kind"], "active");
+        assert_eq!(body["close_outcome"], "not_attempted");
+        assert_eq!(body["pane_closed"], false);
+    }
+
+    /// (a) A stalled attempt's context — taken off the pane before the
+    /// runner's close — is what the retry inherits. Removing that hand-over
+    /// (falling back to the closed pane, which no longer exists) loses it.
+    #[test]
+    fn a_stalled_attempts_context_is_inherited_by_the_retry() {
+        let tm = crate::terminal::TerminalManager::new();
+        let settled = SettledStart {
+            start: ContinuationStart::Stalled(stall_evidence()),
+            ctx: Some(test_ctx()),
+            stalled: Some(stall_evidence()),
+            close: StallCloseOutcome::Closed,
+        };
+        match continuation_attempt_step(settled, 1, &tm, "closed-pane") {
+            AttemptStep::Retry { ctx, detail } => {
+                assert!(
+                    ctx.is_some(),
+                    "the retry inherits the stalled pane's context"
+                );
+                assert!(
+                    detail.starts_with("never started — no transcript"),
+                    "{detail}"
+                );
+            }
+            _ => panic!("a stalled first attempt is retried"),
+        }
+    }
+
+    /// A never-started attempt's context is still parked on its dead pane, and
+    /// the retry takes it back off.
+    #[test]
+    fn a_never_started_attempts_context_is_taken_back_off_its_dead_pane() {
+        let tm = crate::terminal::TerminalManager::new();
+        let pane = live_fixture_pane(&tm, "dead");
+        pane.set_isolated_edit_ctx(test_ctx());
+        pane.set_alive_for_test(false);
+        let settled = SettledStart::plain(ContinuationStart::NeverStarted(NeverStartedEvidence {
+            exit_code: Some(1),
+            lifetime_ms: 73,
+            last_output: None,
+        }));
+        match continuation_attempt_step(settled, 1, &tm, "dead") {
+            AttemptStep::Retry { ctx, .. } => assert!(ctx.is_some()),
+            _ => panic!("a never-started first attempt is retried"),
+        }
+    }
+
+    /// (b) The final stalled attempt is not retried: it posts the
+    /// `never started — no transcript after <waited> (N attempts)` reason and
+    /// hands the held context to the remover rather than dropping it.
+    #[test]
+    fn the_final_stalled_attempt_is_exhausted_and_hands_its_context_to_the_remover() {
+        let tm = crate::terminal::TerminalManager::new();
+        let settled = SettledStart {
+            start: ContinuationStart::Stalled(stall_evidence()),
+            ctx: Some(test_ctx()),
+            stalled: Some(stall_evidence()),
+            close: StallCloseOutcome::Closed,
+        };
+        match continuation_attempt_step(settled, CONTINUATION_START_MAX_ATTEMPTS, &tm, "p") {
+            AttemptStep::Exhausted {
+                reason,
+                exit_code,
+                ctx,
+            } => {
+                assert!(
+                    reason.starts_with(&format!(
+                        "never started — no transcript after 90s ({CONTINUATION_START_MAX_ATTEMPTS} attempts)"
+                    )),
+                    "{reason}"
+                );
+                assert_eq!(exit_code, None);
+                assert!(ctx.is_some(), "the held context goes to the remover");
+                assert!(ContinuationOutcome::SpawnFailed
+                    .matches_recorded(&format!("spawn_failed: {reason}")));
+            }
+            _ => panic!("the final stalled attempt is exhausted"),
+        }
+    }
+
+    /// (c) A condition check whose transcript appeared across the runner's own
+    /// close is reported failed — the runner ended it, so nothing else will
+    /// post the run's report — while one that genuinely started is not.
+    #[test]
+    fn a_condition_check_the_runner_ended_across_its_close_is_reported() {
+        let ended = SettledStart {
+            start: ContinuationStart::Started { pty_alive: false },
+            ctx: None,
+            stalled: Some(stall_evidence()),
+            close: StallCloseOutcome::ClosedStartedAcross,
+        };
+        let reason = condition_check_failure_reason(&ended).expect("reported");
+        assert!(reason.contains("closed by the runner"), "{reason}");
+        let started = SettledStart::plain(ContinuationStart::Started { pty_alive: false });
+        assert_eq!(condition_check_failure_reason(&started), None);
+        let unknown = SettledStart::plain(ContinuationStart::StallCloseUnknown(stall_evidence()));
+        assert!(condition_check_failure_reason(&unknown)
+            .unwrap()
+            .contains("did not complete"));
     }
 
     /// The window must outlast the identity shim's own default resolve wait,

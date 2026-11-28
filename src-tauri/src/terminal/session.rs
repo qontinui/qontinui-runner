@@ -4613,6 +4613,13 @@ impl TerminalSession {
         self.total_bytes_produced.load(Ordering::Relaxed)
     }
 
+    /// Test seam: advance the produced-bytes counter of a PTY-less fixture, as
+    /// the reader thread does for real output.
+    #[cfg(test)]
+    pub(crate) fn produce_bytes_for_test(&self, n: u64) {
+        self.total_bytes_produced.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Monotonic count of mutations to this session's rendered cell grid.
     ///
     /// LOCK-FREE by construction: a single atomic load, no grid lock. The

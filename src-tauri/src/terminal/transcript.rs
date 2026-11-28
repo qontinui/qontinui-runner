@@ -261,6 +261,15 @@ pub(crate) fn claude_config_dirs_from(
 /// that hash is not reproducible from Rust — see [`project_dir`].
 const MAX_PROJECT_DIR_NAME: usize = 200;
 
+/// Whether `project_path`'s `projects/<dir>` name is pure path arithmetic —
+/// i.e. a caller can name where a session's transcript WILL land before it
+/// exists. `false` past [`MAX_PROJECT_DIR_NAME`], where the on-disk name
+/// carries a hash only Claude Code computes, so an absent file there proves
+/// nothing.
+pub(crate) fn project_dir_is_computable(project_path: &str) -> bool {
+    encode_project_path(project_path).len() <= MAX_PROJECT_DIR_NAME
+}
+
 /// Encode a project path (a session's cwd) to the directory name Claude Code
 /// stores its transcripts under: `<config_dir>/projects/<encoded>/`.
 ///

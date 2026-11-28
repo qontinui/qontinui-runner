@@ -236,18 +236,10 @@ fn apply_trust_arm(
 ) -> Result<(), String> {
     match trust {
         TrustArm::Pinned(account) => {
-            if let (Some(pinned), Some(stated)) = (child_pin, account.as_deref()) {
-                if pinned != stated {
-                    return Err(format!(
-                        "terminal trust arm names account {stated} but the PTY is pinned to \
-                         {pinned}; refusing rather than deriving trust for an account the \
-                         child will not read"
-                    ));
-                }
-            }
+            let account = pinned_derivation_account(child_pin, account.as_deref())?;
             let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
                 working_dir,
-                account.as_deref(),
+                account,
                 crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
             );
             match gate.decision.refusal() {
@@ -263,6 +255,180 @@ fn apply_trust_arm(
             Ok(())
         }
     }
+}
+
+/// The account a pinned arm derives trust IN: the account the child will
+/// actually read. Shared by the cwd and the `--add-dir` arms so neither can
+/// derive trust for an account the child will not read.
+///
+/// - The stated account and the PTY's pin disagree → refused outright (see
+///   [`apply_trust_arm`]): the runner's own drift, not a trust verdict.
+/// - The arm states `None` (the ambient default) but the PTY env pins
+///   `CLAUDE_CONFIG_DIR` → the PIN, because that is the config the child reads;
+///   deriving in the ambient default would write trust the child never sees
+///   and leave it facing the dialog.
+/// - Otherwise the stated account (`None` = the ambient default, with no pin
+///   on the PTY either, so the child reads the default too).
+fn pinned_derivation_account<'a>(
+    child_pin: Option<&'a str>,
+    account: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    match (child_pin, account) {
+        (Some(pinned), Some(stated)) if pinned != stated => Err(format!(
+            "terminal trust arm names account {stated} but the PTY is pinned to \
+             {pinned}; refusing rather than deriving trust for an account the \
+             child will not read"
+        )),
+        (pin, None) => Ok(pin),
+        (_, stated) => Ok(stated),
+    }
+}
+
+/// Apply one [`TrustArm`] to an `--add-dir` sibling of the spawn, BEFORE the PTY
+/// exists.
+///
+/// On the pinned arm this is the trust gate's sibling derivation
+/// ([`crate::claude_session::trust_gate::pre_accept_add_dir_sibling_sync`]): the
+/// key the CLI consults for an `--add-dir` directory is its PRIMARY checkout's,
+/// and an interactive `claude` whose account lacks it parks on the "Adding a new
+/// directory … Yes, add it" dialog at startup with nobody to answer. A sibling
+/// whose grant does not land refuses the spawn with the gate's own
+/// `spawn_blocked …` text, exactly as the cwd arm does.
+///
+/// On [`TrustArm::AccountChosenLater`] no account is known, so nothing can be
+/// derived for it; the every-account mint is deliberately NOT extended to
+/// siblings (it writes worktree keys, not the primary key this dialog reads,
+/// and would widen the ambient grant the gate exists to replace). Logged, never
+/// silent.
+fn apply_sibling_trust_arm(
+    sibling: &str,
+    trust: &TrustArm,
+    child_pin: Option<&str>,
+) -> Result<(), String> {
+    match trust {
+        TrustArm::Pinned(account) => {
+            let account = pinned_derivation_account(child_pin, account.as_deref())?;
+            let gate = crate::claude_session::trust_gate::pre_accept_add_dir_sibling_sync(
+                sibling,
+                account,
+                crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
+            );
+            match gate.decision.refusal() {
+                Some(refusal) => Err(refusal),
+                None => Ok(()),
+            }
+        }
+        TrustArm::AccountChosenLater => {
+            info!(
+                sibling = %sibling,
+                "terminal: add-dir sibling trust NOT derived — the account is chosen after \
+                 this point, so there is no account to derive it for; an interactive `claude` \
+                 may raise the add-dir dialog for this directory"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Every `--add-dir` directory a launch argv names, in order, deduplicated.
+///
+/// Both spellings the CLI accepts: the attached `--add-dir=<dir>` form every
+/// runner launch emits
+/// ([`crate::agent_worktree::isolated_edit::claude_add_dir_args`]), and the
+/// variadic `--add-dir <dir>...` form a launch template may carry, whose values
+/// run until the next flag. Parsing stops at the `--` terminator, after which
+/// everything is the prompt.
+fn add_dir_siblings(command: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |dir: &str| {
+        if !dir.is_empty() && !out.iter().any(|d| d == dir) {
+            out.push(dir.to_string());
+        }
+    };
+    let mut in_variadic = false;
+    for arg in command {
+        if arg == "--" {
+            break;
+        }
+        if let Some(dir) = arg.strip_prefix("--add-dir=") {
+            in_variadic = false;
+            push(dir);
+        } else if arg == "--add-dir" {
+            in_variadic = true;
+        } else if arg.starts_with('-') {
+            in_variadic = false;
+        } else if in_variadic {
+            push(arg);
+        }
+    }
+    out
+}
+
+/// Establish Claude workspace trust for everything a spawn's child will read
+/// trust for — the cwd and every `--add-dir` sibling named in `command` —
+/// BEFORE the PTY exists. The one call [`TerminalManager::create`] makes.
+///
+/// Each directory is first put through the scope fence (`scope`, which is
+/// [`workspace_trust_scope`] in production and injected by tests): in scope,
+/// its trust arm runs and a refusal refuses the spawn; out of scope, the skip is
+/// logged — at `info` on the pinned arm, where it is an unattended interactive
+/// `claude` that may raise a dialog nobody answers (coord finding `9089767f`),
+/// at `debug` for an operator shell.
+fn establish_spawn_trust(
+    working_dir: &str,
+    command: Option<&[String]>,
+    trust: &TrustArm,
+    child_pin: Option<&str>,
+    scope: impl Fn(&str) -> Option<&'static str>,
+) -> Result<(), String> {
+    let out_of_scope = |dir: &str, role: &'static str| match trust {
+        TrustArm::Pinned(account) => info!(
+            dir = %dir,
+            role,
+            account = account.as_deref().unwrap_or("<ambient default>"),
+            "terminal: workspace trust NOT pre-accepted — the directory is outside the \
+             workspace root and the runner's looping-agent homes, so the trust gate did \
+             not run; an interactive `claude` here may raise the workspace-trust dialog"
+        ),
+        TrustArm::AccountChosenLater => debug!(
+            dir = %dir,
+            role,
+            "terminal: workspace trust NOT pre-accepted — the directory is outside the \
+             trust scope"
+        ),
+    };
+
+    match scope(working_dir) {
+        Some(scope) => {
+            debug!(
+                working_dir = %working_dir,
+                scope,
+                trust_arm = ?trust,
+                "terminal: workspace trust in scope — applying the trust arm"
+            );
+            apply_trust_arm(working_dir, trust, child_pin)?;
+        }
+        None => out_of_scope(working_dir, "working_dir"),
+    }
+
+    for sibling in command.map(add_dir_siblings).unwrap_or_default() {
+        if sibling == working_dir {
+            continue;
+        }
+        match scope(&sibling) {
+            Some(scope) => {
+                debug!(
+                    sibling = %sibling,
+                    scope,
+                    trust_arm = ?trust,
+                    "terminal: add-dir sibling in trust scope — applying the trust arm"
+                );
+                apply_sibling_trust_arm(&sibling, trust, child_pin)?;
+            }
+            None => out_of_scope(&sibling, "add_dir_sibling"),
+        }
+    }
+    Ok(())
 }
 
 /// Containment test on canonicalized paths, so `..` segments and Windows
@@ -522,40 +688,20 @@ impl TerminalManager {
         // `spawn_blocked …` text, which the lifecycle-posting caller classifies
         // with `trust_gate::is_spawn_blocked_refusal` rather than reporting a
         // child that never existed as `exited`.
-        match workspace_trust_scope(&working_dir) {
-            Some(scope) => {
-                debug!(
-                    working_dir = %working_dir,
-                    scope,
-                    trust_arm = ?trust,
-                    "terminal: workspace trust in scope — applying the trust arm"
-                );
-                apply_trust_arm(
-                    &working_dir,
-                    &trust,
-                    TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
-                )
-                .map_err(SpawnFailure::before_child)?;
-            }
-            // Never silent: a skipped trust write on a backend spawn is an
-            // interactive `claude` that will raise the trust dialog with nobody
-            // to answer it (coord finding `9089767f`), so that arm logs at
-            // `info`. An operator shell anywhere on the box is routine, `debug`.
-            None => match &trust {
-                TrustArm::Pinned(account) => info!(
-                    working_dir = %working_dir,
-                    account = account.as_deref().unwrap_or("<ambient default>"),
-                    "terminal: workspace trust NOT pre-accepted — the directory is outside the \
-                     workspace root and the runner's looping-agent homes, so the trust gate did \
-                     not run; an interactive `claude` here may raise the workspace-trust dialog"
-                ),
-                TrustArm::AccountChosenLater => debug!(
-                    working_dir = %working_dir,
-                    "terminal: workspace trust NOT pre-accepted — the directory is outside the \
-                     trust scope"
-                ),
-            },
-        }
+        //
+        // The cwd is not the only directory the child reads trust for: every
+        // `--add-dir` sibling of a multi-worktree launch raises its own startup
+        // dialog when the account lacks its primary checkout's key, so
+        // [`establish_spawn_trust`] gates the siblings named in `command` too —
+        // one call, covering every surface that passes `--add-dir` in its argv.
+        establish_spawn_trust(
+            &working_dir,
+            command.as_deref(),
+            &trust,
+            TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
+            workspace_trust_scope,
+        )
+        .map_err(SpawnFailure::before_child)?;
 
         let page_id = self.resolve_page_id(
             page_id,
@@ -1518,7 +1664,10 @@ mod tests {
         assert!(v.get("info").is_none(), "{v}");
     }
 
-    use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+    use super::{
+        add_dir_siblings, apply_sibling_trust_arm, apply_trust_arm,
+        command_implies_bypass_permissions, establish_spawn_trust, TerminalManager, TrustArm,
+    };
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
     /// manager. `bind_coord_session` must fire the observer with the
@@ -2040,6 +2189,481 @@ mod tests {
             !crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
             "runner drift is not a trust verdict: {err}"
         );
+    }
+
+    // ---- `--add-dir` sibling trust (plan
+    // `2026-11-27-runner-spawned-continuations-park-on-claude-code-worktree-trust-prompt`
+    // Phase 1). Each test enters through `establish_spawn_trust`, the one call
+    // `TerminalManager::create` makes, with a real primary + `git worktree add`
+    // layout under the isolated ambient workspace root's agent-worktree root.
+
+    /// A multi-worktree launch's layout: the cwd worktree and one sibling
+    /// worktree, each a linked worktree of its own primary checkout, both under
+    /// `<ws>/agent-worktrees/<agent>/`, plus an account dir.
+    struct MultiWorktree {
+        // Field order is drop order: `_restore` must drop while `_amb` still
+        // holds the env lock, so the dial and worktree-root vars are put back
+        // before a concurrent fixture can take the lock and set its own.
+        _restore: crate::test_env::EnvVarRestore,
+        _amb: crate::test_env::IsolatedAmbient,
+        cwd: String,
+        sibling: std::path::PathBuf,
+        sibling_primary: std::path::PathBuf,
+        cwd_primary: std::path::PathBuf,
+        account: String,
+        config_file: std::path::PathBuf,
+    }
+
+    fn multi_worktree(
+        tier: &str,
+        projects: impl FnOnce(&MultiWorktree) -> serde_json::Value,
+    ) -> MultiWorktree {
+        use crate::claude_session::trust_gate::test_fixtures::git;
+        let amb = crate::test_env::isolated_ambient();
+        // `isolated_ambient` holds the env lock; the dial override and the two
+        // worktree-root overrides `agent_worktree_root` honours are captured
+        // and restored under it.
+        let restore = crate::test_env::EnvVarRestore::capture(&[
+            "QONTINUI_TRUST_GATE_TIER",
+            "QONTINUI_WORKTREE_ROOT",
+            "COORD_WORKTREE_ROOT",
+        ]);
+        std::env::remove_var("QONTINUI_WORKTREE_ROOT");
+        std::env::remove_var("COORD_WORKTREE_ROOT");
+        std::env::set_var("QONTINUI_TRUST_GATE_TIER", tier);
+        let ws = crate::workspace_paths::runner_workspace_root()
+            .into_root()
+            .expect("the isolated ambient workspace root");
+        let agent_dir = ws
+            .join("agent-worktrees")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let make = |name: &str| {
+            let primary = ws.join(name);
+            std::fs::create_dir_all(&primary).unwrap();
+            git(&primary, &["init", "-q"]);
+            git(
+                &primary,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "i",
+                ],
+            );
+            let wt = agent_dir.join(name);
+            git(&primary, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+            (
+                std::fs::canonicalize(&primary).unwrap(),
+                std::fs::canonicalize(&wt).unwrap(),
+            )
+        };
+        let (cwd_primary, cwd_wt) = make("runner");
+        let (sibling_primary, sibling) = make("web");
+        let account_dir = amb.dir().join("acct");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let config_file = account_dir.join(crate::claude_session::workspace_trust::CONFIG_FILE);
+        let fx = MultiWorktree {
+            _amb: amb,
+            _restore: restore,
+            cwd: cwd_wt.to_string_lossy().into_owned(),
+            sibling,
+            sibling_primary,
+            cwd_primary,
+            account: account_dir.to_string_lossy().into_owned(),
+            config_file,
+        };
+        let doc = serde_json::json!({ "projects": projects(&fx) });
+        std::fs::write(&fx.config_file, doc.to_string()).unwrap();
+        fx
+    }
+
+    fn key(p: &std::path::Path) -> String {
+        crate::claude_session::workspace_trust::project_key(p).unwrap()
+    }
+
+    fn launch(fx: &MultiWorktree) -> Result<(), String> {
+        let command = argv(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            &format!("--add-dir={}", fx.sibling.display()),
+            "--",
+            "run /implement-plan",
+        ]);
+        establish_spawn_trust(
+            &fx.cwd,
+            Some(&command),
+            &TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+            |_| Some("test-scope"),
+        )
+    }
+
+    /// The defect itself: an account that lacks the sibling's PRIMARY-checkout
+    /// key gets that key written before exec, stamped runner-minted. The cwd
+    /// arm alone mints only the cwd's primary, so removing the sibling arm
+    /// leaves the web primary untrusted and fails this test.
+    #[test]
+    fn a_sibling_primary_key_the_account_lacks_is_written_before_exec() {
+        use crate::claude_session::spawn_preconditions::{trust_verdict_in, TrustVerdict};
+        use crate::claude_session::workspace_trust::is_runner_minted;
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        let sibling_primary_key = key(&fx.sibling_primary);
+        assert_ne!(
+            trust_verdict_in(&fx.config_file, &sibling_primary_key),
+            TrustVerdict::Trusted
+        );
+
+        assert_eq!(launch(&fx), Ok(()));
+
+        assert_eq!(
+            trust_verdict_in(&fx.config_file, &sibling_primary_key),
+            TrustVerdict::Trusted,
+            "the key the CLI consults for the --add-dir sibling must be trusted before exec"
+        );
+        assert!(is_runner_minted(&fx.config_file, &sibling_primary_key));
+        // Only the consulted key: the sibling worktree's own key is not minted.
+        let raw = std::fs::read_to_string(&fx.config_file).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            doc["projects"].get(key(&fx.sibling)).is_none(),
+            "the sibling worktree key is not what the CLI consults: {raw}"
+        );
+    }
+
+    /// A sibling whose `.git` names ANOTHER repo's worktree admin dir is
+    /// refused even at the most permissive dial, the refusal is the gate's
+    /// classifiable `spawn_blocked …` text, and the victim repo is never
+    /// trusted.
+    #[test]
+    fn a_sibling_with_a_forged_gitdir_is_refused_and_blocks_the_spawn() {
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        let (_victim_tmp, victim, _victim_wt) =
+            crate::claude_session::trust_gate::test_fixtures::linked_worktree_fixture(&[]);
+        let admin = std::fs::read_dir(victim.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(
+            fx.sibling.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+
+        let err = launch(&fx).expect_err("a forged sibling link must block the spawn");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(err.contains("add-dir sibling"), "{err}");
+        let raw = std::fs::read_to_string(&fx.config_file).unwrap();
+        assert!(
+            !raw.contains(&key(&victim)),
+            "the victim repo was trusted: {raw}"
+        );
+        assert!(!raw.contains(&key(&fx.sibling_primary)), "{raw}");
+    }
+
+    /// A sibling whose primary is already trusted produces no write — at the
+    /// STRICTEST dial, where an untrusted sibling would be refused, so the
+    /// `Ok` also proves the trusted reading was taken from the primary key.
+    #[test]
+    fn an_already_trusted_sibling_produces_no_write() {
+        let fx = multi_worktree("ask-first", |fx| {
+            serde_json::json!({
+                key(std::path::Path::new(&fx.cwd)): { "hasTrustDialogAccepted": true },
+                key(&fx.cwd_primary): { "hasTrustDialogAccepted": true },
+                key(&fx.sibling_primary): { "hasTrustDialogAccepted": true },
+            })
+        });
+        let before = std::fs::read(&fx.config_file).unwrap();
+        assert_eq!(launch(&fx), Ok(()));
+        assert_eq!(
+            std::fs::read(&fx.config_file).unwrap(),
+            before,
+            "an already-trusted launch must not rewrite the account file"
+        );
+    }
+
+    /// The withholding dial on a PTY: an untrusted sibling is a refusal, not a
+    /// hang, and nothing is minted for it.
+    #[test]
+    fn an_untrusted_sibling_under_a_withholding_dial_blocks_the_spawn() {
+        let fx = multi_worktree("draft-required", |fx| {
+            serde_json::json!({
+                key(std::path::Path::new(&fx.cwd)): { "hasTrustDialogAccepted": true },
+                key(&fx.cwd_primary): { "hasTrustDialogAccepted": true },
+            })
+        });
+        let before = std::fs::read(&fx.config_file).unwrap();
+        let err = launch(&fx).expect_err("an underivable sibling on a PTY is refused");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// [`launch`] with the sibling, the arm and the PTY pin chosen by the test.
+    fn launch_with(
+        fx: &MultiWorktree,
+        sibling: &std::path::Path,
+        arm: TrustArm,
+        child_pin: Option<&str>,
+    ) -> Result<(), String> {
+        let command = argv(&[
+            "claude",
+            &format!("--add-dir={}", sibling.display()),
+            "--",
+            "run /implement-plan",
+        ]);
+        establish_spawn_trust(&fx.cwd, Some(&command), &arm, child_pin, |_| {
+            Some("test-scope")
+        })
+    }
+
+    /// The cwd and its primary already trusted, so only the sibling arm can
+    /// write or refuse.
+    fn cwd_trusted(fx: &MultiWorktree) -> serde_json::Value {
+        serde_json::json!({
+            key(std::path::Path::new(&fx.cwd)): { "hasTrustDialogAccepted": true },
+            key(&fx.cwd_primary): { "hasTrustDialogAccepted": true },
+        })
+    }
+
+    /// A4: a pinned arm that states no account (`None`, the ambient default)
+    /// while the PTY env pins `CLAUDE_CONFIG_DIR` derives in the PIN — the
+    /// config the child reads — not in the ambient default.
+    #[test]
+    fn a_pinned_arm_with_no_stated_account_derives_in_the_ptys_pin() {
+        use crate::claude_session::spawn_preconditions::{trust_verdict_in, TrustVerdict};
+        let fx = multi_worktree("proceed", cwd_trusted);
+        assert_eq!(
+            launch_with(&fx, &fx.sibling, TrustArm::Pinned(None), Some(&fx.account)),
+            Ok(())
+        );
+        assert_eq!(
+            trust_verdict_in(&fx.config_file, &key(&fx.sibling_primary)),
+            TrustVerdict::Trusted,
+            "the sibling's key must land in the account the child reads"
+        );
+    }
+
+    /// The cwd half of A4: with the cwd UNtrusted everywhere, a pinned arm that
+    /// states no account while the PTY pins `CLAUDE_CONFIG_DIR` writes the
+    /// cwd's primary-checkout key into the PIN's config file — and leaves the
+    /// ambient default (`$HOME/.claude.json`) untouched. Deriving in the
+    /// ambient default instead would trust a file the child never reads.
+    #[test]
+    fn a_pinned_arm_with_no_stated_account_derives_the_cwd_key_in_the_ptys_pin() {
+        use crate::claude_session::spawn_preconditions::{trust_verdict_in, TrustVerdict};
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        let ambient_file = fx
+            ._amb
+            .dir()
+            .join(crate::claude_session::workspace_trust::CONFIG_FILE);
+        assert_ne!(ambient_file, fx.config_file);
+        std::fs::write(
+            &ambient_file,
+            serde_json::json!({ "projects": {} }).to_string(),
+        )
+        .unwrap();
+        let ambient_before = std::fs::read(&ambient_file).unwrap();
+        let cwd_primary_key = key(&fx.cwd_primary);
+        assert_ne!(
+            trust_verdict_in(&fx.config_file, &cwd_primary_key),
+            TrustVerdict::Trusted
+        );
+
+        assert_eq!(
+            establish_spawn_trust(
+                &fx.cwd,
+                None,
+                &TrustArm::Pinned(None),
+                Some(&fx.account),
+                |_| Some("test-scope"),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            trust_verdict_in(&fx.config_file, &cwd_primary_key),
+            TrustVerdict::Trusted,
+            "the cwd's primary key must land in the account the child reads"
+        );
+        assert_eq!(
+            std::fs::read(&ambient_file).unwrap(),
+            ambient_before,
+            "the ambient default account must not be written when the PTY is pinned"
+        );
+    }
+
+    /// A2: a sibling that IS a primary checkout, named directly, goes through
+    /// the same mint guards as one reached through a linked worktree. It is
+    /// not an allocated worktree, so conjunct 1 fails and — even at the most
+    /// permissive dial — nothing is minted and the PTY spawn is refused.
+    #[test]
+    fn a_primary_checkout_named_directly_as_a_sibling_is_not_minted_on_weaker_terms() {
+        let fx = multi_worktree("proceed", cwd_trusted);
+        let before = std::fs::read(&fx.config_file).unwrap();
+        let err = launch_with(
+            &fx,
+            &fx.sibling_primary,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        )
+        .expect_err("an unallocated primary checkout as a sibling is refused");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-primary-checkout-mint-not-permitted"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// A primary checkout named directly whose own key is already trusted
+    /// passes at the strictest dial with no write: its OWN key is the one read.
+    #[test]
+    fn a_trusted_primary_checkout_named_directly_as_a_sibling_produces_no_write() {
+        let fx = multi_worktree("ask-first", |fx| {
+            let mut p = cwd_trusted(fx);
+            p[key(&fx.sibling_primary)] = serde_json::json!({ "hasTrustDialogAccepted": true });
+            p
+        });
+        let before = std::fs::read(&fx.config_file).unwrap();
+        assert_eq!(
+            launch_with(
+                &fx,
+                &fx.sibling_primary,
+                TrustArm::Pinned(Some(fx.account.clone())),
+                Some(&fx.account),
+            ),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&fx.config_file).unwrap(), before);
+    }
+
+    /// `TrustOutcome::Skipped`: the account has no config file yet (the CLI
+    /// creates it at first launch, and the trust module will not half-create
+    /// it), so the permitted mint does not land and the PTY spawn is refused.
+    #[test]
+    fn a_sibling_mint_the_trust_module_skips_blocks_the_spawn() {
+        let fx = multi_worktree("proceed", |_| serde_json::json!({}));
+        std::fs::remove_file(&fx.config_file).unwrap();
+        let err = launch_with(
+            &fx,
+            &fx.sibling,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        )
+        .expect_err("a skipped write did not land");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-trust-write-did-not-land") && err.contains("skipped"),
+            "{err}"
+        );
+    }
+
+    /// `TrustOutcome::Failed`: the account dir and file are read-only, so the
+    /// atomic rewrite fails and the PTY spawn is refused. Unix-only (mode
+    /// bits), and skipped where the process can write through them (root).
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_mint_whose_write_fails_blocks_the_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = multi_worktree("proceed", cwd_trusted);
+        let dir = std::path::Path::new(&fx.account).to_path_buf();
+        let set = |mode: u32| {
+            std::fs::set_permissions(
+                &fx.config_file,
+                std::fs::Permissions::from_mode(mode & 0o666),
+            )
+            .unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set(0o555);
+        if std::fs::write(dir.join("probe"), b"x").is_ok() {
+            set(0o755);
+            eprintln!("skipped: this process writes through read-only mode bits");
+            return;
+        }
+        let result = launch_with(
+            &fx,
+            &fx.sibling,
+            TrustArm::Pinned(Some(fx.account.clone())),
+            Some(&fx.account),
+        );
+        set(0o755);
+        let err = result.expect_err("a failed write did not land");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        assert!(
+            err.contains("add-dir-sibling-trust-write-did-not-land") && err.contains("FAILED"),
+            "{err}"
+        );
+    }
+
+    /// The sibling arm refuses a PTY pin that disagrees with the stated
+    /// account itself — runner drift, not a trust verdict — rather than
+    /// deriving trust for an account the child will not read.
+    #[test]
+    fn the_sibling_arm_refuses_a_pin_that_disagrees_with_the_stated_account() {
+        let target = tempfile::tempdir().unwrap();
+        let err = apply_sibling_trust_arm(
+            &target.path().to_string_lossy(),
+            &TrustArm::Pinned(Some("C:/claude/.claude-a".into())),
+            Some("C:/claude/.claude-b"),
+        )
+        .expect_err("a disagreeing pin is refused");
+        assert!(
+            err.contains(".claude-a") && err.contains(".claude-b"),
+            "{err}"
+        );
+        assert!(
+            !crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "runner drift is not a trust verdict: {err}"
+        );
+    }
+
+    #[test]
+    fn add_dir_siblings_reads_both_spellings_and_stops_at_the_terminator() {
+        assert_eq!(
+            add_dir_siblings(&argv(&[
+                "claude",
+                "--add-dir=/wt/a",
+                "--model",
+                "sonnet",
+                "--add-dir",
+                "/wt/b",
+                "/wt/c",
+                "--settings",
+                "s.json",
+                "--add-dir=/wt/a",
+                "--",
+                "--add-dir=/prompt/text",
+            ])),
+            vec![
+                "/wt/a".to_string(),
+                "/wt/b".to_string(),
+                "/wt/c".to_string()
+            ]
+        );
+        assert!(add_dir_siblings(&argv(&["claude", "--", "do it"])).is_empty());
     }
 
     // The every-account arm is deliberately NOT exercised here: it writes into
