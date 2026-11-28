@@ -15,14 +15,16 @@ use crate::settings::{
     OpenAiCompatibleSettings, PiCliSettings,
 };
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
+pub use crate::ai_provider::usage_probe::{
+    probe_account_usage, USAGE_PROBE_CONFIRM_MAX_AGE, USAGE_PROBE_POLL_MAX_AGE,
+};
+use std::time::Duration;
 
 // ============================================================================
 // Keychain Operations for API Keys
@@ -1099,13 +1101,26 @@ pub struct AccountUsageInfo {
     pub period_elapsed_fraction: Option<f64>,
     /// Days remaining until the billing period resets.
     pub period_remaining_days: Option<f64>,
-    /// Session-window (5-hour) utilization 0.0–1.0. Only populated when the
-    /// stats came from the OAuth usage endpoint (`source == "oauth_usage"`).
+    /// Session-window (5-hour) utilization 0.0–1.0, from the OAuth usage
+    /// endpoint or the header probe's `-unified-5h-utilization`. `None` when
+    /// no figure was read; [`Self::session_window`] says whether that is
+    /// because the account HAS no such window here or because it went unread.
     #[serde(default)]
     pub session_utilization: Option<f64>,
-    /// Unix seconds when the 5-hour session window resets.
+    /// Unix seconds when the 5-hour session window resets (the endpoint's
+    /// `five_hour.resets_at`, or the header probe's `-unified-5h-reset`).
     #[serde(default)]
     pub session_resets_at: Option<u64>,
+    /// Whether this reading reports a five-hour session window, has positive
+    /// evidence of none, or did not read it
+    /// ([`crate::ai_provider::usage_probe::SessionWindow`]). A deserialized
+    /// row that carries none reads `unread`.
+    #[serde(default)]
+    pub session_window: crate::ai_provider::usage_probe::SessionWindow,
+    /// The header probe's `-unified-representative-claim` (`five_hour`,
+    /// `seven_day`, …), passed through for diagnosis. No decision reads it.
+    #[serde(default)]
+    pub representative_claim: Option<String>,
     /// Per-model scoped weekly limits (e.g. the Fable-only cap).
     #[serde(default)]
     pub model_limits: Vec<ModelLimitInfo>,
@@ -1119,6 +1134,14 @@ pub struct AccountUsageInfo {
     /// was readable, which is UNKNOWN and never equal to another `None`.
     #[serde(default)]
     pub account_hash: Option<String>,
+    /// What the OAuth usage endpoint did for this probe: which token asked,
+    /// whether it answered, was refused its scope, or is cooling and until
+    /// when (`ai_provider::oauth_usage_gate`). Its own field, never `error`:
+    /// [`probe_result_exhausted`] reads `error` as "this account will not
+    /// serve a request", and an endpoint refusal says nothing of the kind.
+    /// `None` only on a row built outside the probe.
+    #[serde(default)]
+    pub usage_endpoint: Option<crate::ai_provider::oauth_usage_gate::UsageEndpointInfo>,
 }
 
 /// One per-model scoped weekly limit, mirrored to the frontend.
@@ -1130,119 +1153,13 @@ pub struct ModelLimitInfo {
     pub resets_at: Option<u64>,
 }
 
-/// Compute expected usage fields from the reset timestamp.
-///
-/// The Anthropic 7-day window resets at `resets_at`. We compute how far
-/// through the current 7-day period we are and derive expected linear usage.
-fn compute_expected_usage(
-    utilization: f64,
-    resets_at: Option<u64>,
-) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    let Some(reset_ts) = resets_at else {
-        return (None, None, None, None);
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if now == 0 || reset_ts <= now {
-        // Period already expired or clock issue
-        return (None, None, None, None);
-    }
-    const PERIOD_SECS: f64 = 7.0 * 24.0 * 3600.0; // 7 days in seconds
-    let remaining_secs = (reset_ts - now) as f64;
-    let elapsed_secs = PERIOD_SECS - remaining_secs;
-    // Clamp: if elapsed_secs < 0 the period just started fresh
-    let elapsed_secs = elapsed_secs.max(0.0);
-    let elapsed_fraction = (elapsed_secs / PERIOD_SECS).clamp(0.0, 1.0);
-    let remaining_days = remaining_secs / 86400.0;
-    let expected = elapsed_fraction; // linear expectation
-    let delta = utilization - expected;
-    (
-        Some(expected),
-        Some(delta),
-        Some(elapsed_fraction),
-        Some(remaining_days),
-    )
-}
-
-/// Read the OAuth token a Claude config directory authenticates with: its
-/// long-lived `claude setup-token` token (`settings.json`
-/// `env.CLAUDE_CODE_OAUTH_TOKEN`) when it has one — that is what a `claude`
-/// child under this dir uses, since Claude Code applies the settings `env`
-/// block — else the access token in its `.credentials.json`.
-pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
-    if let Some(token) =
-        qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(config_dir))
-    {
-        return Ok(token);
-    }
-    let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
-    let content = std::fs::read_to_string(&creds_path).map_err(|e| {
-        String::from(AppError::IoError(std::io::Error::new(
-            e.kind(),
-            format!("Cannot read {}: {}", creds_path.display(), e),
-        )))
-    })?;
-    let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        String::from(AppError::ParseError(format!(
-            "Invalid credentials JSON: {}",
-            e
-        )))
-    })?;
-    json["claudeAiOauth"]["accessToken"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "No accessToken in credentials".to_string())
-}
-
-/// Whether the OAuth credentials at `creds_path` carry an `expiresAt` that is
-/// already in the past. Returns `false` on any read/parse failure or when the
-/// field is absent — callers fall back to the existing error-surfacing path.
-pub(crate) fn is_oauth_token_expired(creds_path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(creds_path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    let expires_at_ms = json["claudeAiOauth"]["expiresAt"].as_i64().unwrap_or(0);
-    if expires_at_ms <= 0 {
-        return false;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    now_ms >= expires_at_ms
-}
-
-/// How long a probe result — success OR failure — is reused before the
-/// account is asked again.
-///
-/// Sized to swallow the burst: the four independent callers
-/// (`check_accounts_usage`, `/analytics/account-usage`, the 10-minute
-/// snapshot timer, `account_migration`'s confirmation) no longer each cost a
-/// request, and a 429'd account is not immediately re-probed into another
-/// 429. A minute is well inside the resolution of the weekly/5-hour windows
-/// these numbers describe, so nothing downstream reads a materially staler
-/// figure than before.
-const USAGE_PROBE_TTL: Duration = Duration::from_secs(60);
-
-/// Shared single-flight + TTL cache in front of the live probe. Keyed by
-/// `config_dir`, which is exactly the per-account identity the probe and the
-/// selection snapshot already use.
-static USAGE_PROBE_CACHE: Lazy<
-    crate::commands::usage_probe_cache::CoalescingCache<AccountUsageInfo>,
-> = Lazy::new(|| crate::commands::usage_probe_cache::CoalescingCache::new(USAGE_PROBE_TTL));
-
 /// An account's label: the basename of its config dir. A dir that names no
 /// final component lexically (`…/..`, a trailing `.`) is resolved on disk
 /// first. One that still has none (a filesystem root, or a path that does not
 /// exist) keeps its full path, which serves local displays only: the coord
 /// report sends no row whose label is not a bare name
 /// ([`usage_twin_report::wire_label`]).
-fn account_label(config_dir: &str) -> String {
+pub(crate) fn account_label(config_dir: &str) -> String {
     let path = std::path::Path::new(config_dir);
     if let Some(name) = path.file_name() {
         return name.to_string_lossy().into_owned();
@@ -1311,256 +1228,6 @@ pub(crate) fn account_hash_for(config_dir: &str, home: Option<&std::path::Path>)
     Some(hex::encode(Sha256::digest(uuid.as_bytes())))
 }
 
-/// Probe a single account for its weekly rate limit utilization.
-///
-/// Reads through a shared single-flight + TTL cache
-/// ([`USAGE_PROBE_CACHE`]): concurrent callers for the same account await ONE
-/// upstream request, and a result is reused for [`USAGE_PROBE_TTL`].
-///
-/// This is not an optimization. The probe has four independent callers that
-/// each fanned out one request per configured account with no coalescing and
-/// no TTL — measured at 25 usage checks per 5-minute tick and **18,981 HTTP
-/// 429s per day** in the dev logs. Because the probe consumes the same
-/// per-account quota the CLI does, that stampede both competed with real work
-/// and then reported the 429s it earned as account exhaustion.
-///
-/// See [`crate::commands::usage_probe_cache`] for the mechanism.
-pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
-    // Subscription accounts are off while a model gateway is declared, and a
-    // subscription token must not be spent or sent on their behalf
-    // (`crate::model_gateway`). Answered before the cache so no stale sample
-    // outlives the switch.
-    if crate::model_gateway::gateway_declared() {
-        let label = account_label(&config_dir);
-        let account_hash = account_hash_for(&config_dir, dirs::home_dir().as_deref());
-        return AccountUsageInfo {
-            config_dir,
-            label,
-            error: Some(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string()),
-            account_hash,
-            ..Default::default()
-        };
-    }
-    let key = config_dir.clone();
-    USAGE_PROBE_CACHE
-        .get_or_fetch(&key, move || async move {
-            // Identity is read here, after the probe, so every return path of
-            // the probe (token error, probe error, success) carries it: an
-            // errored row is exactly the one a consumer must collapse onto its
-            // healthy twin on another device.
-            let hash_dir = config_dir.clone();
-            let mut info = probe_account_usage_uncached(config_dir).await;
-            info.account_hash = account_hash_for(&hash_dir, dirs::home_dir().as_deref());
-            info
-        })
-        .await
-}
-
-/// The live probe. Makes a minimal API call (1 token, cheapest model) and
-/// reads the `anthropic-ratelimit-unified-7d-utilization` response header,
-/// which always contains the exact weekly usage fraction regardless of
-/// threshold.
-///
-/// Call [`probe_account_usage`] instead — going straight to this bypasses the
-/// coalescing that keeps the runner off Anthropic's rate limiter.
-async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
-    let label = account_label(&config_dir);
-
-    // Pre-flight: if the stored OAuth token is already expired, attempt a
-    // silent refresh BEFORE issuing the probe. Mirrors the warm-path discipline
-    // at `claude_api_warm.rs:174-188`. Refresh failure is non-fatal — we still
-    // try the probe with whatever token we have so the caller sees a real auth
-    // error rather than a swallowed "couldn't refresh."
-    //
-    // Skipped when the dir holds a long-lived `claude setup-token` token: that
-    // is the token `read_oauth_token` returns and the probe sends, so
-    // refreshing a stale `.credentials.json` beside it would be a token-endpoint
-    // round-trip (and a refresh-token rotation) for a credential nothing uses.
-    let creds_path = std::path::PathBuf::from(&config_dir).join(".credentials.json");
-    let has_long_lived_token =
-        qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(&config_dir))
-            .is_some();
-    if !has_long_lived_token && is_oauth_token_expired(&creds_path) {
-        // refresh_credentials_blocking uses reqwest::blocking::Client internally.
-        // Calling it directly from async context panics ("Cannot drop a runtime
-        // in a context where blocking is not allowed"), so offload to a blocking
-        // thread. Refresh failure is non-fatal — we still probe with whatever
-        // token we have.
-        let creds_for_refresh = creds_path.clone();
-        let _ = spawn_blocking_tracked(move || {
-            crate::ai_provider::oauth_refresh::refresh_credentials_blocking(&creds_for_refresh)
-        })
-        .await;
-    }
-
-    let token = match read_oauth_token(&config_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            return AccountUsageInfo {
-                config_dir,
-                label,
-                utilization: 1.0,
-                error: Some(e),
-                ..Default::default()
-            };
-        }
-    };
-
-    // Preferred source: the OAuth usage endpoint — zero token cost, exact
-    // session-window (5h) + weekly utilization and reset times (the same
-    // numbers `/usage` shows). Subscription OAuth tokens only; API keys have
-    // no usage windows, so they skip straight to the header probe below.
-    if token.starts_with("sk-ant-oat") {
-        match crate::ai_provider::oauth_usage::fetch(&token).await {
-            Ok(snap) => {
-                let weekly = snap.seven_day.clone();
-                let session = snap.five_hour.clone();
-                let utilization_7d = weekly.as_ref().map(|w| w.utilization).unwrap_or(0.0);
-                let resets_at_7d = weekly.as_ref().and_then(|w| w.resets_at);
-                let (expected, delta, elapsed_frac, remaining_days) =
-                    compute_expected_usage(utilization_7d, resets_at_7d);
-                info!(
-                    "Account '{}' (oauth_usage): 7d={:.0}% 5h={:.0}%",
-                    label,
-                    utilization_7d * 100.0,
-                    session
-                        .as_ref()
-                        .map(|s| s.utilization * 100.0)
-                        .unwrap_or(0.0),
-                );
-                return AccountUsageInfo {
-                    config_dir,
-                    label,
-                    utilization: utilization_7d,
-                    rate_limit_type: Some("seven_day".to_string()),
-                    resets_at: resets_at_7d,
-                    status: snap.blocking_severity.then(|| "blocked".to_string()),
-                    error: None,
-                    expected_utilization: expected,
-                    usage_delta: delta,
-                    period_elapsed_fraction: elapsed_frac,
-                    period_remaining_days: remaining_days,
-                    session_utilization: session.as_ref().map(|s| s.utilization),
-                    session_resets_at: session.as_ref().and_then(|s| s.resets_at),
-                    model_limits: snap
-                        .model_limits
-                        .into_iter()
-                        .map(|m| ModelLimitInfo {
-                            model: m.model,
-                            utilization: m.utilization,
-                            resets_at: m.resets_at,
-                        })
-                        .collect(),
-                    source: Some("oauth_usage".to_string()),
-                    // Filled by `probe_account_usage`'s cached closure.
-                    account_hash: None,
-                };
-            }
-            Err(e) => {
-                info!(
-                    "Account '{}': oauth usage endpoint unavailable ({e}) — falling back to header probe",
-                    label
-                );
-            }
-        }
-    }
-
-    // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible.
-    // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
-    // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
-    // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
-    let client = reqwest::Client::new();
-    // Not a coord write: Anthropic's API, authenticated by the operator's own
-    // OAuth/API credential via `anthropic_auth::apply_async`.
-    // Always the vendor route: this measures a subscription account's own quota,
-    // and `probe_account_usage` never reaches here while a gateway is declared.
-    let request = crate::model_gateway::ModelCall::Vendor {
-        token: token.to_string(),
-    }
-    .post_async(&client, crate::model_gateway::MESSAGES_PATH)
-    .header("anthropic-version", "2023-06-01")
-    .header("content-type", "application/json")
-    .json(&serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}]
-    }));
-    let response = request.send().await;
-
-    match response {
-        Ok(resp) => {
-            let headers = resp.headers();
-
-            // Parse weekly (7-day) utilization from response headers
-            let utilization_7d = headers
-                .get("anthropic-ratelimit-unified-7d-utilization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-
-            let status_7d = headers
-                .get("anthropic-ratelimit-unified-7d-status")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let resets_at_7d = headers
-                .get("anthropic-ratelimit-unified-7d-reset")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-
-            // Also grab 5-hour utilization for context
-            let utilization_5h = headers
-                .get("anthropic-ratelimit-unified-5h-utilization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<f64>().ok());
-
-            info!(
-                "Account '{}': 7d={:.0}% 5h={:.0}% status={:?}",
-                label,
-                utilization_7d * 100.0,
-                utilization_5h.unwrap_or(0.0) * 100.0,
-                status_7d
-            );
-
-            let error = if resp.status().is_success() {
-                None
-            } else {
-                let status_code = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                Some(format!("API error ({}): {}", status_code, body))
-            };
-
-            let (expected, delta, elapsed_frac, remaining_days) =
-                compute_expected_usage(utilization_7d, resets_at_7d);
-
-            AccountUsageInfo {
-                config_dir,
-                label,
-                utilization: utilization_7d,
-                rate_limit_type: Some("seven_day".to_string()),
-                resets_at: resets_at_7d,
-                status: status_7d,
-                error,
-                expected_utilization: expected,
-                usage_delta: delta,
-                period_elapsed_fraction: elapsed_frac,
-                period_remaining_days: remaining_days,
-                session_utilization: utilization_5h,
-                source: Some("probe".to_string()),
-                ..Default::default()
-            }
-        }
-        Err(e) => AccountUsageInfo {
-            config_dir,
-            label,
-            utilization: 1.0,
-            error: Some(format!("Network error: {}", e)),
-            source: Some("probe".to_string()),
-            ..Default::default()
-        },
-    }
-}
-
 /// Check usage for all configured Claude accounts.
 ///
 /// Probes each account by making a minimal API call (Haiku, 1 token) and
@@ -1570,10 +1237,11 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
 pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandResponse, String> {
     info!("Checking usage for {} Claude accounts", config_dirs.len());
 
-    // Probe all accounts concurrently
+    // Probe all accounts concurrently. The Terminal page polls this every 5
+    // minutes and the Settings button sits beside it: a poller's max age.
     let futures: Vec<_> = config_dirs
         .into_iter()
-        .map(|dir| async move { probe_account_usage(dir).await })
+        .map(|dir| async move { probe_account_usage(dir, USAGE_PROBE_POLL_MAX_AGE).await })
         .collect();
 
     let results = futures::future::join_all(futures).await;
@@ -1687,10 +1355,25 @@ pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
 /// Which of the two refresh entry points is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageRefreshCaller {
-    /// Startup and `account_migration`: feeds the account picker.
+    /// Startup, `account_migration`'s roster probe and
+    /// `limit_hit::cool_until_reset`: feeds the account picker, and confirms a
+    /// limit that was just hit.
     SelectionSnapshot,
     /// The 10-minute timer: the fleet report to coord.
     FleetReport,
+}
+
+impl UsageRefreshCaller {
+    /// How old a successful probe result this caller accepts (plan
+    /// `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+    /// D7): a fresh reading is the point of the selection snapshot, while the
+    /// fleet report is a poller.
+    fn max_age(self) -> Duration {
+        match self {
+            UsageRefreshCaller::SelectionSnapshot => USAGE_PROBE_CONFIRM_MAX_AGE,
+            UsageRefreshCaller::FleetReport => USAGE_PROBE_POLL_MAX_AGE,
+        }
+    }
 }
 
 /// What one refresh does, decided from how many Claude config dirs the runner
@@ -1889,9 +1572,10 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
             .map(|a| a.config_dir)
             .collect()
     };
+    let max_age = caller.max_age();
     let futures: Vec<_> = config_dirs
         .into_iter()
-        .map(|dir| async move { probe_account_usage(dir).await })
+        .map(|dir| async move { probe_account_usage(dir, max_age).await })
         .collect();
     let results = futures::future::join_all(futures).await;
     if plan.record_snapshot {
@@ -1947,6 +1631,12 @@ mod usage_twin_report {
         weekly_resets_at: Option<u64>,
         session_utilization: Option<f64>,
         session_resets_at: Option<u64>,
+        /// `reported` | `absent` | `unread`
+        /// ([`crate::ai_provider::usage_probe::SessionWindow`]). Coord's
+        /// ingest ignores it until Phase 4 of plan
+        /// `2026-11-26-runner-usage-source-is-dark-so-the-launch-budget-never-reads-a-session-figure`
+        /// stores it; a runner that sends none reads `unread` there.
+        session_window: crate::ai_provider::usage_probe::SessionWindow,
         model_limits: &'a [super::ModelLimitInfo],
         exhausted: bool,
         source: Option<&'a str>,
@@ -2087,6 +1777,7 @@ mod usage_twin_report {
                     weekly_resets_at: r.resets_at,
                     session_utilization: r.session_utilization,
                     session_resets_at: r.session_resets_at,
+                    session_window: r.session_window,
                     model_limits: &r.model_limits,
                     exhausted: super::probe_result_exhausted(r),
                     source: r.source.as_deref(),
@@ -2406,6 +2097,7 @@ mod usage_twin_report {
                     weekly_resets_at: Some(1_700_000_000),
                     session_utilization: Some(0.5),
                     session_resets_at: None,
+                    session_window: crate::ai_provider::usage_probe::SessionWindow::Absent,
                     model_limits: &limits,
                     exhausted: false,
                     source: Some("oauth_usage"),
@@ -2438,6 +2130,9 @@ mod usage_twin_report {
             );
             // coord's `WireAccount::account_hash` reads exactly this key.
             assert_eq!(acct["account_hash"], serde_json::json!(HASH));
+            // Phase 4 of plan `2026-11-26-runner-usage-source-is-dark-…` reads
+            // exactly this key and these three spellings.
+            assert_eq!(acct["session_window"], serde_json::json!("absent"));
         }
 
         /// An expired credential against coord's uniform
@@ -2538,6 +2233,7 @@ mod usage_twin_report {
                     weekly_resets_at: None,
                     session_utilization: None,
                     session_resets_at: None,
+                    session_window: crate::ai_provider::usage_probe::SessionWindow::Absent,
                     model_limits: &limits,
                     exhausted: false,
                     source: None,
@@ -3348,10 +3044,8 @@ mod usage_report_scope_tests {
     // `subject_isolation_harness` cannot write on Windows either. Their
     // helpers are dead code there, not wrong.
     #![cfg_attr(windows, allow(dead_code, unused_imports))]
-    use super::{
-        refresh_account_usage_snapshot, refresh_fleet_usage_report, AccountUsageInfo,
-        USAGE_PROBE_CACHE,
-    };
+    use super::{refresh_account_usage_snapshot, refresh_fleet_usage_report, AccountUsageInfo};
+    use crate::ai_provider::usage_probe::USAGE_PROBE_CACHE;
     use crate::settings::AccountSelectionMode;
     use crate::test_env::{EnvVarRestore, IsolatedAmbient};
     use std::sync::{Arc, Mutex};
@@ -3520,7 +3214,9 @@ mod usage_report_scope_tests {
             ..Default::default()
         };
         USAGE_PROBE_CACHE
-            .get_or_fetch(&dir, move || async move { reading })
+            .get_or_fetch(&dir, super::USAGE_PROBE_POLL_MAX_AGE, move || async move {
+                reading
+            })
             .await;
         dir
     }
@@ -3554,6 +3250,21 @@ mod usage_report_scope_tests {
                 assert_eq!(plan_usage_refresh(1, c, lone), plan(false, false, false));
                 assert_eq!(plan_usage_refresh(2, c, lone), plan(true, false, true));
             }
+        }
+
+        /// D7 through the refresh entry points: the selection snapshot
+        /// (startup, migration's roster probe, `cool_until_reset`) wants a
+        /// fresh reading, the fleet report is a poller.
+        #[test]
+        fn each_refresh_caller_passes_its_max_age() {
+            assert_eq!(
+                UsageRefreshCaller::SelectionSnapshot.max_age(),
+                std::time::Duration::from_secs(60)
+            );
+            assert_eq!(
+                UsageRefreshCaller::FleetReport.max_age(),
+                std::time::Duration::from_secs(270)
+            );
         }
 
         /// The fleet report covers a runner with fewer than two accounts by

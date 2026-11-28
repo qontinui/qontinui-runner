@@ -32,12 +32,19 @@ fn mark_current_account_rate_limited(headers: &reqwest::header::HeaderMap) {
     let Some(dir) = super::config::get_resolved_config_dir() else {
         return;
     };
-    let secs = headers
+    let secs = retry_after_secs(headers).unwrap_or(DEFAULT_RETRY_AFTER_SECS);
+    super::config::mark_account_rate_limited_with_duration(&dir, Duration::from_secs(secs));
+}
+
+/// A response's `Retry-After`, as whole seconds. `None` when the header is
+/// absent or is not a plain integer (the HTTP-date form is not read). Shared
+/// with the OAuth usage endpoint's cooldown (`oauth_usage`), so both read the
+/// server's hint the same way.
+pub(super) fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_RETRY_AFTER_SECS);
-    super::config::mark_account_rate_limited_with_duration(&dir, Duration::from_secs(secs));
 }
 
 /// Run a prompt via Claude API (direct HTTP calls)

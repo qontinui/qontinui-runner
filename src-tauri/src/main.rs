@@ -6946,8 +6946,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `pick_best_account`. Its account half is served from the
                 // probe cache the startup refresh just filled.
                 tauri::async_runtime::spawn(async {
-                    let mut tick =
-                        tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
+                    let mut tick = tokio::time::interval(
+                        ai_provider::usage_probe::FLEET_USAGE_REPORT_INTERVAL,
+                    );
                     loop {
                         tick.tick().await;
                         commands::ai_settings::refresh_fleet_usage_report().await;

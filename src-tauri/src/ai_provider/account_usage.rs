@@ -59,7 +59,7 @@
 //!    cooldown** (closest to expiry).
 //!
 //! The usage signal comes from a cached snapshot, never an inline probe: the
-//! probe endpoint (`commands::ai_settings::probe_account_usage`) self-rate-
+//! probe endpoint (`ai_provider::usage_probe::probe_account_usage`) self-rate-
 //! limits, so probing on the hot path would give the worst signal exactly
 //! when it matters most. The snapshot is refreshed off the hot path — at
 //! startup and periodically (see `main.rs`), and opportunistically whenever

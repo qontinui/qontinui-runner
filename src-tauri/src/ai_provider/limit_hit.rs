@@ -583,6 +583,39 @@ mod tests {
         assert_eq!(c.until, reset);
     }
 
+    /// A header-probe row whose 5-hour window is full cools until the
+    /// window's OWN reset, parsed from `-unified-5h-reset`. Before that header
+    /// was read, such a row carried no reset and cooled on the banner or the
+    /// one-hour floor.
+    #[test]
+    fn a_header_probe_row_with_a_full_five_hour_window_cools_until_its_parsed_reset() {
+        let reset = utc(2026, 11, 13, 20, 0);
+        let reset_secs = reset.timestamp().to_string();
+        let row = crate::ai_provider::usage_probe::probe_row_from_headers(
+            "/a",
+            &[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                (
+                    "anthropic-ratelimit-unified-representative-claim",
+                    "five_hour",
+                ),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+                ("anthropic-ratelimit-unified-7d-reset", "1795392000"),
+                ("anthropic-ratelimit-unified-5h-utilization", "0.995"),
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", reset_secs.as_str()),
+            ],
+        );
+        assert_eq!(row.source.as_deref(), Some("probe"));
+        assert_eq!(
+            exhausted_window_reset(&row, now()),
+            Some((reset, ResetSource::FiveHourProbe))
+        );
+        let c = cooling_for("/a", &hit(None), &[row], now()).expect("cools");
+        assert_eq!(c.source, ResetSource::FiveHourProbe);
+        assert_eq!(c.until, reset);
+    }
+
     #[test]
     fn no_exhausted_window_falls_to_the_banner_then_the_floor() {
         let probe = vec![info("/a", 0.2, None, Some(0.1), None)];

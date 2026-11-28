@@ -22,7 +22,7 @@ static ACCOUNT_COOLDOWNS: Mutex<Option<HashMap<String, (Instant, Duration)>>> = 
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
 /// One account's weekly-usage sample, captured by the usage probe
-/// (`commands::ai_settings::probe_account_usage`) and ranked by
+/// (`ai_provider::usage_probe::probe_account_usage`) and ranked by
 /// [`usage_rank`] — or, in `HighestExpectedUsage` mode, by
 /// [`usage_rank_highest_expected`].
 ///
@@ -60,7 +60,7 @@ struct UsageSample {
     /// Expected utilization at probe time: the **linear elapsed fraction of
     /// the account's 7-day window** (0.0–1.0), NOT a budget or an allowance.
     /// `1.0` means the window is about to reset; `0.0` means it just did.
-    /// Computed by `commands::ai_settings::compute_expected_usage`, which
+    /// Computed by `ai_provider::usage_probe::compute_expected_usage`, which
     /// returns `None` when `resets_at` is missing or already past (the Haiku
     /// header-probe fallback), so this is `None` for accounts with no usable
     /// pace signal.
@@ -536,7 +536,7 @@ pub fn usage_rank(config_dir: &str) -> Option<UsageRank> {
 ///
 /// `expected == 0.0` is a live case, not a theoretical one: `elapsed_fraction`
 /// clamps to `0.0` on a just-reset window
-/// (`commands::ai_settings::compute_expected_usage`). A bare division would
+/// (`ai_provider::usage_probe::compute_expected_usage`). A bare division would
 /// then yield `0.0 / 0.0 == NaN`, and `partial_cmp` degrades NaN to
 /// [`Ordering::Equal`] — which would make the selection order depend on the
 /// roster's input position instead of on the data.

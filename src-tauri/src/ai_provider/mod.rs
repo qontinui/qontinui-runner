@@ -27,6 +27,7 @@ pub mod middleware;
 pub mod multimodal;
 pub(crate) mod oauth_refresh;
 pub mod oauth_usage;
+pub mod oauth_usage_gate;
 pub mod oneshot;
 mod openai_compat;
 pub mod prepaid_balance;
@@ -37,6 +38,7 @@ pub(crate) mod process;
 pub mod retry;
 pub(crate) mod routing;
 mod types;
+pub mod usage_probe;
 
 // Re-export public API
 pub use account_usage::{

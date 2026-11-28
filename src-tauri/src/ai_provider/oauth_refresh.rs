@@ -75,10 +75,12 @@ fn retry_backoff(hard_failures: u32) -> Duration {
         .min(REFRESH_HARD_FAIL_BACKOFF_CAP)
 }
 
-/// Stable fingerprint of a refresh token. Only ever compared against another
+/// Stable fingerprint of a token. Only ever compared against another
 /// fingerprint — the token itself is never stored in the refresh state, so a
-/// state dump can't leak a credential. `0` means "no token".
-fn token_fingerprint(token: &str) -> u64 {
+/// state dump can't leak a credential. `0` means "no token". Also keys the
+/// usage endpoint's per-token cooldown (`super::oauth_usage_gate`). Never
+/// logged.
+pub(crate) fn token_fingerprint(token: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     if token.is_empty() {
         return 0;
@@ -110,12 +112,34 @@ fn mark_hard_failure(creds_path: &Path, token_fp: u64) {
         entry.hard_failed_token = Some(token_fp);
         entry.hard_failures = 1;
     }
+    let long_lived = creds_path
+        .parent()
+        .and_then(qontinui_runner_lib::claude_oauth_token::from_config_dir)
+        .is_some();
     warn!(
         path = %creds_path.display(),
         attempts = entry.hard_failures,
+        "{}",
+        hard_failure_warning(long_lived)
+    );
+}
+
+/// The WARN a rejected grant earns. A dir that also holds a long-lived
+/// `claude setup-token` token authenticates with THAT token, which
+/// [`has_valid_credentials`] already reads as the whole verdict, so its dead
+/// `.credentials.json` grant costs only the OAuth usage endpoint (the one
+/// caller that needs the grant's `user:profile` scope). Saying "INVALID"
+/// there would name a state the account is not in.
+fn hard_failure_warning(dir_has_long_lived_token: bool) -> &'static str {
+    if dir_has_long_lived_token {
+        "OAuth refresh: the .credentials.json grant was REJECTED (logout elsewhere, password \
+         change, revoked or rotated refresh token) — the profile grant is dead, which costs the \
+         usage endpoint only; the account stays VALID on its long-lived token. A /login of this \
+         account restores the usage endpoint's per-model limits"
+    } else {
         "OAuth refresh: the grant was REJECTED (logout elsewhere, password change, revoked or \
          rotated refresh token) — this account is reported INVALID until it is re-authenticated"
-    );
+    }
 }
 
 /// Clear any recorded hard failure for `creds_path` — a refresh succeeded, so
@@ -325,7 +349,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
     // dropping the client inside `tokio::task::spawn_blocking` panics with
     // "Cannot drop a runtime in a context where blocking is not allowed" —
     // still load-bearing for the two `spawn_blocking` callers that remain
-    // (`commands::ai_settings::probe_account_usage`, the warm API provider).
+    // (`ai_provider::usage_probe::probe_account_usage`, the warm API provider).
     let request_body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -450,6 +474,39 @@ pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
             request_background_refresh(&path);
         }
     }
+}
+
+/// Whether the grant in the `.credentials.json` at `creds_path` could still be
+/// refreshed: it holds a refresh token the token endpoint has not rejected
+/// (the hard-failure memo, [`grant_hard_failed`]). The OAuth usage endpoint
+/// asks for a background refresh of its profile-scoped token only when this
+/// holds, so a dead grant is POSTed once, not once per probe.
+pub(crate) fn profile_grant_refreshable(creds_path: &Path) -> bool {
+    read_creds_snapshot(creds_path).refreshable(creds_path)
+}
+
+/// Test-only seam: hold the refresh-request log's guard while a test outside
+/// this module queues requests and reads them back (see
+/// [`refresh_requests_for_test`]). A CHILD of `env_lock` in the test-lock
+/// hierarchy, because it is held from another file: `hierarchy_lock` takes the
+/// env lock first, so either call order nests. This module's own tests keep
+/// the standalone `refresh_log_guard`.
+#[cfg(test)]
+pub(crate) fn refresh_log_guard_for_test() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&tests::REFRESH_LOG_GUARD)
+}
+
+/// Test-only seam: drain the recorded background-refresh requests for
+/// `creds_path` alone, leaving every other path's in the log. Hold
+/// [`refresh_log_guard_for_test`] around the whole test.
+#[cfg(test)]
+pub(crate) fn refresh_requests_for_test(creds_path: &Path) -> usize {
+    let Ok(mut log) = tests::REFRESH_REQUESTS.lock() else {
+        return 0;
+    };
+    let before = log.len();
+    log.retain(|p| p != creds_path);
+    before - log.len()
 }
 
 /// Test-only seam: record the refresh token CURRENTLY held by
@@ -681,7 +738,7 @@ mod tests {
     /// process-global while `cargo test` runs tests in parallel threads, so
     /// without this a peer test's queued refresh lands inside another test's
     /// drain-and-assert and the exact-contents assertions flake.
-    static REFRESH_LOG_GUARD: Mutex<()> = Mutex::new(());
+    pub(super) static REFRESH_LOG_GUARD: Mutex<()> = Mutex::new(());
 
     /// Hold for the duration of any test that queues or inspects refresh
     /// requests. Recovers from a poisoned guard (a panicking test must not
@@ -955,6 +1012,40 @@ mod tests {
             prev = cur;
         }
         assert_eq!(retry_backoff(u32::MAX), REFRESH_HARD_FAIL_BACKOFF_CAP);
+    }
+
+    /// A dir that authenticates with a long-lived token is never told its
+    /// account is INVALID over a dead profile grant: only the usage endpoint
+    /// loses anything. A dir without one keeps the INVALID wording.
+    #[test]
+    fn a_dead_grant_beside_a_long_lived_token_is_not_reported_invalid() {
+        let beside = hard_failure_warning(true);
+        assert!(!beside.contains("INVALID"), "{beside}");
+        assert!(beside.contains("usage endpoint only"), "{beside}");
+        assert!(beside.contains("stays VALID"), "{beside}");
+        let alone = hard_failure_warning(false);
+        assert!(
+            alone.contains("reported INVALID until it is re-authenticated"),
+            "{alone}"
+        );
+    }
+
+    /// The gate on the usage endpoint's background refresh: refreshable
+    /// while the grant is live, not once it has been rejected, and live again
+    /// after a re-login writes a new refresh token.
+    #[test]
+    fn a_profile_grant_is_refreshable_until_the_token_endpoint_rejects_it() {
+        let _log = refresh_log_guard();
+        let (guard, path) = dir_with_creds(past_ms(), "rt-profile");
+        let creds = guard.path().join(".credentials.json");
+        assert!(profile_grant_refreshable(&creds));
+        mark_grant_revoked_for_test(&path);
+        assert!(!profile_grant_refreshable(&creds));
+        let (_none, _) = dir_with_creds(past_ms(), "");
+        assert!(
+            !profile_grant_refreshable(&_none.path().join(".credentials.json")),
+            "no refresh token, nothing to refresh"
+        );
     }
 
     #[test]
