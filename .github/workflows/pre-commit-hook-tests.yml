@@ -1,0 +1,229 @@
+name: pre-commit hook tests
+
+# Runs the toolchain-free test suites for the repo's own git hooks
+# (`.pre-commit-hooks/*-test.sh`) on Linux.
+#
+# WHY THIS EXISTS: those suites were registered only as local `pre-commit`
+# hooks, so they ran on the author's box or not at all. On Windows several fail
+# for reasons that have nothing to do with the change (NTFS cannot hold some
+# fixture filenames), so authors there commit with `SKIP=…`, and
+# qontinui-runner#2435 did exactly that, on the stated assumption that "CI runs
+# them on Linux". Nothing did. Arming the local hooks is also opt-in
+# (CONTRIBUTING.md), so an unarmed author never runs them at all. This job makes
+# the assumption true.
+#
+# Adopted from qontinui-runner#2526, whose author session closed before it
+# could land. That PR wrote one step per suite and a final step failing on any
+# suite without one. This version finds the suites by glob instead, so a new
+# suite runs here by default rather than turning this job red.
+#
+# WHICH SUITES RUN HERE: every `.pre-commit-hooks/*-test.sh` EXCEPT the ones
+# `gen-events-hook-suites.yml` runs. That workflow (qontinui-runner#2783) runs
+# the suites behind the `gen-events-drift` hook, on a wider `paths:` filter.
+# The exclusion list is READ from that file's suite loop at run time, never
+# copied here, so moving a suite between the two workflows is an edit to one
+# file. If the read finds nothing, every suite runs here (twice-run beats
+# never-run), and the job says so.
+#
+# A GREEN SUITE MUST HAVE TESTED SOMETHING. Exit 0 is not enough, because
+# several suites exit 0 with arms skipped. Each suite must:
+#   * print its summary, either `N passed, M failed` or `passed: N  failed: M`;
+#   * pass at least one case and fail none;
+#   * print no SKIP line except one matching its ALLOWED_SKIPS entry below. A
+#     suite with no entry may skip nothing.
+# This is the same refusal of a vacuous pass that gen-events-hook-suites.yml
+# makes.
+#
+# THE ALLOWED SKIPS (what this job does not cover):
+#   * shared-target-test's real-library and real abs_run arms need
+#     qontinui-claude-config (a PRIVATE repo) beside the checkout. This public
+#     repo's CI does not check it out, so those arms SKIP here and say why.
+#   * ts-codegen-deps-test's npm rungs are opt-in
+#     (QONTINUI_TS_CODEGEN_DEPS_TEST_NPM=1). They need a registry, and they
+#     probe the local environment rather than hook logic.
+#   * Windows. The suites are not NTFS-clean today; making them so is a
+#     separate change, and a red Windows leg here would only be that.
+#
+# `pre-commit` is installed so that prepush-stash-guard-test's real-framework
+# arm runs instead of skipping. Node is installed because ts-codegen-deps-test
+# exits 1 without it.
+#
+# `paths:` is wide for the reason gen-events-hook-suites.yml gives: a suite
+# that checks the REAL tree goes red on whichever PR next triggers it, not on
+# the PR that broke it. crate-inputs-test's real-repo arm derives which files
+# outside src-tauri/ the cargo gate compiles from what `src-tauri/src` embeds
+# (`include_str!` / `include_dir!`), so `src-tauri/src/**` is a trigger.
+#
+# NOT a required status context: it is path-filtered, and a path-filtered
+# trigger creates no check-run on a non-matching PR, so a required context
+# would wedge every unrelated PR. Red CI is the merge-stopper.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".pre-commit-hooks/**"
+      - "src-tauri/scripts/generate_types.sh"
+      - "src-tauri/build.rs"
+      # crate-inputs-test's real-repo arm reads what this tree embeds and
+      # every workspace manifest.
+      - "src-tauri/src/**"
+      - "**/Cargo.toml"
+      # untimed-subprocess-test's no-argument arm runs this checker on the
+      # real tree.
+      - "scripts/check_untimed_subprocess.py"
+      # The exclusion list is read from this file.
+      - ".github/workflows/gen-events-hook-suites.yml"
+      - ".github/workflows/pre-commit-hook-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".pre-commit-hooks/**"
+      - "src-tauri/scripts/generate_types.sh"
+      - "src-tauri/build.rs"
+      # crate-inputs-test's real-repo arm reads what this tree embeds and
+      # every workspace manifest.
+      - "src-tauri/src/**"
+      - "**/Cargo.toml"
+      # untimed-subprocess-test's no-argument arm runs this checker on the
+      # real tree.
+      - "scripts/check_untimed_subprocess.py"
+      # The exclusion list is read from this file.
+      - ".github/workflows/gen-events-hook-suites.yml"
+      - ".github/workflows/pre-commit-hook-tests.yml"
+  # A daily run catches what no trigger above names: crate-inputs-test's
+  # real-repo arm also asserts on embedded files that live outside these
+  # paths (frontend sources, specs, docs), so moving one of them breaks it
+  # without starting this job.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR-scoped supersession; same single-expression group as the other
+# path-filtered selftests (see oom-signature-tests.yml for the reasoning).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  hook-tests:
+    name: pre-commit hook tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The suites never touch a terminal; this also keeps guard_shared_target's
+      # /dev/tty notice off a runner that has none.
+      QONTINUI_PREPUSH_NO_TTY: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A per-job venv under runner.temp, as in
+      # python-executor-command-table.yml. This job only runs on GitHub-hosted
+      # ubuntu-latest today, where a bare `pip install` would be harmless; the
+      # venv keeps the step correct if the job is ever given a self-hosted
+      # lane, where setup-python's interpreter outlives the job. Its bin goes
+      # on PATH, so the suite's `python3 -c 'import pre_commit'` finds it.
+      - name: Install pre-commit
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --disable-pip-version-check "pre-commit==4.0.1"
+
+      - name: Git identity for fixture commits
+        run: |
+          git config --global user.name "hook-tests"
+          git config --global user.email "hook-tests@users.noreply.github.com"
+
+      - name: Run the suites, refusing a vacuous pass
+        shell: bash
+        run: |
+          # GitHub runs `shell: bash` as `bash -eo pipefail`. Turn -e OFF: a
+          # failing suite must still print its log and its ::error, and the
+          # remaining suites must still run.
+          set +e -uo pipefail
+          shopt -s nullglob
+          export TMPDIR="$RUNNER_TEMP"
+
+          # suite -> a fixed string every SKIP line it prints must contain.
+          declare -A ALLOWED_SKIPS=(
+            [shared-target-test.sh]='no qontinui-claude-config/'
+            [ts-codegen-deps-test.sh]='QONTINUI_TS_CODEGEN_DEPS_TEST_NPM=1'
+          )
+
+          # The suites gen-events-hook-suites.yml runs, read from its loop
+          # entries (`<suite>.sh\|yes|no`). Anchored, so a commented-out entry
+          # does not count.
+          other=.github/workflows/gen-events-hook-suites.yml
+          delegated=""
+          if [ -f "$other" ]; then
+            delegated="$(sed -nE 's/^[[:space:]]+([A-Za-z0-9_.-]+-test\.sh)\\\|(yes|no)( \\|; do)$/\1/p' "$other")"
+          fi
+          if [ -z "$delegated" ]; then
+            echo "::notice::read no suite list from $other, so every suite runs here"
+          else
+            echo "run by $other, not here:"; sed 's/^/  /' <<< "$delegated"
+          fi
+
+          suites=(.pre-commit-hooks/*-test.sh)
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::no .pre-commit-hooks/*-test.sh found; this job tests nothing"
+            exit 1
+          fi
+
+          status=0; ran=0
+          for path in "${suites[@]}"; do
+            suite="$(basename "$path")"
+            if grep -qxF "$suite" <<< "$delegated"; then continue; fi
+            ran=$((ran + 1))
+            log="$RUNNER_TEMP/${suite%.sh}.log"
+            echo "::group::${suite}"
+            bash "$path" > "$log" 2>&1
+            rc=$?
+            cat "$log"
+            echo "::endgroup::"
+            # Two summary shapes: `N passed, M failed` and `passed: N  failed: M`.
+            counts="$(sed -nE \
+              -e 's/.*\b([0-9]+) passed, ([0-9]+) failed.*/\1 \2/p' \
+              -e 's/.*passed: ([0-9]+)[[:space:]]+failed: ([0-9]+).*/\1 \2/p' \
+              "$log" | tail -n 1)"
+            passed="${counts% *}"; failed="${counts#* }"
+            allowed="${ALLOWED_SKIPS[$suite]:-}"
+            skips="$(grep -E '^[[:space:]]*(SKIP|skip)[[:space:]]' "$log")"
+            if [ -n "$allowed" ]; then
+              skips="$(grep -vF -- "$allowed" <<< "$skips")"
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::${suite} exited ${rc}"; status=1
+            elif [ -z "$counts" ]; then
+              echo "::error::${suite} printed no pass/fail summary, so it cannot be shown to have run"; status=1
+            elif [ "$passed" -eq 0 ] || [ "$failed" -ne 0 ]; then
+              echo "::error::${suite}: ${passed} passed, ${failed} failed"; status=1
+            elif [ -n "$skips" ]; then
+              echo "::error::${suite} skipped cases this runner should run:"
+              sed 's/^/  /' <<< "$skips"
+              status=1
+            else
+              echo "${suite}: ${passed} passed, ${failed} failed"
+            fi
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::every suite was excluded, so this job tested nothing"
+            status=1
+          fi
+          exit "$status"
