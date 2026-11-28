@@ -70,7 +70,7 @@ impl ActionMissing {
             error_detail: None,
             hint: None,
             code: Some(ACTION_MISSING_CODE.to_string()),
-            suggestions: None,
+            refusal: None,
         }
     }
 

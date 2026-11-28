@@ -654,7 +654,9 @@ fn action_missing_result(missing: &ui_bridge::action_wire::ActionMissing) -> Act
             ui_bridge::UiBridgeError {
                 code: ui_bridge::types::UiBridgeErrorCode::MissingParam,
                 message: message.clone(),
-                recovery: Some(ui_bridge::RecoveryHint::Unrecoverable),
+                recovery: Some(qontinui_types::refusal::NextAction::new(
+                    qontinui_types::refusal::NextActionKind::FixRequest,
+                )),
                 context: Some(serde_json::json!({
                     "field": "action",
                     "code": ui_bridge::action_wire::ACTION_MISSING_CODE,
