@@ -143,7 +143,9 @@ pub enum TrustTargets<'a> {
 }
 
 /// What happened for one (config file, project key) pair. Returned for logging
-/// and for the unit tests; no caller branches on it.
+/// and for the unit tests, and read by `trust_gate::finish`: on an interactive
+/// PTY spawn a grant whose outcome is not `Trusted`/`AlreadyTrusted` refuses the
+/// spawn (`trust_gate::promote_unlanded_grant`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustOutcome {
     /// The flag was already `true` — no write was attempted.
@@ -152,7 +154,9 @@ pub enum TrustOutcome {
     Trusted,
     /// Deliberately left alone; the reason is a fixed, greppable label.
     Skipped(&'static str),
-    /// An IO or serialization failure. Non-fatal; the spawn proceeds.
+    /// An IO or serialization failure. Non-fatal for a `--print` child, which
+    /// degrades and proceeds; an interactive PTY spawn is refused instead
+    /// (`trust_gate::promote_unlanded_grant`).
     Failed(String),
 }
 

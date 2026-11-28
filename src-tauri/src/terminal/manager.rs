@@ -1203,7 +1203,8 @@ impl TerminalManager {
     }
 
     /// [`Self::close`], but through `TerminalSession::close_after_graceful_exit`
-    /// — reachable only from [`Self::graceful_exit`]'s gone arm.
+    /// — reachable from [`Self::graceful_exit`]'s gone arm and from
+    /// [`Self::close_exited`].
     fn close_after_graceful_exit(&self, id: &str) -> Result<(), String> {
         let session = {
             let mut sessions = self
