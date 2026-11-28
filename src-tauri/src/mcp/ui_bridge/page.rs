@@ -910,12 +910,19 @@ pub async fn ui_bridge_page_close_request_handler(
         .map(str::to_string);
     let close_mode = crate::terminal::CloseMode::from_request_body(body.as_ref().map(|Json(v)| v));
     if let Some(refusal) = handoff_label_refusal(close_mode, requested.as_deref(), main_label) {
+        const CODE: &str = "HANDOFF_LABEL_NOT_MAIN";
+        let typed = crate::mcp::refusal_envelope::refusal_for_envelope(
+            CODE,
+            StatusCode::BAD_REQUEST,
+            Some(&refusal),
+            Some(qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::FixRequest,
+            )),
+            None,
+        );
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error_with_code(
-                refusal,
-                "HANDOFF_LABEL_NOT_MAIN",
-            )),
+            Json(ApiResponse::error_with_refusal(refusal, CODE, typed)),
         ));
     }
 

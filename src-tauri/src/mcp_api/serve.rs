@@ -197,14 +197,24 @@ pub(super) fn acquire_api_listener_with(
 /// learns the runner is coming back instead of waiting out its own timeout.
 pub(super) fn booting_response() -> axum::response::Response {
     use axum::response::IntoResponse;
-    let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
-        "the runner is booting: it holds its listener but its routes are not ready yet — \
-         retry after the Retry-After interval",
-        qontinui_runner_lib::listeners::RUNNER_BOOTING_CODE,
+    const RETRY_AFTER_S: u32 = 2;
+    let message = "the runner is booting: it holds its listener but its routes are not ready \
+                   yet — retry after the Retry-After interval";
+    let code = qontinui_runner_lib::listeners::RUNNER_BOOTING_CODE;
+    // Typed, not free text: the refusal carries `retry_later` with the same
+    // delay the `Retry-After` header states, so a reader that renders
+    // refusals learns "come back in 2s" without parsing the sentence.
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Some(message),
+        None,
+        Some(RETRY_AFTER_S),
     );
+    let body = crate::mcp::types::ApiResponse::<()>::error_with_refusal(message, code, refusal);
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        [(axum::http::header::RETRY_AFTER, "2")],
+        [(axum::http::header::RETRY_AFTER, RETRY_AFTER_S.to_string())],
         axum::Json(body),
     )
         .into_response()
@@ -977,6 +987,8 @@ mod listener_adoption_tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], RUNNER_BOOTING_CODE);
+        assert_eq!(v["refusal"]["next_action"]["kind"], "retry_later");
+        assert_eq!(v["refusal"]["next_action"]["retry_after_s"], 2);
     }
 
     #[cfg(unix)]
