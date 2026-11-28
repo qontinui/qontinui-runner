@@ -1,6 +1,6 @@
 ---
 description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, merge a diagnosed coord defect directly through the one notifying door (scripts/agent-direct-merge.sh; served policy git-operations direct-merge-with-notification, operator decision 2026-10-16), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
-argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once]"
+argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once] [--attest-intent=<gate_id|none>]"
 allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate, Agent
 ---
 
@@ -54,8 +54,20 @@ unchanged. Step 5a carries the procedure.
   - `--no-remediate` — skip the remediation-plan + `/vet-imp` step (recovery
     only). The defect evidence is still written to the PR comment.
   - `--once` — single pass (no watch loop): assess, act, report, exit.
+  - `--attest-intent=<failed gate_id | none>` — an intent-attestation hand-off (`none` when no
+    failed gate watches the duplicate). It comes with exactly two pr-refs: the CLOSED duplicate
+    first, then its LANDED successor. Step 1 sends the pair straight to the intent-attestation
+    block in Step 6 item 2.
 
 ## Step 1 — Collect the session's PRs
+
+**An intent-attestation hand-off skips collection.** With `--attest-intent=<failed gate_id | none>`
+and exactly two pr-refs, the first is a CLOSED duplicate and the second is its LANDED
+successor. A gate continuation that met an unserved attestation door names them this way. Do
+not collect or watch PRs, and do not read the closed PR as terminal: it is the work. Run the
+block "When the successor carries the duplicate's intent with DIFFERENT content" in Step 6
+item 2 for that pair and that failed gate (with `none`, its (v) reads back the PR alone), from
+the block's first paragraph, and stop at the outcome it reaches.
 
 Same detection as `/name`: for each git repo this session has touched (current
 worktrees, recent commits), intersect local branches with open PRs:
@@ -1615,7 +1627,7 @@ Then:
    nothing to adopt — an open or merged PR whose `Adoption-Supersedes:` line
    covers #N or whose title declares `supersedes #N`, a CLOSED one whose own
    coord card shows it landed (a coord ff-land is CLOSED on GitHub), or a
-   successor #N's card lists in `superseded_by` or `superseded_by_refused` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
+   successor #N's card lists in `superseded_by`, `superseded_by_refused` or `superseded_by_pending` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
    adoption; `RENEWED` means your own session already holds it, which is
    yours only when your own earlier call for that key printed UNKNOWN. Exit 2
    is UNKNOWN: do not adopt on it — including a CLOSED adopter whose coord card
@@ -1629,6 +1641,17 @@ Then:
    `coord_adopt_pr` claim (no `pushed_head`, since you never push to the
    original) once your new PR reads back, together with the `adopt-wip:` release
    above. The two locks answer different questions, and an adoption holds both.
+   **Record the supersession once your new PR reads back.** Call
+   `coord_declare_supersession` for each original PR you adopted, naming the
+   original as predecessor and your new PR as successor (same repo), and read
+   `superseded_by_status` back off the original's `coord_pr_status` card. A
+   closed original with no recorded declaration reads `not_watched` in
+   `coord_session_obligations`, which keeps its authoring session from
+   passing `/finish-session` step 0.6 even after your PR lands. A recorded
+   declaration whose same-repo successor landed reads `landed`. The
+   `Adoption-Supersedes:` line in the PR body is disclosure, not a
+   declaration, and coord does not read it. (Plan
+   `2026-11-21-session-obligations-honor-a-landed-supersession-successor`.)
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
@@ -1679,8 +1702,46 @@ Then:
    (c) Before step (d), read the predecessor's card back (`coord_pr_status`) and wait until its `superseded_by` entry carries a content verdict, or coord retires it through patch-id evidence. Coord records that verdict only in a sweep that probes an OPEN predecessor (30 min rest, doubling to 24 h), so declaring and closing within minutes leaves the PR reading `unknown`, not `retired`. If you must close sooner, expect `unknown` until the next sweep.
    (d) Only then close the PR. `coord_declare_supersession` says it itself: it does NOT close the predecessor, "closing stays yours, after you move or retire the gates".
 
-   A gate already `failed` is not repaired (it cannot be withdrawn or re-pointed): record its discharge as a finding naming the dead `gate_id`. On a coord carrying the Phase 2 change, a closed superseded PR and its failed gate read `retired` when a landed declared successor's content verdict shows the PR's work carried, or when coord has patch-id land evidence for it; otherwise they keep reading `not_watched` or `unknown`.
+   A gate already `failed` is not repaired (it cannot be withdrawn or re-pointed): record its discharge as a finding naming the dead `gate_id`. On a coord carrying the Phase 2 change, a closed superseded PR and its failed gate read `retired` when a landed declared successor's content verdict shows the PR's work carried, or when coord has patch-id land evidence for it. On a coord carrying plan `2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished` Phase 2, they also read `retired` when a reviewed intent attestation (below) stands for it. Otherwise they keep reading `not_watched` or `unknown`.
    For an adoption this is the closing half: once the adopting PR has landed, run it for the original PR (the adopting PR's body already references the original through `Adoption-Supersedes:`, which satisfies step 1's reference requirement).
+
+   **When the successor carries the duplicate's intent with DIFFERENT content: attest it, after an independent review** (plan `2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished` Phase 4). The rule is [policy: finished-criteria/a-closed-unmerged-pr-is-finished-when-its-work-is-on-the-default-branch], item 1's fourth form and item 4. It applies when the duplicate is closed unlanded and its successor LANDED, but no content verdict can read `noop`: its `superseded_by` content verdict was recorded and is not tree `noop`; the duplicate's head conflicts with the default branch under `git merge-tree`; the successor never references the duplicate, so `coord_declare_supersession` refuses; or `content` is null. No sweep fills a null `content` in for a closed or cross-repo duplicate, so measure it yourself: fetch both shas and run `git merge-tree --write-tree <successor merge_commit> <duplicate head_sha>`. Exit 1 with a tree oid on stdout's first line is a conflict. Exit 0 with a tree other than `<merge_commit>^{tree}` means the content differs, and one equal to it means the bytes match. Any other non-zero exit, or a cross-repo pair (no shared history), cannot be measured. Either way proceed, and tell the reviewer what you found. A declaration alone does not retire the failed gate here; the attestation does. Run it only once the successor's `coord_pr_status` reads `land_stamp` `terminal`; until then, register (vi)'s `time_elapsed` gate:
+
+   (i) **Probe the door and prove the owner before spending a review.**
+
+      - **Door:** it is served when `tools/list` on your door (or `coord-revive.sh tools` on the runner proxy) lists `coord_attest_intent_carried`, or when `POST https://coord.qontinui.io/coord/pr-intent-attestations` with the body `{}` gets any HTTP answer other than 404, whatever the credential. A 401, 403 or 422 means the route exists; `{}` writes nothing. A transport failure is no answer: probe up to 3 times, then run `/coord-revive`; still no answer ends the attempt (last bullet of (vi)). If neither door serves it, skip the review and go to (vi)'s not-served arm.
+      - **Owner:** in ONE Bash call, set `CTC_TMP` to a private `mktemp -d` directory, source `scripts/lib/coord-tenant-credential.sh`, run `ctc_owner_tenant <predecessor owner/repo> <successor owner/repo>` (one tenant must own both), and print `CTC_TMP`, `CTC_STATE`, `CTC_TENANT` and `CTC_BEARER_SRC`. Later calls use that literal `CTC_TMP` path. On `CTC_STATE=proven` it stages that tenant's bearer at `$CTC_TMP/bearer.hdr`; pass it as `-H @"$CTC_TMP/bearer.hdr"`, never on argv. A `CTC_BEARER_SRC` ending in `mint` or `mint(cached)` is the bootstrap credential coord refuses here: none usable. `refuted` or `unknown` means no single owner is proven (last bullet of (vi)).
+      - **Tenant:** when `CTC_TENANT` is the tenant your door acts in (`coord_query_identity` `tenant_id`), use the MCP tools below. Otherwise run (ii) to (v) under the staged bearer over the HTTP twins: `GET`/`POST https://coord.qontinui.io/coord/agent-findings`, `POST https://coord.qontinui.io/coord/pr-intent-attestations`, and `GET https://coord.qontinui.io/coord/overlord/watch-verdict?gate_id=<id>` (or `?repo=<owner/repo>&pr_number=<n>`). The card's `intent_attestation` is read in the caller's tenant and has no HTTP twin, so this arm never consults it.
+
+   (ii) **Reuse a review, or get one. Never attest without one.** A review this procedure posts is a finding titled `intent-review: ...`, and the duplicate PR carries a comment naming it ((iii)). Read the comment first: `gh pr view <n> --repo <predecessor owner/repo> --comments`, then each finding it names by id (`coord_recent_findings {finding_id}`, which serves it past expiry; read any `superseded_by` by id and count it too). Then catch any the comments missed with `coord_recent_findings` over the resource keys `<predecessor owner/repo>#<n>` and `<successor owner/repo>#<n>` with `limit: 100`; a full page is UNKNOWN. Its HTTP twin is `curl -sS -G https://coord.qontinui.io/coord/agent-findings --data-urlencode 'resource_keys=<predecessor owner/repo>#<n>' --data-urlencode 'resource_keys=<successor owner/repo>#<n>' --data-urlencode limit=100 -H @"$CTC_TMP/bearer.hdr"` (encoded, or `#` starts a URL fragment). Count only unsuperseded findings with that title prefix whose body quotes both CURRENT full shas and carries an `independence` triple.
+
+      - If ANY such review answers `not carried` or `cannot tell`, do not attest, whatever else is live, and do not commission another. If the card's `intent_attestation` reads `recorded`, or in the HTTP arm always, run Retraction. The PR stays owed ((vi) says in what state).
+      - Otherwise a `carried` review is reused: go to (iv) with its `finding_id`.
+
+   With no such review, spawn a fresh-context reviewer subagent and give it: the duplicate's diff at its CURRENT head (`gh pr diff <n> --repo <predecessor owner/repo>`, checked against the card's `head_sha`); the successor's whole landed change (`gh pr diff <n> --repo <successor owner/repo>`); the default branch; and the merge-tree result above. Do NOT give it this session's reasoning, its own "superseded duplicate" finding, or why the PR was closed [policy: verification-and-evidence/independence-is-context-not-credential]. Ask it one question: does the landed successor carry the duplicate's intent on the default branch? Post its answer as (iii) says, whatever it is; any other answer is handled as the first bullet above says. Only `carried` goes on to (iv).
+
+   (iii) **Post the review as a coord finding** (`coord_post_finding`). Title it `intent-review: <predecessor owner/repo>#<n> -> <successor owner/repo>#<n>: <carried | not carried | cannot tell>`, with topic `intent-attestation` and the two resource keys from (ii). Its body must quote BOTH full 40-hex shas the review read (the duplicate's head and the successor's land), then the answer and its reasons, then this session's `independence` triple: `verified` (what the review confirmed), `against` (the two diffs at the two shas, and the default branch) and `context` (how the reviewer's context excluded this session's reasoning). Coord checks for both on every read, so an abbreviated sha contributes nothing. A `not carried` or `cannot tell` answer sets `supersedes` to the `carried` review (ii) counted, else to the card's live attestation's `review_finding_id`. Keep the returned `finding_id`, and leave the durable trace (ii) reads first: `gh pr comment <n> --repo <predecessor owner/repo> --body 'intent-review: <answer> finding=<finding_id>'`, read back with `gh pr view <n> --repo <predecessor owner/repo> --comments`. A trace that does not read back ends the attempt as (vi)'s last bullet says.
+
+   (iv) **Write the record.** Re-run (ii)'s read first: a `not carried` or `cannot tell` review that has appeared since stops the write. Then call `coord_attest_intent_carried` {predecessor_repo, predecessor_pr, successor_repo, successor_pr, duplicate_head_sha, successor_land_sha, review_finding_id, independence: {verified, against, context}}. `successor_land_sha` is the successor card's `merge_commit`, exactly. `independence` is the triple in the review's body, copied verbatim. A repeat answers `written: false`, so re-issuing is safe. Its HTTP twin takes the same fields, with (i)'s bearer.
+
+   (v) **Read it back** with `coord_watch_verdict` `{item: {repo, pr_number}}` for the duplicate AND `{item: {gate_id}}` for its failed `pr_merged` gate. Only a `retired` gate is the evidence. When no failed `pr_merged` gate watches the duplicate, the evidence is the PR reading `retired` (or `landed`, when a same-repo declaration stands) beside a fresh `coord_pr_status` whose `intent_attestation` reads `recorded` with an entry where `head_current` is true, `successor_land` is `terminal` at the attested sha, and `review` is `resolved` with an empty `missing`. In the HTTP arm the watch-verdict alone decides: the PR `retired` with a `reasons[]` entry `independently attested: successor <repo>#<n> carries this PR's intent (finding <id>)`.
+
+   (vi) **Anything but a `retired` read-back is UNKNOWN. The item stays owed; never report it retired.**
+
+      - **Refused** (`retryable: false`, the code in `error`: HTTP 422, or 403 for a `caller_*` code). Fix what the code names, then run (iv) again:
+        - `duplicate_head_mismatch`: go back to (ii) and review the CURRENT head. Never write a new sha into a finding whose review read another head.
+        - `review_finding_unresolvable`: read the finding by id. If `superseded_by` is set, go back to (ii). Re-post only when it is absent from the attesting tenant. `review_finding_missing_sha`: re-post the review quoting both shas it actually read, or go back to (ii) if it read others.
+        - `not_owner`: re-run (i); if coord still refuses, end at the last bullet.
+        - `successor_land_mismatch`: correct `successor_land_sha` to the card's `merge_commit`. With none on the card, end at the last bullet.
+        - `successor_not_landed`, `predecessor_not_closed_unlanded`, `independence_missing`, `independence_blank`, or `invalid_argument` (a missing, malformed or unknown field, which the message names): correct that argument; for a state coord must reach, register (vi)'s `time_elapsed` gate (WATCHED), else end at the last bullet.
+        - `caller_tenant_unresolved`, `caller_device_required` or `caller_presenter_unproven`: use (i)'s owner bearer.
+      - **Scoped out**: a REST 403 whose `code` is `bootstrap_credential_scope`, or over MCP a masked-tool answer (`tool_not_available_to_principal`). Re-issue over the HTTP twin with (i)'s owner bearer. With none, end at the last bullet.
+      - **Retryable** (`retryable: true`, `verification_unavailable`, HTTP 503): nothing was decided. Retry up to 3 times, a minute apart, then end at the last bullet.
+      - **Transport failure** (a timeout, any other 5xx, or the MCP client's "Command failed with no output"): presume the write LOST. Run `/coord-revive`, re-issue over the door it reports LIVE, and read back as in (v).
+      - **Not served**: `-32601` or "unknown tool" means the coord or runner build predates the door. A runner-proxy refusal (`error.data.code` `COORD_MCP_PROXY_METHOD_NOT_ALLOWED`) says nothing about coord: try the HTTP twin. A 404 there means coord predates the door too. Register through `/gate`, in the tenant (i) proved, a read-back gate whose continuation re-runs this block, which makes the unit WATCHED. While the PR that ships the door is open (`gh pr list --repo qontinui/qontinui-coord --search "<plan stem>" --state all`), that is `{"kind":"pr_merged","repo":"qontinui/qontinui-coord","pr_number":<n>}`. Once it has merged or closed, or when the search finds nothing or fails, it is `{"kind":"time_elapsed","duration_secs":21600}`. Either way the continuation is `{"action":"run_skill","skill":"babysit-prs","args":["<predecessor owner/repo>#<n>","<successor owner/repo>#<n>","--attest-intent=<failed gate_id, or none>"]}`, which `/babysit-prs` Step 1 routes straight to this block. Read the gate back by its `gate_id`. With no such gate the unit is DROPPED under `/unattended`'s rules.
+      - When a refusal you could not fix, a credential you could not stage, a transport failure a re-issue did not settle, or a read-back that is not `retired` ends the attempt, post a finding that names the PR, its failed `gate_id`, the review `finding_id` and what coord answered, verbatim. Classify that, and a decisive `not carried` or `cannot tell` review, as `/unattended` Step 1a-bis does; the finding never makes it RECORDED.
+
+   **Retraction.** When a review finds the intent NOT carried while an attestation is live, (iii) posts it superseding the `carried` review, so neither (ii) nor coord's resolver reads that review again. Then call `coord_retract_intent_attestation` {predecessor_repo, predecessor_pr, successor_repo, successor_pr, reason}, with `reason` citing the new finding's id. Its HTTP twin is `POST https://coord.qontinui.io/coord/pr-intent-attestations/retract`, with the same body and (i)'s bearer. Read `coord_watch_verdict` back: the gate (or PR) must leave `retired`, and the item is owed again. Treat any of these as an urgent UNKNOWN: a refused retract (`no_live_attestation` means none was recorded), an unserved one, a transport failure that a re-issue did not settle, or a PR or gate that still reads `retired` afterwards. Post a finding naming the pair and the disproving review's `finding_id`, and never report the item finished.
 
 3. **Verify coord ingested the land** — within a few minutes the PR's
    `pr_state` should read `merged` (coord's phantom-open sweep and land-cause
