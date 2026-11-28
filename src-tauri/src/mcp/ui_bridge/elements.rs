@@ -1058,7 +1058,9 @@ pub(crate) fn as_action_failure(
                         UiBridgeError {
                             code: super::types::UiBridgeErrorCode::ActionFailed,
                             message: d.message,
-                            recovery: Some(super::types::RecoveryHint::Resnapshot),
+                            recovery: Some(qontinui_types::refusal::NextAction::new(
+                                qontinui_types::refusal::NextActionKind::Resnapshot,
+                            )),
                             context: Some(attach(d.context)),
                         }
                     }
@@ -1069,7 +1071,9 @@ pub(crate) fn as_action_failure(
                     None => UiBridgeError {
                         code: super::types::UiBridgeErrorCode::ActionFailed,
                         message: message.clone(),
-                        recovery: Some(super::types::RecoveryHint::Resnapshot),
+                        recovery: Some(qontinui_types::refusal::NextAction::new(
+                            qontinui_types::refusal::NextActionKind::Resnapshot,
+                        )),
                         context: Some(attach(None)),
                     },
                 };
@@ -1678,7 +1682,7 @@ async fn execute_action_dispatch(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }));
             }
 
@@ -2845,7 +2849,9 @@ async fn component_action_ipc(
                 let detail = UiBridgeError {
                     code: super::types::UiBridgeErrorCode::ActionNotSupported,
                     message: error_msg.to_string(),
-                    recovery: Some(super::types::RecoveryHint::Unrecoverable),
+                    recovery: Some(qontinui_types::refusal::NextAction::new(
+                        qontinui_types::refusal::NextActionKind::FixRequest,
+                    )),
                     context: Some(serde_json::json!({
                         "componentId": id,
                         "actionId": action_id,
@@ -3659,7 +3665,7 @@ fn api_error_to_value(message: impl Into<String>) -> ApiResponse<serde_json::Val
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -3898,7 +3904,7 @@ fn apply_strict_timeout_reshape(
                 error_detail: err.error_detail,
                 hint: err.hint,
                 code: err.code,
-                suggestions: err.suggestions,
+                refusal: err.refusal,
             };
             Err((status, Json(widened)))
         }
@@ -4942,7 +4948,7 @@ pub async fn ui_bridge_expect_element_handler(
                 error_detail: None,
                 hint: Some(envelope.data.unwrap_or(serde_json::Value::Null)),
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         ))
     }
@@ -7395,11 +7401,11 @@ mod action_not_supported_tests {
     #[test]
     fn typed_terminal_codes_survive_dispatch() {
         for (code, expected_recovery) in [
-            ("SEND_KEYS_INVALID", "FIX_REQUEST"),
-            ("WRITE_TEXT_INVALID", "FIX_REQUEST"),
-            ("PASTE_TEXT_INVALID", "FIX_REQUEST"),
-            ("SCROLLBACK_MAX_LINES_INVALID", "FIX_REQUEST"),
-            ("TERMINAL_NO_MOUNTED_VIEW", "SCROLL_INTO_VIEW"),
+            ("SEND_KEYS_INVALID", "fix_request"),
+            ("WRITE_TEXT_INVALID", "fix_request"),
+            ("PASTE_TEXT_INVALID", "fix_request"),
+            ("SCROLLBACK_MAX_LINES_INVALID", "fix_request"),
+            ("TERMINAL_NO_MOUNTED_VIEW", "scroll_into_view"),
         ] {
             let msg = format!("{code}: the handler's own diagnosis, verbatim");
             let failure: ActionResult = Err((
@@ -7419,7 +7425,7 @@ mod action_not_supported_tests {
                 "the handler's typed code must not be re-coded: {wire}"
             );
             assert_eq!(
-                wire.pointer("/error_detail/recovery")
+                wire.pointer("/error_detail/recovery/kind")
                     .and_then(|v| v.as_str()),
                 Some(expected_recovery),
                 "RESNAPSHOT is wrong advice for {code}: {wire}"
@@ -7478,7 +7484,9 @@ mod action_not_supported_tests {
                  Element advertises: {:?}",
                 action_name, supported
             ),
-            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            recovery: Some(qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::FixRequest,
+            )),
             context: Some(json!({
                 "code": "ACTION_NOT_SUPPORTED",
                 "supported_actions": supported,
@@ -7492,7 +7500,7 @@ mod action_not_supported_tests {
             error_detail: Some(detail),
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         };
         let env_json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(

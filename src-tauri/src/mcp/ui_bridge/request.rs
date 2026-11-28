@@ -1310,7 +1310,7 @@ pub(crate) fn wrap_ipc_result(
                 error_detail: body.error_detail,
                 hint: body.hint,
                 code: body.code,
-                suggestions: body.suggestions,
+                refusal: body.refusal,
             }),
         )
     })
@@ -1387,7 +1387,7 @@ pub(crate) fn wrap_ipc_result_keeping_failure_data(
                 UiBridgeErrorCode::FrontendNotReady => StatusCode::SERVICE_UNAVAILABLE,
                 // A wedged native event loop is a 503, not a 500: nothing is
                 // broken, the request cannot be delivered RIGHT NOW, and the
-                // code carries `RecoveryHint::WaitForRecovery`. Mapping it to
+                // code carries a `retry_later` next action. Mapping it to
                 // 500 would tell an agent to give up on a condition that
                 // clears.
                 UiBridgeErrorCode::EventLoopUnresponsive => StatusCode::SERVICE_UNAVAILABLE,

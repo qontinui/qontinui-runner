@@ -89,6 +89,11 @@ export interface ExternalElement {
   focused: boolean;
   value?: string;
   checked?: boolean;
+  /**
+   * The element's own `aria-busy` reading (`@qontinui/ui-bridge` >= 0.62
+   * `ElementState.ariaBusy`). Absent when the source did not send it.
+   */
+  ariaBusy?: boolean;
   text?: string;
   label?: string;
   parent?: string | null;

@@ -2904,6 +2904,140 @@ mod tests {
         assert_eq!(a.source.as_deref(), Some("user_pref"));
     }
 
+    // -- the tenant admin ceiling (plan 2026-11-24-tenant-admins-switch-agent-
+    //    spawns-off-per-agent-type, Phases 3 and 6) ---------------------------
+
+    /// Coord folds the admin ceiling into the SERVED `enabled`/`disposition`
+    /// (`enabled = !admin_disabled && (pref ?? default_enabled)`), and adds
+    /// `admin_disabled` plus `source: "admin"` to the row. The runner decides on
+    /// the served `enabled` alone and never reads `default_enabled`, so the
+    /// ceiling needs no runner-side field — but the new keys must decode, and a
+    /// `default_enabled: true` riding along (were coord ever to send it) must
+    /// not re-enable the row.
+    fn admin_disabled_rows(disposition: Option<&str>, spawn_path: &str) -> Vec<RegistryAgent> {
+        // `None` omits the key: the runner's no-disposition fallback must still
+        // degrade, whatever coord does or does not send.
+        let disposition = disposition
+            .map(|d| format!(r#""disposition":"{d}","#))
+            .unwrap_or_default();
+        let body = format!(
+            r#"{{"agents":[
+                {{"agent_name":"implement-plan","purpose":"implement a plan",
+                  "spawn_path":"{spawn_path}","policy_required":false,
+                  "default_enabled":true,"enabled":false,
+                  {disposition}"source":"admin",
+                  "admin_disabled":true}},
+                {{"agent_name":"standing_continuation",
+                  "spawn_path":"standing_continuation","enabled":true,
+                  "source":"default"}}
+            ]}}"#
+        );
+        let reg: EffectiveRegistry =
+            serde_json::from_str(&body).expect("the admin-ceiling payload must decode");
+        let a = &reg.agents[0];
+        assert_eq!(a.source.as_deref(), Some("admin"));
+        assert!(!a.enabled, "the served fold, not default_enabled, decides");
+        reg.agents
+    }
+
+    /// An admin-disabled role refuses a named standing spawn — the
+    /// `/sessions/spawn` `role` path, which calls `authorize_spawn(Some(role),
+    /// StandingContinuation, ..)` — even with the standing class itself opted
+    /// in, and even though the row's `default_enabled` is true. Covered for the
+    /// row's own class and for the seeder's `in_session_subagent` class (which
+    /// the cross-class disable floor carries across), under `degrade` (also
+    /// what coord serves when the admin picked none), `block`, and a row that
+    /// arrives with no disposition key at all.
+    ///
+    /// `warn_proceed` is deliberately NOT a refusal: plan D5 lets the admin pick
+    /// any of the row's `allowed_dispositions`, and an admin who picks
+    /// `warn_proceed` chose "proceed and say the step was skipped". That arm is
+    /// pinned separately below so the choice stays visible.
+    #[test]
+    fn an_admin_disabled_role_refuses_a_named_standing_spawn() {
+        for spawn_path in ["standing_continuation", "in_session_subagent"] {
+            for (disposition, label) in [
+                (Some("degrade"), "degrade_to_inline"),
+                (Some("block"), "deny"),
+                (None, "degrade_to_inline"),
+            ] {
+                let rows = admin_disabled_rows(disposition, spawn_path);
+                let v = decide(
+                    Resolution::Fresh(&rows),
+                    Some("implement-plan"),
+                    SpawnPath::StandingContinuation,
+                );
+                assert_eq!(
+                    v.decision.label(),
+                    label,
+                    "admin-disabled `implement-plan` ({spawn_path}, {disposition:?}) must \
+                     not spawn standing"
+                );
+                assert!(
+                    v.decision.refusal().is_some(),
+                    "/sessions/spawn refuses on `refusal()`; it must be Some"
+                );
+                assert!(
+                    !break_glass_may_override(v.rule),
+                    "the break-glass must not lift an admin disable (rule {})",
+                    v.rule
+                );
+            }
+            // The admin's `warn_proceed`: proceeds, with the warning surfaced.
+            let rows = admin_disabled_rows(Some("warn_proceed"), spawn_path);
+            let v = decide(
+                Resolution::Fresh(&rows),
+                Some("implement-plan"),
+                SpawnPath::StandingContinuation,
+            );
+            assert_eq!(v.decision.label(), "warn_proceed", "{spawn_path}");
+            assert!(v.decision.refusal().is_none(), "{spawn_path}");
+        }
+    }
+
+    /// Key normalization (D6): the harness built-ins are spelled `Explore` /
+    /// `Plan` by the Agent tool, while the registry grammar is `[a-z0-9_-]`, so
+    /// the row an admin writes is `explore`. That lowercased row must govern a
+    /// spawn named `Explore` — the disable, not the class default.
+    #[test]
+    fn a_lowercased_row_governs_a_spawn_named_in_mixed_case() {
+        let rows = vec![
+            RegistryAgent {
+                disposition: Some("block".to_string()),
+                ..row_for("explore", "in_session_subagent", false)
+            },
+            row_for("in_session_subagent", "in_session_subagent", true),
+        ];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("Explore"),
+            SpawnPath::InSessionSubagent,
+        );
+        assert_eq!(
+            v.decision.label(),
+            "deny",
+            "`explore` must govern `Explore`, not fall to the enabled class row"
+        );
+        assert_eq!(v.rule, "registry-row-disabled-disposition");
+
+        // The same holds through the cross-class floor: a disable recorded on
+        // `explore` under another class still reaches `Explore`.
+        let rows = vec![
+            RegistryAgent {
+                disposition: Some("block".to_string()),
+                ..row_for("explore", "standing_continuation", false)
+            },
+            row_for("in_session_subagent", "in_session_subagent", true),
+        ];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("Explore"),
+            SpawnPath::InSessionSubagent,
+        );
+        assert_eq!(v.decision.label(), "deny");
+        assert_eq!(v.rule, "registry-row-disabled-other-class-floor");
+    }
+
     #[test]
     fn allows_spawn_only_for_allow_and_warn() {
         assert!(SpawnDecision::Allow.allows_spawn());

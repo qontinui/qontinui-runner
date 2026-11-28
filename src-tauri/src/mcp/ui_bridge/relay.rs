@@ -976,11 +976,20 @@ pub async fn ui_bridge_relay_dispatch_handler(
                     .join(", ")
             ));
             err.code = Some("AMBIGUOUS_TAB".to_string());
-            err.suggestions = Some(
-                ids.iter()
-                    .map(|c| format!("retry with {{\"tabId\": \"{}\"}}", c.id))
-                    .collect(),
-            );
+            // The remedy is the caller's to apply: pin the target with one of
+            // the candidates `hint.candidates` lists.
+            err.refusal = Some(crate::mcp::refusal_envelope::refusal_for_envelope(
+                "AMBIGUOUS_TAB",
+                StatusCode::CONFLICT,
+                err.error.as_deref(),
+                Some(
+                    qontinui_types::refusal::NextAction::new(
+                        qontinui_types::refusal::NextActionKind::FixRequest,
+                    )
+                    .with_target("tabId"),
+                ),
+                None,
+            ));
             err.hint = Some(serde_json::json!({
                 "candidates": ids
                     .iter()

@@ -6278,6 +6278,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 3: the agent upstream-adopt (identical body, latest publication only).
     "coord_adopt_upstream_prompt_document",
     "coord_agent_registry_effective",
+    // Plan 2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type
+    // Phase 4: admits the report the agent-spawn guard hook is to send (plan
+    // Phase 5) for an agent type it found no registry row for, so the admin
+    // catalog (Phase 3b, coord) can list it as `observed`. Designed as a
+    // best-effort background call on an `UNKNOWN_AGENT` miss that never blocks
+    // the spawn; until coord serves the tool, a call answers an error the hook
+    // ignores. It confers no spawn authority.
+    "coord_agent_registry_observe",
     "coord_alert_claim",
     "coord_alert_queue",
     "coord_alert_release",
@@ -6533,6 +6541,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // release / reclaim.
     "coord_unbind_repo_tenant",
     "coord_unmute_gate",
+    // Plan 2026-10-09-coord-knows-which-box-holds-which-credential Phase 3: the
+    // credential-probe catalogue AGENT write (twin `PUT
+    // /coord/agent-credential-probe-specs`, qontinui-coord#4484). coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; the handler's
+    // `credential_probes::authorize_agent_writer` (possession + tenant-admin
+    // user) is the authorization. This list only forwards. Without it, this
+    // proxy refused the seed the door exists for (coord-revive.sh read it as
+    // METHOD_NOT_ALLOWED cause=drift), forcing the HTTP twin.
+    "coord_upsert_credential_probe_spec",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
     "coord_watch_verdict",
@@ -13064,17 +13081,38 @@ pub fn create_router(
                     )
                 })
             };
+            // On a blocking thread, like its neighbours: per workdir it reads
+            // the config and may run bounded git spawns (the workdir-artifact
+            // exclude), none of which belongs on a tokio worker. A panicked
+            // pass reports zero counts rather than taking the boot task down.
             let session_counts = if workdirs.is_empty() {
                 Default::default()
             } else {
-                crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
+                let session_reconcile = move || {
+                    crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
+                };
+                tokio::task::spawn_blocking(session_reconcile)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("coord_mcp: boot session reconcile task failed ({e}); counts unknown, reported as zero");
+                    Default::default()
+                })
             };
 
             // Plan 2026-07-07 Change 1 secondary gap: root self-heal ALWAYS runs,
             // independent of session presence. Change 1 core fix: on a same-port
             // restart this ADOPTS the on-disk nonce (no file rewrite) instead of
             // minting a fresh one that would strand a live client's cached nonce.
-            let root_action = crate::coord_mcp::reconcile_root_config(reconcile_bound_port);
+            // Blocking thread for the same reason as the session pass above. A
+            // panicked pass reads as `Leave` (nothing applied), with a warning.
+            let root_reconcile =
+                move || crate::coord_mcp::reconcile_root_config(reconcile_bound_port);
+            let root_action = tokio::task::spawn_blocking(root_reconcile)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("coord_mcp: boot root reconcile task failed ({e}); reported as Leave");
+                    crate::coord_mcp::RootReconcileAction::Leave
+                });
 
             // Change 2 observability: one structured summary of restore vs
             // self-heal so a future silent rotation (restored=0 → root Rewrite) is
@@ -17779,6 +17817,37 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 3:
+    /// the catalogue's agent WRITE forwards too, in sorted position, so a
+    /// proxied session can seed a spec instead of falling back to the HTTP twin.
+    #[test]
+    fn coord_upsert_credential_probe_spec_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed(
+            "coord_upsert_credential_probe_spec"
+        ));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_upsert_credential_probe_spec")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        assert!(
+            !COORD_MCP_DELIBERATE_EXCLUSIONS.contains(&"coord_upsert_credential_probe_spec"),
+            "a tool cannot be both forwarded and deliberately excluded"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_upsert_credential_probe_spec")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+    }
+
     /// Plan `2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors`
     /// Phase 1: coord#4238 put `coord_auto_publish_status` on coord's device
     /// floor; without this entry every runner-proxied session got `-32601`.
@@ -17839,6 +17908,48 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type`
+    /// Phase 4: the guard hook's unknown-agent report forwards, in sorted
+    /// position, is not a deliberate exclusion, passes the body gate, and the
+    /// comment above it does not hide it from the source-text parse.
+    #[test]
+    fn coord_agent_registry_observe_is_allowed_and_parses_from_source() {
+        let tool = "coord_agent_registry_observe";
+        assert!(coord_mcp_tool_is_allowed(tool));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+            "membership is a binary_search over the sorted table (order pinned by \
+             allowlist_tables_are_sorted)"
+        );
+        // It records an observed name, so it is a write; a later read prefix
+        // (e.g. `coord_agent_registry_`) must not reclassify it.
+        assert_eq!(
+            crate::session::coord_transport_rung::operation_for_call("tools/call", Some(tool)),
+            crate::session::coord_transport_rung::OPERATION_WRITE,
+            "{tool} is a write and the proxy must classify it as one"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not also be a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"agent_name":"explore"}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
@@ -23907,6 +24018,17 @@ mod supervised_workers_health_tests {
                 Site::Call,
                 "tokio::task::spawn_blocking(move || {",
                 "one-shot blocking census of on-disk .mcp.json configs, awaited by the restore",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(session_reconcile)",
+                "awaited one-shot blocking reconcile of the session .mcp.json configs (reads \
+                 each config and may run bounded git spawns for the workdir-artifact exclude)",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(root_reconcile)",
+                "awaited one-shot blocking reconcile of the root .mcp.json config",
             ),
             (
                 Site::Call,

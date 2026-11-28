@@ -692,6 +692,25 @@ impl Saturation {
     pub(crate) fn ratio(self) -> f64 {
         self.used as f64 / self.max as f64
     }
+
+    /// The count half of the pair (never negative — [`Self::new`] refused it).
+    pub(crate) fn used(self) -> i64 {
+        self.used
+    }
+
+    /// The ceiling half of the pair (always positive — [`Self::new`] refused
+    /// anything else).
+    pub(crate) fn max(self) -> i64 {
+        self.max
+    }
+
+    /// Which tasks the pair counts: `"threads"` or `"pids"`.
+    pub(crate) fn counter_name(self) -> &'static str {
+        match self.counter {
+            SaturationCounter::Threads => "threads",
+            SaturationCounter::Pids => "pids",
+        }
+    }
 }
 
 impl ResourceSample {
@@ -1475,7 +1494,7 @@ fn collect_host_lane() -> ResourceSample {
 /// publish "this device is idle" for a device that did not answer, which on a
 /// `NULLS LAST` ranking is worse than publishing nothing at all. See
 /// [`ResourceSample::active_terminal_sessions`].
-fn live_terminal_session_count() -> Option<i32> {
+pub(crate) fn live_terminal_session_count() -> Option<i32> {
     use std::sync::Arc;
     let app = crate::tauri_app_handle::current()?;
     let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?;

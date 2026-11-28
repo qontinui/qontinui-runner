@@ -12,7 +12,7 @@ use crate::mcp::types::{ApiResponse, ApiState};
 use crate::str_utils::truncate_str_ellipsis;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback, WorkspaceRootUnresolved};
-use qontinui_types::refusal::RefusalCode;
+use qontinui_types::refusal::{RefusalCode, RefusalSource};
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -200,7 +200,7 @@ async fn handle_scan(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         )
     })?;
@@ -212,7 +212,7 @@ async fn handle_scan(
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }))
 }
 
@@ -293,16 +293,25 @@ const RUNNER_CHECKOUT_HINT: &str =
      from inside that checkout.";
 
 /// The 422 body for a scan with no checkout to read: the shared refusal
-/// sentence, its stable code, and [`RUNNER_CHECKOUT_HINT`].
+/// sentence, its stable code, the typed `refusal` envelope, and
+/// [`RUNNER_CHECKOUT_HINT`].
 fn scan_root_missing_response(missing: ScanRootMissing) -> ApiResponse<()> {
-    let (error, code) = match missing {
-        ScanRootMissing::RootUnresolved(unresolved) => {
-            (unresolved.to_string(), RefusalCode::WorkspaceRootUnresolved)
-        }
-        ScanRootMissing::CheckoutAbsent => (
-            SiblingCheckoutAbsent::new("qontinui-runner", SiblingFallback::Unsupported).to_string(),
-            RefusalCode::SiblingCheckoutAbsent,
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let (error, code, refusal) = match missing {
+        ScanRootMissing::RootUnresolved(unresolved) => (
+            unresolved.to_string(),
+            RefusalCode::WorkspaceRootUnresolved,
+            Some(unresolved.refusal(RefusalSource::Runner, observed_at)),
         ),
+        ScanRootMissing::CheckoutAbsent => {
+            let absent =
+                SiblingCheckoutAbsent::new("qontinui-runner", SiblingFallback::Unsupported);
+            (
+                absent.to_string(),
+                RefusalCode::SiblingCheckoutAbsent,
+                absent.refusal(RefusalSource::Runner, observed_at),
+            )
+        }
     };
     ApiResponse {
         success: false,
@@ -311,7 +320,7 @@ fn scan_root_missing_response(missing: ScanRootMissing) -> ApiResponse<()> {
         error_detail: None,
         hint: Some(serde_json::Value::String(RUNNER_CHECKOUT_HINT.to_string())),
         code: Some(code.as_str().to_string()),
-        suggestions: None,
+        refusal,
     }
 }
 
@@ -1369,6 +1378,9 @@ mod tests {
             "{error}"
         );
         assert_eq!(hint_of(&body), RUNNER_CHECKOUT_HINT);
+        let refusal = body.refusal.as_ref().expect("a typed refusal");
+        assert_eq!(refusal.code.as_str(), "sibling_checkout_absent");
+        assert_eq!(refusal.next_action.kind.as_str(), "none_terminal");
         for said in [error.as_str(), RUNNER_CHECKOUT_HINT] {
             assert!(!said.contains("QONTINUI_ROOT"), "{said}");
         }
@@ -1391,6 +1403,9 @@ mod tests {
         assert_eq!(body.code.as_deref(), Some("workspace_root_unresolved"));
         assert_eq!(body.error.as_deref(), Some(unresolved.to_string().as_str()));
         assert_eq!(hint_of(&body), RUNNER_CHECKOUT_HINT);
+        let refusal = body.refusal.as_ref().expect("a typed refusal");
+        assert_eq!(refusal.code.as_str(), "workspace_root_unresolved");
+        assert_eq!(refusal.next_action.kind.as_str(), "set_setting");
         assert!(!unresolved.to_string().contains("QONTINUI_ROOT"));
     }
 }

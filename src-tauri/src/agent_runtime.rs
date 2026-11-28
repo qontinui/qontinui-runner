@@ -4471,6 +4471,26 @@ fn admit_launch(
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
     let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    if decision.is_err() {
+        // The same projection the decision was taken from (pure arithmetic),
+        // re-read for the tripped lane's observation: the decision itself
+        // carries only the stamp string.
+        let (projected, _) = reading.projected(pending);
+        if let Some((severity, observation)) = projected.tripped() {
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredLaunch,
+                severity,
+                crate::pressure_stop::WhatClass::CoordLaunch,
+                observation,
+                // The reading is charged with admitted, not-yet-running
+                // continuations: a projection whenever any are pending.
+                serde_json::json!({
+                    "observed_is_projection": pending > 0,
+                    "projected_pending_spawns": pending,
+                }),
+            );
+        }
+    }
     decision
 }
 
@@ -7076,7 +7096,10 @@ fn commit_pressure_stamp_reason(
 /// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
 /// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
 /// is read off the observation's METRIC, never re-derived from the severity.
-fn load_pressure_stamp_reason(
+///
+/// `pub(crate)` so `pressure_stop` records the same grammar as a stop event's
+/// `reason` rather than spelling it a second time.
+pub(crate) fn load_pressure_stamp_reason(
     severity: &str,
     observation: &crate::resource_guard::GateObservation,
 ) -> String {
@@ -7672,6 +7695,16 @@ async fn run_gate_continuation_inner(
                 observation.clause(severity),
                 payload.anchor_key
             );
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredContinuation,
+                severity,
+                crate::pressure_stop::WhatClass::GateContinuation,
+                &observation,
+                // The guard judges a reading charged with admitted,
+                // not-yet-running spawns, and the verdict does not carry the
+                // pending count: say the number may be a projection.
+                serde_json::json!({"observed_may_be_projection": true}),
+            );
             // The stamp reason names the lane and the REAL numbers, in the
             // `<class>:<detail>` shape coord-side grouping keys on:
             // `thread_pressure:warn:300_over_256` or
@@ -8095,10 +8128,12 @@ pub(crate) fn build_continuation_claude_command(
     // by [`LaunchFrame::resolve`]). Bound into `LaunchSpec.model`, which
     // renders exactly one `--model` and drops any template `--model`, in
     // either the `--model <m>` or the attached `--model=<m>` spelling. `None`
-    // keeps the template / account default — today's argv. The effort half is
-    // `LaunchSpec::effort`, owned by qontinui-runner#2569 (plan
-    // `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V8).
+    // keeps the template / account default — today's argv.
     launch_model: Option<String>,
+    // The reasoning effort coord decided for this spawn (`launch_effort`),
+    // bound into `LaunchSpec.effort`: one `--effort`, any template `--effort`
+    // dropped. `None` keeps the template / account default.
+    launch_effort: Option<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
@@ -8146,6 +8181,7 @@ pub(crate) fn build_continuation_claude_command(
         session_id: Some(pinned_session_id.to_string()),
         name: session_name.map(str::to_string),
         model: launch_model,
+        effort: launch_effort,
         extra_required,
         ..Default::default()
     };
@@ -8363,8 +8399,8 @@ async fn run_continuation_terminal(
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
     // coord's launch decision, validated and logged once for every attempt
-    // below. The model binds into `LaunchSpec.model`; the effort waits on
-    // `LaunchSpec::effort` (qontinui-runner#2569) and the line says so.
+    // below. The model binds into `LaunchSpec.model`, the effort into
+    // `LaunchSpec.effort`.
     let launch = payload.launch.resolve();
     launch.log(
         LaunchSeam::Terminal,
@@ -8508,6 +8544,7 @@ async fn run_continuation_terminal(
             crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
             launch.spec_model(),
+            launch.spec_effort(),
         );
         // ...unless an operator template put a replacement prompt in the final
         // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
@@ -8516,11 +8553,21 @@ async fn run_continuation_terminal(
         let command = Some(argv);
 
         // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
-        // as project slash commands regardless of the device's ~/.claude.
-        crate::fleet_commands::provision_fleet_commands_for_session(workdir);
-        // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
-        // no qontinui-claude-config checkout has no skills dir at all.
-        crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // as project slash commands regardless of the device's ~/.claude. Then do
+        // the same for the fleet SKILLS (.claude/skills/<name>/SKILL.md): a device
+        // with no qontinui-claude-config checkout has no skills dir at all. Both
+        // run on the blocking pool. Each pass joins a registry fetch and polls a
+        // `git ls-files` child, and on 2026-10-27 twenty of them ran one after
+        // another, each holding a worker (plan
+        // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+        {
+            let wd = workdir.to_string();
+            crate::spawn_off_worker::run_provisioning_off_worker(workdir, move || {
+                crate::fleet_commands::provision_fleet_commands_for_session(&wd);
+                crate::fleet_skills::provision_fleet_skills_for_session(&wd);
+            })
+            .await;
+        }
         // And the named-subagent defs (embedded floor + checkout overlay). Off
         // the async worker: the ownership probe may run git per destination.
         {
@@ -8535,30 +8582,58 @@ async fn run_continuation_terminal(
         // and leave an unattended, interactive `claude` facing the trust dialog).
         crate::claude_session::trust_gate::warm_dial().await;
 
-        let result = crate::commands::terminal::create_tracked_terminal_session_backend(
-            &terminal_manager,
-            &session_registry,
-            app.clone(),
-            title.clone(),
-            workdir.to_string(),
-            payload.anchor_key.clone(),
-            payload.anchor_key.clone(),
-            intent_repo.clone(),
-            command,
-            ctx.take(),
-            capture_hint,
-            Some(target_page),
-            // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
-            // the critical floor. A gate continuation is brand-new autonomous work
-            // with nobody at the keyboard to answer a dialog, and it is exactly the
-            // class of spawn that piled `claude` + `rustc` onto an already-starved
-            // box on the night of the incident. Refusing here is NOT a silent
-            // forever-refusal: the `Err` arm below calls `report_spawn_failed`, so
-            // coord learns the continuation did not start and can re-dispatch it
-            // once the box breathes — the same defer-don't-reject posture
-            // `ci_node::admission` takes for CI work.
-            false,
-        );
+        // The create is SYNCHRONOUS (ConPTY open, `CreateProcess`, coord row
+        // registration). One was measured at 38 s on 2026-10-27. So it runs on the
+        // blocking pool instead of holding an async worker for that whole time
+        // (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+        // D2). Everything it needs is moved in: the managers are `Arc` clones and
+        // the `AppHandle` is a handle clone. (Boot resume, account migration and
+        // the respawn receiver keep their create inline for cancel safety; see
+        // `resume_door.rs`.)
+        let result = {
+            let (tm, sr, app, title, workdir) = (
+                terminal_manager.clone(),
+                session_registry.clone(),
+                app.clone(),
+                title.clone(),
+                workdir.to_string(),
+            );
+            let (slug, topic, repo, isolated) = (
+                payload.anchor_key.clone(),
+                payload.anchor_key.clone(),
+                intent_repo.clone(),
+                ctx.take(),
+            );
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                crate::commands::terminal::create_tracked_terminal_session_backend(
+                    &tm,
+                    &sr,
+                    app,
+                    title,
+                    workdir,
+                    slug,
+                    topic,
+                    repo,
+                    command,
+                    isolated,
+                    capture_hint,
+                    Some(target_page),
+                    // UNATTENDED spawn — resource_override: false, i.e. this path
+                    // RESPECTS the critical floor. A gate continuation is brand-new
+                    // autonomous work with nobody at the keyboard to answer a
+                    // dialog, and it is exactly the class of spawn that piled
+                    // `claude` + `rustc` onto an already-starved box on the night
+                    // of the incident. Refusing here is NOT a silent
+                    // forever-refusal: the `Err` arm below calls
+                    // `report_spawn_failed`, so coord learns the continuation did
+                    // not start and can re-dispatch it once the box breathes — the
+                    // same defer-don't-reject posture `ci_node::admission` takes
+                    // for CI work.
+                    false,
+                )
+            })
+            .await
+        };
 
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
@@ -9525,7 +9600,7 @@ async fn run_condition_check_terminal(
     );
     // coord's launch decision for this check (`conditions/dispatch.rs`
     // `spawn_frame` stamps the same `launch_*` keys): model via
-    // `LaunchSpec.model`; effort waits on qontinui-runner#2569.
+    // `LaunchSpec.model`, effort via `LaunchSpec.effort`.
     let launch = payload.launch.resolve();
     launch.log(
         LaunchSeam::Terminal,
@@ -9576,6 +9651,7 @@ async fn run_condition_check_terminal(
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
         launch.spec_model(),
+        launch.spec_effort(),
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
@@ -9639,27 +9715,40 @@ async fn run_condition_check_terminal(
     let held_secrets =
         crate::condition_secrets::register(&payload.run_id, &payload.target_url, &payload.secrets);
 
-    let result = crate::commands::terminal::create_tracked_terminal_session_backend(
-        &terminal_manager,
-        &session_registry,
-        app.clone(),
-        title,
-        workdir,
-        None, // work_unit_slug — a condition check is not work-unit-scoped
-        None, // correlation_topic
-        None, // intent_repo — no repo edited
-        command,
-        None, // isolated_ctx — no worktree acquired
-        capture_hint,
-        Some(target_page),
-        // UNATTENDED spawn — respect the critical floor (see the gate-
-        // continuation site above for the full rationale). A condition check is
-        // the *cheapest* thing to drop when the box is out of commit: it edits
-        // nothing, commits nothing, and coord re-issues the check on its next
-        // pass, so a refusal here costs one deferred probe rather than a lost
-        // session.
-        false,
-    );
+    // Synchronous create, run on the blocking pool for the same reason as the
+    // gate-continuation site above (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    let result = {
+        let (tm, sr, app) = (
+            terminal_manager.clone(),
+            session_registry.clone(),
+            app.clone(),
+        );
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            crate::commands::terminal::create_tracked_terminal_session_backend(
+                &tm,
+                &sr,
+                app,
+                title,
+                workdir,
+                None, // work_unit_slug — a condition check is not work-unit-scoped
+                None, // correlation_topic
+                None, // intent_repo — no repo edited
+                command,
+                None, // isolated_ctx — no worktree acquired
+                capture_hint,
+                Some(target_page),
+                // UNATTENDED spawn — respect the critical floor (see the gate-
+                // continuation site above for the full rationale). A condition
+                // check is the *cheapest* thing to drop when the box is out of
+                // commit: it edits nothing, commits nothing, and coord re-issues
+                // the check on its next pass, so a refusal here costs one
+                // deferred probe rather than a lost session.
+                false,
+            )
+        })
+        .await
+    };
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
@@ -10996,25 +11085,32 @@ async fn run_agent_subprocess(
         }
     }
 
-    // Provision the named-subagent defs into the spawned worktree's cwd so the
-    // headless `claude` can resolve subagents the spawn prompt references
-    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
-    // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    // Off the async worker: the ownership probe may run git per destination.
+    // Provision the session cwd, all of it on the blocking pool: the copies, the
+    // registry fetches and the `git ls-files` probes are synchronous and would
+    // otherwise hold an async worker (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
     {
-        let wt = primary_wt.clone();
-        let _ = spawn_blocking_tracked(move || provision_agent_definitions_recorded(&wt)).await;
+        let wd = primary_wt.clone();
+        crate::spawn_off_worker::run_provisioning_off_worker(&primary_wt, move || {
+            // The named-subagent defs, so the headless `claude` can resolve
+            // subagents the spawn prompt references (merge-specialist,
+            // repo-auditor, ...). Fail-soft: a copy error here must not abort an
+            // otherwise-launchable spawn — the agent just lacks subagents.
+            provision_agent_definitions_recorded(&wd);
+            // /vet-plan and /implement-plan, so they resolve as project slash
+            // commands regardless of the device's ~/.claude.
+            crate::fleet_commands::provision_fleet_commands_for_session(&wd);
+            // The fleet SKILLS. Unlike the skills, the agent defs above need a
+            // resolved workspace root even for their embedded floor. With
+            // nothing declared, no runner checkout above the executable and no
+            // `<home>/qontinui-root`, that root is the folder holding the main
+            // working tree of the checkout this cwd is the top level of (a
+            // linked worktree's main checkout, here); otherwise the defs stay
+            // absent.
+            crate::fleet_skills::provision_fleet_skills_for_session(&wd);
+        })
+        .await;
     }
-    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
-    // resolve as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Unlike the skills, the agent defs above need a
-    // resolved workspace root even for their embedded floor. With nothing
-    // declared, no runner checkout above the executable and no
-    // `<home>/qontinui-root`, that root is the folder holding the main working
-    // tree of the checkout this cwd is the top level of (a linked worktree's
-    // main checkout, here); otherwise the defs stay absent.
-    crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
 
@@ -12342,6 +12438,18 @@ pub(crate) fn finalize_headless_child_env(
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
     crate::terminal::apply_python_utf8_default_tokio(cmd);
+
+    // The same base PATH the PTY plane composes from: the runner's own entries,
+    // then the user's toolchain dirs (plan
+    // 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path, Phase 1).
+    // Before it, a headless child inherited the systemd unit's PATH verbatim,
+    // with no `~/.cargo/bin`. A runner with no PATH leaves the child's alone.
+    if let Some(base) = crate::terminal::child_path::child_base_path() {
+        cmd.env(
+            "PATH",
+            crate::terminal::child_path::compose_child_path(Some(&base), &[]),
+        );
+    }
 
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
@@ -14078,6 +14186,76 @@ mod tests {
 
     use super::*;
 
+    // ── D2 of plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+    //    continuation-cap: the PTY create runs off the async workers ──
+
+    /// The continuation PTY create must not hold an async worker. It goes
+    /// through `spawn_off_worker::run_terminal_create_off_worker`. The pin
+    /// `spawn_off_worker::tests::continuation_terminal_create_sites_all_run_off_the_async_workers`
+    /// holds `run_continuation_terminal` and every other unattended create site
+    /// to that seam. This test is the seam's latency.
+    ///
+    /// Four stand-in creates block 2 s each (one real create was measured at
+    /// 38 s on 2026-10-27) on a 2-worker runtime. An unrelated 50 ms timer must
+    /// still finish within 50 + 500 ms. There are four creates rather than one
+    /// because a single blocked worker of two leaves the other free, and the
+    /// test could then not fail.
+    ///
+    /// Mutation check: make the seam call `create()` inline instead of through
+    /// `spawn_blocking_tracked`. Then both workers stay blocked, the timer is
+    /// about 2 s late, and this test fails.
+    #[test]
+    fn continuation_terminal_create_runs_off_the_async_workers() {
+        use crate::spawn_off_worker::test_support::{timer_delay_while_blocked, MAX_EXTRA_DELAY};
+        use std::sync::atomic::Ordering;
+
+        let (extra, outs) = timer_delay_while_blocked(4, |i, entered| async move {
+            crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok::<_, String>((format!("terminal-{i}"), None::<uuid::Uuid>))
+            })
+            .await
+        });
+        assert!(
+            extra <= MAX_EXTRA_DELAY,
+            "four 2 s terminal creates delayed a 50 ms timer by {extra:?} (bound 500ms) — the \
+             create ran on the async workers"
+        );
+        let expected: Vec<Result<(String, Option<uuid::Uuid>), String>> = (0..4)
+            .map(|i| Ok((format!("terminal-{i}"), None)))
+            .collect();
+        assert_eq!(outs, expected);
+    }
+
+    /// The seam returns the create's own refusal unchanged, so the site's
+    /// classifier (`classify_pty_spawn_error`) still sees the prefix it keys
+    /// on. A create that panics becomes an `Err` that the site's spawn-failed
+    /// arm reports, rather than a panic of the continuation task.
+    #[tokio::test]
+    async fn continuation_terminal_create_off_worker_keeps_the_create_error_and_reports_a_panic() {
+        let refused: Result<(), String> =
+            crate::spawn_off_worker::run_terminal_create_off_worker(|| {
+                Err("resource_guard:critical: threads 401 >= 400".to_string())
+            })
+            .await;
+        assert_eq!(
+            refused,
+            Err("resource_guard:critical: threads 401 >= 400".to_string())
+        );
+
+        let panicked: Result<(), String> =
+            crate::spawn_off_worker::run_terminal_create_off_worker(|| {
+                panic!("stand-in create panic")
+            })
+            .await;
+        let msg = panicked.expect_err("a panicked create must be an Err");
+        assert!(
+            msg.starts_with("terminal create task did not complete: "),
+            "{msg}"
+        );
+    }
+
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
     //    delivered-before-the-runner-finishes-booting-…, Phase 1) ──
 
@@ -14974,6 +15152,7 @@ mod tests {
                 Vec::new(),
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
                 None,
+                None,
             )
         };
         let without = build(None);
@@ -15002,6 +15181,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -15029,6 +15209,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -15061,6 +15242,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -15086,6 +15268,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         // The prompt stays the trailing positional behind `--`.
@@ -15144,6 +15327,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         let flag = cmd
             .iter()
@@ -15185,6 +15369,7 @@ mod tests {
             ],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
         assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
@@ -15218,6 +15403,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -15243,6 +15429,7 @@ mod tests {
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -15275,6 +15462,7 @@ mod tests {
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -15315,6 +15503,7 @@ mod tests {
                     account_command: None,
                     ..Default::default()
                 },
+                None,
                 None,
             )
         };
@@ -15359,6 +15548,7 @@ mod tests {
                     ..Default::default()
                 },
                 launch.resolve().spec_model(),
+                launch.resolve().spec_effort(),
             )
         };
         let model_values = |argv: &[String]| -> Vec<String> {
@@ -15468,6 +15658,7 @@ mod tests {
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
                 None,
             );
             let flags: Vec<usize> = cmd
@@ -16691,6 +16882,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         let flag = cmd

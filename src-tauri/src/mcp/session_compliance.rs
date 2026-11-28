@@ -133,18 +133,36 @@
 //! `production-and-cost#agent-spawn-authorization` requires a standing
 //! per-path opt-in that does not exist. When coord's config says `reopen`,
 //! this module does nothing — see [`Applicability::nudge_allowed`].
+//!
+//! ## Whose tenant — the session's
+//!
+//! Plan `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`.
+//! Coord's compliance config and its compliance rows are per tenant. Both the
+//! config read and the POST present the credential of the SESSION's tenant:
+//! at turn end the one decision the continuation verdict made for this Stop,
+//! at close one resolved from the lifecycle record
+//! ([`crate::mcp::policy_tenant::closed_session_policy_target`]). They used
+//! to present the device DEFAULT credential, so on a multi-bound device a
+//! session working another tenant's repo was gated by the default tenant's
+//! config and its rows landed in the default tenant. When the session's tenant
+//! is UNKNOWN nothing is read and nothing is filed — the turn or close is
+//! WITHHELD and counted ([`COMPLIANCE_WITHHELD_TENANT_UNKNOWN`]), never filed
+//! under the default tenant.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, info};
+use uuid::Uuid;
 
-use super::continuation_verdict::{coord_client_parts, http_client};
-use crate::session::session_lifecycle_store::SessionLifecycleStore;
+use super::continuation_verdict::{coord_base, http_client};
+use crate::mcp::policy_tenant::{self, PolicyTarget};
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use qontinui_runner_lib::file_tail::read_tail_lossy;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -312,42 +330,95 @@ impl ComplianceConfig {
     }
 }
 
-static CONFIG_CACHE: OnceLock<Mutex<Option<(Instant, Option<ComplianceConfig>)>>> = OnceLock::new();
+/// One config-cache slot: the coord base and the tenant whose credential read
+/// the config ([`PolicyTarget::tenant`]).
+///
+/// It used to be ONE slot keyed by nothing, so whichever tenant's config was
+/// read last gated every session on the box for the TTL. An UNKNOWN tenant
+/// reads and writes no entry (it reads nothing at all).
+type ConfigKey = (String, Option<Uuid>);
 
-fn config_cache() -> &'static Mutex<Option<(Instant, Option<ComplianceConfig>)>> {
-    CONFIG_CACHE.get_or_init(|| Mutex::new(None))
+type ConfigSlot = (Instant, Option<ComplianceConfig>);
+
+static CONFIG_CACHE: OnceLock<Mutex<HashMap<ConfigKey, ConfigSlot>>> = OnceLock::new();
+
+fn config_cache() -> &'static Mutex<HashMap<ConfigKey, ConfigSlot>> {
+    CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// TTL-cached enforcement-config read. `None` = coord could not be consulted
-/// (no JWT, transport error, non-2xx including the 404/501 this route returns
-/// until coord's Phase 3 lands, undecodable body) ⇒ the caller does nothing.
-async fn fetch_config() -> Option<ComplianceConfig> {
-    let now = Instant::now();
-    if let Ok(g) = config_cache().lock() {
-        if let Some((at, cached)) = g.as_ref() {
-            if now.duration_since(*at) < CONFIG_TTL {
-                return cached.clone();
-            }
-        }
-    }
-    let fresh = fetch_config_uncached().await;
+/// The config cached for `(base, tenant)` while within [`CONFIG_TTL`] of
+/// `now`. The outer `None` is a miss; `Some(None)` is a cached "coord could not
+/// be consulted".
+fn config_cache_lookup(
+    base: &str,
+    tenant: Option<Uuid>,
+    now: Instant,
+) -> Option<Option<ComplianceConfig>> {
+    let g = config_cache().lock().ok()?;
+    let (at, cached) = g.get(&(base.to_string(), tenant))?;
+    (now.duration_since(*at) < CONFIG_TTL).then(|| cached.clone())
+}
+
+/// Cache `config` as `(base, tenant)`'s, read at `at`.
+fn config_cache_store(
+    base: &str,
+    tenant: Option<Uuid>,
+    at: Instant,
+    config: Option<ComplianceConfig>,
+) {
     if let Ok(mut g) = config_cache().lock() {
-        *g = Some((now, fresh.clone()));
+        g.insert((base.to_string(), tenant), (at, config));
     }
+}
+
+/// TTL-cached enforcement-config read under `target`'s credential. `None` =
+/// coord could not be consulted (no usable credential for the target tenant,
+/// transport error, non-2xx including the 404/501 this route returns until
+/// coord's Phase 3 lands, undecodable body) ⇒ the caller does nothing.
+async fn fetch_config(target: PolicyTarget) -> Option<ComplianceConfig> {
+    let base = coord_base();
+    let now = Instant::now();
+    if let Some(cached) = config_cache_lookup(&base, target.tenant, now) {
+        return cached;
+    }
+    let fresh = fetch_config_uncached(&base, target).await;
+    config_cache_store(&base, target.tenant, now, fresh.clone());
     fresh
 }
 
-async fn fetch_config_uncached() -> Option<ComplianceConfig> {
-    let (base, jwt) = match coord_client_parts() {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("session-compliance: config skipped ({e})");
+/// The config GET under `target`'s credential (`coord_http::coord_get_for`),
+/// refused before it can be sent unless its bearer claims `target.tenant`.
+fn build_config_get(
+    client: &reqwest::Client,
+    base: &str,
+    target: PolicyTarget,
+) -> Result<reqwest::Request, String> {
+    policy_tenant::build_checked(
+        crate::coord_http::coord_get_for(
+            client,
+            format!("{base}/coord/session-compliance/config"),
+            target.scope,
+        ),
+        target,
+    )
+    .map(|(request, _presented)| request)
+}
+
+async fn fetch_config_uncached(base: &str, target: PolicyTarget) -> Option<ComplianceConfig> {
+    let client = http_client().ok()?;
+    let (build_client, build_base) = (client.clone(), base.to_string());
+    let built = policy_tenant::build_off_runtime(move || {
+        build_config_get(&build_client, &build_base, target)
+    })
+    .await;
+    let request = match built {
+        Ok(request) => request,
+        Err(reason) => {
+            debug!(reason = %reason, "session-compliance: config read not sent");
             return None;
         }
     };
-    let client = http_client().ok()?;
-    let url = format!("{base}/coord/session-compliance/config");
-    let resp = client.get(&url).bearer_auth(&jwt).send().await.ok()?;
+    let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
             status = resp.status().as_u16(),
@@ -357,6 +428,52 @@ async fn fetch_config_uncached() -> Option<ComplianceConfig> {
     }
     let body: Value = resp.json().await.ok()?;
     ComplianceConfig::from_body(&body)
+}
+
+// ===========================================================================
+// The session's tenant (Design §3)
+// ===========================================================================
+
+/// Process-lifetime count of compliance turns and closes WITHHELD because the
+/// session's tenant was UNKNOWN: no config read, no transcript read, no POST.
+/// Each withhold logs the running total as `withheld_total`; Phase 2's gate is
+/// that it stays 0 for sessions whose tenant resolves.
+static COMPLIANCE_WITHHELD_TENANT_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// A compliance turn or close WITHHELD because the session's tenant was
+/// UNKNOWN; `total` is [`COMPLIANCE_WITHHELD_TENANT_UNKNOWN`] after counting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Withheld {
+    total: u64,
+}
+
+/// The target compliance acts under — or [`Withheld`], counted and logged,
+/// when the session's tenant is UNKNOWN. Never the default tenant: a row filed
+/// there would be a record about a session that tenant does not govern
+/// (served `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+fn compliance_target(
+    tenant: &Result<PolicyTarget, String>,
+    at: &'static str,
+    session: &str,
+) -> Result<PolicyTarget, Withheld> {
+    match tenant {
+        Ok(target) => Ok(*target),
+        Err(reason) => {
+            let withheld_total =
+                COMPLIANCE_WITHHELD_TENANT_UNKNOWN.fetch_add(1, Ordering::Relaxed) + 1;
+            info!(
+                session = %session,
+                at,
+                withheld_total,
+                reason = %reason,
+                "session-compliance: compliance_withheld_tenant_unknown — the session's tenant is \
+                 unknown, so nothing was read or filed under any tenant"
+            );
+            Err(Withheld {
+                total: withheld_total,
+            })
+        }
+    }
 }
 
 // ===========================================================================
@@ -646,28 +763,65 @@ fn compliance_body(
     body
 }
 
-/// POST the (possibly absent) report to coord and return its verdict. `None`
-/// on every failure path — unreachable coord, 404/501 (the route does not
-/// exist on production coord yet), non-2xx, undecodable body.
+/// The compliance POST under `target`'s credential
+/// (`coord_http::coord_post_for`), refused before it can be sent unless its
+/// bearer claims `target.tenant` — so an unpaired runner, or a tenant with no
+/// usable slot, files nothing rather than filing anonymously.
+fn build_compliance_post(
+    client: &reqwest::Client,
+    base: &str,
+    claude_session_id: &str,
+    body: &Value,
+    target: PolicyTarget,
+) -> Result<reqwest::Request, String> {
+    policy_tenant::build_checked(
+        crate::coord_http::coord_post_for(
+            client,
+            format!("{base}/coord/sessions/{claude_session_id}/compliance"),
+            target.scope,
+        )
+        .json(body),
+        target,
+    )
+    .map(|(request, _presented)| request)
+}
+
+/// POST the (possibly absent) report to coord under `target`'s credential and
+/// return its verdict. `None` on every failure path — no usable credential,
+/// unreachable coord, 404/501 (the route does not exist on production coord
+/// yet), non-2xx, undecodable body.
 async fn post_compliance(
+    target: PolicyTarget,
     claude_session_id: &str,
     report: Option<&Value>,
     absent_reason: Option<&str>,
 ) -> Option<ComplianceVerdict> {
-    let (base, jwt) = coord_client_parts().ok()?;
     let client = http_client().ok()?;
-    let url = format!("{base}/coord/sessions/{claude_session_id}/compliance");
     let body = compliance_body(report, absent_reason, nudge_state_for(claude_session_id));
-    // coord-auth-exempt(device-jwt-required): `coord_client_parts` fails closed
-    // when unpaired, so the turn-end hook goes inert rather than filing a
-    // compliance verdict anonymously.
-    let resp = client
-        .post(&url)
-        .bearer_auth(&jwt)
-        .json(&body)
-        .send()
-        .await
-        .ok()?;
+    let (build_client, build_sid, build_body) =
+        (client.clone(), claude_session_id.to_string(), body.clone());
+    let built = policy_tenant::build_off_runtime(move || {
+        build_compliance_post(
+            &build_client,
+            &coord_base(),
+            &build_sid,
+            &build_body,
+            target,
+        )
+    })
+    .await;
+    let request = match built {
+        Ok(request) => request,
+        Err(reason) => {
+            debug!(
+                session = %claude_session_id,
+                reason = %reason,
+                "session-compliance: verdict POST not sent"
+            );
+            return None;
+        }
+    };
+    let resp = client.execute(request).await.ok()?;
     if !resp.status().is_success() {
         debug!(
             status = resp.status().as_u16(),
@@ -1156,7 +1310,7 @@ pub fn nudge_text(v: &ComplianceVerdict) -> String {
 /// CONTINUATION verdict too, so this is not merely a latency nicety. Anything
 /// slower than the budget fails open (allow), exactly like an unreachable
 /// coord.
-const TURN_END_BUDGET: Duration = Duration::from_millis(2500);
+pub(crate) const TURN_END_BUDGET: Duration = Duration::from_millis(2500);
 
 /// Observe one turn end: applicability gate → parse → emit → decide whether a
 /// nudge is warranted.
@@ -1165,32 +1319,62 @@ const TURN_END_BUDGET: Duration = Duration::from_millis(2500);
 /// `session_id` (the Claude UUID coord keys compliance on — *not* the runner
 /// terminal id the URL path may use) and the `transcript_path`.
 ///
+/// `tenant` is the ONE tenant decision the continuation verdict made for this
+/// Stop: the config read and the POST present that tenant's credential, and an
+/// UNKNOWN tenant withholds the whole turn ([`compliance_target`]).
+///
 /// Returns the nudge CANDIDATE. The caller
 /// ([`crate::mcp::continuation_verdict`]) owns the inherited loop guards
 /// (`stop_hook_active`, the rolling hourly cap) and calls [`mark_nudged`] only
 /// if it actually delivers. Every failure path — including exceeding
 /// [`TURN_END_BUDGET`] — returns `None`.
-pub async fn observe_turn_end(hook_input: &Value) -> Option<ComplianceNudge> {
-    match tokio::time::timeout(TURN_END_BUDGET, observe_turn_end_inner(hook_input)).await {
-        Ok(nudge) => nudge,
+pub async fn observe_turn_end(
+    hook_input: &Value,
+    tenant: &Result<PolicyTarget, String>,
+) -> Option<ComplianceNudge> {
+    observe_turn_end_outcome(hook_input, tenant)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`observe_turn_end`] with the withhold of an UNKNOWN tenant kept apart from
+/// "no nudge": `Err` means nothing was read or filed for this turn.
+async fn observe_turn_end_outcome(
+    hook_input: &Value,
+    tenant: &Result<PolicyTarget, String>,
+) -> Result<Option<ComplianceNudge>, Withheld> {
+    let session = hook_input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let target = compliance_target(tenant, "turn_end", session)?;
+    match tokio::time::timeout(TURN_END_BUDGET, observe_turn_end_inner(hook_input, target)).await {
+        Ok(nudge) => Ok(nudge),
         Err(_) => {
             debug!("session-compliance: turn-end budget exceeded — allowing the stop");
-            None
+            Ok(None)
         }
     }
 }
 
-async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
+async fn observe_turn_end_inner(
+    hook_input: &Value,
+    target: PolicyTarget,
+) -> Option<ComplianceNudge> {
     // 1. Applicability FIRST — before touching the transcript.
-    let config = fetch_config().await?;
+    let config = fetch_config(target).await?;
     let applicability = config.applicability();
     if !applicability.emits() {
         debug!(
             reason = %config.applicability_reason,
+            tenant = %policy_tenant::target_label(&Ok(target)).0,
             "session-compliance: inert for this tenant"
         );
         return None;
     }
+    let config_version = config.prompt_document_version;
 
     // 2. Identity + transcript, both straight off the hook payload.
     let session_id = hook_input
@@ -1224,13 +1408,13 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     if !nudge_possible {
         let sid = session_id.to_string();
         tauri::async_runtime::spawn(async move {
-            let _ = emit(&sid, report.as_ref()).await;
+            let _ = emit(target, &sid, report.as_ref(), config_version).await;
         });
         return None;
     }
 
     // 4. Emit and wait — a nudge is possible, so the verdict is load-bearing.
-    let verdict = emit(session_id, report.as_ref()).await?;
+    let verdict = emit(target, session_id, report.as_ref(), config_version).await?;
 
     if verdict.verdict != "unverified" {
         return None;
@@ -1302,19 +1486,29 @@ fn detect(transcript: &Path) -> Option<Option<Value>> {
     Some(scan_transcript(&tail))
 }
 
-/// POST the detection result and log the outcome.
-async fn emit(session_id: &str, report: Option<&Value>) -> Option<ComplianceVerdict> {
+/// POST the detection result under `target`'s credential and log the
+/// outcome, naming the tenant it was filed under and the version of that
+/// tenant's prompt document its config was read against.
+async fn emit(
+    target: PolicyTarget,
+    session_id: &str,
+    report: Option<&Value>,
+    config_version: Option<i64>,
+) -> Option<ComplianceVerdict> {
     let absent_reason = if report.is_none() {
         Some(ABSENT_NO_BLOCK)
     } else {
         None
     };
-    let verdict = post_compliance(session_id, report, absent_reason).await?;
+    let verdict = post_compliance(target, session_id, report, absent_reason).await?;
     info!(
         session = %session_id,
         block_present = report.is_some(),
         verdict = %verdict.verdict,
         reason = %verdict.reason,
+        tenant = %policy_tenant::target_label(&Ok(target)).0,
+        config_prompt_document_version =
+            %crate::mcp::continuation_verdict::version_label(config_version),
         "session-compliance"
     );
     Some(verdict)
@@ -1357,9 +1551,30 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
         return;
     }
     let session_id = claude_session_id.to_string();
+    let inputs = CloseTenantInputs::of(&record);
     let config_dir = record.config_dir;
-    let working_dir = record.working_dir;
     tauri::async_runtime::spawn(async move {
+        // Whose compliance this is: the session's tenant, resolved from the
+        // record (Design §5). The nonce may already be released, so the
+        // registry leg — or the record's durable tenant — usually decides.
+        // Decided BEFORE taking a finalize permit: the decision may wait its
+        // whole budget, and a finalize permit held through it would stall the
+        // other closes. It has its own, wider bound instead, so a boot sweep
+        // closing many records cannot fire an unbounded burst of proxy and
+        // secure-storage reads.
+        let Ok(decision_permit) = close_decision_permits().acquire().await else {
+            return;
+        };
+        let tenant = policy_tenant::closed_session_policy_target(
+            &inputs.terminal_id,
+            &session_id,
+            inputs.working_dir.as_deref(),
+            inputs.recorded_row,
+            inputs.recorded_tenant,
+            CLOSE_TENANT_BUDGET,
+        )
+        .await;
+        drop(decision_permit);
         // The liveness poll closes many stale records at once after a crash
         // restart, and every one of these does a config-dir walk, a multi-MB
         // read and a coord POST. Bound the burst rather than letting a boot
@@ -1368,8 +1583,47 @@ pub fn finalize_on_close(claude_session_id: &str, store: &Weak<SessionLifecycleS
             Ok(p) => p,
             Err(_) => return,
         };
-        finalize_impl(&session_id, config_dir.as_deref(), working_dir.as_deref()).await;
+        let _ = finalize_impl(
+            &session_id,
+            config_dir.as_deref(),
+            inputs.working_dir.as_deref(),
+            &tenant,
+        )
+        .await;
     });
+}
+
+/// How long the close-time finalize's tenant decision may take. No hook waits
+/// on it — the finalize is detached, and the decision runs before a finalize
+/// permit is taken — so it may take what SessionStart takes; a read that has
+/// not settled is `Unnamed`, which the record's durable tenant may still
+/// decide, and which is otherwise UNKNOWN on a multi-bound device (withheld).
+const CLOSE_TENANT_BUDGET: Duration = policy_tenant::ROUTE_TENANT_BUDGET;
+
+/// What a closed lifecycle record names for its close-time tenant decision
+/// (Design §5): the terminal that hosted it, its working dir, the coord row it
+/// records (`finish_coord_session_id`) and its DURABLE tenant (`tenant_id`,
+/// stamped at spawn and kept across a restart for exactly this). Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseTenantInputs {
+    terminal_id: String,
+    working_dir: Option<String>,
+    recorded_row: Option<Uuid>,
+    recorded_tenant: Option<Uuid>,
+}
+
+impl CloseTenantInputs {
+    fn of(record: &TerminalSessionRecord) -> Self {
+        CloseTenantInputs {
+            terminal_id: record.terminal_id.clone(),
+            working_dir: record.working_dir.clone(),
+            recorded_row: record.finish_coord_session_id,
+            recorded_tenant: record
+                .tenant_id
+                .as_deref()
+                .and_then(|t| Uuid::parse_str(t.trim()).ok()),
+        }
+    }
 }
 
 /// Concurrency bound for close-time finalizes (see [`finalize_on_close`]).
@@ -1381,23 +1635,44 @@ fn finalize_permits() -> &'static tokio::sync::Semaphore {
     FINALIZE_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(FINALIZE_CONCURRENCY))
 }
 
-async fn finalize_impl(session_id: &str, config_dir: Option<&str>, working_dir: Option<&str>) {
-    let Some(config) = fetch_config().await else {
-        return;
+/// Concurrency bound for close-time TENANT DECISIONS — wider than
+/// [`FINALIZE_CONCURRENCY`], because a decision is a proxy read plus a few local
+/// slot reads, not a transcript read and a POST.
+const CLOSE_DECISION_CONCURRENCY: usize = 6;
+
+static CLOSE_DECISION_PERMITS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn close_decision_permits() -> &'static tokio::sync::Semaphore {
+    CLOSE_DECISION_PERMITS.get_or_init(|| tokio::sync::Semaphore::new(CLOSE_DECISION_CONCURRENCY))
+}
+
+/// The close-time detection + emit. `Err` is the withhold of an UNKNOWN
+/// tenant; every other path — including the fail-open ones — is `Ok`.
+async fn finalize_impl(
+    session_id: &str,
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    tenant: &Result<PolicyTarget, String>,
+) -> Result<(), Withheld> {
+    let target = compliance_target(tenant, "session_close", session_id)?;
+    let Some(config) = fetch_config(target).await else {
+        return Ok(());
     };
     if !config.applicability().emits() {
-        return;
+        return Ok(());
     }
+    let config_version = config.prompt_document_version;
     let Some(path) = resolve_transcript(config_dir, working_dir, session_id) else {
         debug!(session = %session_id, "session-compliance: no transcript at close — no-op");
-        return;
+        return Ok(());
     };
     // Same reason as the turn-end path: the read + per-line parse is
     // synchronous and must not run on the async worker.
     let Ok(Some(report)) = spawn_blocking_tracked(move || detect(&path)).await else {
-        return;
+        return Ok(());
     };
-    let _ = emit(session_id, report.as_ref()).await;
+    let _ = emit(target, session_id, report.as_ref(), config_version).await;
+    Ok(())
 }
 
 /// Locate the on-disk transcript for a closed session. Prefers the recorded
@@ -1507,878 +1782,4 @@ pub fn coverage_bound() -> CoverageBound {
 // ===========================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    const BLOCK: &str = r#"<!-- POLICY_COMPLIANCE v1 -->
-```json
-{ "schema": "policy-compliance/1",
-  "items": [{"ref":"A1","state":"landed","evidence":{"pr":"qontinui/qontinui-runner#1"}}],
-  "clauses_applied": [{"id":"finish-to-zero","for":"A1"}],
-  "policy_gaps": [], "escalations": [], "declined": [] }
-```
-"#;
-
-    fn assistant_line(texts: &[&str]) -> String {
-        let content: Vec<Value> = texts
-            .iter()
-            .map(|t| json!({"type": "text", "text": t}))
-            .collect();
-        json!({
-            "type": "assistant",
-            "uuid": "u1",
-            "timestamp": "2026-07-30T12:00:00Z",
-            "message": {"model": "claude-opus-5", "content": content}
-        })
-        .to_string()
-    }
-
-    // ── extract_compliance_block ─────────────────────────────────────────
-
-    #[test]
-    fn extracts_a_fenced_block() {
-        let v = extract_compliance_block(BLOCK).expect("block found");
-        assert_eq!(v["schema"], SCHEMA);
-        assert_eq!(v["items"][0]["ref"], "A1");
-    }
-
-    #[test]
-    fn extracts_an_unfenced_block() {
-        let text =
-            "<!-- POLICY_COMPLIANCE v1 -->\n{\"schema\":\"policy-compliance/1\",\"items\":[]}";
-        assert!(extract_compliance_block(text).is_some());
-    }
-
-    #[test]
-    fn prose_alone_is_not_a_pass() {
-        // The single most important negative: a session can print the words
-        // having read nothing. That must not satisfy the check.
-        let text = "I emitted the POLICY_COMPLIANCE footer and everything reconciled. \
-                    All items landed. schema policy-compliance/1.";
-        assert!(extract_compliance_block(text).is_none());
-    }
-
-    #[test]
-    fn an_inline_mention_cannot_locate_a_later_block() {
-        // The opener must START a line. Prose naming the marker mid-sentence
-        // must not reach forward and adopt an unrelated JSON object.
-        let text = "As promised I wrote the <!-- POLICY_COMPLIANCE v1 --> footer.\n\
-                    Here is some config: {\"schema\":\"policy-compliance/1\",\"items\":[]}";
-        assert!(extract_compliance_block(text).is_none());
-    }
-
-    #[test]
-    fn an_indented_opener_still_matches() {
-        let text = "   <!-- POLICY_COMPLIANCE v1 -->\n\
-                    {\"schema\":\"policy-compliance/1\",\"items\":[{\"ref\":\"A\"}]}";
-        assert!(extract_compliance_block(text).is_some());
-    }
-
-    #[test]
-    fn a_stray_brace_in_the_opener_does_not_lose_the_block() {
-        let text = "<!-- POLICY_COMPLIANCE v1 {see plan} -->\n```json\n\
-                    {\"schema\":\"policy-compliance/1\",\"items\":[{\"ref\":\"A\"}]}\n```";
-        let v = extract_compliance_block(text).expect("block found past the stray brace");
-        assert_eq!(v["items"][0]["ref"], "A");
-    }
-
-    #[test]
-    fn malformed_json_is_not_a_pass() {
-        let text =
-            "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{ \"schema\": \"policy-compliance/1\", \
-                    \"items\": [ {\"ref\": }\n```";
-        assert!(extract_compliance_block(text).is_none());
-    }
-
-    #[test]
-    fn wrong_schema_string_is_not_a_pass() {
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n\
-                    {\"schema\":\"policy-compliance/2\",\"items\":[]}\n```";
-        assert!(extract_compliance_block(text).is_none());
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{\"items\":[]}\n```";
-        assert!(extract_compliance_block(text).is_none());
-    }
-
-    #[test]
-    fn items_must_be_an_array() {
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n\
-                    {\"schema\":\"policy-compliance/1\",\"items\":{}}\n```";
-        assert!(extract_compliance_block(text).is_none());
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n\
-                    {\"schema\":\"policy-compliance/1\"}\n```";
-        assert!(extract_compliance_block(text).is_none());
-    }
-
-    #[test]
-    fn multiple_blocks_last_wins() {
-        let first = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n\
-                     {\"schema\":\"policy-compliance/1\",\"items\":[{\"ref\":\"first\"}]}\n```";
-        let second = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n\
-                      {\"schema\":\"policy-compliance/1\",\"items\":[{\"ref\":\"second\"}]}\n```";
-        let text = format!("{first}\n\nsome prose\n\n{second}");
-        let v = extract_compliance_block(&text).expect("block found");
-        assert_eq!(v["items"][0]["ref"], "second");
-    }
-
-    #[test]
-    fn a_later_prose_mention_does_not_invalidate_an_earlier_real_block() {
-        let text = format!("{BLOCK}\n\nAs shown above, the POLICY_COMPLIANCE report is done.");
-        let v = extract_compliance_block(&text).expect("block found");
-        assert_eq!(v["items"][0]["ref"], "A1");
-    }
-
-    // ── scan_transcript ──────────────────────────────────────────────────
-
-    #[test]
-    fn scans_a_block_in_a_single_content_block() {
-        let jsonl = format!(
-            "{}\n{}\n",
-            assistant_line(&["Working on it."]),
-            assistant_line(&[BLOCK])
-        );
-        assert!(scan_transcript(&jsonl).is_some());
-    }
-
-    #[test]
-    fn scans_a_block_split_across_content_blocks() {
-        // The recon hazard: Claude can emit the marker + fence in one text
-        // block and the payload in the next. Joining is what makes it match.
-        let head = "<!-- POLICY_COMPLIANCE v1 -->\n```json";
-        let tail = "{\"schema\":\"policy-compliance/1\",\"items\":[{\"ref\":\"split\"}]}\n```";
-        let jsonl = format!("{}\n", assistant_line(&[head, tail]));
-        let v = scan_transcript(&jsonl).expect("block found across content blocks");
-        assert_eq!(v["items"][0]["ref"], "split");
-    }
-
-    #[test]
-    fn scans_a_block_split_across_messages() {
-        let head = "<!-- POLICY_COMPLIANCE v1 -->\n```json";
-        let tail = "{\"schema\":\"policy-compliance/1\",\"items\":[]}\n```";
-        let jsonl = format!("{}\n{}\n", assistant_line(&[head]), assistant_line(&[tail]));
-        assert!(scan_transcript(&jsonl).is_some());
-    }
-
-    #[test]
-    fn user_records_and_tool_blocks_are_ignored() {
-        // A user PASTING the block must not count as the assistant emitting it.
-        let user = json!({
-            "type": "user",
-            "message": {"content": [{"type": "text", "text": BLOCK}]}
-        })
-        .to_string();
-        assert!(scan_transcript(&user).is_none());
-
-        let tool_only = json!({
-            "type": "assistant",
-            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"cmd": BLOCK}}]}
-        })
-        .to_string();
-        assert!(scan_transcript(&tool_only).is_none());
-    }
-
-    #[test]
-    fn malformed_and_partial_lines_are_skipped_not_fatal() {
-        let jsonl = format!(
-            "{{ this is not json\n\n{}\n{{\"type\":\"assistant\"}}\n",
-            assistant_line(&[BLOCK])
-        );
-        assert!(scan_transcript(&jsonl).is_some());
-    }
-
-    #[test]
-    fn an_empty_transcript_yields_no_block() {
-        assert!(scan_transcript("").is_none());
-        assert!(scan_transcript("\n\n  \n").is_none());
-    }
-
-    // ── ComplianceConfig / Applicability ─────────────────────────────────
-
-    #[test]
-    fn applicable_config_enforces() {
-        let c = ComplianceConfig::from_body(&json!({
-            "enabled": true, "mode": "nudge", "max_attempts": 1,
-            "enforced_clause_ref": "policy/session-protocol#finish-to-zero",
-            "applicable": true, "applicability_reason": "applicable",
-            "clause_resolved_via": "clause_id", "prompt_document_version": 4
-        }))
-        .expect("parsed");
-        assert_eq!(c.applicability(), Applicability::Enforce);
-        assert!(c.applicability().emits());
-        assert!(c.applicability().nudge_allowed(&c.mode));
-    }
-
-    #[test]
-    fn enforcement_disabled_still_emits_but_never_nudges() {
-        // Report-only by default is the whole point of Phase 1: the verdict
-        // emit is how the false-positive rate gets measured.
-        let c = ComplianceConfig::from_body(&json!({
-            "enabled": false, "mode": "nudge", "applicable": false,
-            "applicability_reason": "enforcement_disabled"
-        }))
-        .expect("parsed");
-        assert_eq!(c.applicability(), Applicability::ReportOnly);
-        assert!(c.applicability().emits());
-        assert!(!c.applicability().nudge_allowed(&c.mode));
-    }
-
-    #[test]
-    fn clause_absent_or_document_missing_is_fully_inert() {
-        for reason in ["clause_absent", "document_missing"] {
-            let c = ComplianceConfig::from_body(&json!({
-                "enabled": true, "mode": "nudge", "applicable": false,
-                "applicability_reason": reason
-            }))
-            .expect("parsed");
-            assert_eq!(c.applicability(), Applicability::Inert, "reason {reason}");
-            assert!(!c.applicability().emits(), "reason {reason}");
-        }
-    }
-
-    #[test]
-    fn reopen_mode_never_nudges() {
-        // A spawn that outlives the request needs a standing per-path opt-in
-        // that does not exist — so `reopen` is inert on the nudge arm.
-        let c = ComplianceConfig::from_body(&json!({
-            "enabled": true, "mode": "reopen", "applicable": true,
-            "applicability_reason": "applicable"
-        }))
-        .expect("parsed");
-        assert_eq!(c.applicability(), Applicability::Enforce);
-        assert!(c.applicability().emits());
-        assert!(!c.applicability().nudge_allowed(&c.mode));
-    }
-
-    #[test]
-    fn an_unknown_reason_word_never_escalates_to_enforce() {
-        let c = ComplianceConfig::from_body(&json!({
-            "enabled": true, "mode": "nudge", "applicable": true,
-            "applicability_reason": "some_future_reason"
-        }))
-        .expect("parsed");
-        assert_eq!(c.applicability(), Applicability::ReportOnly);
-        let c = ComplianceConfig::from_body(&json!({"applicability_reason": "some_future_reason"}))
-            .expect("parsed");
-        assert_eq!(c.applicability(), Applicability::Inert);
-    }
-
-    #[test]
-    fn an_empty_config_body_is_inert() {
-        let c = ComplianceConfig::from_body(&json!({})).expect("parsed");
-        assert!(!c.enabled);
-        assert_eq!(c.applicability(), Applicability::Inert);
-        assert!(ComplianceConfig::from_body(&json!("nope")).is_none());
-        assert!(ComplianceConfig::from_body(&Value::Null).is_none());
-    }
-
-    // ── ComplianceVerdict / footprint ────────────────────────────────────
-
-    #[test]
-    fn verdict_parses_footprint_strings_and_objects() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "reconciliation": {},
-            "footprint": {
-                "prs": ["qontinui/qontinui-runner#42", {"ref": "qontinui/qontinui-web#7"}],
-                "commits": [{"sha": "abc1234"}],
-                "claims": []
-            }
-        }));
-        assert_eq!(v.verdict, "unverified");
-        assert_eq!(
-            v.footprint_prs,
-            vec!["qontinui/qontinui-runner#42", "qontinui/qontinui-web#7"]
-        );
-        assert_eq!(v.footprint_commits, vec!["abc1234"]);
-        assert!(!v.footprint_is_empty());
-    }
-
-    #[test]
-    fn an_absent_footprint_reads_empty() {
-        let v = ComplianceVerdict::from_body(&json!({"verdict": "unverified"}));
-        assert!(v.footprint_is_empty());
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified",
-            "footprint": {"prs": [], "commits": [], "claims": []}
-        }));
-        assert!(v.footprint_is_empty());
-    }
-
-    /// §A4 condition 3: CLAIMS ALONE MUST NOT ARM THE NUDGE.
-    ///
-    /// coord builds `footprint.claims` from `claims_audit` rows of kind
-    /// `symbol`/`file_glob`, and the fleet's `/preflight` protocol acquires
-    /// file-glob claims before the first line of code is written. If claims
-    /// counted, this footprint would be non-empty at turn 1 of nearly every
-    /// session — and since an unfinished session's verdict is `unverified`
-    /// with `reason: "absent"` by construction, the nudge would fire at its
-    /// FIRST pause. That is the per-turn nag condition 3 exists to prevent.
-    #[test]
-    fn claims_alone_do_not_arm_the_nudge() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "footprint": {
-                "prs": [], "commits": [],
-                "claims": ["src/**/*.rs", "qontinui-runner:src/mcp/*"]
-            }
-        }));
-        assert!(!v.footprint_claims.is_empty(), "claims still parsed");
-        assert!(
-            v.footprint_is_empty(),
-            "claims measure work STARTED, not work DONE — they must not arm the nudge"
-        );
-
-        // A single PR or commit DOES arm it: a report is genuinely owed.
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
-        }));
-        assert!(!v.footprint_is_empty());
-    }
-
-    /// A commit object carrying a non-null `pr_number` — the normal case for a
-    /// commit pushed on a PR branch — must render as its SHA, not as a PR ref.
-    /// The session being nudged needs the sha to fill `evidence.sha`.
-    #[test]
-    fn a_commit_with_a_pr_number_renders_its_sha() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "footprint": {
-                "prs": [],
-                "commits": [{
-                    "sha": "abc1234", "repo": "qontinui/qontinui-runner",
-                    "branch": "feat/x", "pr_number": 923,
-                    "recorded_at": "2026-07-30T00:00:00Z"
-                }],
-                "claims": []
-            }
-        }));
-        assert_eq!(
-            v.footprint_commits,
-            vec!["abc1234"],
-            "a commit must not render as owner/repo#N"
-        );
-    }
-
-    /// A block that WAS emitted but failed reconciliation must not be told it
-    /// emitted nothing — the nudge would contradict itself two lines later.
-    #[test]
-    fn the_nudge_does_not_claim_an_emitted_block_is_missing() {
-        let emitted = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified",
-            "reason": "2 of 5 item(s) could not be reconciled: A1, B2",
-            "reconciliation": {},
-            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
-        }));
-        let text = nudge_text(&emitted);
-        assert!(
-            !text.contains("You did not emit"),
-            "must not assert absence about a block that was emitted: {text}"
-        );
-        assert!(text.contains("did not reconcile"));
-
-        let absent = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
-        }));
-        assert!(nudge_text(&absent).contains("You did not emit"));
-    }
-
-    // ── nudge text ───────────────────────────────────────────────────────
-
-    #[test]
-    fn nudge_carries_the_observed_footprint() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "absent",
-            "footprint": {"prs": ["o/r#1"], "commits": ["deadbee"], "claims": []}
-        }));
-        let text = nudge_text(&v);
-        assert!(text.contains("policy/session-protocol` v4 Step 3"));
-        assert!(text.contains("PRs `o/r#1`"));
-        assert!(text.contains("commits `deadbee`"));
-        assert!(text.contains("claims `none`"));
-        assert!(text.contains("reconciled against those observations"));
-        // `absent` is the plain missing-block case — no contradiction sentence.
-        assert!(!text.contains("failed to reconcile"));
-    }
-
-    #[test]
-    fn nudge_names_contradicted_claims_when_coord_supplies_them() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "contradicted",
-            "reconciliation": {"unreconciled": [{"ref": "A1"}, "B2"]},
-            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
-        }));
-        let text = nudge_text(&v);
-        assert!(text.contains("failed to reconcile"));
-        assert!(text.contains("A1"));
-        assert!(text.contains("B2"));
-    }
-
-    #[test]
-    fn nudge_falls_back_to_coords_reason_when_the_payload_is_unfamiliar() {
-        let v = ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified", "reason": "contradicted",
-            "reconciliation": {"some": "future shape"},
-            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
-        }));
-        let text = nudge_text(&v);
-        assert!(text.contains("could not reconcile every claim"));
-        assert!(text.contains("contradicted"));
-    }
-
-    #[test]
-    fn unreconciled_refs_reads_the_shapes_it_knows_and_no_others() {
-        assert_eq!(
-            unreconciled_refs(&json!({"unreconciled": ["A", {"ref": "B"}]})),
-            vec!["A", "B"]
-        );
-        assert_eq!(
-            unreconciled_refs(&json!({"items": [
-                {"ref": "A", "reconciled": true},
-                {"ref": "B", "reconciled": false},
-                {"ref": "C", "status": "reconciled"},
-                {"ref": "D", "status": "contradicted"}
-            ]})),
-            vec!["B", "D"]
-        );
-        assert!(unreconciled_refs(&json!({"unknown": 1})).is_empty());
-        assert!(unreconciled_refs(&Value::Null).is_empty());
-    }
-
-    // ── counted per-session cap ──────────────────────────────────────────
-    //
-    // `NUDGED` is process-global across the whole test binary, so every test
-    // below uses a session key unique to itself.
-
-    #[test]
-    fn mark_nudged_is_a_counted_compare_and_set() {
-        let a = "session-compliance-test-marker-a";
-        let b = "session-compliance-test-marker-b";
-        let c = NudgeClass::Report;
-        assert_eq!(nudge_attempts_for(a, c), 0);
-        assert!(mark_nudged(a, c, 1), "first claim wins");
-        assert!(
-            !mark_nudged(a, c, 1),
-            "second claim must lose at max_attempts=1"
-        );
-        assert_eq!(nudge_attempts_for(a, c), 1);
-        assert_eq!(nudge_attempts_for(b, c), 0, "the cap is per session");
-    }
-
-    /// The headline behaviour of the change: the cap is the OPERATOR's number.
-    /// Under the old set-based guard this test was unwritable — delivery
-    /// stopped at one no matter what `max_attempts` said.
-    #[test]
-    fn a_higher_cap_allows_exactly_that_many() {
-        let s = "session-compliance-test-cap-three";
-        let c = NudgeClass::Report;
-        for i in 1..=3 {
-            assert!(mark_nudged(s, c, 3), "attempt {i} of 3 must be granted");
-            assert_eq!(nudge_attempts_for(s, c), i);
-        }
-        assert!(!mark_nudged(s, c, 3), "the fourth is refused");
-        assert_eq!(nudge_attempts_for(s, c), 3, "and does not increment");
-    }
-
-    /// `max_attempts: 0` means never nudge — a setting the old cap could not
-    /// express at all.
-    #[test]
-    fn a_zero_cap_never_nudges() {
-        let s = "session-compliance-test-cap-zero";
-        for c in NudgeClass::ALL {
-            assert!(!mark_nudged(s, c, 0));
-            assert_eq!(nudge_attempts_for(s, c), 0);
-        }
-        assert!(
-            !any_class_under_cap(s, 0),
-            "a zero cap leaves no class eligible, so the pre-coord screen              short-circuits before the verdict is even fetched"
-        );
-    }
-
-    /// The entire backward-compatibility argument for this change: an
-    /// untouched config still nudges exactly once. Without this, flipping the
-    /// `unwrap_or` would triple the fleet's nudge rate with a green suite.
-    #[test]
-    fn an_absent_max_attempts_defaults_to_one() {
-        assert_eq!(
-            ComplianceConfig::from_body(&json!({}))
-                .expect("parsed")
-                .max_attempts,
-            1
-        );
-        assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": null}))
-                .expect("parsed")
-                .max_attempts,
-            1
-        );
-        assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": "3"}))
-                .expect("parsed")
-                .max_attempts,
-            1,
-            "a non-numeric value is not a cap"
-        );
-    }
-
-    #[test]
-    fn an_absurd_max_attempts_is_clamped() {
-        assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": 999_999}))
-                .expect("parsed")
-                .max_attempts,
-            MAX_NUDGE_ATTEMPTS_CEILING as u32
-        );
-    }
-
-    /// The timestamp goes on the wire, so its SHAPE is part of the contract.
-    /// `to_rfc3339()` would emit 0/3/6/9 fractional digits depending on the
-    /// clock reading; the 9-digit form is rejected by some RFC3339 parsers and
-    /// rounded by Postgres.
-    #[test]
-    fn the_nudge_timestamp_is_fixed_width_utc() {
-        let s = "session-compliance-test-stamp";
-        assert!(mark_nudged(s, NudgeClass::Report, 1));
-        let (attempts, last_at) = nudge_state_for(s).expect("a nudged session has state");
-        assert_eq!(attempts, 1);
-        let at = last_at.expect("a delivered nudge stamps its time");
-        assert!(at.ends_with('Z'), "UTC as Z, not +00:00: {at}");
-        assert_eq!(at.len(), 24, "fixed-width milliseconds: {at}");
-        assert!(chrono::DateTime::parse_from_rfc3339(&at).is_ok());
-    }
-
-    /// The restart bug, pinned at the seam it actually broke.
-    ///
-    /// A session this run never saw reads `None`, and `None` must OMIT the
-    /// fields — not send `0`. Coord's store is last-write-wins, so a
-    /// fabricated zero at session close would erase a real count recorded
-    /// before the restart.
-    #[test]
-    fn an_unknown_session_omits_the_nudge_fields_rather_than_sending_zero() {
-        assert!(nudge_state_for("session-compliance-test-never-seen").is_none());
-
-        let body = compliance_body(None, Some(ABSENT_NO_BLOCK), None);
-        assert!(
-            body.get("nudge_attempts").is_none(),
-            "a fabricated 0 would overwrite coord's real count: {body}"
-        );
-        assert!(body.get("last_nudged_at").is_none());
-        // The report half of the post is unaffected.
-        assert_eq!(body["absent_reason"], json!(ABSENT_NO_BLOCK));
-
-        let carried = compliance_body(
-            None,
-            None,
-            Some((2, Some("2026-08-08T10:00:00.000Z".into()))),
-        );
-        assert_eq!(carried["nudge_attempts"], json!(2));
-        assert_eq!(carried["last_nudged_at"], json!("2026-08-08T10:00:00.000Z"));
-
-        // A recorded count with no stamp still carries the count.
-        let stampless = compliance_body(None, None, Some((1, None)));
-        assert_eq!(stampless["nudge_attempts"], json!(1));
-        assert!(stampless.get("last_nudged_at").is_none());
-    }
-
-    // ── per-CLASS keying (plan `2026-08-08-runner-enforced-policy-pull`
-    //    Phase 3) ─────────────────────────────────────────────────────────
-
-    /// THE regression this whole sub-change exists to prevent.
-    ///
-    /// `NUDGED` used to be keyed on `session_id` ALONE. With a second nudge
-    /// class that makes the two MUTUALLY EXCLUSIVE per session — whichever
-    /// fires first permanently suppresses the other, so a session that got a
-    /// report-enforcement nudge could never be told it skipped the policy pull.
-    /// A verification arm silently swallowed by an unrelated arm is worse than
-    /// no arm, because the dashboard reads clean.
-    #[test]
-    fn one_classs_marker_does_not_suppress_the_other() {
-        let s = "session-compliance-test-class-independence";
-
-        assert!(mark_nudged(s, NudgeClass::Report, 1), "report claim wins");
-        assert!(
-            !mark_nudged(s, NudgeClass::Report, 1),
-            "the report class is now at its cap"
-        );
-
-        // ...and the policy-pull class is untouched. Under the old key this
-        // assertion failed: the session was simply "already nudged".
-        assert_eq!(nudge_attempts_for(s, NudgeClass::PolicyPull), 0);
-        assert!(
-            mark_nudged(s, NudgeClass::PolicyPull, 1),
-            "an exhausted report budget must not consume the policy-pull one"
-        );
-        assert_eq!(nudge_attempts_for(s, NudgeClass::PolicyPull), 1);
-        assert_eq!(
-            nudge_attempts_for(s, NudgeClass::Report),
-            1,
-            "and the policy-pull delivery did not touch the report counter"
-        );
-    }
-
-    /// The pre-coord screen must stay open while ANY class has budget left,
-    /// or an exhausted class would suppress the other one turn earlier — the
-    /// same bug moved upstream of the marker.
-    #[test]
-    fn the_pre_coord_screen_stays_open_while_any_class_has_budget() {
-        let s = "session-compliance-test-any-class";
-        assert!(any_class_under_cap(s, 1));
-        assert!(mark_nudged(s, NudgeClass::PolicyPull, 1));
-        assert!(
-            any_class_under_cap(s, 1),
-            "one class spent, the other still due"
-        );
-        assert!(mark_nudged(s, NudgeClass::Report, 1));
-        assert!(!any_class_under_cap(s, 1), "both classes spent");
-    }
-
-    /// The configured cap applies PER CLASS, and `max_attempts: 0` still means
-    /// never — for every class.
-    #[test]
-    fn the_configured_cap_applies_to_each_class_independently() {
-        let s = "session-compliance-test-per-class-cap";
-        for c in NudgeClass::ALL {
-            for i in 1..=2 {
-                assert!(mark_nudged(s, c, 2), "{} attempt {i} of 2", c.as_str());
-            }
-            assert!(!mark_nudged(s, c, 2), "{} is capped at 2", c.as_str());
-            assert_eq!(nudge_attempts_for(s, c), 2);
-        }
-    }
-
-    /// Coord stores ONE count per session, so the classes are SUMMED on the
-    /// wire — and the `None`-vs-`0` distinction survives that summing. `None`
-    /// still means "this run has no record of the session", which must OMIT the
-    /// fields rather than send a fabricated `0` into a last-write-wins store.
-    #[test]
-    fn the_reported_count_sums_the_classes_without_collapsing_none_to_zero() {
-        let s = "session-compliance-test-sum";
-        assert!(
-            nudge_state_for(s).is_none(),
-            "no record for either class is None, not Some((0, None))"
-        );
-
-        assert!(mark_nudged(s, NudgeClass::Report, 1));
-        assert_eq!(nudge_state_for(s).expect("recorded").0, 1);
-
-        assert!(mark_nudged(s, NudgeClass::PolicyPull, 1));
-        let (attempts, last_at) = nudge_state_for(s).expect("recorded");
-        assert_eq!(attempts, 2, "coord's per-session count spans the classes");
-        assert!(
-            last_at.is_some(),
-            "the most recent delivery across the classes stamps the report"
-        );
-
-        // And the omission rule still holds end to end.
-        let body = compliance_body(
-            None,
-            Some(ABSENT_NO_BLOCK),
-            nudge_state_for("never-seen-sum"),
-        );
-        assert!(body.get("nudge_attempts").is_none());
-    }
-
-    /// The class labels are part of the observable contract (marker key,
-    /// operator-visible reason strings), and the policy-pull one must match
-    /// coord's signal name so the two sides read as one thing.
-    #[test]
-    fn the_class_labels_are_stable_and_distinct() {
-        assert_eq!(NudgeClass::Report.as_str(), "report");
-        assert_eq!(NudgeClass::PolicyPull.as_str(), "policy_pull");
-        assert_eq!(NudgeClass::ALL.len(), 2);
-        assert_ne!(NudgeClass::ALL[0], NudgeClass::ALL[1]);
-        assert_eq!(
-            NudgeClass::ALL[0],
-            NudgeClass::PolicyPull,
-            "the precondition arm is offered first: telling a session to fix its report \
-             while it has never read the document defining the report is backwards"
-        );
-    }
-
-    // ── the policy-pull arm ──────────────────────────────────────────────
-
-    fn verdict_with(reconciliation: Value, reason: &str) -> ComplianceVerdict {
-        ComplianceVerdict::from_body(&json!({
-            "verdict": "unverified",
-            "reason": reason,
-            "reconciliation": reconciliation,
-            "footprint": {"prs": ["qontinui/qontinui-coord#1"], "commits": [], "claims": []},
-        }))
-    }
-
-    fn policy_pull_signal(result: &str, detail: Value) -> Value {
-        json!({"session_signals": [{
-            "signal": "policy_pull",
-            "result": result,
-            "detail": detail,
-        }]})
-    }
-
-    /// `unavailable` and `error` mean coord could not CHECK. Nudging on either
-    /// would assert something coord does not know — and it is exactly the
-    /// population (unattributable transports, a coord ahead of its migration)
-    /// that the `Unavailable` arm exists to protect.
-    #[test]
-    fn only_an_absent_policy_pull_signal_is_nudgeable() {
-        let detail = json!({"why": "no read"});
-        assert!(policy_pull_absent(&policy_pull_signal("absent", detail.clone())).is_some());
-        for benign in ["found", "unavailable", "error", "", "ABSENT", "future_word"] {
-            assert!(
-                policy_pull_absent(&policy_pull_signal(benign, detail.clone())).is_none(),
-                "`{benign}` must not produce a nudge"
-            );
-        }
-        // A payload from a coord that does not emit the signal at all.
-        assert!(policy_pull_absent(&json!({"items": []})).is_none());
-        assert!(policy_pull_absent(&Value::Null).is_none());
-        // A different session-level signal must not be mistaken for this one.
-        assert!(policy_pull_absent(&json!({"session_signals": [
-            {"signal": "something_else", "result": "absent", "detail": {}}
-        ]}))
-        .is_none());
-    }
-
-    /// The two arms are independent: a session whose block reconciled perfectly
-    /// but which never pulled policy gets the POLICY-PULL nudge, not "re-emit
-    /// the block" — which would be a false statement about its own work.
-    #[test]
-    fn a_clean_report_with_no_policy_pull_nudges_only_the_policy_arm() {
-        let v = verdict_with(
-            {
-                let mut r = policy_pull_signal("absent", json!({"why": "no read"}));
-                r["schema_ok"] = json!(true);
-                r["unreconciled_refs"] = json!([]);
-                r
-            },
-            "policy pull not observed: no read",
-        );
-        assert_eq!(due_nudge_classes(&v), vec![NudgeClass::PolicyPull]);
-        assert!(
-            !report_arm_failed(&v),
-            "a reason that is ONLY the policy-pull clause is not a report failure"
-        );
-    }
-
-    /// Both failing yields both classes, policy-pull first — so a single turn
-    /// delivers one and the other stays eligible instead of being swallowed.
-    #[test]
-    fn both_arms_failing_yields_both_classes_in_priority_order() {
-        let mut r = policy_pull_signal("absent", json!({"why": "no read"}));
-        r["schema_ok"] = json!(true);
-        r["unreconciled_refs"] = json!(["#1"]);
-        let v = verdict_with(
-            r,
-            "1 of 1 item(s) could not be reconciled: #1; policy pull not observed: no read",
-        );
-        assert_eq!(
-            due_nudge_classes(&v),
-            vec![NudgeClass::PolicyPull, NudgeClass::Report]
-        );
-    }
-
-    /// A missing block with the policy pull FOUND is the pre-existing report
-    /// arm, untouched.
-    #[test]
-    fn a_missing_block_with_a_found_pull_is_the_report_arm_alone() {
-        let v = verdict_with(policy_pull_signal("found", json!({})), "absent");
-        assert_eq!(due_nudge_classes(&v), vec![NudgeClass::Report]);
-    }
-
-    /// The policy-pull prompt must correct STEP 0, name the doors that work,
-    /// and — when the read was merely stale — say so, because a session that
-    /// read v5 believes it is current and will not re-read unless told the
-    /// number moved.
-    #[test]
-    fn the_policy_pull_prompt_states_the_stale_case_distinctly() {
-        let never = policy_pull_nudge_text(&json!({
-            "current_version": 6,
-            "why": "this session has attributed policy reads but never read \
-                    policy/session-protocol",
-            "stale_version_reads": [],
-        }));
-        assert!(never.contains("policy/session-protocol"));
-        assert!(never.contains("Step 0"));
-        assert!(
-            never.contains("/coord/agent-prompt-documents"),
-            "the masked-tools escape hatch must be named: {never}"
-        );
-        assert!(!never.contains("while v6 is current"));
-        assert!(
-            !never.contains("did not emit"),
-            "this arm must never assert the block was missing: {never}"
-        );
-
-        let stale = policy_pull_nudge_text(&json!({
-            "current_version": 6,
-            "why": "this session read policy/session-protocol at a SUPERSEDED version",
-            "stale_version_reads": [{"version": 5, "source": "mcp"}],
-        }));
-        assert!(
-            stale.contains("You read v5 while v6 is current"),
-            "the stale case must name both numbers: {stale}"
-        );
-    }
-
-    /// Two Stops racing the same session must not both deliver — the stated
-    /// reason `mark_nudged` is a compare-and-set rather than check-then-set.
-    #[test]
-    fn concurrent_claims_yield_exactly_one_winner() {
-        let s = "session-compliance-test-race";
-        let winners: usize = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(move || usize::from(mark_nudged(s, NudgeClass::Report, 1))))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
-        });
-        assert_eq!(winners, 1, "exactly one of eight racing claims may win");
-        assert_eq!(nudge_attempts_for(s, NudgeClass::Report), 1);
-    }
-
-    // ── coverage bound ───────────────────────────────────────────────────
-
-    #[test]
-    fn coverage_bound_is_static_and_names_the_bare_terminal_gap() {
-        let c = coverage_bound();
-        assert!(!c.derived, "must never be derived from a runner metric");
-        assert_eq!(c.schema, "session-compliance-coverage/1");
-        assert!(c.not_covered.len() >= 4);
-        assert!(c
-            .not_covered
-            .iter()
-            .any(|g| g.scope.contains("bare terminals")));
-        assert!(c.note.contains("liveUntracked"));
-    }
-
-    // ── transcript tail reader ───────────────────────────────────────────
-
-    #[test]
-    fn tail_reader_drops_the_truncated_first_line() {
-        // Unique per process AND per nanosecond: several test runs share this
-        // box, and a collision here would be a confusing cross-run failure.
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!(
-            "qontinui-compliance-tail-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        let path = dir.join("t.jsonl");
-        // One oversized junk line, then the real record. The junk line pushes
-        // the file past the window, so it must be dropped as partial.
-        let filler = "x".repeat((TRANSCRIPT_TAIL_BYTES + 1024) as usize);
-        std::fs::write(&path, format!("{filler}\n{}\n", assistant_line(&[BLOCK]))).expect("write");
-        let tail = read_transcript_tail(&path).expect("tail");
-        assert!(!tail.contains("xxxx"), "partial first line must be dropped");
-        assert!(scan_transcript(&tail).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_missing_transcript_reads_none_and_never_panics() {
-        assert!(read_transcript_tail(Path::new("/definitely/not/here.jsonl")).is_none());
-        assert!(detect(Path::new("/definitely/not/here.jsonl")).is_none());
-    }
-}
+mod tests;

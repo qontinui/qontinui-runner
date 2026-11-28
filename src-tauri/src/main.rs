@@ -243,6 +243,11 @@ mod pm_detect;
 mod process_capture;
 pub(crate) use qontinui_runner_lib::process_deadline;
 pub(crate) use qontinui_runner_lib::process_helpers;
+/// The durable record of every resource-guard refusal or deferral, posted to
+/// coord with the box's stats (plan
+/// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3). Every
+/// hook site is a `resource_guard` verdict.
+mod pressure_stop;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -292,6 +297,7 @@ mod semantic_conventions;
 mod served_corpus;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+mod session_placement; // Runner page/terminal/window placement on the session census + debounced early census post (plan 2026-11-16-runner-page-name-reaches-the-coord-session-identity-card, Phase 4)
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
                            // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
                            // Reads each hosted session's transcript and POSTs file-edit attribution to
@@ -308,6 +314,10 @@ mod model_gateway;
 // pick up. Must come before any module that panics during static init.
 mod skills;
 mod slash_commands;
+/// The synchronous steps of a session spawn (the PTY create, the session-cwd
+/// provisioning), run on the blocking pool instead of an async worker. Plan
+/// 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2.
+mod spawn_off_worker;
 mod spawn_placement;
 mod spec_api;
 mod spec_experimentation;
@@ -2132,6 +2142,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = plans_dir_migration::persist_env_plans_dir() {
         warn!("plans dir migration failed (non-fatal): {}", e);
     }
+
+    // The login-shell PATH read every hosted-session child's base PATH folds
+    // in (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path).
+    // It runs on its own thread with a hard timeout, so neither this boot nor
+    // any spawn waits for it; until it answers children get the cargo-home
+    // fallback dirs.
+    terminal::child_path::start_login_shell_read();
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //

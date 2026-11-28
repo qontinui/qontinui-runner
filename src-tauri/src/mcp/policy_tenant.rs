@@ -40,7 +40,20 @@
 //! `unknown-must-not-render-as-a-default`). On a single-bound device the sole
 //! tenant is proven, so an unresolvable read falls back to the default slot and
 //! behaves as before.
+//!
+//! ## The Stop hook and session close decide the same way
+//!
+//! The Stop-hook readers — the work-status read and the continuation rules
+//! ([`super::continuation_verdict`]), the compliance config read and the
+//! compliance POST ([`super::session_compliance`]) — take ONE decision per Stop
+//! from [`route_policy_target`], bounded by [`STOP_TENANT_BUDGET`], and the
+//! close-time compliance finalize takes one from the lifecycle record
+//! ([`closed_session_policy_target`]) (plan
+//! `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`).
+//! Every request any of them builds passes [`build_checked`] before it is sent,
+//! so none leaves without a credential claiming the tenant it was decided for.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -216,6 +229,144 @@ pub(crate) fn cache_file_tenant(
     }
 }
 
+/// How a reader names the tenant it acted under, for its log line and the
+/// continuation verdict's `tenant` / `tenant_reason` fields: `(tenant, reason)`.
+///
+/// `tenant` is short and greppable — the target tenant's uuid, `default-slot`
+/// when the default credential claims no tenant, or `unknown` when the decision
+/// gave no target — and `reason` carries the why for the last two, so a log
+/// query on the tenant never has to match a sentence.
+pub(crate) fn target_label(target: &Result<PolicyTarget, String>) -> (String, Option<String>) {
+    match target {
+        Ok(PolicyTarget {
+            tenant: Some(t), ..
+        }) => (t.to_string(), None),
+        Ok(PolicyTarget { tenant: None, .. }) => (
+            "default-slot".to_string(),
+            Some("the default credential claims no tenant".to_string()),
+        ),
+        Err(cause) => ("unknown".to_string(), Some(cause.clone())),
+    }
+}
+
+// ===========================================================================
+// The presented credential (the last-moment guard, pure)
+// ===========================================================================
+
+/// The tenant a device JWT names, from its unverified `tenant_id` claim.
+///
+/// Used only to NAME a local cache file and to check that a request presents
+/// the target tenant's credential, never to authorize anything — the same
+/// posture `coord_mcp::device_jwt_claim_tenant` takes. Coord resolves the rows
+/// a request reads or writes from this same bearer, so the claim is the right
+/// scope for both.
+fn tenant_of_jwt(jwt: &str) -> Option<Uuid> {
+    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())?;
+    Uuid::parse_str(&raw).ok()
+}
+
+/// The bearer token a built request will present, off its own
+/// `Authorization` header. `None` for no header, a non-bearer one, or an empty
+/// token. The token goes no further than [`tenant_of_jwt`] and a presence test.
+fn presented_bearer(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    let value = headers.get(reqwest::header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .trim()
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// The tenant a built request's bearer claims — the credential it will
+/// ACTUALLY present, read off its `Authorization` header rather than
+/// re-resolved, so the check below and the cache-file name are about the bytes
+/// on the wire. `None` for no header, a non-bearer one, or a token whose
+/// `tenant_id` claim is absent or not a uuid. The token itself goes no further.
+pub(crate) fn presented_claim(headers: &reqwest::header::HeaderMap) -> Option<Uuid> {
+    tenant_of_jwt(presented_bearer(headers)?)
+}
+
+/// Refuse to send a coord request whose credential is not the target tenant's.
+///
+/// `coord_get_for(Owned(t))` / `coord_post_for(Owned(t))` send UNAUTHENTICATED
+/// when `t` has no usable slot (and a slot can lapse between the tenant
+/// decision and the request), and an answer to such a request could be another
+/// tenant's — which would then be rendered, cached and filed as `t`'s, or a
+/// write would land wherever coord's anonymous resolution put it. The tenant
+/// decision already refuses the no-credential case up front
+/// ([`policy_tenant_decision`]); this is the same rule at the last moment, on
+/// the request that would go out. A target naming no tenant (a default slot
+/// whose credential claims none) asserts nothing, so it checks nothing.
+pub(crate) fn check_presented(target: Option<Uuid>, presented: Option<Uuid>) -> Result<(), String> {
+    match (target, presented) {
+        (Some(t), Some(p)) if t == p => Ok(()),
+        (Some(t), Some(p)) => Err(format!(
+            "the credential this runner would present for tenant {t} claims tenant {p}, so the \
+             coord request was not sent"
+        )),
+        (Some(t), None) => Err(format!(
+            "this runner holds no usable credential claiming tenant {t}, so the coord request \
+             was not sent"
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
+/// How long building one tenant-stating request may take. Building it resolves
+/// the credential (`coord_get_for` / `coord_post_for` read the slot store, and
+/// may reach the OS keychain), which is synchronous — so it runs off the async
+/// runtime under this bound ([`build_off_runtime`]). Normally milliseconds.
+pub(crate) const CREDENTIAL_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Run `build` — a closure returning a [`build_checked`] request — on a
+/// blocking thread under [`CREDENTIAL_BUILD_TIMEOUT`], so a slow secure-storage
+/// or keychain read never stalls an async worker or outlives a caller's budget.
+pub(crate) async fn build_off_runtime<T: Send + 'static>(
+    build: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    match tokio::time::timeout(
+        CREDENTIAL_BUILD_TIMEOUT,
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(build),
+    )
+    .await
+    {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => Err(format!("credential resolution failed ({e})")),
+        Err(_) => Err(format!(
+            "credential resolution did not finish within {} ms, so the coord request was not sent",
+            CREDENTIAL_BUILD_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+/// Build `rb` — a request from `coord_http::coord_get_for` /
+/// `coord_post_for` under `target.scope` — and refuse it BEFORE it can be sent
+/// unless its bearer claims `target.tenant` ([`check_presented`]) and, for a
+/// target naming no tenant, unless it presents a bearer at all.
+///
+/// The second half is what keeps "unpaired ⇒ inert" true on the tenant-stating
+/// seam: those helpers send UNAUTHENTICATED when no slot resolves, and a
+/// default slot whose credential claims no tenant gives `check_presented`
+/// nothing to compare. Returns the request and the tenant its bearer claims.
+pub(crate) fn build_checked(
+    rb: reqwest::RequestBuilder,
+    target: PolicyTarget,
+) -> Result<(reqwest::Request, Option<Uuid>), String> {
+    let request = rb
+        .build()
+        .map_err(|e| format!("could not build the coord request: {e}"))?;
+    let presented = presented_claim(request.headers());
+    check_presented(target.tenant, presented)?;
+    if presented_bearer(request.headers()).is_none() {
+        return Err(
+            "this runner holds no usable device credential (unpaired, or its default slot is \
+             not usable), so the coord request was not sent"
+                .to_string(),
+        );
+    }
+    Ok((request, presented))
+}
+
 // ===========================================================================
 // The spawn-time body (local I/O only)
 // ===========================================================================
@@ -327,61 +478,303 @@ async fn registry_leg(why: &'static str, registry_session: Option<Uuid>) -> Poli
     }
 }
 
-/// The SessionStart route's tenant decision for the session behind
-/// `GET /sessions/{route_id}/policy-context`.
+/// A hook route's fetch target for the session behind `/sessions/{route_id}/…`
+/// — the SessionStart policy injection (under [`ROUTE_TENANT_BUDGET`]) and the
+/// Stop-hook continuation verdict (under [`STOP_TENANT_BUDGET`]). `Err` is the
+/// UNKNOWN cause: no request is made for it.
 ///
 /// `route_id` is the runner TERMINAL id the hook sends (falling back to the
 /// Claude session id); `session_key` is what `mcp::sessions::resolve_session_key`
 /// made of it (an `AiCoordRegistrar`-mapped coord session id, else the path id).
-/// The registry fallback asks for the terminal's own coord row first — the leg
-/// the session-info tenancy block calls the data plane — then for `session_key`.
-pub(crate) async fn route_policy_decision(
+/// The proxy leg reads the terminal's cwd, else `fallback_workdir` (the Stop
+/// payload's `cwd`). The registry fallback asks for the terminal's own coord
+/// row first — the leg the session-info tenancy block calls the data plane —
+/// then for `session_key`.
+pub(crate) async fn route_policy_target(
     route_id: &str,
     session_key: &str,
-) -> PolicyTenantDecision {
-    let (workdir, registry_session) = route_session_ref(route_id, session_key);
-    let read = match tokio::time::timeout(
-        ROUTE_TENANT_BUDGET,
+    fallback_workdir: Option<&str>,
+    budget: Duration,
+) -> Result<PolicyTarget, String> {
+    let (workdir, registry_session) = route_session_ref(route_id, session_key, fallback_workdir);
+    decide_target_within(
+        budget,
         read_session_policy_tenant(route_id, workdir.as_deref(), registry_session),
+        device_multi_bound(),
+        default_slot_tenant_off_runtime(),
     )
     .await
-    {
+}
+
+/// How much of a decision's budget is held back from the tenant READ for the
+/// rest of the decision — the binding count and, on the default-slot arm, the
+/// default credential's claim. Both are local file reads off the runtime, so
+/// an unsettled read still leaves them room to decide `DefaultSlot` on a
+/// single-bound device rather than timing the whole decision out.
+pub(crate) const DECISION_RESERVE: Duration = Duration::from_millis(500);
+
+/// The whole tenant decision under ONE deadline (`budget`): the read (bounded
+/// at `budget - DECISION_RESERVE`, past which it is `Unnamed`), the binding
+/// count — skipped when the read decides on its own ([`needs_binding_count`])
+/// — and the default credential's claim on the default-slot arm.
+///
+/// A decision that has not finished by `budget` is UNKNOWN: by then the
+/// binding count has not settled either, and the count is what would have
+/// licensed the default slot (an unreadable count is already read as
+/// multi-bound, [`device_multi_bound`]). Generic over its three reads so the
+/// timing is testable on a paused clock.
+pub(crate) async fn decide_target_within(
+    budget: Duration,
+    read: impl Future<Output = PolicyTenantRead>,
+    multi_bound: impl Future<Output = bool>,
+    default_slot_tenant: impl Future<Output = Option<Uuid>>,
+) -> Result<PolicyTarget, String> {
+    let read_budget = budget.saturating_sub(DECISION_RESERVE);
+    let decided = tokio::time::timeout(budget, async {
+        let read = read_within(read_budget, read).await;
+        let multi_bound = if needs_binding_count(&read) {
+            multi_bound.await
+        } else {
+            false
+        };
+        match policy_tenant_decision(read, multi_bound) {
+            PolicyTenantDecision::DefaultSlot => {
+                let claimed = default_slot_tenant.await;
+                fetch_target(PolicyTenantDecision::DefaultSlot, || claimed)
+            }
+            decision => fetch_target(decision, || None),
+        }
+    })
+    .await;
+    decided.unwrap_or_else(|_| {
+        Err(format!(
+            "this session's tenant is UNKNOWN — its tenant decision did not complete within \
+             its {} ms budget, so the device's bindings were not counted in time. The runner \
+             did not fall back to the device default tenant, which may not be the tenant that \
+             governs this session's repo",
+            budget.as_millis()
+        ))
+    })
+}
+
+/// Does deciding on `read` need the device's binding count? Only the two
+/// inconclusive reads do: a named tenant (with or without a usable credential)
+/// and the proxy's default-slot answer decide the same on every device
+/// ([`policy_tenant_decision`]), so for them the count is a wasted
+/// secure-storage read on every Stop.
+pub(crate) fn needs_binding_count(read: &PolicyTenantRead) -> bool {
+    matches!(
+        read,
+        PolicyTenantRead::ProxyRefused { .. } | PolicyTenantRead::Unnamed(_)
+    )
+}
+
+/// [`default_slot_tenant`] off the runtime: it reads the encrypted slot store,
+/// and may reach the OS keychain. A join failure is no claim.
+async fn default_slot_tenant_off_runtime() -> Option<Uuid> {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(default_slot_tenant)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `read`, or — when it has not answered within `budget` — an `Unnamed` read
+/// saying so. Unnamed decides UNKNOWN on a multi-bound device and the default
+/// slot on a single-bound one ([`policy_tenant_decision`]), so a slow tenant
+/// read can never stall the caller past its budget.
+pub(crate) async fn read_within(
+    budget: Duration,
+    read: impl Future<Output = PolicyTenantRead>,
+) -> PolicyTenantRead {
+    match tokio::time::timeout(budget, read).await {
         Ok(read) => read,
         Err(_) => PolicyTenantRead::Unnamed(format!(
-            "the session's tenant did not settle within the SessionStart route's {}s budget",
-            ROUTE_TENANT_BUDGET.as_secs()
+            "the session's tenant did not settle within its {} ms budget",
+            budget.as_millis()
         )),
-    };
-    let multi_bound = device_multi_bound().await;
-    policy_tenant_decision(read, multi_bound)
+    }
 }
 
 /// How long the SessionStart route waits for the session's tenant. The hook
 /// calls the route under `curl --max-time 15` and swallows a timeout, so a read
 /// that used the proxy's whole `CWD_TENANT_BUDGET` (10 s) before a 4 s fetch
 /// would leave under a second of margin and, past it, deliver neither the body
-/// nor the fail-open notice. Capping the read keeps the notice deliverable: an
-/// unsettled read is `Unnamed`, which the decision turns into UNKNOWN on a
-/// multi-bound device and the default slot on a single-bound one.
+/// nor the fail-open notice. Capping the decision keeps the notice
+/// deliverable: an unsettled read is `Unnamed`, which the decision turns into
+/// UNKNOWN on a multi-bound device and the default slot on a single-bound one.
 pub(crate) const ROUTE_TENANT_BUDGET: Duration = Duration::from_secs(8);
 
+/// How long the Stop route's whole tenant decision may take (plan
+/// `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`
+/// Design §4). It runs before the compliance turn and the continuation reads,
+/// and all of them must fit the hook's `curl --max-time 10` — the sum is
+/// pinned by `continuation_verdict`'s
+/// `the_stop_paths_worst_case_fits_the_hooks_curl_max_time`. SessionStart has
+/// already settled the proxy's expectation for a live session, so the await
+/// normally returns at once, and the verdict caches an answered decision.
+pub(crate) const STOP_TENANT_BUDGET: Duration = Duration::from_secs(2);
+
 /// `(workdir, registry session id)` for the route's session: the hosting
-/// terminal's cwd and coord row when `route_id` names a live terminal, else
-/// `session_key` read as a registry id.
-fn route_session_ref(route_id: &str, session_key: &str) -> (Option<String>, Option<Uuid>) {
+/// terminal's cwd (else `fallback_workdir`) and coord row when `route_id` names
+/// a live terminal, else `session_key` read as a registry id.
+fn route_session_ref(
+    route_id: &str,
+    session_key: &str,
+    fallback_workdir: Option<&str>,
+) -> (Option<String>, Option<Uuid>) {
+    let (workdir, row) = live_terminal_ref(route_id);
+    (
+        workdir.or_else(|| non_empty(fallback_workdir)),
+        row.or_else(|| Uuid::parse_str(session_key.trim()).ok()),
+    )
+}
+
+/// `(cwd, coord row)` of the live terminal `terminal_id` names, each `None`
+/// when there is no such terminal or it holds none.
+fn live_terminal_ref(terminal_id: &str) -> (Option<String>, Option<Uuid>) {
     use tauri::Manager;
     let terminal = crate::tauri_app_handle::current().and_then(|app| {
         app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
-            .and_then(|tm| tm.get(route_id))
+            .and_then(|tm| tm.get(terminal_id))
     });
     let workdir = terminal
         .as_ref()
-        .map(|t| t.working_dir().trim().to_string())
-        .filter(|w| !w.is_empty());
-    let registry_session = terminal
-        .and_then(|t| t.coord_session_id())
-        .or_else(|| Uuid::parse_str(session_key.trim()).ok());
-    (workdir, registry_session)
+        .and_then(|t| non_empty(Some(t.working_dir())));
+    let row = terminal.and_then(|t| t.coord_session_id());
+    (workdir, row)
+}
+
+fn non_empty(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The fetch target for a session whose lifecycle record just CLOSED — the
+/// close-time compliance finalize (Design §5). It reads through the same
+/// [`read_session_policy_tenant`] as the hook routes, from the record: its
+/// `terminal_id`, its `working_dir`, and its coord row. By close the terminal's
+/// nonce may be released (`NoNonce`), and then the registry leg decides.
+///
+/// After a runner restart the in-process registry knows nothing about a
+/// session the boot sweep closes, so the registry leg reads `Unnamed` for
+/// every one of them. The record's DURABLE `tenant_id` (stamped at spawn) is
+/// then the answer ([`recorded_fallback_tenant`]), read as a registry answer:
+/// `Owned` when this runner holds a usable credential for it, UNKNOWN when not.
+pub(crate) async fn closed_session_policy_target(
+    terminal_id: &str,
+    harness_session_id: &str,
+    recorded_workdir: Option<&str>,
+    recorded_row: Option<Uuid>,
+    recorded_tenant: Option<Uuid>,
+    budget: Duration,
+) -> Result<PolicyTarget, String> {
+    let (live_workdir, live_row) = live_terminal_ref(terminal_id);
+    let (workdir, registry_session) = close_session_ref(
+        recorded_workdir,
+        live_workdir.as_deref(),
+        registrar_row(harness_session_id),
+        recorded_row,
+        live_row,
+    );
+    let read = live_read_then_recorded(
+        budget.saturating_sub(DECISION_RESERVE * 2),
+        read_session_policy_tenant(terminal_id, workdir.as_deref(), registry_session),
+        recorded_tenant,
+        |tenant| async move {
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                crate::auth::device_holds_usable_binding(&tenant)
+            })
+            .await
+            .unwrap_or(false)
+        },
+    );
+    decide_target_within(
+        budget,
+        read,
+        device_multi_bound(),
+        default_slot_tenant_off_runtime(),
+    )
+    .await
+}
+
+/// A closed session's read: the LIVE leg bounded by `live_budget` on its own,
+/// then the record's durable tenant when the live leg named none (or did not
+/// answer in time — a timed-out live leg is `Unnamed`). Bounding only the live
+/// leg is the point: a slow proxy or registry read must not hide the record's
+/// answer by eating the whole decision budget. `credential` says whether this
+/// runner holds a usable credential for the recorded tenant; without one the
+/// registry answer decides UNKNOWN on every device.
+///
+/// The recorded tenant is always a CALLER'S CHOICE, never a default: its only
+/// production writer is the spawn's `spawn_tenant` (`terminal/manager.rs`
+/// `update_identity_by_terminal`, where `None` — no tenant chosen — records
+/// nothing), the frontend door and the worker executor write `None`, and the
+/// device default sampled at spawn goes to the separate
+/// `spawn_device_default` field. (The `SessionRegistry` intent's
+/// device-default stamp is a different, in-process store.)
+pub(crate) async fn live_read_then_recorded<C, F>(
+    live_budget: Duration,
+    live: impl Future<Output = PolicyTenantRead>,
+    recorded: Option<Uuid>,
+    credential: C,
+) -> PolicyTenantRead
+where
+    C: FnOnce(Uuid) -> F,
+    F: Future<Output = bool>,
+{
+    let live = read_within(live_budget, live).await;
+    match recorded_fallback_tenant(&live, recorded) {
+        Some(tenant) => PolicyTenantRead::Registry {
+            tenant,
+            credential: credential(tenant).await,
+        },
+        None => live,
+    }
+}
+
+/// The lifecycle record's durable tenant, when the live read named none
+/// (`Unnamed`) — and only then: a proxy answer, a proxy refusal, or a registry
+/// answer is the session's CURRENT state and outranks a spawn-time stamp. Pure.
+pub(crate) fn recorded_fallback_tenant(
+    live: &PolicyTenantRead,
+    recorded: Option<Uuid>,
+) -> Option<Uuid> {
+    match live {
+        PolicyTenantRead::Unnamed(_) => recorded,
+        _ => None,
+    }
+}
+
+/// The coord row this runner registered for `harness_session_id` since boot
+/// (the `AiCoordRegistrar`'s reverse map), if any.
+fn registrar_row(harness_session_id: &str) -> Option<Uuid> {
+    use tauri::Manager;
+    crate::tauri_app_handle::current().and_then(|app| {
+        app.try_state::<std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .and_then(|r| r.session_id_for(harness_session_id))
+    })
+}
+
+/// `(workdir, registry session id)` for a closed record. Pure.
+///
+/// The record's own `working_dir` first, the terminal's live cwd second. The
+/// coord row is the one keyed by the session's OWN harness id first (the
+/// registrar's map), then the row the record itself names
+/// (`finish_coord_session_id`), and the terminal's live row last: a pane hosts
+/// sessions in sequence, so by close the terminal can already be bound to the
+/// NEXT session's row.
+fn close_session_ref(
+    recorded_workdir: Option<&str>,
+    live_workdir: Option<&str>,
+    registrar_row: Option<Uuid>,
+    recorded_row: Option<Uuid>,
+    live_row: Option<Uuid>,
+) -> (Option<String>, Option<Uuid>) {
+    (
+        non_empty(recorded_workdir).or_else(|| non_empty(live_workdir)),
+        registrar_row.or(recorded_row).or(live_row),
+    )
 }
 
 /// The tenant a DIRECT-EXEC spawn in `workdir` composes the policy body for
@@ -508,280 +901,8 @@ pub(crate) fn resolve_shell_pane_policy_tenant(terminal_id: &str, workdir: &str)
 // ===========================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    fn tenant(n: u8) -> Uuid {
-        Uuid::from_bytes([n; 16])
-    }
-
-    /// Every read that can reach the decision, for the exhaustive checks.
-    fn unresolvable_reads() -> Vec<PolicyTenantRead> {
-        vec![
-            PolicyTenantRead::Unnamed(
-                "no coord-mcp session key names this session (no_session_nonce), and the \
-                 session registry holds no tenant for it"
-                    .to_string(),
-            ),
-            PolicyTenantRead::ProxyRefused {
-                code: "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
-                message: "tenant unresolvable by any route".to_string(),
-            },
-            PolicyTenantRead::ProxyRefused {
-                code: crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE,
-                message: "the tenant of this session's repo is not established yet".to_string(),
-            },
-        ]
-    }
-
-    // ── new_session_body_tenant: a machine-row answer never briefs a multi-bound spawn ──
-
-    /// Review finding A1: on a multi-bound device an UNSETTLED repo answer
-    /// falls through to the machine rows (the device default), so a direct-exec
-    /// spawn must compose no body rather than the default tenant's. A settled
-    /// answer, or any single-bound device, keeps the stated tenant.
-    #[test]
-    fn a_direct_exec_spawn_composes_no_body_on_an_unsettled_repo_of_a_multi_bound_device() {
-        let a = tenant(0xA);
-        assert_eq!(new_session_body_tenant(Some(a), false, true), None);
-        assert_eq!(new_session_body_tenant(Some(a), true, true), Some(a));
-        assert_eq!(new_session_body_tenant(Some(a), false, false), Some(a));
-        assert_eq!(new_session_body_tenant(Some(a), true, false), Some(a));
-        assert_eq!(new_session_body_tenant(None, true, true), None);
-    }
-
-    // ── spawn_policy_body_in: the session's tenant, never the default's ──
-
-    /// Design §6 / Tests bullet 1. The device's default credential claims A
-    /// (A's cache file is the one the pre-fix `spawn_policy_body()` read, for
-    /// `tenant_of_jwt(AuthManager::get_access_token())`); the session's tenant
-    /// is B. The spawn body must be B's.
-    #[test]
-    fn spawn_body_for_session_tenant_b_is_bs_file_when_the_default_claims_a() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (a, b) = (tenant(0xA1), tenant(0xB2));
-        crate::session::spawn_prompt::write_policy_body_cache(dir.path(), &a, "A's policy body")
-            .expect("write A");
-        crate::session::spawn_prompt::write_policy_body_cache(dir.path(), &b, "B's policy body")
-            .expect("write B");
-
-        assert_eq!(
-            spawn_policy_body_in(dir.path(), Mode::On, Some(b)).as_deref(),
-            Some("B's policy body"),
-            "a session of tenant B must be composed B's body, never the default (A)'s"
-        );
-        assert_eq!(
-            spawn_policy_body_in(dir.path(), Mode::On, Some(a)).as_deref(),
-            Some("A's policy body")
-        );
-        // No tenant composes nothing — there is no unscoped fallback name.
-        assert_eq!(spawn_policy_body_in(dir.path(), Mode::On, None), None);
-        // A tenant with no cache yet composes nothing (inline briefing).
-        assert_eq!(
-            spawn_policy_body_in(dir.path(), Mode::On, Some(tenant(0xC3))),
-            None
-        );
-        // The Mode gate is unchanged: off/observe inject nothing.
-        for dark in [Mode::Off, Mode::Observe] {
-            assert_eq!(spawn_policy_body_in(dir.path(), dark, Some(b)), None);
-        }
-    }
-
-    // ── policy_tenant_decision ──────────────────────────────────────────
-
-    /// Tests bullet 3. A multi-bound device with an unresolvable session tenant
-    /// is UNKNOWN, never the default slot — and the render is the notice,
-    /// never A's documents.
-    #[test]
-    fn multi_bound_with_an_unresolvable_tenant_is_unknown_and_renders_the_notice() {
-        for read in unresolvable_reads() {
-            let decision = policy_tenant_decision(read.clone(), true);
-            let PolicyTenantDecision::Unknown(reason) = &decision else {
-                panic!("{read:?} on a multi-bound device must be Unknown, got {decision:?}");
-            };
-            assert!(
-                reason.contains("UNKNOWN on a device bound to several tenants"),
-                "{reason}"
-            );
-            assert!(
-                reason.contains("did not inject the device default tenant's policy"),
-                "{reason}"
-            );
-            // No target ⇒ no fetch.
-            assert_eq!(
-                fetch_target(decision.clone(), || panic!(
-                    "an Unknown never reads the default"
-                )),
-                Err(reason.clone())
-            );
-            assert_eq!(
-                spawn_body_tenant(&decision, || panic!("an Unknown never reads the default")),
-                None
-            );
-            // What the route injects for it: the notice, naming the cause, and
-            // no policy body at all.
-            let notice = super::super::policy_context::render_failure_notice(
-                reason,
-                "startup",
-                "2026-11-13T12:00:00Z",
-            );
-            assert!(notice.contains("POLICY PULL FAILED: this session's tenant is UNKNOWN"));
-            assert!(!notice.contains("===== policy/session-protocol"));
-        }
-    }
-
-    /// Tests bullet 4: the first-call race. A repo still unsettled after the
-    /// proxy's budget on a multi-bound device is UNKNOWN, and the cause names
-    /// the proxy's retryable code.
-    #[test]
-    fn a_repo_unsettled_refusal_on_a_multi_bound_device_is_unknown() {
-        let decision = policy_tenant_decision(
-            PolicyTenantRead::ProxyRefused {
-                code: crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE,
-                message: "the tenant of this session's repo is not established yet".to_string(),
-            },
-            true,
-        );
-        let PolicyTenantDecision::Unknown(reason) = decision else {
-            panic!("a repo-unsettled refusal must never resolve to the default: {decision:?}");
-        };
-        assert!(
-            reason.contains(crate::coord_mcp::TENANT_REPO_UNSETTLED_CODE),
-            "{reason}"
-        );
-    }
-
-    /// Tests bullet 5 / Design §2a. The proxy (or the registry) names tenant T
-    /// and this runner holds no usable credential for T: UNKNOWN on every
-    /// device, and there is no target, so no fetch is made.
-    #[test]
-    fn a_resolved_tenant_with_no_usable_credential_is_unknown_and_fetches_nothing() {
-        let t = tenant(0x5A);
-        for read in [
-            PolicyTenantRead::ProxyOwned {
-                tenant: t,
-                credential: false,
-            },
-            PolicyTenantRead::Registry {
-                tenant: t,
-                credential: false,
-            },
-        ] {
-            for multi_bound in [true, false] {
-                let decision = policy_tenant_decision(read.clone(), multi_bound);
-                let PolicyTenantDecision::Unknown(reason) = &decision else {
-                    panic!("{read:?} (multi_bound={multi_bound}) must be Unknown: {decision:?}");
-                };
-                assert!(
-                    reason.contains(&format!("no usable credential for tenant {t}")),
-                    "the notice names the tenant it could not act as: {reason}"
-                );
-                assert!(
-                    fetch_target(decision.clone(), || panic!("never read")).is_err(),
-                    "no target, so nothing is fetched"
-                );
-            }
-        }
-    }
-
-    /// A resolved tenant with a usable credential is fetched under ITS scope and
-    /// filed under it — on either device shape.
-    #[test]
-    fn a_resolved_tenant_with_a_credential_is_owned_and_fetched_under_its_own_scope() {
-        let b = tenant(0xB2);
-        for read in [
-            PolicyTenantRead::ProxyOwned {
-                tenant: b,
-                credential: true,
-            },
-            PolicyTenantRead::Registry {
-                tenant: b,
-                credential: true,
-            },
-        ] {
-            for multi_bound in [true, false] {
-                let decision = policy_tenant_decision(read.clone(), multi_bound);
-                assert_eq!(decision, PolicyTenantDecision::Owned(b), "{read:?}");
-                assert_eq!(
-                    fetch_target(decision.clone(), || panic!("Owned never reads the default")),
-                    Ok(PolicyTarget {
-                        scope: TenantScope::Owned(b),
-                        tenant: Some(b),
-                    })
-                );
-                assert_eq!(
-                    spawn_body_tenant(&decision, || panic!("Owned never reads the default")),
-                    Some(b)
-                );
-            }
-        }
-    }
-
-    /// Tests bullet 9 (decision half). On a single-bound device the sole tenant
-    /// is proven: every inconclusive read falls back to the default slot, which
-    /// is exactly what the pre-fix code fetched under.
-    #[test]
-    fn a_single_bound_device_falls_back_to_the_default_slot_as_before() {
-        let a = tenant(0xA1);
-        for read in unresolvable_reads()
-            .into_iter()
-            .chain([PolicyTenantRead::ProxyDefaultSlot])
-        {
-            let decision = policy_tenant_decision(read.clone(), false);
-            assert_eq!(decision, PolicyTenantDecision::DefaultSlot, "{read:?}");
-            assert_eq!(
-                fetch_target(decision.clone(), || Some(a)),
-                Ok(PolicyTarget {
-                    scope: TenantScope::Device,
-                    tenant: Some(a),
-                })
-            );
-            assert_eq!(spawn_body_tenant(&decision, || Some(a)), Some(a));
-        }
-    }
-
-    /// The proxy answering the default slot is a DECISION, not an inconclusive
-    /// read: the session's own coord-mcp calls present the default credential,
-    /// so the default slot's policy is the matching one even on a multi-bound
-    /// device.
-    #[test]
-    fn the_proxy_answering_the_default_slot_is_the_default_slot_on_any_device() {
-        for multi_bound in [true, false] {
-            assert_eq!(
-                policy_tenant_decision(PolicyTenantRead::ProxyDefaultSlot, multi_bound),
-                PolicyTenantDecision::DefaultSlot
-            );
-        }
-        // A default credential naming no tenant targets no tenant: nothing is
-        // cached or filed under a guessed one.
-        assert_eq!(
-            fetch_target(PolicyTenantDecision::DefaultSlot, || None),
-            Ok(PolicyTarget {
-                scope: TenantScope::Device,
-                tenant: None,
-            })
-        );
-    }
-
-    // ── cache_file_tenant ───────────────────────────────────────────────
-
-    /// Tests bullet 6 (pure half). The file is named for the PRESENTED bearer's
-    /// claim, and only when it is the session's tenant.
-    #[test]
-    fn the_cache_file_is_named_for_the_presented_claim_only_when_it_is_the_sessions() {
-        let (a, b) = (tenant(0xA1), tenant(0xB2));
-        assert_eq!(cache_file_tenant(Some(b), Some(b)), Some(b));
-        assert_eq!(
-            cache_file_tenant(Some(b), Some(a)),
-            None,
-            "a body fetched under A's credential is never filed under B"
-        );
-        assert_eq!(cache_file_tenant(Some(b), None), None, "no claim, no file");
-        assert_eq!(
-            cache_file_tenant(None, Some(a)),
-            None,
-            "no session tenant, no file"
-        );
-        assert_eq!(cache_file_tenant(None, None), None);
-    }
-}
+/// Test fixtures shared with the Stop-hook readers' tests.
+#[cfg(test)]
+pub(crate) mod test_support;

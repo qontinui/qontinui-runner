@@ -1196,6 +1196,7 @@ async fn publish_budget_with(
                 "fleet::publish_budget: ~/.qontinui/machine.json missing — \
                  run `qontinui_profile device init` to register identity. Skipping budget publish."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1206,6 +1207,7 @@ async fn publish_budget_with(
             warn!(
                 "fleet::publish_budget: machine.json device_id is not a valid UUID ({e}). Skipping."
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1244,6 +1246,7 @@ async fn publish_budget_with(
             warn!(
                 "fleet::publish_budget: active profile has no coord_url; skipping budget publish (cache written)"
             );
+            note_ci_jobs_unpublishable();
             return Ok(());
         }
     };
@@ -1270,6 +1273,17 @@ async fn publish_budget_with(
                 body.disk_total_gb,
                 body.max_concurrent_agents,
                 body.max_concurrent_ci_jobs
+            );
+            Ok(())
+        }
+        // A one-attempt change publish fails again on every sample tick until
+        // coord takes it (its value stays unrecorded), so it logs at debug:
+        // warning per tick would flood the log while coord is down. The
+        // retried boot publish and the periodic re-assert keep the warning.
+        Err(e) if delivery == BudgetDelivery::Once => {
+            tracing::debug!(
+                "fleet::publish_budget: one-attempt change publish failed ({e}); \
+                 next sample tick retries, payload cached at ~/.qontinui/last_budget.json"
             );
             Ok(())
         }
@@ -1308,11 +1322,29 @@ fn budget_republish_secs() -> u64 {
 }
 
 /// The `max_concurrent_ci_jobs` the last SUCCESSFUL budget publish carried;
-/// `-1` = none yet in this process.
-static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// [`CI_JOBS_NEVER_PUBLISHED`] = none yet in this process,
+/// [`CI_JOBS_UNPUBLISHABLE`] = none, because a publish found nothing to
+/// publish to.
+static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(CI_JOBS_NEVER_PUBLISHED);
+const CI_JOBS_NEVER_PUBLISHED: i64 = -1;
+const CI_JOBS_UNPUBLISHABLE: i64 = -2;
 
 fn record_advertised_ci_jobs(jobs: i32) {
     ADVERTISED_CI_JOBS.store(i64::from(jobs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A publish returned without POSTing (no device identity, no coord base):
+/// mark "never published" as unpublishable, so [`ci_jobs_publish_owed`] does
+/// not re-run a publish that has nowhere to go on every sample tick. A value a
+/// successful publish recorded is left alone.
+fn note_ci_jobs_unpublishable() {
+    let _ = ADVERTISED_CI_JOBS.compare_exchange(
+        CI_JOBS_NEVER_PUBLISHED,
+        CI_JOBS_UNPUBLISHABLE,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Has the CI node's capacity moved off what the last successful budget
@@ -1330,7 +1362,28 @@ fn advertised_ci_jobs_changed() -> bool {
         0
     };
     let advertised = ADVERTISED_CI_JOBS.load(std::sync::atomic::Ordering::Relaxed);
-    advertised >= 0 && advertised != i64::from(now.min(i32::MAX as u32))
+    ci_jobs_publish_owed(advertised, now, ci.enabled)
+}
+
+/// Is a CI-capacity publish owed, given what the last successful publish
+/// advertised ([`ADVERTISED_CI_JOBS`]), the capacity `now`, and whether the
+/// node is enabled? A changed capacity is owed. So is an enabled node's
+/// capacity that NO publish has carried yet: a failed boot publish leaves
+/// nothing recorded, and without this its CI capacity waited a full budget
+/// period for the re-assert (review round 5 on qontinui-runner#2921). A
+/// disabled node with nothing recorded owes nothing here, and neither does a
+/// box with nowhere to publish to: the periodic re-assert covers both. If the
+/// boot publish is still on its retry ladder, the tick's one attempt overlaps
+/// it, and should the older boot body land last, the recorded value differs
+/// from `now` and the next tick corrects it. PURE.
+fn ci_jobs_publish_owed(advertised: i64, now: u32, ci_enabled: bool) -> bool {
+    if advertised == CI_JOBS_NEVER_PUBLISHED {
+        return ci_enabled;
+    }
+    if advertised < 0 {
+        return false;
+    }
+    advertised != i64::from(now.min(i32::MAX as u32))
 }
 
 /// Periodically re-assert this device's budget, so a clobbered or stale
@@ -1396,7 +1449,9 @@ fn advertised_ci_jobs_changed() -> bool {
 /// [`advertised_ci_jobs_changed`]), the budget is published on that tick with
 /// ONE attempt ([`BudgetDelivery::Once`]), so a failing budget route costs a
 /// tick at most one request timeout and never the retry ladder; a failure
-/// leaves the advertised value unrecorded, so the next tick tries again.
+/// leaves the advertised value unrecorded, so the next tick tries again. An
+/// enabled CI node whose boot publish failed counts as changed too
+/// ([`ci_jobs_publish_owed`]), so its capacity reaches coord on the next tick.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -1431,12 +1486,19 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // same gated loop — no timer or gate of its own. Rebuilt per
             // supervised run; its durable state lives on disk.
             let mut reporter = computer::Reporter::new();
+            // The pressure-stop switch as SET, from this loop's first moment;
+            // `flush` re-reads it every tick and discards the queue when off.
+            crate::pressure_stop::refresh_enabled_from_settings();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                // Pressure-stop events the resource guard queued since the
+                // last tick (plan 2026-11-24-pressure-stops-record-box-stats-
+                // in-coord Phase 3): one batch, same gate, same cadence.
+                crate::pressure_stop::flush().await;
                 reporter.tick().await;
 
                 // The CI node sizes its concurrency from coord's capacity
@@ -4350,14 +4412,20 @@ const MAX_DIRTY_FILES_REPORTED: usize = 50;
 /// `.claude/commands/*`, so they report the nested path individually and the
 /// exclude applies; a scratch fixture does not, and must commit a placeholder
 /// under the parent to reproduce the real shape (see the roster test).
+///
+/// The three coord-mcp names are `coord_mcp`'s own constants, not retyped
+/// literals: `coord_mcp` writes those files and also excludes them where it
+/// writes them (`provision_exclude::exclude_workdir_artifacts`, for the repos
+/// and linked worktrees this publisher-cycle heal never reaches), so the two
+/// rosters cannot drift apart.
 const MANAGED_REPO_EXCLUDES: &[&str] = &[
-    ".mcp.json",
+    crate::coord_mcp::MCP_JSON_FILE,
     "agent-worktrees/",
     ".agent-worktrees/",
-    ".coord-mcp-status",
+    crate::coord_mcp::COORD_MCP_STATUS_FILE,
     // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
     // which a crash between its write and its rename would leave behind.
-    ".coord-mcp-status.tmp-*",
+    crate::coord_mcp::COORD_MCP_STATUS_TMP_GLOB,
     ".claude/worktrees/",
 ];
 
@@ -5734,6 +5802,13 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
     Some(default_branch)
 }
 
+/// True when `path` is the root of a git checkout: it carries its own `.git`,
+/// a directory (a primary) or a file (a linked worktree). A directory without
+/// one is NOT a checkout even when git would resolve it to an enclosing repo.
+fn is_checkout_root(path: &std::path::Path) -> bool {
+    path.join(".git").exists()
+}
+
 /// Capture the state of a single primary git tree at `repo_path`. Returns
 /// `None` when the directory isn't a git repo (no `.git/` dir). All
 /// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
@@ -5743,8 +5818,7 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
-    let dot_git = repo_path.join(".git");
-    if !dot_git.exists() {
+    if !is_checkout_root(repo_path) {
         return None;
     }
 
@@ -7003,6 +7077,18 @@ pub async fn publish_tree_state() -> Result<(), String> {
             continue;
         }
         if !path.is_dir() {
+            continue;
+        }
+        // Only a checkout ROOT is a tree. A `qontinui-*` directory with no
+        // `.git` of its own (e.g. `qontinui-worktrees/`, a folder of agent
+        // worktrees) must be skipped BEFORE the fetch and the restore sweep
+        // below: git resolves it upward to whatever repository encloses the
+        // workspace, so the fetch wrote that repository's FETCH_HEAD every
+        // cycle and logged a WARN (measured on merytshost 2026-11-25, ~270
+        // times in one day; plan 2026-10-28-one-session-lifecycle-authority
+        // Phase 2, finding 369745f0). capture_tree already refused such a
+        // directory, but only after both had run.
+        if !is_checkout_root(&path) {
             continue;
         }
 
@@ -8388,6 +8474,21 @@ mod tests {",
             "an enabled ci_node configured to 0 is an OPINION of zero and must \
              reach the wire — omission would make capacity un-withdrawable"
         );
+    }
+
+    /// Review round 5 on qontinui-runner#2921: a failed boot publish records
+    /// nothing (`-1`), and an ENABLED node then owes its capacity on the next
+    /// tick instead of waiting a budget period; a disabled one does not.
+    #[test]
+    fn a_failed_boot_publish_is_owed_on_the_next_tick_for_an_enabled_node() {
+        assert!(ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 4, true));
+        assert!(!ci_jobs_publish_owed(CI_JOBS_NEVER_PUBLISHED, 0, false));
+        // Nowhere to publish to: not re-run every tick.
+        assert!(!ci_jobs_publish_owed(CI_JOBS_UNPUBLISHABLE, 4, true));
+        assert!(!ci_jobs_publish_owed(4, 4, true));
+        assert!(ci_jobs_publish_owed(4, 5, true));
+        assert!(ci_jobs_publish_owed(4, 0, false), "disabling is a change");
+        assert!(!ci_jobs_publish_owed(i64::from(i32::MAX), u32::MAX, true));
     }
 
     /// Plan `2026-09-22-ci-capacity-is-hand-typed-...` Phase 2: an enabled
@@ -13335,6 +13436,39 @@ mod binding_set_resolution_tests {
             crate::auth::select_scoped_bearer(&am, crate::auth::TenantScope::Device, None, 1),
             None,
             "the legacy slot is empty: Device would send the heartbeat anonymously"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkout_root_tests {
+    #[test]
+    fn is_checkout_root_requires_the_directorys_own_dot_git() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // Pins the predicate only (not the walk's ordering): an ancestor's .git
+        // must NOT make a child directory a checkout root.
+        std::fs::create_dir(base.path().join(".git")).unwrap();
+        let folder = base.path().join("qontinui-worktrees");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(
+            !super::is_checkout_root(&folder),
+            "a folder inside a repo is not a checkout root"
+        );
+        assert!(super::capture_tree(&folder).is_none());
+
+        let primary = base.path().join("qontinui-primary");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        assert!(
+            super::is_checkout_root(&primary),
+            "a .git directory marks a primary"
+        );
+
+        let linked = base.path().join("qontinui-linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../.git/worktrees/x").unwrap();
+        assert!(
+            super::is_checkout_root(&linked),
+            "a .git file marks a linked worktree"
         );
     }
 }

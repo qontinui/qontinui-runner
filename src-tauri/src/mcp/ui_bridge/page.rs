@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, EventTarget};
 use tracing::{debug, error, info, warn};
 
-use super::types::{RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+use super::types::{UiBridgeError, UiBridgeErrorCode};
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
@@ -1382,7 +1382,9 @@ pub(crate) fn navigate_rejection_response(
     let detail = UiBridgeError {
         code: UiBridgeErrorCode::InvalidRequest,
         message,
-        recovery: Some(RecoveryHint::Unrecoverable),
+        recovery: Some(qontinui_types::refusal::NextAction::new(
+            qontinui_types::refusal::NextActionKind::FixRequest,
+        )),
         context: Some(context),
     };
     let message = detail.message.clone();
@@ -3276,7 +3278,7 @@ async fn ui_bridge_tab_activate_handler_dispatch(
                     error_detail: Some(detail),
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }),
             ));
         }
@@ -3298,7 +3300,7 @@ async fn ui_bridge_tab_activate_handler_dispatch(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }),
             ))
         }
@@ -4533,7 +4535,7 @@ mod page_evaluate_tagging_tests {
         );
         assert_eq!(
             body["error_detail"]["recovery"],
-            serde_json::json!("UNRECOVERABLE")
+            serde_json::json!({"kind": "fix_request"})
         );
     }
 

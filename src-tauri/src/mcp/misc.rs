@@ -653,7 +653,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                         error_detail: None,
                         hint: None,
                         code: None,
-                        suggestions: None,
+                        refusal: None,
                     })
                 }
             }
@@ -667,7 +667,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             })
         }
     }

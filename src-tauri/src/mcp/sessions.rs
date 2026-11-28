@@ -1432,6 +1432,25 @@ async fn get_stop_reason(
     )
 }
 
+/// A stop-reason error body with its typed refusal: the runner `code`
+/// beside the shared [`Refusal`](qontinui_types::refusal::Refusal) built for
+/// it, so the route answers no free-text error.
+fn stop_reason_refusal(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Json<ApiResponse<()>> {
+    let message = message.into();
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        status,
+        Some(&message),
+        None,
+        None,
+    );
+    Json(ApiResponse::error_with_refusal(message, code, refusal))
+}
+
 /// The whole of [`get_stop_reason`] after state extraction: `None` (the
 /// lifecycle store is not managed — a runner still booting) is a 503, else
 /// [`stop_reason_for`]. Split out so the route can be driven over HTTP in a
@@ -1447,11 +1466,12 @@ fn stop_reason_response(
     let store = store.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiResponse::error_with_code(
+            stop_reason_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
                 "session lifecycle store unavailable, so why this session stopped is UNKNOWN \
                  — not absent. Retry once the runner has finished starting",
-                "SERVICE_UNAVAILABLE",
-            )),
+            ),
         )
     })?;
     stop_reason_for(store, id, probe).map(Json)
@@ -1499,12 +1519,13 @@ fn stop_reason_for(
     let records = store.all_records_checked().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiResponse::error_with_code(
+            stop_reason_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
                 "the session lifecycle registry is unreadable (its lock is poisoned), so why \
                  this session stopped is UNKNOWN — not absent. Retry; if it persists the \
                  runner has a defect worth reporting",
-                "SERVICE_UNAVAILABLE",
-            )),
+            ),
         )
     })?;
     match records
@@ -1516,7 +1537,9 @@ fn stop_reason_for(
         Some(rec) => Ok(crate::session::stop_reason::stop_reason(&rec, &probe(&rec))),
         None => Err((
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::error_with_code(
+            stop_reason_refusal(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
                 format!(
                     "no terminal session or terminal `{id}` in the lifecycle registry. Closed \
                      terminal sessions are kept {CLOSED_RETENTION_HOURS} hours (older ones are \
@@ -1525,8 +1548,7 @@ fn stop_reason_for(
                      orchestration-loop worker, whose record is keyed by its task_run_id — \
                      pass that id"
                 ),
-                "SESSION_NOT_FOUND",
-            )),
+            ),
         )),
     }
 }
@@ -1637,7 +1659,11 @@ async fn continuation_verdict(
     // runner's own continuation registry: a gate continuation is armed by
     // default, everything else keeps the flag's dark default.
     let mode = crate::mcp::continuation_verdict::mode_for_terminal(&id);
-    Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input, mode).await)
+    // `id` and `key` together name the session whose OWN tenant every
+    // Stop-hook read is made under — decided once per Stop inside the verdict
+    // (plan
+    // `2026-11-13-runner-stop-hook-continuation-rules-and-compliance-use-the-device-default-tenant`).
+    Json(crate::mcp::continuation_verdict::continuation_verdict(&id, &key, &hook_input, mode).await)
 }
 
 // =============================================================================
