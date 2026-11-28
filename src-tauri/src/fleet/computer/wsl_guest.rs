@@ -114,7 +114,7 @@ pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
 /// of the union and `SHOW_RC` the exit of `systemctl show` — a listing is only
 /// a COMPLETE inventory when show also exited 0 and returned one `Id=` record
 /// per listed unit (see [`GuestProbe::inventory_complete`]).
-pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null); frc=$?; files=$(printf '%s\n' "$files" | awk '$1 ~ /^actions\.runner\./ && $2 != "alias"'); if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'UNIT_COUNT\t%s\n' "$(printf '%s\n' "$units" | awk 'NF' | wc -l)"; printf 'SHOW_BEGIN\n'; shrc=0; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; shrc=$?; fi; printf '\nSHOW_END\n'; printf 'SHOW_RC\t%s\n' "$shrc"; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
+pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; if [ -e /dev/dxg ]; then printf 'DXG\t1\n'; elif [ -d /dev ]; then printf 'DXG\t0\n'; fi; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null); frc=$?; files=$(printf '%s\n' "$files" | awk '$1 ~ /^actions\.runner\./ && $2 != "alias"'); if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'UNIT_COUNT\t%s\n' "$(printf '%s\n' "$units" | awk 'NF' | wc -l)"; printf 'SHOW_BEGIN\n'; shrc=0; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; shrc=$?; fi; printf '\nSHOW_END\n'; printf 'SHOW_RC\t%s\n' "$shrc"; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
 
 /// Everything one guest probe produced. Holds the identity HASH, never the
 /// raw machine id — [`parse_guest_probe`] hashes it and drops it.
@@ -135,6 +135,9 @@ pub(crate) struct GuestProbe {
     pub(crate) oom_kill_total: Option<u64>,
     /// PID 1 is systemd.
     pub(crate) systemd: bool,
+    /// `/dev/dxg` — WSL2's GPU paravirtualization device, the guest's only
+    /// path to a GPU. `None` when the probe printed no `DXG` line.
+    pub(crate) gpu_paravirt: Option<bool>,
     /// Exit status of `systemctl list-units`. The unit list is authoritative
     /// (an empty list means "no runner units", not "could not ask") only when
     /// systemd is PID 1 AND this is `Some(0)`.
@@ -226,6 +229,13 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
             }
             "OOM_KILL" => g.oom_kill_total = v.trim().parse().ok(),
             "PID1" => g.systemd = v.trim() == "systemd",
+            "DXG" => {
+                g.gpu_paravirt = match v.trim() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                }
+            }
             "LIST_RC" => g.list_rc = v.trim().parse().ok(),
             "UNIT_COUNT" => g.unit_count = v.trim().parse().ok(),
             "SHOW_RC" => g.show_rc = v.trim().parse().ok(),
@@ -302,7 +312,7 @@ pub(crate) mod probe {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `wsl --list --running --quiet` as a lossy UTF-8 read of its UTF-16LE
@@ -357,6 +367,7 @@ DISK_TOTAL\t1081101176832\n\
 BTIME\t1790000000\n\
 OOM_KILL\t3\n\
 PID1\tsystemd\n\
+DXG\t1\n\
 LIST_RC\t0\n\
 RUNNER_ACTIVE\t0\n\
 UNIT_COUNT\t1\n\
@@ -389,6 +400,11 @@ PROBE_END\n";
         assert_eq!(g.memory_total_bytes, Some(32_768_000 * 1024));
         assert_eq!(g.oom_kill_total, Some(3));
         assert!(g.systemd);
+        assert_eq!(g.gpu_paravirt, Some(true));
+        for (line, want) in [("DXG\t0", Some(false)), ("DXG\tjunk", None), ("", None)] {
+            let other = parse_guest_probe(&GUEST_OUTPUT.replace("DXG\t1", line)).unwrap();
+            assert_eq!(other.gpu_paravirt, want, "{line:?}");
+        }
         assert_eq!(g.units.len(), 1);
         assert_eq!(g.units[0].result.as_deref(), Some("oom-kill"));
         assert_eq!(g.booted_at.as_deref(), Some("2026-09-21T14:13:20Z"));
@@ -496,6 +512,11 @@ exit 0
     #[test]
     fn a_unit_known_only_to_list_unit_files_is_reported() {
         let g = run_guest_script(false, false);
+        // The live script prints its `DXG` line (`/dev` exists on any test host).
+        assert_eq!(
+            g.gpu_paravirt,
+            Some(std::path::Path::new("/dev/dxg").exists())
+        );
         let units: Vec<(&str, Option<&str>)> = g
             .units
             .iter()

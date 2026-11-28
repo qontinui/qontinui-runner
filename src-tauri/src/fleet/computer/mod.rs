@@ -44,6 +44,7 @@
 
 pub(crate) mod access;
 pub(crate) mod events;
+pub(crate) mod gpu;
 pub(crate) mod identity;
 pub(crate) mod services;
 pub(crate) mod services_bound;
@@ -522,6 +523,9 @@ pub(crate) const MAX_UNIT_LEN: usize = 256;
 /// coord's `MAX_SERVICES_PER_COMPUTER`: an entry listing more services is
 /// refused, and the refusal costs the whole report.
 pub(crate) const MAX_SERVICES_PER_COMPUTER: usize = 256;
+/// coord's serialized-size bound on each free-form JSON member (`gpus`,
+/// `access`, event `detail`) — `computers.rs` `MAX_JSON_BYTES`.
+pub(crate) const MAX_JSON_BYTES: usize = 16 * 1024;
 
 fn too_long(v: &Option<String>) -> bool {
     v.as_ref().is_some_and(|s| s.chars().count() > MAX_TEXT_LEN)
@@ -2399,6 +2403,7 @@ mod tests {
         ("wsl_guest.rs", include_str!("wsl_guest.rs")),
         ("access.rs", include_str!("access.rs")),
         ("identity.rs", include_str!("identity.rs")),
+        ("gpu.rs", include_str!("gpu.rs")),
     ];
 
     /// The production part of a source file: its test module split off.
