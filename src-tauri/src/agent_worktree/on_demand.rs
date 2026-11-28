@@ -81,6 +81,99 @@ const MAX_CENSUS_WAIT_SECS: u64 = 10;
 /// the 300s census cadence, so a single missed tick does not cry wolf.
 const CENSUS_STALE_AFTER_SECS: u64 = 600;
 
+/// A last-good coord pull older than this is ABSENT, never "reachable": the
+/// survey then makes a live pull instead. Twice the reclaim poller's 300 s
+/// cadence (`reclaim::DEFAULT_RECLAIM_INTERVAL_SECS`), so one missed or slow
+/// poller tick does not drop the snapshot, and two do.
+const COORD_PULL_STALE_AFTER_SECS: u64 = 600;
+
+// ---------------------------------------------------------------------------
+// Where the survey's coord half comes from.
+// ---------------------------------------------------------------------------
+
+/// How [`survey`] gets coord's decision.
+///
+/// Plan `2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull`:
+/// a live pull per GET under a fixed 15 s timeout blinded every class-2 pass
+/// whenever coord was slower than that, while the poller held a good pull the
+/// whole time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPolicy {
+    /// Use the last-good pull when it is in bound (≤
+    /// [`COORD_PULL_STALE_AFTER_SECS`] old, same device and coord base) and
+    /// make NO coord request; otherwise pull live. For READ-ONLY callers.
+    SnapshotFirst,
+    /// Always pull live. For a caller whose coord half AUTHORIZES a removal
+    /// (`reclaim_now`): a decision up to 10 minutes old must never do that.
+    LiveOnly,
+}
+
+/// Which pull the survey's coord half rests on. Serialized as
+/// `"live"` | `"poller_snapshot"` | `"on_demand_snapshot"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullSource {
+    /// A pull made for this very request.
+    Live,
+    /// The background reclaim poller's last-good pull, reused.
+    PollerSnapshot,
+    /// An earlier on-demand (survey) pull, reused.
+    OnDemandSnapshot,
+}
+
+impl PullSource {
+    fn of_snapshot(taker: reclaim::PullTaker) -> Self {
+        match taker {
+            reclaim::PullTaker::Poller => PullSource::PollerSnapshot,
+            reclaim::PullTaker::OnDemand => PullSource::OnDemandSnapshot,
+        }
+    }
+}
+
+/// Where a coord pull came from, and when coord answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullProvenance {
+    pub source: PullSource,
+    pub taken_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What [`choose_pull`] decided.
+#[derive(Debug, Clone)]
+enum PullChoice {
+    /// Serve this in-bound last-good pull; make no coord request.
+    Snapshot(reclaim::LastGoodPull),
+    /// Make a live pull.
+    Live,
+}
+
+/// PURE selector of the survey's coord half. `current` is the
+/// `(device_id, coord_base)` this runner would pull from right now; `None`
+/// (unconfigured) never matches a snapshot. A snapshot is used only under
+/// [`PullPolicy::SnapshotFirst`], when its key matches `current`, and when
+/// its age is in `0..=COORD_PULL_STALE_AFTER_SECS` — a `taken_at` in the
+/// future (a wall clock that stepped back) is not trusted either.
+fn choose_pull(
+    policy: PullPolicy,
+    snapshot: Option<reclaim::LastGoodPull>,
+    current: Option<(Uuid, &str)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PullChoice {
+    if policy == PullPolicy::LiveOnly {
+        return PullChoice::Live;
+    }
+    let (Some(snap), Some((device_id, base))) = (snapshot, current) else {
+        return PullChoice::Live;
+    };
+    if snap.device_id != device_id || snap.coord_base != base {
+        return PullChoice::Live;
+    }
+    let age = (now - snap.taken_at).num_seconds();
+    if age < 0 || age as u64 > COORD_PULL_STALE_AFTER_SECS {
+        return PullChoice::Live;
+    }
+    PullChoice::Snapshot(snap)
+}
+
 // ---------------------------------------------------------------------------
 // Skip reasons — the refusal vocabulary. One token per guard.
 // ---------------------------------------------------------------------------
@@ -817,19 +910,32 @@ impl SurveyQuery {
 #[derive(Debug, Clone, Serialize)]
 pub struct Survey {
     pub device_id: Option<Uuid>,
-    /// `false` when coord could not be reached — the panel says so instead of
-    /// implying "nothing to clean".
+    /// `true` when the coord decision this answer rests on was ANSWERED by
+    /// coord — a live pull made for this request, or a last-good pull no older
+    /// than 600 s (see [`Survey::coord_pull_source`] and
+    /// [`Survey::coord_pull_age_secs`] for which, and how old). `false` when
+    /// there is no such decision; the panel then says so instead of implying
+    /// "nothing to clean". An over-age snapshot never makes this `true`.
     ///
-    /// SCOPE: this describes the pull THIS REQUEST just made. It says nothing
-    /// about the background poller, which is the only thing that can actually
-    /// remove a worktree. Read [`Survey::poller`] for that. The distinction is
-    /// not academic — from 2026-07-28 to 08-01 this field read `true` on every
-    /// request while the poller failed 100 % of its pulls for five days, and a
-    /// reader who took `coord_reachable` as evidence the reclaim pipeline was
-    /// alive would have been wrong for the whole window.
+    /// SCOPE: this describes the decision the ANSWER used. It says nothing
+    /// about whether the background poller is working now, which is the only
+    /// thing that can remove a worktree on its own. Read [`Survey::poller`]
+    /// for that. The distinction is not academic — from 2026-07-28 to 08-01
+    /// this field read `true` on every request while the poller failed 100 %
+    /// of its pulls for five days.
     pub coord_reachable: bool,
     /// Present when `coord_reachable == false`.
     pub coord_error: Option<String>,
+    /// Which pull the coord half rests on: `"live"` (made for this request),
+    /// `"poller_snapshot"` (the reclaim poller's last-good pull) or
+    /// `"on_demand_snapshot"` (an earlier survey's pull). `null` when there
+    /// is no pull (`coord_reachable == false`).
+    pub coord_pull_source: Option<PullSource>,
+    /// RFC3339 time coord answered that pull. `null` when there is no pull.
+    pub coord_pull_taken_at: Option<String>,
+    /// Age of that pull in seconds at answer time — `0` for a live pull.
+    /// `null` when there is no pull.
+    pub coord_pull_age_secs: Option<u64>,
     /// Health of the BACKGROUND POLLER — the executor. A subsystem's health
     /// signal must report on its OUTPUT, not on the inputs of whoever asked.
     pub poller: reclaim::PollerHealth,
@@ -967,7 +1073,16 @@ struct Assembled {
 /// Never errors on a coord failure either — it degrades to
 /// `coord_reachable: false` with every item blocked as `coord-unreachable`,
 /// the honest fail-safe (no decision ⇒ no eligibility).
-pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
+///
+/// ## Where coord's half comes from
+///
+/// `policy` decides ([`choose_pull`]). Under [`PullPolicy::SnapshotFirst`] an
+/// in-bound last-good pull ([`reclaim::last_good_pull`]) is served with NO
+/// coord request, and the answer names its source and age; otherwise, and
+/// always under [`PullPolicy::LiveOnly`], a live pull is made under the 15 s
+/// on-demand timeout. A live pull that fails while only an over-age snapshot
+/// exists reads `coord_reachable: false`, exactly as before.
+pub async fn survey(query: SurveyQuery, policy: PullPolicy) -> Result<Survey, String> {
     let previous = census::latest_census();
 
     // `?refresh=1` — kick a walk in the BACKGROUND. Deliberately not the
@@ -990,8 +1105,42 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
     // wait <=10s) rather than their sum. The ownership read is a multi-page
     // cursor walk; its budget bounds the whole walk, and running out after
     // page one yields a PARTIAL index (`coord_ownership_partial`), not a hang.
+    let now_at_choice = chrono::Utc::now();
+    let current_device = census::load_device_id_pub();
+    let current_base = qontinui_runner_lib::profiles::connected_coord_base();
+    let choice = choose_pull(
+        policy,
+        reclaim::last_good_pull(),
+        current_device.zip(current_base.as_deref()),
+        now_at_choice,
+    );
+    let coord_half = async {
+        match choice {
+            PullChoice::Snapshot(snap) => {
+                let provenance = PullProvenance {
+                    source: PullSource::of_snapshot(snap.taker),
+                    taken_at: snap.taken_at,
+                };
+                Ok(Some((snap.device_id, snap.pull, provenance)))
+            }
+            PullChoice::Live => reclaim::fetch_pull(
+                reclaim::ON_DEMAND_PULL_TIMEOUT,
+                reclaim::PullTaker::OnDemand,
+            )
+            .await
+            .map(|o| {
+                o.map(|(id, p)| {
+                    let provenance = PullProvenance {
+                        source: PullSource::Live,
+                        taken_at: chrono::Utc::now(),
+                    };
+                    (id, std::sync::Arc::new(p), provenance)
+                })
+            }),
+        }
+    };
     let (pull, waited, ownership) = tokio::join!(
-        reclaim::fetch_pull(),
+        coord_half,
         census::wait_for_census_after(wait_for, query.wait()),
         custody::coord::fetch_ownership(custody::coord::SURVEY_WALK_BUDGET)
     );
@@ -1034,7 +1183,7 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
         });
 
     let (device_id, pull, coord_error) = match pull {
-        Ok(Some((id, p))) => (Some(id), Some(p), None),
+        Ok(Some((id, p, provenance))) => (Some(id), Some((p, provenance)), None),
         Ok(None) => (
             None,
             None,
@@ -1058,7 +1207,8 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
 
     Ok(assemble_survey(
         snapshot.as_ref(),
-        pull.as_ref(),
+        pull.as_ref()
+            .map(|(p, provenance)| (p.as_ref(), provenance)),
         device_id,
         coord_error,
         census::census_build_active(),
@@ -1075,7 +1225,8 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
 /// freshness behaviour is unit-testable without a disk walk or coord.
 fn assemble_survey(
     snapshot: Option<&CensusSnapshot>,
-    pull: Option<&ReclaimPull>,
+    // coord's decision and where it came from; `None` = no decision.
+    pull: Option<(&ReclaimPull, &PullProvenance)>,
     coord_device_id: Option<Uuid>,
     coord_error: Option<String>,
     census_refreshing: bool,
@@ -1086,8 +1237,14 @@ fn assemble_survey(
     ownership: Option<&CoordOwnership>,
     ownership_error: Option<String>,
 ) -> Survey {
+    let provenance = pull.map(|(_, prov)| *prov);
+    let pull = pull.map(|(p, _)| p);
     let coord_reachable = pull.is_some();
     let remove_armed = pull.is_some_and(|p| p.remove_armed);
+    let coord_pull_age_secs = provenance.map(|p| (now - p.taken_at).num_seconds().max(0) as u64);
+    let coord_pull_source = provenance.map(|p| p.source);
+    let coord_pull_taken_at = provenance.map(|p| p.taken_at.to_rfc3339());
+    let pull_clause = coord_pull_clause(coord_pull_source, coord_pull_age_secs);
 
     let Some(snapshot) = snapshot else {
         // Cold start: we do NOT know what is on disk, and we say so.
@@ -1095,6 +1252,9 @@ fn assemble_survey(
             device_id: coord_device_id,
             coord_reachable,
             coord_error,
+            coord_pull_source,
+            coord_pull_taken_at,
+            coord_pull_age_secs,
             poller: reclaim::poller_health(),
             remove_armed,
             canonical_excluded: 0,
@@ -1121,13 +1281,17 @@ fn assemble_survey(
             census_build_ms: None,
             census_refreshing,
             census_note: if census_refreshing {
-                "No disk snapshot yet — the first census walk of this session is still \
-                 running. This list is not 'nothing to clean up', it is 'not known yet'."
-                    .to_string()
+                format!(
+                    "No disk snapshot yet — the first census walk of this session is still \
+                     running. This list is not 'nothing to clean up', it is 'not known yet'. \
+                     {pull_clause}"
+                )
             } else {
-                "No disk snapshot yet — the census has not completed a walk this session. \
-                 This list is not 'nothing to clean up', it is 'not known yet'."
-                    .to_string()
+                format!(
+                    "No disk snapshot yet — the census has not completed a walk this session. \
+                     This list is not 'nothing to clean up', it is 'not known yet'. \
+                     {pull_clause}"
+                )
             },
         };
     };
@@ -1167,6 +1331,9 @@ fn assemble_survey(
         device_id: Some(snapshot.req.device_id),
         coord_reachable,
         coord_error,
+        coord_pull_source,
+        coord_pull_taken_at,
+        coord_pull_age_secs,
         poller: reclaim::poller_health(),
         remove_armed,
         canonical_excluded,
@@ -1178,8 +1345,8 @@ fn assemble_survey(
         census_build_ms: Some(snapshot.build_ms),
         census_refreshing,
         census_note: format!(
-            "Disk state as of {} ago{}{}. Removal always re-checks live disk before \
-             deleting anything.",
+            "Disk state as of {} ago{}{}. {pull_clause} Removal always re-checks live disk \
+             before deleting anything.",
             humanize_secs(age_secs),
             if status == CensusStatus::Stale {
                 " (stale — the census walk is overdue)"
@@ -1192,6 +1359,24 @@ fn assemble_survey(
                 ""
             }
         ),
+    }
+}
+
+/// The `census_note` sentence naming where coord's half came from and how old
+/// it is, so an operator never reads a reused decision as a live one.
+fn coord_pull_clause(source: Option<PullSource>, age_secs: Option<u64>) -> String {
+    let age = humanize_secs(age_secs.unwrap_or(0));
+    match source {
+        Some(PullSource::Live) => "Coord decision: a live pull made for this request.".to_string(),
+        Some(PullSource::PollerSnapshot) => {
+            format!("Coord decision: the reclaim poller's pull from {age} ago.")
+        }
+        Some(PullSource::OnDemandSnapshot) => {
+            format!("Coord decision: an earlier on-demand pull from {age} ago.")
+        }
+        None => {
+            "Coord decision: none — coord was not reached, so nothing is reclaimable.".to_string()
+        }
     }
 }
 
@@ -1533,11 +1718,16 @@ fn census_junctioned_sinks(w: &WorktreeCensus) -> Vec<String> {
 /// disk facts come from the cached census snapshot (see [`survey`]), so the
 /// candidate list IS minutes old by construction. It proposes; live disk
 /// disposes. `coord`'s half of the decision is never cached — `fetch_pull`
-/// runs per call.
+/// runs per call ([`PullPolicy::LiveOnly`]).
 pub async fn reclaim_now(req: ReclaimRequest) -> Result<ReclaimOutcome, String> {
     // The candidate set comes from the cached census (bounded, always answers);
     // every guard below is then re-run against LIVE disk in `execute_targets`.
-    let survey = survey(SurveyQuery::default()).await?;
+    //
+    // LiveOnly, never SnapshotFirst: this survey's coord half AUTHORIZES the
+    // removals below, and a last-good pull can be up to 600 s old. Plan
+    // `2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull`
+    // ("Resolved: `reclaim_now` stays live").
+    let survey = survey(SurveyQuery::default(), PullPolicy::LiveOnly).await?;
     let requested: Option<Vec<String>> = req
         .ids
         .map(|ids| ids.iter().map(|s| norm_path(s)).collect::<Vec<_>>());
@@ -2212,9 +2402,11 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
     }
 }
 
-/// `GET /agent-worktrees/wip-orphans` — the report, from a live survey.
+/// `GET /agent-worktrees/wip-orphans` — the report, from a survey whose coord
+/// half is snapshot-first ([`PullPolicy::SnapshotFirst`]). It is a read-only
+/// report that authorizes nothing, so a last-good pull is enough.
 pub async fn wip_orphans(query: SurveyQuery) -> Result<WipOrphanReport, String> {
-    let s = survey(query).await?;
+    let s = survey(query, PullPolicy::SnapshotFirst).await?;
     Ok(build_wip_orphans(&s, chrono::Utc::now()))
 }
 
@@ -2791,13 +2983,17 @@ mod tests {
     #[tokio::test]
     async fn survey_reads_the_cached_census_and_never_starts_a_walk() {
         let _amb = crate::test_env::isolated_ambient();
+        let _pull_lock = reclaim::LAST_GOOD_PULL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reclaim::reset_last_good_pull_for_test();
         // Publish a snapshot the way the periodic census task would…
         let wt = "D:/qontinui-root/qontinui-runner-wt-cached";
         census::publish_census_for_test(census_req(vec![census_row(wt, false, Some(false))]));
 
         let walks_before = census::census_builds_started();
         let started = std::time::Instant::now();
-        let s = survey(SurveyQuery::default())
+        let s = survey(SurveyQuery::default(), PullPolicy::LiveOnly)
             .await
             .expect("survey must always answer");
         let elapsed = started.elapsed();
@@ -3417,6 +3613,9 @@ mod tests {
             device_id: None,
             coord_reachable: false,
             coord_error: None,
+            coord_pull_source: None,
+            coord_pull_taken_at: None,
+            coord_pull_age_secs: None,
             poller: reclaim::poller_health(),
             remove_armed: false,
             canonical_excluded: 0,
@@ -4111,5 +4310,305 @@ mod tests {
         for r in all {
             assert!(!r.detail().is_empty(), "{:?} needs a detail sentence", r);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 2026-11-28-reclaimable-survey-serves-the-reclaim-pollers-last-good-coord-pull
+    // — the survey's coord half is snapshot-first, bounded by age.
+    // -----------------------------------------------------------------------
+
+    const SNAP_BASE: &str = "https://coord.example.test";
+
+    fn last_good(
+        device_id: Uuid,
+        base: &str,
+        taker: reclaim::PullTaker,
+        now: chrono::DateTime<chrono::Utc>,
+        age_secs: i64,
+    ) -> reclaim::LastGoodPull {
+        reclaim::LastGoodPull {
+            device_id,
+            coord_base: base.to_string(),
+            pull: std::sync::Arc::new(pull_with(Vec::new())),
+            taken_at: now - chrono::Duration::seconds(age_secs),
+            taker,
+        }
+    }
+
+    fn device() -> Uuid {
+        Uuid::from_u128(0x5ff7_0e5b)
+    }
+
+    /// (1) A poller snapshot aged 599 s is in bound: the survey is reachable,
+    /// names the poller as its source, and reports the age.
+    #[test]
+    fn a_599s_poller_snapshot_reads_reachable_and_says_where_it_came_from() {
+        let _amb = crate::test_env::isolated_ambient();
+        let now = chrono::Utc::now();
+        let pull = pull_with(Vec::new());
+        let provenance = PullProvenance {
+            source: PullSource::PollerSnapshot,
+            taken_at: now - chrono::Duration::seconds(599),
+        };
+        let census = snapshot_of(Vec::new(), now, chrono::Duration::seconds(30));
+        let s = assemble_survey(
+            Some(&census),
+            Some((&pull, &provenance)),
+            Some(device()),
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
+        assert!(s.coord_reachable);
+        assert_eq!(s.coord_pull_age_secs, Some(599));
+        let wire = serde_json::to_value(&s).expect("survey serializes");
+        assert_eq!(wire["coord_pull_source"], "poller_snapshot");
+        assert_eq!(wire["coord_pull_age_secs"], 599);
+        assert!(wire["coord_pull_taken_at"].is_string());
+        assert!(
+            s.census_note
+                .contains("reclaim poller's pull from 9m 59s ago"),
+            "the note must name the source and age: {}",
+            s.census_note
+        );
+    }
+
+    /// A live pull is labelled "live", age 0.
+    #[test]
+    fn a_live_pull_is_labelled_live_with_age_zero() {
+        let now = chrono::Utc::now();
+        let pull = pull_with(Vec::new());
+        let provenance = PullProvenance {
+            source: PullSource::Live,
+            taken_at: now,
+        };
+        let s = assemble_survey(
+            None,
+            Some((&pull, &provenance)),
+            Some(device()),
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
+        let wire = serde_json::to_value(&s).expect("survey serializes");
+        assert_eq!(wire["coord_pull_source"], "live");
+        assert_eq!(wire["coord_pull_age_secs"], 0);
+    }
+
+    /// The boundary sits at 600 s, the literal: 600 in bound, 601 out.
+    #[test]
+    fn the_snapshot_bound_is_600_seconds() {
+        assert_eq!(COORD_PULL_STALE_AFTER_SECS, 600);
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 600);
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Snapshot(_)
+        ));
+    }
+
+    /// (2) A snapshot aged 601 s is absent: the selector pulls live.
+    #[test]
+    fn a_601s_snapshot_is_absent_and_the_selector_pulls_live() {
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 601);
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+    }
+
+    /// (3) LiveOnly never uses a snapshot, however fresh — `reclaim_now`'s
+    /// coord half authorizes removals.
+    #[test]
+    fn live_only_ignores_even_a_10s_old_snapshot() {
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 10);
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::LiveOnly,
+                Some(snap.clone()),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+        // …while the same snapshot IS used snapshot-first, so the LiveOnly
+        // assertion above is not vacuous.
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Snapshot(_)
+        ));
+    }
+
+    /// (4) A snapshot taken for another device is not used.
+    #[test]
+    fn a_snapshot_for_another_device_is_not_used() {
+        let now = chrono::Utc::now();
+        let other = Uuid::from_u128(0xeb21_55ed);
+        let snap = last_good(other, SNAP_BASE, reclaim::PullTaker::Poller, now, 10);
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+    }
+
+    /// (4b) A snapshot taken from another coord base (a profile switch) is
+    /// not used.
+    #[test]
+    fn a_snapshot_from_another_coord_base_is_not_used() {
+        let now = chrono::Utc::now();
+        let snap = last_good(
+            device(),
+            "https://other-coord.example.test",
+            reclaim::PullTaker::Poller,
+            now,
+            10,
+        );
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+        // Unconfigured (no device / base) never matches either.
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 10);
+        assert!(matches!(
+            choose_pull(PullPolicy::SnapshotFirst, Some(snap), None, now),
+            PullChoice::Live
+        ));
+    }
+
+    /// A snapshot stamped in the future (the wall clock stepped back) is not
+    /// trusted.
+    #[test]
+    fn a_snapshot_from_the_future_is_not_used() {
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, -30);
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+    }
+
+    /// (5) A failed live pull with only an over-age snapshot reads
+    /// `coord_reachable: false` and every row is blocked `coord-unreachable`.
+    #[test]
+    fn a_failed_live_pull_with_only_an_over_age_snapshot_is_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::Poller, now, 601);
+        // The selector refuses the over-age snapshot…
+        assert!(matches!(
+            choose_pull(
+                PullPolicy::SnapshotFirst,
+                Some(snap),
+                Some((device(), SNAP_BASE)),
+                now
+            ),
+            PullChoice::Live
+        ));
+        // …and the live pull fails, so assembly gets no decision at all.
+        let wt = "D:/qontinui-root/qontinui-runner-wt-overage";
+        let census = snapshot_of(
+            vec![census_row(wt, false, Some(false))],
+            now,
+            chrono::Duration::seconds(30),
+        );
+        let s = assemble_survey(
+            Some(&census),
+            None,
+            None,
+            Some("GET …: operation timed out".to_string()),
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
+        assert!(!s.coord_reachable);
+        assert_eq!(s.coord_pull_source, None);
+        assert_eq!(s.coord_pull_age_secs, None);
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].status, "blocked");
+        assert_eq!(s.items[0].reason, Some("coord-unreachable"));
+        let wire = serde_json::to_value(&s).expect("survey serializes");
+        assert!(wire["coord_pull_source"].is_null());
+    }
+
+    /// (6, survey half) A snapshot taken on demand is labelled
+    /// "on_demand_snapshot", never "poller_snapshot".
+    #[test]
+    fn an_on_demand_snapshot_is_labelled_on_demand_never_poller() {
+        let now = chrono::Utc::now();
+        let snap = last_good(device(), SNAP_BASE, reclaim::PullTaker::OnDemand, now, 20);
+        let PullChoice::Snapshot(snap) = choose_pull(
+            PullPolicy::SnapshotFirst,
+            Some(snap),
+            Some((device(), SNAP_BASE)),
+            now,
+        ) else {
+            panic!("a 20 s on-demand snapshot is in bound");
+        };
+        let provenance = PullProvenance {
+            source: PullSource::of_snapshot(snap.taker),
+            taken_at: snap.taken_at,
+        };
+        let s = assemble_survey(
+            None,
+            Some((snap.pull.as_ref(), &provenance)),
+            Some(snap.device_id),
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
+        let wire = serde_json::to_value(&s).expect("survey serializes");
+        assert_eq!(wire["coord_pull_source"], "on_demand_snapshot");
+        assert_eq!(wire["coord_pull_age_secs"], 20);
+        assert_eq!(
+            serde_json::to_value(PullSource::of_snapshot(reclaim::PullTaker::Poller)).unwrap(),
+            "poller_snapshot"
+        );
     }
 }

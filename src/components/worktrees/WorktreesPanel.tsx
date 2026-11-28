@@ -89,6 +89,10 @@ function reasonTone(reason: string | null): string {
 function CensusFreshness({ survey }: { survey: WorktreeSurvey }) {
   const pending = survey.census_status === "pending";
   const stale = survey.census_status === "stale";
+  // A reused coord pull says how old it is, so it never reads as a live one.
+  const coordSnapshot =
+    survey.coord_pull_source === "poller_snapshot" ||
+    survey.coord_pull_source === "on_demand_snapshot";
   const tone = pending
     ? "bg-[#e0af68]/10 text-[#e0af68]"
     : stale
@@ -121,6 +125,14 @@ function CensusFreshness({ survey }: { survey: WorktreeSurvey }) {
             {stale ? " (stale — the scan is overdue)" : ""}
             {survey.census_refreshing ? " · rescanning now…" : ""}
           </>
+        )}
+        {coordSnapshot && (
+          <span
+            data-testid="worktrees-coord-pull-age"
+            data-coord-pull-source={survey.coord_pull_source}
+          >
+            {` · coord decision as of ${formatAge(survey.coord_pull_age_secs)}`}
+          </span>
         )}
       </span>
     </div>

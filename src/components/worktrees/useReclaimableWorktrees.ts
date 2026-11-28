@@ -93,10 +93,26 @@ export interface WorktreeSurveyItem {
  */
 export type CensusStatus = "pending" | "fresh" | "stale";
 
+/**
+ * Where the survey's coord decision came from: a pull made for this request,
+ * or a reused last-good one (the reclaim poller's, or an earlier survey's).
+ */
+export type CoordPullSource = "live" | "poller_snapshot" | "on_demand_snapshot";
+
 export interface WorktreeSurvey {
   device_id: string | null;
+  /**
+   * `true` when the coord decision this answer rests on was answered by coord:
+   * a live pull, or a last-good pull no older than 600 s.
+   */
   coord_reachable: boolean;
   coord_error: string | null;
+  /** Which pull the coord half rests on; `null` when there is none. */
+  coord_pull_source: CoordPullSource | null;
+  /** RFC3339 time coord answered that pull; `null` when there is none. */
+  coord_pull_taken_at: string | null;
+  /** Age of that pull in seconds (`0` for a live pull); `null` when there is none. */
+  coord_pull_age_secs: number | null;
   remove_armed: boolean;
   canonical_excluded: number;
   items: WorktreeSurveyItem[];
