@@ -678,9 +678,23 @@ function resolveAccountConfigDir(
     return sorted[0]?.config_dir ?? null;
   }
   const match = accounts.find(
-    (a) => a.label.toLowerCase() === raw || a.config_dir.toLowerCase() === raw,
+    (a) =>
+      a.label.toLowerCase() === raw ||
+      a.config_dir.toLowerCase() === raw ||
+      accountShortName(a.label) === raw,
   );
   return match?.config_dir ?? null;
+}
+
+/**
+ * The name an operator types for an account: the roster label is the config
+ * dir's basename (`.claude-iris`), so `iris` is that label minus the leading
+ * dots and `claude-` prefix — the same derivation as the runner's
+ * `derive_account_name`.
+ */
+export function accountShortName(label: string): string {
+  const stripped = label.toLowerCase().replace(/^\.+/, "");
+  return stripped.startsWith("claude-") ? stripped.slice("claude-".length) : stripped;
 }
 
 /** A value that can only be a tenant id or a prefix of one: hex and dashes, long enough to be the displayed short form. */
@@ -945,7 +959,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const args =
         tenantFirstArgs(
           rawArgs,
-          ctx.accounts.map((a) => a.label),
+          ctx.accounts.flatMap((a) => [a.label, accountShortName(a.label)]),
         ) ?? rawArgs;
       const counted = resolveCount(args);
       if ("ok" in counted) return counted;

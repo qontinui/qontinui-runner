@@ -796,15 +796,25 @@ pub(crate) struct TenantSlug {
 /// `Err`, because coord is saying it could not read the bindings.
 pub(crate) fn parse_identity_slugs(body: &serde_json::Value) -> Result<Vec<TenantSlug>, String> {
     if let Some(err) = body.get("error") {
-        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("no message");
-        return Err(format!("tenant slugs: coord answered a JSON-RPC error: {msg}"));
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("no message");
+        return Err(format!(
+            "tenant slugs: coord answered a JSON-RPC error: {msg}"
+        ));
     }
     let result = body
         .get("result")
         .ok_or_else(|| "tenant slugs: identity answer has no result".to_string())?;
     if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
-        let msg = result.pointer("/content/0/text").and_then(|v| v.as_str()).unwrap_or("no message");
-        return Err(format!("tenant slugs: coord answered an error result: {msg}"));
+        let msg = result
+            .pointer("/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no message");
+        return Err(format!(
+            "tenant slugs: coord answered an error result: {msg}"
+        ));
     }
     let parsed: serde_json::Value;
     let ident = match result.get("structuredContent").filter(|v| v.is_object()) {
@@ -1561,7 +1571,9 @@ mod tests {
     #[test]
     fn identity_slugs_a_jsonrpc_error_keeps_coords_message() {
         let body = serde_json::json!({"error": {"code": -32001, "message": "unauthorized"}});
-        assert!(parse_identity_slugs(&body).unwrap_err().contains("unauthorized"));
+        assert!(parse_identity_slugs(&body)
+            .unwrap_err()
+            .contains("unauthorized"));
         let body = serde_json::json!({"result": {"isError": true, "content": [{"text": "boom"}]}});
         assert!(parse_identity_slugs(&body).unwrap_err().contains("boom"));
     }
