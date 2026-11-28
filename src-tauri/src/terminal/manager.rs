@@ -792,11 +792,7 @@ impl TerminalManager {
             {
                 store.update_identity_by_terminal(
                     &info.id,
-                    &crate::session::session_lifecycle_store::SessionIdentityUpdate {
-                        bypass_permissions: Some(bypass_permissions),
-                        tenant_id: spawn_tenant.map(|t| t.to_string()),
-                        ..Default::default()
-                    },
+                    &spawn_identity_update(bypass_permissions, spawn_tenant),
                 );
                 // W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-
                 // coord-credential): the device default the identity seam read
@@ -1577,8 +1573,67 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
         || joined.contains("--permission-mode=bypassPermissions")
 }
 
+/// What the lifecycle record's `tenant_id` is stamped with for a spawn: the
+/// CALLER'S chosen tenant, and nothing when the caller chose none. Never a
+/// resolved or default tenant — `policy_tenant::live_read_then_recorded`
+/// promotes this stamp to the session's tenant at close time, so a default
+/// written here would file a session's compliance under the default tenant on
+/// a multi-bound device.
+fn spawn_tenant_stamp(spawn_tenant: Option<uuid::Uuid>) -> Option<String> {
+    spawn_tenant.map(|t| t.to_string())
+}
+
+/// The identity update the spawn writes onto its lifecycle record. A pure
+/// function of the spawn inputs, so the writer's tenant rule is testable
+/// without spawning a terminal: the record's `tenant_id` comes from
+/// [`spawn_tenant_stamp`] and from nothing else.
+fn spawn_identity_update(
+    bypass_permissions: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) -> crate::session::session_lifecycle_store::SessionIdentityUpdate {
+    crate::session::session_lifecycle_store::SessionIdentityUpdate {
+        bypass_permissions: Some(bypass_permissions),
+        tenant_id: spawn_tenant_stamp(spawn_tenant),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// No tenant chosen records no tenant: the stamp is never a default.
+    #[test]
+    fn a_spawn_with_no_chosen_tenant_stamps_none() {
+        assert_eq!(super::spawn_tenant_stamp(None), None);
+        let t = uuid::Uuid::from_bytes([7; 16]);
+        assert_eq!(super::spawn_tenant_stamp(Some(t)), Some(t.to_string()));
+    }
+
+    /// Review round 6 A2: `spawn_identity_update` carries no tenant when the
+    /// caller chose none, exactly the chosen one otherwise, and no other
+    /// field. This pins the helper's rule. That the spawn writer passes the
+    /// helper's value (and builds no update inline) is held by review, not by
+    /// this test.
+    #[test]
+    fn the_spawn_identity_update_carries_only_the_chosen_tenant() {
+        use crate::session::session_lifecycle_store::SessionIdentityUpdate;
+        assert_eq!(
+            super::spawn_identity_update(true, None),
+            SessionIdentityUpdate {
+                bypass_permissions: Some(true),
+                ..Default::default()
+            }
+        );
+        let t = uuid::Uuid::from_bytes([9; 16]);
+        assert_eq!(
+            super::spawn_identity_update(false, Some(t)),
+            SessionIdentityUpdate {
+                bypass_permissions: Some(false),
+                tenant_id: Some(t.to_string()),
+                ..Default::default()
+            }
+        );
+    }
+
     /// The `terminal-created` wire shape the frontend reads: `surface` sits
     /// beside the flattened `TerminalInfo` fields, never nested under an `info`
     /// key. Losing the flatten or renaming `surface` would stay green elsewhere

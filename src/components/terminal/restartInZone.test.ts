@@ -36,6 +36,7 @@ function mountPage(persisted: unknown, initialTabs: string[]) {
   const render = () => harness.renderSettled(ZoneLayoutHost);
   const labels: Record<number, string> = {};
   const closed: string[] = [];
+  const closeOptions: unknown[] = [];
   const setZoneLabel = vi.fn((zone: number, label: string) => {
     labels[zone] = label;
   });
@@ -52,15 +53,16 @@ function mountPage(persisted: unknown, initialTabs: string[]) {
         if (spawned !== null) tabIds = [...tabIds, spawned];
         return spawned;
       },
-      closeTerminal: (tabId) => {
+      closeTerminal: (tabId, options) => {
         closed.push(tabId);
+        closeOptions.push(options);
         tabIds = tabIds.filter((id) => id !== tabId);
       },
     };
     const outcome = await restartInZone(deps, zoneIdx);
     return { outcome, after: render() };
   }
-  return { render, labels, closed, setZoneLabel, restart };
+  return { render, labels, closed, closeOptions, setZoneLabel, restart };
 }
 
 const grid = (layoutId: string, assignments: Record<number, string>, focusedZone = 0) => ({
@@ -72,6 +74,17 @@ const grid = (layoutId: string, assignments: Record<number, string>, focusedZone
 beforeEach(() => harness.reset());
 
 describe("restart in zone", () => {
+  it("retires the replaced pane immediately, with no Undo window", async () => {
+    const page = mountPage(grid("quad", { 0: "a", 1: "b" }, 0), ["a", "b"]);
+
+    const { outcome } = await page.restart(0, "n");
+
+    expect(outcome).toStrictEqual({ restarted: true, tabId: "n", retiredTabId: "a" });
+    // A restart REPLACES the pane; the retirement is not an operator close, so
+    // it must not hold the old PTY open for the 10 s Undo window.
+    expect(page.closeOptions).toStrictEqual([{ immediate: true }]);
+  });
+
   it("tmux: keeps the session's grid zone and label, and comes back from tmux in it", async () => {
     const page = mountPage(grid("quad", { 0: "a", 1: "b", 2: "c" }, 2), ["a", "b", "c"]);
     page.labels[2] = "build";

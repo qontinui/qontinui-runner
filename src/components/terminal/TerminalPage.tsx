@@ -1339,7 +1339,7 @@ function TerminalPageInner({
           tabId,
           { configDir, isWindows, sessionId: crypto.randomUUID() },
           {
-            disposeTab: closeTerminal,
+            disposeTab: (id) => closeTerminal(id, { immediate: true }),
             notify: (message) => workflowGen.setNotification({ message, type: "error" }),
           },
         );

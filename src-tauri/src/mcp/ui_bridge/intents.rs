@@ -343,15 +343,17 @@ fn read_state_flag(element: &serde_json::Value, field: &str) -> Option<bool> {
 ///
 /// `disabled` / `ariaDisabled` were added to [`ALLOWED_STATES`] ahead of the
 /// bridge that emits them: `@qontinui/ui-bridge@0.22.0` — the version this
-/// repo depends on (`^0.22.0`) — builds element state in `getElementState()`
-/// as `visible` / `enabled` / `focused` only, and its published
-/// `ElementState` type declares no `disabled` or `ariaDisabled` at all. The
-/// ui-bridge commit that splits them is not on that package's release
-/// lineage yet. Reading an absent key as `false` therefore made BOTH new
-/// names permanently unmatchable: accepted at the door, then polled against a
-/// key the bridge never emits until the timeout expired.
+/// repo depended on when the probe was written — builds element state in
+/// `getElementState()` as `visible` / `enabled` / `focused` only, and its
+/// published `ElementState` type declares no `disabled` or `ariaDisabled` at
+/// all. At the time, the ui-bridge commit that splits them was not yet on that
+/// package's release lineage. Reading an absent key as `false` therefore
+/// made BOTH new names permanently unmatchable: accepted at the door, then
+/// polled against a key the bridge never emits until the timeout expired.
+/// The split has since shipped (0.24.0, ui-bridge#144), so the derived and
+/// not-observable arms below now serve older or external bridges.
 ///
-/// So each name gets the honest answer available on the live build:
+/// So each name gets the honest answer available on whichever build is running:
 ///
 /// - present on the wire -> its value (a real post-split build wins outright,
 ///   which keeps this forward-compatible),
@@ -874,10 +876,10 @@ mod state_probe_tests {
     //!
     //! The regression these lock down: `disabled` / `ariaDisabled` were added
     //! to `ALLOWED_STATES` ahead of the bridge that emits them.
-    //! `@qontinui/ui-bridge@0.22.0` (this repo depends on `^0.22.0`) builds
-    //! element state as `visible` / `enabled` / `focused` only, so an
-    //! absent-reads-as-`false` probe made both names permanently unmatchable
-    //! — accepted at the door, then silently timed out.
+    //! `@qontinui/ui-bridge@0.22.0` (the bridge `pre_split_element`
+    //! reproduces) builds element state as `visible` / `enabled` / `focused`
+    //! only, so an absent-reads-as-`false` probe made both names permanently
+    //! unmatchable — accepted at the door, then silently timed out.
     use super::{probe_state_field, resolve_state_field, StateProbe, ALLOWED_STATES};
 
     /// The element shape `@qontinui/ui-bridge@0.22.0` actually serializes:
@@ -956,7 +958,7 @@ mod state_probe_tests {
         );
     }
 
-    /// On the shipped bridge `disabled` is not on the wire, but it IS soundly
+    /// On the 0.22.0 bridge `disabled` is not on the wire, but it IS soundly
     /// derivable from the `enabled` fold — and this is the same derivation
     /// the SDK's own predicate runtime uses (`evaluateElementPredicate`'s
     /// `disabled` arm is `state.enabled === false`). Without it, a wait on
@@ -1030,13 +1032,13 @@ mod state_probe_tests {
         }
     }
 
-    /// The contract that ties the allow-list to reality: on the bridge build
-    /// this repo actually depends on, no accepted state may be silently stuck
+    /// The contract that ties the allow-list to reality: on the 0.22.0 bridge
+    /// build `pre_split_element` models, no accepted state may be silently stuck
     /// at `false` forever. Either the probe observes it, or it says it cannot
     /// — the one outcome ruled out is an unmatchable name that looks like a
     /// normal negative.
     #[test]
-    fn no_allowed_state_is_silently_unmatchable_on_the_shipped_bridge() {
+    fn no_allowed_state_is_silently_unmatchable_on_a_pre_split_bridge() {
         // Between them these two pre-split snapshots drive every emitted flag
         // to the value a wait is looking for: `visible`/`enabled`/`focused`
         // true in the first, `enabled:false` (the `disabled` source) in the

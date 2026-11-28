@@ -139,7 +139,7 @@ session's diff (send it to Step 3), and a textual conflict — `coord_pr_status`
 reads `rebase_block_disposition: author_acts` — which coord will not propose, so
 rebase and push once [policy: a-textual-conflict-is-owed-not-watched]. Every
 other head shape exits now (operator decision 2026-10-17, tightening [policy:
-pr-session-finished-when-prs-initially-green]: checks still running on the last
+pr-session-finished-at-push-closed-at-first-verdict]: checks still running on the last
 push no longer hold the session open):
 
 - Checks still `pending` — `pr-checks.sh` reports `queued` and `in_progress`

@@ -2943,10 +2943,11 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // The safe headless seed is a coord door that mints for an EXISTING binding
 // without creating one (the plan's Phase 6), consumed here by Phase 7.
-// Phase 7 consumes that door ([`seed_tenant_slot`]): ONCE per tenant per
-// lapse, attempt recorded BEFORE the call, falling back to ONE durable ask
-// per tenant per lapse when it does not put a slot there (and to NO ask when
-// coord answers `not_bound`). Coord finding
+// Phase 7 consumes that door ([`seed_tenant_slot`]): once per tenant per
+// lapse, re-armed with a backoff only when an attempt ends TRANSIENTLY
+// ([`SeedOutcome::is_transient`]), every attempt recorded BEFORE the call,
+// falling back to ONE durable ask per tenant per lapse when it does not put a
+// slot there (and to NO ask when coord answers `not_bound`). Coord finding
 // `f2dce2cb-b7a8-473b-b1bf-f5631954427b` records the
 // decision and how to reverse it — do not reverse it by calling `pair-cli`.
 //
@@ -3030,7 +3031,7 @@ pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
 /// the ask is shown, so an ask opened by an older build shows today's
 /// [`BINDING_GAP_ASK_REASON`], followed by its stored `seed_outcome` when it
 /// has one.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GapAskRecord {
     /// True once the ask for this tenant in this lapse has been RECORDED —
     /// which, since the record is what the UI reads, is the same as asked.
@@ -3041,7 +3042,8 @@ pub(crate) struct GapAskRecord {
     pub first_seen: i64,
     /// True once the Phase 7 seed attempt for this tenant in this lapse has
     /// been RECORDED — written BEFORE the network call, so a crash mid-call
-    /// or a refusal can never produce a second attempt in the same lapse.
+    /// or a terminal refusal can never produce a second attempt in the same
+    /// lapse. A transient outcome re-arms it through `seed_retry_after`.
     #[serde(default)]
     pub seed_attempted: bool,
     /// What the seed attempt came to, in operator words; empty until the
@@ -3056,6 +3058,102 @@ pub(crate) struct GapAskRecord {
     /// closes on its own once the sidecar stops naming the tenant.
     #[serde(default)]
     pub seed_not_bound: bool,
+    /// Set when the last seed attempt ended TRANSIENTLY
+    /// ([`SeedOutcome::is_transient`]): the seed is re-armed and becomes due
+    /// again on the first pass at or after this unix second. `None` means no
+    /// re-attempt is armed — the first attempt has not concluded yet, it
+    /// succeeded, or it ended terminally. Coord finding
+    /// `f080c7b9-b438-4873-83da-85ad876d3225`: a `NoPresenter` used to consume
+    /// the seed for the whole lapse, and the slot stayed empty after a
+    /// presenter came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_retry_after: Option<i64>,
+    /// Consecutive transient seed failures in this lapse that REACHED for coord
+    /// (a `NoPresenter` makes no request and is not counted, so a long wait for
+    /// a presenter does not inflate the backoff of the first real failure);
+    /// drives the backoff and is reset by a non-transient outcome. `None`
+    /// means the record was written by a build that predates the retry (see
+    /// [`legacy_seed_outcome_is_transient`]), which is the one case where a
+    /// re-arm is inferred from the stored outcome text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_transient_failures: Option<u32>,
+}
+
+/// Hand-written so that a record built in code is new-shape
+/// (`seed_transient_failures: Some(0)`): `None` there means "written by a
+/// pre-retry build" and must only ever come from deserializing such a file.
+impl Default for GapAskRecord {
+    fn default() -> Self {
+        Self {
+            notified: false,
+            first_seen: 0,
+            seed_attempted: false,
+            seed_outcome: String::new(),
+            seed_not_bound: false,
+            seed_retry_after: None,
+            seed_transient_failures: Some(0),
+        }
+    }
+}
+
+impl GapAskRecord {
+    /// Is a RE-attempt of the seed due at `now`? Never for a `not_bound`
+    /// lapse, never before the first attempt was made, and never while the
+    /// backoff runs.
+    fn seed_retry_due(&self, now: i64) -> bool {
+        if self.seed_not_bound || !self.seed_attempted {
+            return false;
+        }
+        match self.seed_retry_after {
+            Some(at) => now >= at,
+            None => {
+                self.seed_transient_failures.is_none()
+                    && legacy_seed_outcome_is_transient(&self.seed_outcome)
+            }
+        }
+    }
+}
+
+/// A record written by a build that predates the transient re-arm stores only
+/// the outcome TEXT. Re-arm it once when that text is one only a transient
+/// outcome produces, so a box already stuck in the f080c7b9 state heals after
+/// upgrade. Anything else (a terminal refusal, an empty or unknown text) stays
+/// consumed, the conservative direction.
+///
+/// Accepted bound: the stored text of a RE-attempt that crashed mid-call is
+/// the previous transient outcome, so if a pre-retry build then rewrites the
+/// file (dropping `seed_transient_failures`) the next upgrade re-arms it once.
+/// That is at most one extra request per downgrade/upgrade cycle.
+fn legacy_seed_outcome_is_transient(outcome: &str) -> bool {
+    outcome == SeedOutcome::NoPresenter.describe()
+        || outcome.starts_with("request failed: ")
+        || outcome.starts_with("unusable response: ")
+        || outcome.starts_with("credential store write failed: ")
+        || outcome.starts_with("refused (HTTP 5")
+        || outcome.starts_with("refused (HTTP 401")
+        || outcome.starts_with("refused (HTTP 408")
+        || outcome.starts_with("refused (HTTP 429")
+}
+
+/// Base of the transient-seed backoff: the first re-attempt after a network
+/// failure waits one refresher interval.
+pub(crate) const SEED_RETRY_BASE_SECS: i64 = 300;
+/// Ceiling of the transient-seed backoff.
+pub(crate) const SEED_RETRY_MAX_SECS: i64 = 6 * 3600;
+
+/// How long after the `failures`-th consecutive transient failure the seed is
+/// re-armed. `NoPresenter` re-arms for the very next pass: no request is made
+/// without a presenter, so a re-check costs a local store read and must not
+/// delay the seed once a presenter is usable again. Everything else that
+/// reached (or tried to reach) coord backs off exponentially, capped.
+pub(crate) fn seed_retry_backoff_secs(outcome: &SeedOutcome, failures: u32) -> i64 {
+    if matches!(outcome, SeedOutcome::NoPresenter) {
+        return 0;
+    }
+    let shift = failures.saturating_sub(1).min(16);
+    SEED_RETRY_BASE_SECS
+        .saturating_mul(1_i64 << shift)
+        .min(SEED_RETRY_MAX_SECS)
 }
 
 /// The on-disk lapse record, keyed by stringified tenant UUID.
@@ -3089,6 +3187,8 @@ impl GapAskState {
                 seed_attempted: false,
                 seed_outcome: String::new(),
                 seed_not_bound: false,
+                seed_retry_after: None,
+                seed_transient_failures: Some(0),
             })
     }
 
@@ -3361,6 +3461,7 @@ fn lapses_report_scoped(
                 "seed_attempted": r.seed_attempted,
                 "seed_outcome": (!r.seed_outcome.is_empty()).then(|| r.seed_outcome.clone()),
                 "seed_not_bound": r.seed_not_bound,
+                "seed_retry_after": r.seed_retry_after,
                 "asked": r.notified,
             })
         })
@@ -3455,9 +3556,11 @@ pub(crate) enum GapAction {
     /// Already asked in this lapse.
     Silent(uuid::Uuid),
     /// Phase 7: the seed attempt for this tenant is due. The attempt is
-    /// already RECORDED (`seed_attempted`) by the time this is returned, and
-    /// no ask has been opened — the ask is the fallback, on the next pass,
-    /// if the attempt does not put a slot there.
+    /// already RECORDED (`seed_attempted`) by the time this is returned. On a
+    /// lapse's FIRST attempt no ask has been opened — the ask is the fallback,
+    /// on the next pass, if the attempt does not put a slot there. A
+    /// RE-attempt (armed by a transient outcome) may come with the lapse's
+    /// one ask in the same pass, or after it.
     SeedDue(uuid::Uuid),
     /// A MEASURED report stopped naming this tenant: the lapse closed and its
     /// record was cleared. `slot_now_held` says whether the reason is that a
@@ -3503,6 +3606,29 @@ pub(crate) fn plan_gap_actions_at(
     now: i64,
     seed_enabled: bool,
 ) -> Vec<GapAction> {
+    plan_gap_actions_with(
+        &mut |p, s| save_gap_ask_state(p, s),
+        state_path,
+        ask_report,
+        tenant_slots,
+        account,
+        now,
+        seed_enabled,
+    )
+}
+
+/// [`plan_gap_actions_at`] with the record writer injected, so the gate can
+/// fail the attempt-recording write alone and check what the pass's final
+/// write then puts on disk.
+fn plan_gap_actions_with(
+    save: &mut dyn FnMut(&std::path::Path, &GapAskState) -> bool,
+    state_path: &std::path::Path,
+    ask_report: &BindingGapReport,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    account: Option<&str>,
+    now: i64,
+    seed_enabled: bool,
+) -> Vec<GapAction> {
     // No signed-in, paired account (see [`binding_gap_ask_account`]): there is
     // nobody to ask on behalf of, and the record is left exactly as it is.
     let Some(account) = account.map(str::trim).filter(|a| !a.is_empty()) else {
@@ -3533,18 +3659,21 @@ pub(crate) fn plan_gap_actions_at(
         })
         .collect();
 
-    // Phase 7: the seed attempt comes first, once per tenant per lapse. The
-    // attempt is PERSISTED here, before any `SeedDue` is returned: a record
-    // that cannot be written would re-arm the seed on every pass (one coord
-    // mint per pass), so on a failed write no seed is due and the tenant goes
-    // straight to the ask, which is harmless to repeat.
+    // Phase 7: the seed attempt comes first, once per tenant per lapse, plus
+    // a RE-attempt whenever the previous one ended transiently and its backoff
+    // has run (`seed_retry_after`). Each attempt is PERSISTED here, before any
+    // `SeedDue` is returned, and consumes the re-arm: a record that cannot be
+    // written would re-arm the seed on every pass (one coord mint per pass),
+    // so on a failed write no seed is due and the tenant goes straight to the
+    // ask, which is harmless to repeat. A crash mid-call leaves no re-arm, so
+    // it never produces a further attempt.
     //
     // A lapse already ASKED with no seed on record (`notified` without
     // `seed_attempted`) stays silent until it closes; the next lapse seeds.
     // A pre-Phase-7 build writes that shape, and so does a pass whose seed
     // write failed but whose ask write then landed: that lapse forgoes its
     // seed, the conservative direction.
-    let due: Vec<uuid::Uuid> = if seed_enabled {
+    let first_due: Vec<uuid::Uuid> = if seed_enabled {
         gaps.iter()
             .copied()
             .filter(|t| {
@@ -3556,40 +3685,75 @@ pub(crate) fn plan_gap_actions_at(
     } else {
         Vec::new()
     };
+    let retry_due: Vec<uuid::Uuid> = if seed_enabled {
+        gaps.iter()
+            .copied()
+            .filter(|t| state.record(t).is_some_and(|r| r.seed_retry_due(now)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let due: Vec<uuid::Uuid> = first_due.iter().chain(&retry_due).copied().collect();
     let seeds_recorded = !due.is_empty() && {
+        let before: Vec<(uuid::Uuid, Option<GapAskRecord>)> =
+            due.iter().map(|t| (*t, state.record(t).cloned())).collect();
         for t in &due {
-            state.entry(t, now).seed_attempted = true;
+            let rec = state.entry(t, now);
+            rec.seed_attempted = true;
+            rec.seed_retry_after = None;
+            // A legacy record re-armed from its outcome text counts as one
+            // transient failure, and is new-shape from here on.
+            rec.seed_transient_failures = Some(rec.seed_transient_failures.unwrap_or(1));
         }
-        let saved = save_gap_ask_state(state_path, &state) && {
+        let saved = save(state_path, &state) && {
             let back = load_gap_ask_state(state_path);
-            due.iter()
-                .all(|t| back.record(t).is_some_and(|r| r.seed_attempted))
+            due.iter().all(|t| {
+                back.record(t)
+                    .is_some_and(|r| r.seed_attempted && r.seed_retry_after.is_none())
+            })
         };
         if !saved {
             warn!(
                 "device_jwt_refresher: the binding-gap lapse record could not be written, so \
                  no seed is attempted this pass (an unrecorded attempt would repeat every pass)"
             );
-            for t in &due {
-                state.entry(t, now).seed_attempted = false;
+            for (t, prev) in before {
+                match prev {
+                    Some(r) => {
+                        state.tenants.insert(t.to_string(), r);
+                    }
+                    None => {
+                        state.entry(&t, now).seed_attempted = false;
+                    }
+                }
             }
         }
         saved
     };
 
     for tenant in gaps {
-        if state.record(&tenant).is_some_and(|r| r.notified) {
-            actions.push(GapAction::Silent(tenant));
-            continue;
-        }
-        if seeds_recorded && due.contains(&tenant) {
+        let seed_due = seeds_recorded && due.contains(&tenant);
+        if seed_due {
             actions.push(GapAction::SeedDue(tenant));
+            // The FIRST attempt withholds the ask until it has concluded. A
+            // re-attempt does not: the ask opens once, on the pass after the
+            // first failure, whether or not a retry is armed.
+            if first_due.contains(&tenant) {
+                continue;
+            }
+        }
+        if state.record(&tenant).is_some_and(|r| r.notified) {
+            if !seed_due {
+                actions.push(GapAction::Silent(tenant));
+            }
             continue;
         }
         // Coord's door said the binding is gone: asking a human to pair would
         // re-create it. Stay silent for the rest of this lapse.
         if state.record(&tenant).is_some_and(|r| r.seed_not_bound) {
-            actions.push(GapAction::Silent(tenant));
+            if !seed_due {
+                actions.push(GapAction::Silent(tenant));
+            }
             continue;
         }
         let (first_seen, reason) = {
@@ -3607,7 +3771,7 @@ pub(crate) fn plan_gap_actions_at(
         });
     }
 
-    let _ = save_gap_ask_state(state_path, &state);
+    let _ = save(state_path, &state);
     actions
 }
 
@@ -3736,13 +3900,16 @@ fn settle_binding_gap_actions(
 // seed Phase 4 removed `pair-cli` for being unable to do safely.
 //
 // Rules this arm keeps:
-//   * once per tenant per lapse — the attempt is persisted by
-//     [`plan_gap_actions_at`] BEFORE [`seed_tenant_slot`] is called;
-//   * every non-success is a fall-back to the ask, never a retry: coord's
-//     `403 not_bound` / `403 presenter_not_device_owner` / `403 …` /
-//     `400` same-tenant / `409 binding_has_no_pairing_user` / `503`, a
-//     transport failure and an unusable body all end in
-//     [`SeedOutcome::describe`] text on the ask record;
+//   * every attempt is persisted by [`plan_gap_actions_at`] BEFORE
+//     [`seed_tenant_slot`] is called, and one call is one request;
+//   * every non-success falls back to the ask (opened once per lapse, and
+//     never for `403 not_bound`), with [`SeedOutcome::describe`] text on it;
+//   * a TERMINAL outcome ([`SeedOutcome::is_transient`] false — any 403,
+//     400, 404, 409, other 4xx, or a tenant mismatch) consumes the seed for
+//     the lapse; a TRANSIENT one (no presenter, transport, unusable body,
+//     store failure, 5xx / 401 / 408 / 429) re-arms it after
+//     [`seed_retry_backoff_secs`] — coord finding
+//     `f080c7b9-b438-4873-83da-85ad876d3225`;
 //   * the write is per-tenant and refuses a cross-tenant claim
 //     ([`crate::auth::AuthManager::store_tenant_device_jwt_expecting`]);
 //   * no `pair-cli`, no `machine-credential/exchange`, no Cognito bearer.
@@ -3775,6 +3942,36 @@ pub(crate) enum SeedOutcome {
 impl SeedOutcome {
     pub(crate) fn succeeded(&self) -> bool {
         matches!(self, SeedOutcome::Seeded | SeedOutcome::SlotAlreadyHeld)
+    }
+
+    /// Could a later attempt of the same seed succeed without anyone acting?
+    /// True re-arms the seed after [`seed_retry_backoff_secs`]; false consumes
+    /// it for the lapse (one ask, no further requests).
+    ///
+    /// * `NoPresenter` — the presenter slot may be refreshed later.
+    /// * `Transport`, 5xx, 408, 429 — coord or the path was unavailable.
+    /// * 401 — coord rejected the presenter credential, which the refresher
+    ///   replaces on its own; the backoff bounds the cost meanwhile.
+    /// * `BadResponse` — a 2xx with no usable token: a coord fault, nothing
+    ///   stored, so a backed-off re-attempt is safe.
+    /// * `PersistFailed` — the local store failed to read or write; a later
+    ///   pass may find it working. The backoff bounds the discarded mints.
+    ///
+    /// Terminal: every other refusal — any 403 (`not_bound`,
+    /// `presenter_not_device_owner`, `binding_user_not_device_owner`, …),
+    /// 400s, 404, 409 — and `TenantMismatch`, which repeating would not fix.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            SeedOutcome::Seeded | SeedOutcome::SlotAlreadyHeld => false,
+            SeedOutcome::NoPresenter
+            | SeedOutcome::Transport(_)
+            | SeedOutcome::BadResponse(_)
+            | SeedOutcome::PersistFailed(_) => true,
+            SeedOutcome::Refused { status, .. } => {
+                *status >= 500 || matches!(*status, 401 | 408 | 429)
+            }
+            SeedOutcome::TenantMismatch { .. } => false,
+        }
     }
 
     /// Coord answered `403 not_bound`: the device is not bound to the tenant.
@@ -3985,16 +4182,35 @@ pub(crate) async fn seed_tenant_slot(
 }
 
 /// Persist what a seed attempt came to on the tenant's lapse record, so the
-/// fallback ask can say why. Best-effort; touches no other field.
+/// fallback ask can say why, and re-arm the seed when the outcome was
+/// transient ([`SeedOutcome::is_transient`]). Best-effort: a failed write
+/// leaves no re-arm, the conservative direction. Touches no ask field.
 pub(crate) fn record_seed_outcome_at(
     path: &std::path::Path,
     tenant: &uuid::Uuid,
     outcome: &SeedOutcome,
+    now: i64,
 ) {
     let mut state = load_gap_ask_state(path);
     if let Some(rec) = state.tenants.get_mut(&tenant.to_string()) {
         rec.seed_outcome = outcome.describe();
         rec.seed_not_bound = outcome.is_not_bound();
+        let prior = rec.seed_transient_failures.unwrap_or(0);
+        if outcome.is_transient() {
+            // A missing presenter made no request, so it does not lengthen
+            // the backoff of the next real failure.
+            let failures = if matches!(outcome, SeedOutcome::NoPresenter) {
+                prior
+            } else {
+                prior.saturating_add(1)
+            };
+            rec.seed_transient_failures = Some(failures);
+            rec.seed_retry_after =
+                Some(now.saturating_add(seed_retry_backoff_secs(outcome, failures)));
+        } else {
+            rec.seed_transient_failures = Some(0);
+            rec.seed_retry_after = None;
+        }
         let _ = save_gap_ask_state(path, &state);
     }
 }
@@ -4008,6 +4224,7 @@ async fn run_due_seeds(
     device_id: &str,
     actions: &[GapAction],
     state_path: Option<&std::path::Path>,
+    now: i64,
 ) -> Vec<(uuid::Uuid, SeedOutcome)> {
     let mut results = Vec::new();
     for action in actions {
@@ -4022,16 +4239,35 @@ async fn run_due_seeds(
                  per-binding door ({})",
                 outcome.describe()
             );
+        } else if outcome.is_transient() {
+            // A missing presenter is re-checked every pass; say so once per
+            // streak rather than every five minutes.
+            let repeat_no_presenter = matches!(outcome, SeedOutcome::NoPresenter)
+                && state_path
+                    .map(load_gap_ask_state)
+                    .and_then(|s| s.record(tenant).map(|r| r.seed_outcome.clone()))
+                    .is_some_and(|prev| prev == SeedOutcome::NoPresenter.describe());
+            let msg = format!(
+                "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
+                 per-binding door did not succeed — {}; the outcome is transient, so the \
+                 seed is re-armed (the operator ask, if not yet open, follows on the next pass)",
+                outcome.describe()
+            );
+            if repeat_no_presenter {
+                debug!("{msg}");
+            } else {
+                warn!("{msg}");
+            }
         } else {
             warn!(
                 "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
-                 per-binding door did not succeed — {}; the operator ask follows on the \
-                 next pass (no retry this lapse)",
+                 per-binding door did not succeed — {}; the refusal is terminal, so the \
+                 operator ask follows on the next pass (no retry this lapse)",
                 outcome.describe()
             );
         }
         if let Some(path) = state_path {
-            record_seed_outcome_at(path, tenant, &outcome);
+            record_seed_outcome_at(path, tenant, &outcome, now);
         }
         results.push((*tenant, outcome));
     }
@@ -6869,6 +7105,7 @@ async fn refresher_loop(
                 did,
                 &gap_actions,
                 binding_gap_ask_path().as_deref(),
+                chrono::Utc::now().timestamp(),
             )
             .await;
         }
@@ -8769,10 +9006,13 @@ mod tenant_slot_refresh_tests {
         qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("test: sidecar not read")
     }
 
+    /// A distinct test tenant per `n` in 0..16. 0..=5 keep their historical
+    /// `a`..`f` spelling; 6..=15 continue with the hex digits `0`..`9`.
     fn tenant(n: u8) -> uuid::Uuid {
+        assert!(n < 16, "tenant(n) supports n in 0..16, got {n}");
+        let c = char::from_digit((u32::from(n) + 10) % 16, 16).expect("hex digit");
         uuid::Uuid::parse_str(&format!(
-            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
-            c = (b'a' + n) as char
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}"
         ))
         .expect("valid uuid")
     }
@@ -15333,10 +15573,13 @@ mod tenant_seed_arm_tests {
         chrono::Utc::now().timestamp() + 3600
     }
 
+    /// A distinct test tenant per `n` in 0..16. 0..=5 keep their historical
+    /// `a`..`f` spelling; 6..=15 continue with the hex digits `0`..`9`.
     fn tenant(n: u8) -> uuid::Uuid {
+        assert!(n < 16, "tenant(n) supports n in 0..16, got {n}");
+        let c = char::from_digit((u32::from(n) + 10) % 16, 16).expect("hex digit");
         uuid::Uuid::parse_str(&format!(
-            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
-            c = (b'a' + n) as char
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}"
         ))
         .expect("valid uuid")
     }
@@ -15484,6 +15727,7 @@ mod tenant_seed_arm_tests {
                 status: 503,
                 code: "bindings_unreadable".into(),
             },
+            now,
         );
         let second = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
         let asks = notified(&second);
@@ -15492,7 +15736,7 @@ mod tenant_seed_arm_tests {
         assert!(reason.contains("per-binding door"), "{reason}");
         assert!(reason.contains("HTTP 503"), "{reason}");
 
-        // And never a second seed or a second ask in the same lapse.
+        // And no second seed inside the backoff, nor a second ask.
         let third = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 120, true);
         assert_eq!(third, vec![GapAction::Silent(t)]);
     }
@@ -15526,6 +15770,7 @@ mod tenant_seed_arm_tests {
                 status: 403,
                 code: "not_bound".into(),
             },
+            now,
         );
         for k in 1..4 {
             let pass = plan_gap_actions_at(
@@ -15744,7 +15989,7 @@ mod tenant_seed_arm_tests {
         assert_eq!(planned, vec![GapAction::SeedDue(ok_t)]);
 
         let (base, seen, stop) = spawn_mock(200, None);
-        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path)).await;
+        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path), 1_800_000_000).await;
         let _ = stop.send(());
         assert_eq!(results, vec![(ok_t, SeedOutcome::Seeded)]);
         assert_eq!(seen.lock().unwrap().len(), 1);
@@ -15777,7 +16022,7 @@ mod tenant_seed_arm_tests {
             403,
             Some(r#"{"code":"not_bound","error":"not_bound"}"#.into()),
         );
-        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path)).await;
+        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path), 1_800_000_000).await;
         let _ = stop.send(());
         assert!(results[0].1.is_not_bound(), "{results:?}");
         assert!(upstream_signal_for(Some(&nb_t.to_string())).consecutive_rejections > 0);
@@ -15786,7 +16031,15 @@ mod tenant_seed_arm_tests {
 
         // Actions with no SeedDue make no request.
         let (base, seen, stop) = spawn_mock(200, None);
-        let none = run_due_seeds(&mgr, &base, DID, &[GapAction::Silent(nb_t)], Some(&path)).await;
+        let none = run_due_seeds(
+            &mgr,
+            &base,
+            DID,
+            &[GapAction::Silent(nb_t)],
+            Some(&path),
+            1_800_000_000,
+        )
+        .await;
         let _ = stop.send(());
         assert!(none.is_empty());
         assert!(seen.lock().unwrap().is_empty());
@@ -15827,6 +16080,447 @@ mod tenant_seed_arm_tests {
         assert_eq!(seed_refusal_code(&other), "unparsed");
         assert_eq!(seed_refusal_code(r#"{"code":"not_bound"}"#), "not_bound");
         assert_eq!(seed_refusal_code(r#"{"error":"forced"}"#), "forced");
+    }
+
+    // ---- transient re-arm (coord finding f080c7b9) ----
+
+    fn seed_dues(actions: &[GapAction]) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, GapAction::SeedDue(_)))
+            .count()
+    }
+
+    /// The incident: the first seed found no presenter, the ask fired, and the
+    /// presenter came back later. The seed must be re-attempted on the first
+    /// pass where a usable presenter exists, and put a token for exactly the
+    /// requested tenant in its slot.
+    #[tokio::test]
+    async fn a_no_presenter_seed_is_retried_once_a_presenter_exists() {
+        let (presenter_t, want) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let mgr = test_auth_manager("retry_no_presenter");
+        let path = gap_state_path("retry_no_presenter");
+        let (base, seen, stop) = spawn_mock(200, None);
+        let now = 1_800_000_000;
+
+        let p1 = plan_gap_actions_at(&path, &gaps(&[want]), Some(&[]), Some(ACCT), now, true);
+        assert_eq!(p1, vec![GapAction::SeedDue(want)]);
+        let r1 = run_due_seeds(&mgr, &base, DID, &p1, Some(&path), now).await;
+        assert_eq!(r1, vec![(want, SeedOutcome::NoPresenter)]);
+        let rec = load_gap_ask_state(&path).tenants[&want.to_string()].clone();
+        assert_eq!(
+            rec.seed_retry_after,
+            Some(now),
+            "re-armed for the next pass"
+        );
+
+        // Next pass, still no presenter: the ask opens ONCE, and the seed is
+        // re-checked behind it without a request.
+        let p2 = plan_gap_actions_at(
+            &path,
+            &gaps(&[want]),
+            Some(&[]),
+            Some(ACCT),
+            now + 300,
+            true,
+        );
+        assert_eq!(seed_dues(&p2), 1, "{p2:?}");
+        assert_eq!(notified(&p2).len(), 1, "{p2:?}");
+        let r2 = run_due_seeds(&mgr, &base, DID, &p2, Some(&path), now + 300).await;
+        assert_eq!(r2, vec![(want, SeedOutcome::NoPresenter)]);
+        assert!(seen.lock().unwrap().is_empty(), "no presenter, no request");
+
+        // The presenter's slot is refreshed.
+        let presenter = jwt_for(Some(presenter_t), future(), "presenter");
+        mgr.store_tenant_device_jwt(&presenter_t, &presenter)
+            .expect("presenter slot");
+
+        let p3 = plan_gap_actions_at(
+            &path,
+            &gaps(&[want]),
+            Some(&[]),
+            Some(ACCT),
+            now + 600,
+            true,
+        );
+        assert_eq!(p3, vec![GapAction::SeedDue(want)], "no second ask");
+        let r3 = run_due_seeds(&mgr, &base, DID, &p3, Some(&path), now + 600).await;
+        let _ = stop.send(());
+        assert_eq!(r3, vec![(want, SeedOutcome::Seeded)]);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(DID.to_string(), presenter, want.to_string())],
+            "exactly one request, presenting the other tenant's credential"
+        );
+        let stored = mgr.get_tenant_device_jwt(&want).unwrap().expect("seeded");
+        assert_eq!(crate::auth::jwt_tenant_claim(&stored), Some(want));
+        assert_eq!(
+            load_gap_ask_state(&path).tenants[&want.to_string()].seed_retry_after,
+            None,
+            "a success disarms the retry"
+        );
+
+        // The slot now exists, so the next measured report closes the lapse.
+        let closed = plan_gap_actions_at(
+            &path,
+            &gaps(&[]),
+            Some(&[want]),
+            Some(ACCT),
+            now + 900,
+            true,
+        );
+        assert_eq!(
+            closed,
+            vec![GapAction::LapseClosed {
+                tenant: want,
+                slot_now_held: true
+            }]
+        );
+    }
+
+    /// A terminal refusal keeps today's behaviour: no re-seed, however long
+    /// the lapse lasts.
+    #[tokio::test]
+    async fn a_terminal_not_bound_is_never_reseeded() {
+        let (presenter_t, want) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let (mgr, _) = store_with_presenter("terminal_not_bound", presenter_t);
+        let path = gap_state_path("terminal_not_bound");
+        let (base, seen, stop) = spawn_mock(
+            403,
+            Some(r#"{"code":"not_bound","error":"not_bound"}"#.into()),
+        );
+        let now = 1_800_000_000;
+        let p1 = plan_gap_actions_at(&path, &gaps(&[want]), Some(&[]), Some(ACCT), now, true);
+        let r1 = run_due_seeds(&mgr, &base, DID, &p1, Some(&path), now).await;
+        assert!(r1[0].1.is_not_bound(), "{r1:?}");
+        for k in 1..6 {
+            let pass = plan_gap_actions_at(
+                &path,
+                &gaps(&[want]),
+                Some(&[]),
+                Some(ACCT),
+                now + k * SEED_RETRY_MAX_SECS,
+                true,
+            );
+            assert_eq!(pass, vec![GapAction::Silent(want)], "pass {k}");
+            run_due_seeds(&mgr, &base, DID, &pass, Some(&path), now).await;
+        }
+        let _ = stop.send(());
+        assert_eq!(seen.lock().unwrap().len(), 1, "one request for the lapse");
+        let rec = load_gap_ask_state(&path).tenants[&want.to_string()].clone();
+        assert_eq!(rec.seed_retry_after, None);
+        assert!(!rec.notified, "not_bound opens no ask");
+    }
+
+    /// Other terminal refusals: one ask, then silence, no re-seed.
+    #[test]
+    fn terminal_refusals_ask_once_and_never_reseed() {
+        for (status, code) in [
+            (403, "presenter_not_device_owner"),
+            (403, "binding_user_not_device_owner"),
+            (400, "requested_tenant_is_presenters"),
+            (409, "binding_has_no_pairing_user"),
+            (404, "unparsed"),
+        ] {
+            let path = gap_state_path("terminal_refusals");
+            let t = tenant(6);
+            let now = 1_800_000_000;
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+            let outcome = SeedOutcome::Refused {
+                status,
+                code: code.into(),
+            };
+            assert!(!outcome.is_transient(), "{status} {code}");
+            record_seed_outcome_at(&path, &t, &outcome, now);
+            let asked =
+                plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
+            assert_eq!(seed_dues(&asked), 0, "{status} {code}: {asked:?}");
+            assert_eq!(notified(&asked).len(), 1, "{status} {code}: {asked:?}");
+            let later = plan_gap_actions_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some(ACCT),
+                now + 10 * SEED_RETRY_MAX_SECS,
+                true,
+            );
+            assert_eq!(later, vec![GapAction::Silent(t)], "{status} {code}");
+        }
+        let mismatch = SeedOutcome::TenantMismatch {
+            returned: Some(tenant(1)),
+        };
+        assert!(!mismatch.is_transient());
+    }
+
+    #[test]
+    fn transient_outcomes_are_classified_and_back_off_exponentially() {
+        for o in [
+            SeedOutcome::NoPresenter,
+            SeedOutcome::Transport("x".into()),
+            SeedOutcome::BadResponse("x".into()),
+            SeedOutcome::PersistFailed("x".into()),
+            SeedOutcome::Refused {
+                status: 503,
+                code: "tenant_token_state_unreadable".into(),
+            },
+            SeedOutcome::Refused {
+                status: 500,
+                code: "unparsed".into(),
+            },
+            SeedOutcome::Refused {
+                status: 401,
+                code: "token_revoked".into(),
+            },
+            SeedOutcome::Refused {
+                status: 429,
+                code: "rate_limited".into(),
+            },
+        ] {
+            assert!(o.is_transient(), "{o:?}");
+        }
+        assert!(!SeedOutcome::Seeded.is_transient());
+        assert!(!SeedOutcome::SlotAlreadyHeld.is_transient());
+
+        let t = SeedOutcome::Transport("x".into());
+        assert_eq!(seed_retry_backoff_secs(&SeedOutcome::NoPresenter, 7), 0);
+        assert_eq!(seed_retry_backoff_secs(&t, 1), SEED_RETRY_BASE_SECS);
+        assert_eq!(seed_retry_backoff_secs(&t, 2), 2 * SEED_RETRY_BASE_SECS);
+        assert_eq!(seed_retry_backoff_secs(&t, 3), 4 * SEED_RETRY_BASE_SECS);
+        assert_eq!(seed_retry_backoff_secs(&t, 40), SEED_RETRY_MAX_SECS);
+        assert_eq!(seed_retry_backoff_secs(&t, u32::MAX), SEED_RETRY_MAX_SECS);
+    }
+
+    /// A 503 is re-attempted once its backoff has run, never before, and a
+    /// second 503 doubles the wait.
+    #[test]
+    fn a_5xx_seed_is_retried_after_its_backoff() {
+        let path = gap_state_path("retry_503");
+        let t = tenant(7);
+        let now = 1_800_000_000;
+        let busy = SeedOutcome::Refused {
+            status: 503,
+            code: "tenant_token_state_unreadable".into(),
+        };
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(&path, &t, &busy, now);
+
+        let early = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
+        assert_eq!(seed_dues(&early), 0, "{early:?}");
+        assert_eq!(notified(&early).len(), 1, "the ask still opens once");
+
+        let due_at = now + SEED_RETRY_BASE_SECS;
+        let before =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), due_at - 1, true);
+        assert_eq!(before, vec![GapAction::Silent(t)]);
+        let retry = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), due_at, true);
+        assert_eq!(retry, vec![GapAction::SeedDue(t)]);
+        // The re-attempt is consumed when planned: a crash mid-call does not
+        // repeat it.
+        let again =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), due_at + 1, true);
+        assert_eq!(again, vec![GapAction::Silent(t)]);
+
+        record_seed_outcome_at(&path, &t, &busy, due_at);
+        let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+        assert_eq!(rec.seed_transient_failures, Some(2));
+        assert_eq!(
+            rec.seed_retry_after,
+            Some(due_at + 2 * SEED_RETRY_BASE_SECS)
+        );
+
+        // A terminal answer on the re-attempt disarms it for good.
+        let p = plan_gap_actions_at(
+            &path,
+            &gaps(&[t]),
+            Some(&[]),
+            Some(ACCT),
+            due_at + 2 * SEED_RETRY_BASE_SECS,
+            true,
+        );
+        assert_eq!(p, vec![GapAction::SeedDue(t)]);
+        record_seed_outcome_at(
+            &path,
+            &t,
+            &SeedOutcome::Refused {
+                status: 409,
+                code: "binding_has_no_pairing_user".into(),
+            },
+            due_at + 2 * SEED_RETRY_BASE_SECS,
+        );
+        let later = plan_gap_actions_at(
+            &path,
+            &gaps(&[t]),
+            Some(&[]),
+            Some(ACCT),
+            now + 100 * SEED_RETRY_MAX_SECS,
+            true,
+        );
+        assert_eq!(later, vec![GapAction::Silent(t)]);
+    }
+
+    /// A record written by a build that predates the re-arm (no
+    /// `seed_retry_after` / `seed_transient_failures`) loads, and is re-armed
+    /// once only when its stored outcome is a transient one.
+    #[test]
+    fn a_pre_retry_record_is_rearmed_only_for_a_transient_outcome() {
+        let t = tenant(8);
+        let now = 1_800_000_000;
+        let write = |path: &std::path::Path, outcome: &str, not_bound: bool| {
+            let body = serde_json::json!({
+                "account": ACCT,
+                "tenants": { t.to_string(): {
+                    "notified": true,
+                    "first_seen": 7,
+                    "seed_attempted": true,
+                    "seed_outcome": outcome,
+                    "seed_not_bound": not_bound,
+                }}
+            });
+            std::fs::write(path, body.to_string()).expect("legacy record");
+        };
+
+        for outcome in [
+            SeedOutcome::NoPresenter.describe(),
+            SeedOutcome::Transport("connection refused".into()).describe(),
+            SeedOutcome::Refused {
+                status: 503,
+                code: "x".into(),
+            }
+            .describe(),
+        ] {
+            let path = gap_state_path("legacy_transient");
+            write(&path, &outcome, false);
+            let p = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+            assert_eq!(p, vec![GapAction::SeedDue(t)], "{outcome}");
+            let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+            assert_eq!(rec.seed_transient_failures, Some(1), "{outcome}");
+            assert!(rec.notified, "the open ask is kept");
+            // Consumed: not re-armed again from the same text.
+            let p = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 1, true);
+            assert_eq!(p, vec![GapAction::Silent(t)], "{outcome}");
+        }
+
+        for (outcome, not_bound) in [
+            (
+                SeedOutcome::Refused {
+                    status: 403,
+                    code: "not_bound".into(),
+                }
+                .describe(),
+                true,
+            ),
+            (
+                SeedOutcome::Refused {
+                    status: 409,
+                    code: "x".into(),
+                }
+                .describe(),
+                false,
+            ),
+            (String::new(), false),
+        ] {
+            let path = gap_state_path("legacy_terminal");
+            write(&path, &outcome, not_bound);
+            let p = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+            assert_eq!(p, vec![GapAction::Silent(t)], "{outcome:?}");
+        }
+    }
+
+    /// A long wait for a presenter must not inflate the backoff of the first
+    /// real failure once one exists (review A1).
+    #[test]
+    fn a_no_presenter_streak_does_not_lengthen_the_next_backoff() {
+        let path = gap_state_path("no_presenter_streak");
+        let t = tenant(10);
+        let mut now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        for _ in 0..10 {
+            record_seed_outcome_at(&path, &t, &SeedOutcome::NoPresenter, now);
+            now += 300;
+            let p = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+            assert_eq!(seed_dues(&p), 1, "{p:?}");
+        }
+        let busy = SeedOutcome::Refused {
+            status: 503,
+            code: "x".into(),
+        };
+        record_seed_outcome_at(&path, &t, &busy, now);
+        let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+        assert_eq!(rec.seed_transient_failures, Some(1));
+        assert_eq!(rec.seed_retry_after, Some(now + SEED_RETRY_BASE_SECS));
+    }
+
+    /// A planning pass whose record write fails seeds nothing and leaves an
+    /// armed retry armed, so it is attempted once the record can be written.
+    #[test]
+    fn a_failed_planning_write_keeps_an_armed_retry_and_seeds_nothing() {
+        let path = gap_state_path("rollback");
+        let t = tenant(11);
+        let now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("x".into()), now);
+        let due_at = now + SEED_RETRY_BASE_SECS;
+
+        // Only the attempt-recording write fails; the pass's final write
+        // lands, so what it writes is what the rollback restored.
+        let mut calls = 0;
+        let mut saver = |p: &std::path::Path, st: &GapAskState| {
+            calls += 1;
+            calls > 1 && save_gap_ask_state(p, st)
+        };
+        let blocked = plan_gap_actions_with(
+            &mut saver,
+            &path,
+            &gaps(&[t]),
+            Some(&[]),
+            Some(ACCT),
+            due_at,
+            true,
+        );
+        assert_eq!(calls, 2, "the attempt write and the final write");
+        assert_eq!(seed_dues(&blocked), 0, "{blocked:?}");
+        assert_eq!(notified(&blocked).len(), 1, "the ask still opens");
+
+        let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+        assert!(rec.notified, "the final write landed");
+        assert_eq!(rec.seed_retry_after, Some(due_at), "still armed");
+        assert_eq!(rec.seed_transient_failures, Some(1));
+        let retry =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), due_at + 1, true);
+        assert_eq!(retry, vec![GapAction::SeedDue(t)]);
+    }
+
+    /// A re-armed record round-trips, and `seed_retry_after` is omitted from
+    /// disk once nothing is armed (older builds ignore both fields either way).
+    #[test]
+    fn the_rearm_fields_round_trip_and_stay_off_disk_when_unset() {
+        let path = gap_state_path("rearm_shape");
+        let t = tenant(9);
+        let now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("x".into()), now);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rec = &raw["tenants"][t.to_string()];
+        assert_eq!(
+            rec["seed_retry_after"],
+            serde_json::json!(now + SEED_RETRY_BASE_SECS)
+        );
+        assert_eq!(rec["seed_transient_failures"], serde_json::json!(1));
+        let state = load_gap_ask_state(&path);
+        assert!(save_gap_ask_state(&path, &state));
+        assert_eq!(load_gap_ask_state(&path), state);
+
+        record_seed_outcome_at(&path, &t, &SeedOutcome::Seeded, now + 300);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw["tenants"][t.to_string()]
+                .get("seed_retry_after")
+                .is_none(),
+            "{raw}"
+        );
     }
 
     /// The arm must never reach for `pair-cli` (it re-creates bindings an
@@ -15897,6 +16591,7 @@ mod tenant_seed_arm_tests {
             seed_attempted,
             seed_outcome: outcome.to_string(),
             seed_not_bound: not_bound,
+            ..Default::default()
         }
     }
 

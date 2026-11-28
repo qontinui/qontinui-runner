@@ -1117,8 +1117,11 @@ pub enum PtyWriteCaller {
     TauriTerminalWrite,
     /// The same command reached through the HTTP Tauri-invoke proxy.
     TauriInvokeProxy,
-    /// A remote (coord-relayed) terminal's `terminal_input` frame.
-    RemoteTerminalInput,
+    /// A remote (coord-relayed) terminal's `terminal_input` frame, with the
+    /// relay's stamps from that frame kept beside it (plan
+    /// `2026-10-28-one-session-lifecycle-authority` Phase 80). Recorded, never
+    /// authority — see [`super::input_funnel::RelayInputProvenance`].
+    RemoteTerminalInput(super::input_funnel::RelayInputProvenance),
     /// `POST /terminals/{id}/write`.
     HttpWrite,
     /// The `/terminals/{id}/ws` socket's `input` frame.
@@ -1162,7 +1165,7 @@ impl PtyWriteCaller {
             Self::ReviewNotes => "review_notes",
             Self::TauriTerminalWrite => "tauri_terminal_write",
             Self::TauriInvokeProxy => "tauri_invoke_proxy",
-            Self::RemoteTerminalInput => "remote_terminal_input",
+            Self::RemoteTerminalInput(_) => "remote_terminal_input",
             Self::HttpWrite => "http_write",
             Self::WebSocketInput => "websocket_input",
             Self::PtyTransport => "pty_transport",
@@ -1209,11 +1212,23 @@ pub struct PtyInputObservation {
 /// through the same `write` path as keystrokes; counting those answers as input
 /// would mask nearly every phantom turn. They are kept, not dropped, so an
 /// investigator can still see the emulator was talking.
+///
+/// A fourth, `last_insert`, holds a prompt pasted WITHOUT its submitting CR
+/// (`insert_prompt`) — a runner-inserted draft. It used to land in
+/// `last_submit`, which made the draft indistinguishable from a submitted turn
+/// (plan `2026-10-28-one-session-lifecycle-authority` Phase 80). It is input,
+/// so [`Self::latest`] considers it.
+///
+/// `funnel` is the pane's input funnel proper — the draft state and the
+/// writer-tagged history the lifecycle kernel reads
+/// ([`super::input_funnel::InputFunnel`]), folded under the same lock.
 #[derive(Clone, Debug, Default)]
 pub struct PtyInputSlots {
     pub last_write: Option<PtyInputObservation>,
     pub last_submit: Option<PtyInputObservation>,
+    pub last_insert: Option<PtyInputObservation>,
     pub last_control_response: Option<PtyInputObservation>,
+    pub funnel: super::input_funnel::InputFunnel,
 }
 
 /// Which [`PtyInputSlots`] field one observation lands in.
@@ -1221,17 +1236,35 @@ pub struct PtyInputSlots {
 enum InputSlot {
     Write,
     Submit,
+    Insert,
     ControlResponse,
 }
 
-impl PtyInputSlots {
-    /// The more recent of the two INPUT slots, whichever choke point it came
-    /// from. `last_control_response` is never input and never considered.
-    pub fn latest(&self) -> Option<&PtyInputObservation> {
-        match (&self.last_write, &self.last_submit) {
-            (Some(w), Some(s)) => Some(if s.at >= w.at { s } else { w }),
-            (w, s) => w.as_ref().or(s.as_ref()),
+impl InputSlot {
+    fn funnel_kind(self) -> super::input_funnel::InputKind {
+        use super::input_funnel::InputKind;
+        match self {
+            Self::Write => InputKind::Write,
+            Self::Submit => InputKind::Submit,
+            Self::Insert => InputKind::Insert,
+            Self::ControlResponse => InputKind::ControlResponse,
         }
+    }
+}
+
+impl PtyInputSlots {
+    /// The most recent of the INPUT slots (write, submit, insert), whichever
+    /// choke point it came from. `last_control_response` is never input and
+    /// never considered. On a tie the later-listed slot wins (insert over
+    /// submit over write), as submit over write always did.
+    pub fn latest(&self) -> Option<&PtyInputObservation> {
+        [&self.last_write, &self.last_submit, &self.last_insert]
+            .into_iter()
+            .flatten()
+            .fold(None, |best: Option<&PtyInputObservation>, o| match best {
+                Some(b) if b.at > o.at => Some(b),
+                _ => Some(o),
+            })
     }
 }
 
@@ -2010,6 +2043,10 @@ impl TerminalSession {
         // grant, so the pad never answers its prompts.
         session.set_permission_request_hook(permission_request_hook);
         session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        // This process spawned the child: its input funnel has seen every byte
+        // written into the pane (an adopted holder pane or a remote mirror
+        // skips this and reads UNKNOWN).
+        session.mark_input_funnel_observed_from_spawn();
         Ok(session)
     }
 
@@ -3867,27 +3904,33 @@ impl TerminalSession {
             writer
                 .flush()
                 .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-        } // writer lock released before observation
+            debug!(
+                terminal_id = %self.id,
+                caller = %caller,
+                bytes = data.len(),
+                "terminal pty write"
+            );
+            let slot = if is_terminal_control_response(data) {
+                InputSlot::ControlResponse
+            } else {
+                InputSlot::Write
+            };
+            // Recorded while the writer lock is still held, so the input
+            // funnel folds writes in the order their bytes reached the PTY —
+            // the draft fold is order-dependent (Phase 80). Lock order is
+            // always writer → last_input; nothing takes them the other way.
+            self.record_input(
+                PtyInputObservation {
+                    caller,
+                    at: Instant::now(),
+                    bytes: data.len(),
+                },
+                slot,
+                slot.funnel_kind(),
+                data,
+            );
+        } // writer lock released before the typed-line observation
 
-        debug!(
-            terminal_id = %self.id,
-            caller = %caller,
-            bytes = data.len(),
-            "terminal pty write"
-        );
-        let slot = if is_terminal_control_response(data) {
-            InputSlot::ControlResponse
-        } else {
-            InputSlot::Write
-        };
-        self.record_input(
-            PtyInputObservation {
-                caller,
-                at: Instant::now(),
-                bytes: data.len(),
-            },
-            slot,
-        );
         self.observe_input(data);
         Ok(())
     }
@@ -3936,6 +3979,32 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// The pane's input funnel: its composer draft state and the
+    /// writer-tagged input history (plan
+    /// `2026-10-28-one-session-lifecycle-authority` Phase 80). A snapshot.
+    pub fn input_funnel(&self) -> super::input_funnel::InputFunnel {
+        self.last_input
+            .lock()
+            .map(|g| g.funnel.clone())
+            .unwrap_or_else(|e| e.into_inner().funnel.clone())
+    }
+
+    /// The composer's draft state, as the input funnel reads it — the
+    /// lifecycle kernel's I axis. `Draft` for a runner-inserted draft.
+    pub fn draft_state(&self) -> super::input_funnel::PaneDraftState {
+        let slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.draft_state().clone()
+    }
+
+    /// This process spawned the pane: its input funnel has seen every byte
+    /// written into it. Only the local spawn path calls this; an adopted
+    /// holder pane or a remote mirror is built by `spawn_with_io` alone and
+    /// keeps reading UNKNOWN.
+    pub(crate) fn mark_input_funnel_observed_from_spawn(&self) {
+        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.mark_observed_from_spawn();
+    }
+
     /// A snapshot of who last wrote to this PTY, through either choke point.
     pub fn last_input(&self) -> PtyInputSlots {
         self.last_input
@@ -3948,13 +4017,46 @@ impl TerminalSession {
     /// skipped: the slot is diagnostic evidence, and silently losing it on one
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
-    fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
+    ///
+    /// The same event is folded into the input funnel under the same lock, as
+    /// `kind` — which differs from `slot` for one case: a `submit_prompt`
+    /// paste fills the `Submit` slot (the phantom-turn detector's question)
+    /// but folds as an `Insert` until its CR is written
+    /// ([`Self::fold_submit_enter`]). `data` is the written bytes for a
+    /// `Write` (the draft fold reads them — never stored), and ignored for the
+    /// paste kinds. Callers hold the writer lock, so folds follow wire order.
+    fn record_input(
+        &self,
+        obs: PtyInputObservation,
+        slot: InputSlot,
+        kind: super::input_funnel::InputKind,
+        data: &[u8],
+    ) {
         let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .funnel
+            .record(obs.caller.clone(), kind, obs.at, obs.bytes, data);
         match slot {
             InputSlot::Write => slots.last_write = Some(obs),
             InputSlot::Submit => slots.last_submit = Some(obs),
+            InputSlot::Insert => slots.last_insert = Some(obs),
             InputSlot::ControlResponse => slots.last_control_response = Some(obs),
         }
+    }
+
+    /// Fold a `submit_prompt`'s submitting CR into the input funnel, once it
+    /// is on the wire: the composer — the paste and any draft it joined — is
+    /// submitted. Funnel only: the `Submit` slot was filled when the paste was
+    /// written, which is what the phantom-turn detector needs.
+    fn fold_submit_enter(&self, caller: PtyWriteCaller) {
+        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        slots.funnel.record(
+            caller,
+            super::input_funnel::InputKind::Submit,
+            Instant::now(),
+            SUBMIT_ENTER.len(),
+            &[],
+        );
     }
 
     /// Observe raw typed input bytes — feed them through the per-terminal
@@ -4046,7 +4148,7 @@ impl TerminalSession {
         message: &str,
         caller: PtyWriteCaller,
     ) -> Result<SubmitPayload, String> {
-        let report = self.paste_prompt(message, caller, PromptOp::Submit)?;
+        let report = self.paste_prompt(message, caller.clone(), PromptOp::Submit)?;
 
         // Sleep so Claude Code's readline can fully process the paste
         // sequence BEFORE the submit byte arrives. Without this, the
@@ -4072,6 +4174,12 @@ impl TerminalSession {
         writer.flush().map_err(|e| {
             format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but flushing the submit enter failed: {e}")
         })?;
+        // The CR is on the wire: only now does the input funnel read the
+        // composer submitted (any failure above leaves it reading `Draft`,
+        // which is what the input box holds). Folded under the writer lock,
+        // like every other fold, so it follows wire order.
+        self.fold_submit_enter(caller);
+        drop(writer);
         // Both halves are on the wire, so this describes a write that really
         // happened rather than one that was merely predicted.
         Ok(submit_payload_of(&report))
@@ -4207,20 +4315,30 @@ impl TerminalSession {
             writer.flush().map_err(|e| {
                 format!("{PROMPT_PARTIALLY_WRITTEN}: the paste block was written but flushing it failed: {e}")
             })?;
-        } // writer lock released
 
-        // The body is on the wire now, so this is an input event the PTY
-        // child can act on even if a submit's trailing CR then fails — record
-        // it here rather than after the CR, or a half-written submit would
-        // read as "no input" to the phantom-turn detector.
-        self.record_input(
-            PtyInputObservation {
-                caller,
-                at: Instant::now(),
-                bytes: block.len(),
-            },
-            InputSlot::Submit,
-        );
+            // The body is on the wire now, so this is an input event the PTY
+            // child can act on even if a submit's trailing CR then fails —
+            // record it here rather than after the CR, or a half-written
+            // submit would read as "no input" to the phantom-turn detector.
+            // An insert lands in its own slot: a draft nobody submitted, not a
+            // turn. For the input funnel BOTH ops fold as an insert here — the
+            // text is in the composer, unsent — and a submit's CR folds the
+            // submit once it is written (`fold_submit_enter`; Phase 80).
+            // Recorded under the writer lock, so folds follow wire order.
+            self.record_input(
+                PtyInputObservation {
+                    caller,
+                    at: Instant::now(),
+                    bytes: block.len(),
+                },
+                match op {
+                    PromptOp::Submit => InputSlot::Submit,
+                    PromptOp::Insert => InputSlot::Insert,
+                },
+                super::input_funnel::InputKind::Insert,
+                &[],
+            );
+        } // writer lock released
 
         Ok(report)
     }
@@ -9145,6 +9263,119 @@ pub(crate) mod tests {
         assert!(payload.sanitized, "the embedded paste END was neutralized");
     }
 
+    /// Phase 80 of plan `2026-10-28-one-session-lifecycle-authority` (its
+    /// Gate): a runner-inserted draft reads `Draft` through the session's own
+    /// funnel — the review notes' insert (`mcp/session_review.rs`,
+    /// `ReviewNotes`) is the caller — and lands in its own slot, not in
+    /// `last_submit` as an unsubmitted turn did before. A submit then clears it.
+    #[test]
+    fn a_runner_inserted_draft_reads_draft_through_the_funnel() {
+        use super::super::input_funnel::{DraftSource, PaneDraftState};
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf);
+        session
+            .insert_prompt("review note", PtyWriteCaller::ReviewNotes)
+            .expect("insert_prompt failed");
+        match session.draft_state() {
+            PaneDraftState::Draft { source, caller, .. } => {
+                assert_eq!(source, DraftSource::Inserted);
+                assert_eq!(caller, PtyWriteCaller::ReviewNotes);
+            }
+            other => panic!("a runner-inserted draft must read Draft, got {other:?}"),
+        }
+        let slots = session.last_input();
+        assert!(slots.last_submit.is_none(), "an insert is not a submit");
+        assert_eq!(
+            slots.last_insert.as_ref().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::ReviewNotes)
+        );
+        assert_eq!(
+            slots.latest().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::ReviewNotes),
+            "an insert is still input to the phantom-turn detector"
+        );
+
+        session
+            .submit_prompt("go", PtyWriteCaller::WorkerSession)
+            .expect("submit_prompt failed");
+        assert_eq!(session.draft_state(), PaneDraftState::NoDraft);
+        let history: Vec<_> = session
+            .input_funnel()
+            .history()
+            .map(|r| r.caller.clone())
+            .collect();
+        // The submit is two events: its paste (folded as an insert) and its
+        // CR (folded as the submit, once written).
+        assert_eq!(
+            history,
+            vec![
+                PtyWriteCaller::ReviewNotes,
+                PtyWriteCaller::WorkerSession,
+                PtyWriteCaller::WorkerSession
+            ]
+        );
+    }
+
+    /// Only the local spawn path marks a pane's funnel observed-from-spawn.
+    /// `spawn_with_io` — the path an adopted PTY-holder pane and a remote
+    /// mirror take alone — must not, or those panes would read "nobody
+    /// wrote" over input this process never saw. A full spawn needs an
+    /// `AppHandle`, so this pins the call sites in the source instead.
+    #[test]
+    fn only_the_local_spawn_path_marks_the_funnel() {
+        let src = include_str!("session.rs");
+        let call = concat!("session.mark_input_funnel_", "observed_from_spawn();");
+        // `spawn(` and `spawn_with_io(` cannot prefix-match each other.
+        let spawn_at = src.find("    pub fn spawn(").expect("spawn");
+        let with_io_at = src
+            .find("    pub fn spawn_with_io(")
+            .expect("spawn_with_io");
+        assert!(
+            spawn_at < with_io_at,
+            "spawn is defined before spawn_with_io"
+        );
+        // Production code only: fixtures below call the mark by hand.
+        let tests_at = src.find("pub(crate) mod tests {").expect("tests module");
+        let hits: Vec<usize> = src
+            .match_indices(call)
+            .map(|(i, _)| i)
+            .filter(|&i| i < tests_at)
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one production mark call");
+        assert!(
+            hits[0] > spawn_at && hits[0] < with_io_at,
+            "the mark is in `spawn`, not `spawn_with_io`"
+        );
+    }
+
+    /// A pane this process did not observe from its spawn (the fixture, like
+    /// an adopted holder pane, skips the spawn path's mark) answers UNKNOWN
+    /// for its writers, never "nobody wrote"; the local spawn path's mark
+    /// makes it answerable.
+    #[test]
+    fn the_funnel_is_unknown_until_the_spawn_path_marks_it() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        assert_eq!(session.input_funnel().written_only_by_creator(), None);
+
+        let session = LiveTestSession::new(buf);
+        session.mark_input_funnel_observed_from_spawn();
+        session
+            .write(b"claude\r", PtyWriteCaller::HttpCreateInitialCommand)
+            .expect("write failed");
+        session
+            .write(b"\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        assert_eq!(session.input_funnel().written_only_by_creator(), Some(true));
+        session
+            .write(b"x", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        assert_eq!(
+            session.input_funnel().written_only_by_creator(),
+            Some(false)
+        );
+    }
+
     /// The insert shares submit's liveness gate: nothing reaches a dead PTY.
     #[test]
     fn insert_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
@@ -9266,7 +9497,7 @@ pub(crate) mod tests {
             PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
-            PtyWriteCaller::RemoteTerminalInput,
+            PtyWriteCaller::RemoteTerminalInput(Default::default()),
             PtyWriteCaller::HttpWrite,
             PtyWriteCaller::WebSocketInput,
             PtyWriteCaller::PtyTransport,

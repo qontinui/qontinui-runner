@@ -84,7 +84,7 @@ export function PruneTerminalsButton() {
     }
     // Request first: the compaction waits for these ids to leave the tab list.
     requestCompaction(keepIds, closeIds);
-    for (const id of closeIds) closeTerminal(id);
+    for (const id of closeIds) closeTerminal(id, { immediate: true });
   }, [busy, closeCount, armed, plan, applyAgentProbe, requestCompaction, closeTerminal]);
 
   if (!actionable) return null;

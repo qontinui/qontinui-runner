@@ -24,12 +24,9 @@
 //! - **Headless seams** (`run_continuation_headless`, `run_agent_subprocess`):
 //!   both `--model` and `--effort`, appended in `headless_agent_args`.
 //! - **Terminal seams** (`run_continuation_terminal`,
-//!   `run_condition_check_terminal`): the model through `LaunchSpec.model`,
-//!   which already beats a template `--model`. The effort is NOT applied
-//!   there yet: `LaunchSpec::effort` is owned by qontinui-runner#2569 (V8), and
-//!   this module must not add a second one. Until that lands the per-spawn log
-//!   line says `effort_applied=false` on a terminal seam, so the gap is
-//!   observable rather than silent.
+//!   `run_condition_check_terminal`): the model through `LaunchSpec.model` and
+//!   the effort through `LaunchSpec.effort`; each beats the same template flag
+//!   (`--model` / `--effort`, either spelling).
 
 use serde::Deserialize;
 
@@ -111,8 +108,7 @@ where
 pub(crate) enum LaunchSeam {
     /// A headless child: `--model` and `--effort` both appended.
     Headless,
-    /// A `LaunchSpec`-rendered terminal argv: model only, until
-    /// qontinui-runner#2569 adds `LaunchSpec::effort`.
+    /// A `LaunchSpec`-rendered terminal argv: model and effort both bound.
     Terminal,
 }
 
@@ -122,11 +118,6 @@ impl LaunchSeam {
             LaunchSeam::Headless => "headless",
             LaunchSeam::Terminal => "terminal",
         }
-    }
-
-    /// Whether this seam can put `--effort` on the argv today.
-    fn applies_effort(self) -> bool {
-        matches!(self, LaunchSeam::Headless)
     }
 }
 
@@ -233,31 +224,28 @@ impl AppliedLaunch {
         self.model.map(str::to_string)
     }
 
+    /// The effort a `LaunchSpec`-rendered (terminal) argv binds into
+    /// `LaunchSpec.effort`.
+    pub(crate) fn spec_effort(&self) -> Option<String> {
+        self.effort.map(str::to_string)
+    }
+
     /// The one per-spawn line (D6), in the plan's grammar
     /// `launch: spawn_type=<t> model=<m|none>(<source>) effort=<e|none>(<source>)`
     /// — an unresolved field reads `none(unresolved)`, a resolved one whose
-    /// frame named no source `<v>(unknown)` — followed by ` seam=<s>`, and
-    /// `effort_applied=false` when a terminal seam carries an effort it cannot
-    /// yet render.
+    /// frame named no source `<v>(unknown)` — followed by ` seam=<s>`.
     pub(crate) fn log_line(&self, seam: LaunchSeam) -> String {
         let field = |v: Option<&str>, src: Option<&str>| match v {
             Some(v) => format!("{v}({})", src.unwrap_or("unknown")),
             None => "none(unresolved)".to_string(),
         };
-        let mut line = format!(
+        format!(
             "launch: spawn_type={} model={} effort={} seam={}",
             self.spawn_type.as_deref().unwrap_or("none"),
             field(self.model, self.model_source.as_deref()),
             field(self.effort, self.effort_source.as_deref()),
             seam.as_str(),
-        );
-        if self.effort.is_some() && !seam.applies_effort() {
-            line.push_str(
-                " effort_applied=false (terminal launches gain LaunchSpec::effort with \
-                 qontinui-runner#2569)",
-            );
-        }
-        line
+        )
     }
 
     /// Emit the per-spawn line, and one warning per dropped key.
@@ -393,15 +381,14 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_seam_says_when_it_cannot_apply_the_effort() {
+    fn a_terminal_seam_binds_model_and_effort_into_the_spec() {
         let applied = frame(json!({"launch_model": "haiku", "launch_effort": "low"})).resolve();
-        let line = applied.log_line(LaunchSeam::Terminal);
-        assert!(line.contains("effort=low(unknown) seam=terminal effort_applied=false"));
         assert_eq!(applied.spec_model().as_deref(), Some("haiku"));
-        // A terminal launch with no effort carries no such marker.
-        let model_only = frame(json!({"launch_model": "haiku"})).resolve();
-        assert!(!model_only
-            .log_line(LaunchSeam::Terminal)
-            .contains("effort_applied"));
+        assert_eq!(applied.spec_effort().as_deref(), Some("low"));
+        assert_eq!(
+            applied.log_line(LaunchSeam::Terminal),
+            "launch: spawn_type=none model=haiku(unknown) effort=low(unknown) seam=terminal"
+        );
+        assert_eq!(frame(json!({})).resolve().spec_effort(), None);
     }
 }

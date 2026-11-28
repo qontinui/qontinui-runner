@@ -1486,12 +1486,19 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // same gated loop — no timer or gate of its own. Rebuilt per
             // supervised run; its durable state lives on disk.
             let mut reporter = computer::Reporter::new();
+            // The pressure-stop switch as SET, from this loop's first moment;
+            // `flush` re-reads it every tick and discards the queue when off.
+            crate::pressure_stop::refresh_enabled_from_settings();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                // Pressure-stop events the resource guard queued since the
+                // last tick (plan 2026-11-24-pressure-stops-record-box-stats-
+                // in-coord Phase 3): one batch, same gate, same cadence.
+                crate::pressure_stop::flush().await;
                 reporter.tick().await;
 
                 // The CI node sizes its concurrency from coord's capacity
@@ -4405,14 +4412,20 @@ const MAX_DIRTY_FILES_REPORTED: usize = 50;
 /// `.claude/commands/*`, so they report the nested path individually and the
 /// exclude applies; a scratch fixture does not, and must commit a placeholder
 /// under the parent to reproduce the real shape (see the roster test).
+///
+/// The three coord-mcp names are `coord_mcp`'s own constants, not retyped
+/// literals: `coord_mcp` writes those files and also excludes them where it
+/// writes them (`provision_exclude::exclude_workdir_artifacts`, for the repos
+/// and linked worktrees this publisher-cycle heal never reaches), so the two
+/// rosters cannot drift apart.
 const MANAGED_REPO_EXCLUDES: &[&str] = &[
-    ".mcp.json",
+    crate::coord_mcp::MCP_JSON_FILE,
     "agent-worktrees/",
     ".agent-worktrees/",
-    ".coord-mcp-status",
+    crate::coord_mcp::COORD_MCP_STATUS_FILE,
     // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
     // which a crash between its write and its rename would leave behind.
-    ".coord-mcp-status.tmp-*",
+    crate::coord_mcp::COORD_MCP_STATUS_TMP_GLOB,
     ".claude/worktrees/",
 ];
 
@@ -5789,6 +5802,13 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
     Some(default_branch)
 }
 
+/// True when `path` is the root of a git checkout: it carries its own `.git`,
+/// a directory (a primary) or a file (a linked worktree). A directory without
+/// one is NOT a checkout even when git would resolve it to an enclosing repo.
+fn is_checkout_root(path: &std::path::Path) -> bool {
+    path.join(".git").exists()
+}
+
 /// Capture the state of a single primary git tree at `repo_path`. Returns
 /// `None` when the directory isn't a git repo (no `.git/` dir). All
 /// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
@@ -5798,8 +5818,7 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
-    let dot_git = repo_path.join(".git");
-    if !dot_git.exists() {
+    if !is_checkout_root(repo_path) {
         return None;
     }
 
@@ -7058,6 +7077,18 @@ pub async fn publish_tree_state() -> Result<(), String> {
             continue;
         }
         if !path.is_dir() {
+            continue;
+        }
+        // Only a checkout ROOT is a tree. A `qontinui-*` directory with no
+        // `.git` of its own (e.g. `qontinui-worktrees/`, a folder of agent
+        // worktrees) must be skipped BEFORE the fetch and the restore sweep
+        // below: git resolves it upward to whatever repository encloses the
+        // workspace, so the fetch wrote that repository's FETCH_HEAD every
+        // cycle and logged a WARN (measured on merytshost 2026-11-25, ~270
+        // times in one day; plan 2026-10-28-one-session-lifecycle-authority
+        // Phase 2, finding 369745f0). capture_tree already refused such a
+        // directory, but only after both had run.
+        if !is_checkout_root(&path) {
             continue;
         }
 
@@ -13405,6 +13436,39 @@ mod binding_set_resolution_tests {
             crate::auth::select_scoped_bearer(&am, crate::auth::TenantScope::Device, None, 1),
             None,
             "the legacy slot is empty: Device would send the heartbeat anonymously"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkout_root_tests {
+    #[test]
+    fn is_checkout_root_requires_the_directorys_own_dot_git() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // Pins the predicate only (not the walk's ordering): an ancestor's .git
+        // must NOT make a child directory a checkout root.
+        std::fs::create_dir(base.path().join(".git")).unwrap();
+        let folder = base.path().join("qontinui-worktrees");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(
+            !super::is_checkout_root(&folder),
+            "a folder inside a repo is not a checkout root"
+        );
+        assert!(super::capture_tree(&folder).is_none());
+
+        let primary = base.path().join("qontinui-primary");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        assert!(
+            super::is_checkout_root(&primary),
+            "a .git directory marks a primary"
+        );
+
+        let linked = base.path().join("qontinui-linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../.git/worktrees/x").unwrap();
+        assert!(
+            super::is_checkout_root(&linked),
+            "a .git file marks a linked worktree"
         );
     }
 }

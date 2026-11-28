@@ -146,6 +146,12 @@ describe("externalToDiscovered", () => {
     expect(result.state.textContent).toBe("nested");
   });
 
+  it("carries the element's ariaBusy reading, and reads an absent one as not busy", () => {
+    expect(externalToDiscovered(externalElement({ ariaBusy: true })).state.ariaBusy).toBe(true);
+    expect(externalToDiscovered(externalElement({ ariaBusy: false })).state.ariaBusy).toBe(false);
+    expect(externalToDiscovered(externalElement()).state.ariaBusy).toBe(false);
+  });
+
   it("passes value through unchanged", () => {
     const result = externalToDiscovered(externalElement({ value: "typed text" }));
     expect(result.state.value).toBe("typed text");

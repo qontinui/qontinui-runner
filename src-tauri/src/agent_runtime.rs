@@ -4471,6 +4471,26 @@ fn admit_launch(
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
     let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    if decision.is_err() {
+        // The same projection the decision was taken from (pure arithmetic),
+        // re-read for the tripped lane's observation: the decision itself
+        // carries only the stamp string.
+        let (projected, _) = reading.projected(pending);
+        if let Some((severity, observation)) = projected.tripped() {
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredLaunch,
+                severity,
+                crate::pressure_stop::WhatClass::CoordLaunch,
+                observation,
+                // The reading is charged with admitted, not-yet-running
+                // continuations: a projection whenever any are pending.
+                serde_json::json!({
+                    "observed_is_projection": pending > 0,
+                    "projected_pending_spawns": pending,
+                }),
+            );
+        }
+    }
     decision
 }
 
@@ -7075,7 +7095,10 @@ fn commit_pressure_stamp_reason(
 /// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
 /// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
 /// is read off the observation's METRIC, never re-derived from the severity.
-fn load_pressure_stamp_reason(
+///
+/// `pub(crate)` so `pressure_stop` records the same grammar as a stop event's
+/// `reason` rather than spelling it a second time.
+pub(crate) fn load_pressure_stamp_reason(
     severity: &str,
     observation: &crate::resource_guard::GateObservation,
 ) -> String {
@@ -7671,6 +7694,16 @@ async fn run_gate_continuation_inner(
                 observation.clause(severity),
                 payload.anchor_key
             );
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredContinuation,
+                severity,
+                crate::pressure_stop::WhatClass::GateContinuation,
+                &observation,
+                // The guard judges a reading charged with admitted,
+                // not-yet-running spawns, and the verdict does not carry the
+                // pending count: say the number may be a projection.
+                serde_json::json!({"observed_may_be_projection": true}),
+            );
             // The stamp reason names the lane and the REAL numbers, in the
             // `<class>:<detail>` shape coord-side grouping keys on:
             // `thread_pressure:warn:300_over_256` or
@@ -8170,10 +8203,12 @@ pub(crate) fn build_continuation_claude_command(
     // by [`LaunchFrame::resolve`]). Bound into `LaunchSpec.model`, which
     // renders exactly one `--model` and drops any template `--model`, in
     // either the `--model <m>` or the attached `--model=<m>` spelling. `None`
-    // keeps the template / account default — today's argv. The effort half is
-    // `LaunchSpec::effort`, owned by qontinui-runner#2569 (plan
-    // `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V8).
+    // keeps the template / account default — today's argv.
     launch_model: Option<String>,
+    // The reasoning effort coord decided for this spawn (`launch_effort`),
+    // bound into `LaunchSpec.effort`: one `--effort`, any template `--effort`
+    // dropped. `None` keeps the template / account default.
+    launch_effort: Option<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
@@ -8221,6 +8256,7 @@ pub(crate) fn build_continuation_claude_command(
         session_id: Some(pinned_session_id.to_string()),
         name: session_name.map(str::to_string),
         model: launch_model,
+        effort: launch_effort,
         extra_required,
         ..Default::default()
     };
@@ -8444,8 +8480,8 @@ async fn run_continuation_terminal(
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
     // coord's launch decision, validated and logged once for every attempt
-    // below. The model binds into `LaunchSpec.model`; the effort waits on
-    // `LaunchSpec::effort` (qontinui-runner#2569) and the line says so.
+    // below. The model binds into `LaunchSpec.model`, the effort into
+    // `LaunchSpec.effort`.
     let launch = payload.launch.resolve();
     launch.log(
         LaunchSeam::Terminal,
@@ -8589,6 +8625,7 @@ async fn run_continuation_terminal(
             crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
             launch.spec_model(),
+            launch.spec_effort(),
         );
         // ...unless an operator template put a replacement prompt in the final
         // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
@@ -10965,7 +11002,7 @@ async fn run_condition_check_terminal(
     );
     // coord's launch decision for this check (`conditions/dispatch.rs`
     // `spawn_frame` stamps the same `launch_*` keys): model via
-    // `LaunchSpec.model`; effort waits on qontinui-runner#2569.
+    // `LaunchSpec.model`, effort via `LaunchSpec.effort`.
     let launch = payload.launch.resolve();
     launch.log(
         LaunchSeam::Terminal,
@@ -11016,6 +11053,7 @@ async fn run_condition_check_terminal(
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
         launch.spec_model(),
+        launch.spec_effort(),
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
@@ -16654,6 +16692,7 @@ mod tests {
                 Vec::new(),
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
                 None,
+                None,
             )
         };
         let without = build(None);
@@ -16682,6 +16721,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -16709,6 +16749,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -16741,6 +16782,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -16766,6 +16808,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         // The prompt stays the trailing positional behind `--`.
@@ -16824,6 +16867,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         let flag = cmd
             .iter()
@@ -16865,6 +16909,7 @@ mod tests {
             ],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
         assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
@@ -16898,6 +16943,7 @@ mod tests {
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
             None,
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -16923,6 +16969,7 @@ mod tests {
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -16955,6 +17002,7 @@ mod tests {
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         assert_eq!(
@@ -16995,6 +17043,7 @@ mod tests {
                     account_command: None,
                     ..Default::default()
                 },
+                None,
                 None,
             )
         };
@@ -17039,6 +17088,7 @@ mod tests {
                     ..Default::default()
                 },
                 launch.resolve().spec_model(),
+                launch.resolve().spec_effort(),
             )
         };
         let model_values = |argv: &[String]| -> Vec<String> {
@@ -17148,6 +17198,7 @@ mod tests {
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
                 None,
             );
             let flags: Vec<usize> = cmd
@@ -18371,6 +18422,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
             None,
         );
         let flag = cmd

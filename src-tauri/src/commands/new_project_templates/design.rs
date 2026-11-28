@@ -31,11 +31,13 @@
 //! finding.
 
 /// `@qontinui/ui-bridge` is pinned exactly to the version the runner itself
-/// ships with (the floor of the repo-root `package.json` range; it must also be
-/// the exact `@qontinui/ui-bridge` peer of the design-kit tag below), so a
-/// scaffold built without a lockfile
-/// cannot drift onto a newer contract; the template's tests assert it is not
-/// below the runner's pin. `@qontinui/design-kit` is installed by git tag (no
+/// ships with (the version `pnpm-lock.yaml` resolves for the repo-root
+/// `package.json` range, never below that range's floor), so a scaffold built
+/// without a lockfile cannot drift onto a newer contract; the template's tests
+/// assert it is exact and not below the runner's pin. The design-kit tag below
+/// declares an OPTIONAL exact `@qontinui/ui-bridge` peer that lags this pin;
+/// npm does not enforce an optional peer the root already pins, so it does not
+/// block an install. `@qontinui/design-kit` is installed by git tag (no
 /// registry credential; `prepare` builds `dist/`).
 pub(super) const PACKAGE_JSON: &str = include_str!("react-ui-bridge/package.json.tmpl");
 pub(super) const VITE_CONFIG: &str = include_str!("react-ui-bridge/vite.config.ts.tmpl");
