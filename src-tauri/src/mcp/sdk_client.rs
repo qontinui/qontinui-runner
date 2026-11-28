@@ -641,6 +641,19 @@ pub async fn sdk_request(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    sdk_request_typed(state, method, path, body)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
+/// [`sdk_request`] keeping the TYPED [`DispatchError`], for handlers whose
+/// IPC fallback is decided by [`ipc_fallback_refusal`].
+async fn sdk_request_typed(
+    state: &Arc<ApiState>,
+    method: Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
     state
         .app_dispatcher
         .dispatch_active_http(
@@ -650,7 +663,6 @@ pub async fn sdk_request(
             body.unwrap_or(serde_json::Value::Null),
         )
         .await
-        .map_err(dispatch_err_to_string)
 }
 
 /// Dispatch directly to a specific registered app by `app_id`, bypassing the
@@ -787,7 +799,7 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
     Some(serde_json::json!({
         "success": false,
         "error": format!(
-            "{code}: {route}: {what} ({detail}); the action was NOT retried on \
+            "{code}: {route}: {what} ({detail}); the request was NOT retried on \
              the runner's own UI"
         ),
         "code": code,
@@ -795,6 +807,42 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
         "detail": detail,
         "retryable": retryable,
     }))
+}
+
+/// The refusal [`ipc_fallback_refusal`] builds, in the shape of the HANDLER's
+/// own return type — the seam that lets a test read each gated read's real
+/// answer (status and body) without an `ApiState`, which needs a live Tauri
+/// `AppHandle`. A handler writes `refuse_ipc_fallback(&err, route)` and its
+/// return type picks the impl, so the status a test reads is the status the
+/// handler answers:
+/// - `Json<Value>` — HTTP 200 with `success: false`;
+/// - `(StatusCode, Json<Value>)` and `Response` — HTTP 502.
+trait RefusalAnswer: Sized {
+    fn from_refusal(body: serde_json::Value) -> Self;
+}
+
+impl RefusalAnswer for Json<serde_json::Value> {
+    fn from_refusal(body: serde_json::Value) -> Self {
+        Json(body)
+    }
+}
+
+impl RefusalAnswer for (StatusCode, Json<serde_json::Value>) {
+    fn from_refusal(body: serde_json::Value) -> Self {
+        (StatusCode::BAD_GATEWAY, Json(body))
+    }
+}
+
+impl RefusalAnswer for axum::response::Response {
+    fn from_refusal(body: serde_json::Value) -> Self {
+        (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+    }
+}
+
+/// [`ipc_fallback_refusal`] answered as the handler's return type `R`
+/// ([`RefusalAnswer`]). `None`: the runner's own UI is the target, fall back.
+fn refuse_ipc_fallback<R: RefusalAnswer>(err: &DispatchError, route: &str) -> Option<R> {
+    ipc_fallback_refusal(err, route).map(R::from_refusal)
 }
 
 // =============================================================================
@@ -2039,7 +2087,7 @@ impl<'q> ElementFilters<'q> {
 async fn handle_elements(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     // Phase 1 wrapper framework: no direct relay action — synthesize from
     // getControlSnapshot for WS-transport apps. Apply existing proxy-side filters.
     let snapshot_payload = match query.get("recency") {
@@ -2344,6 +2392,7 @@ fn record_journey_snapshot(
     app_version: Option<String>,
     body: &Arc<serde_json::Value>,
     filtered: bool,
+    requested_at: std::time::Instant,
 ) {
     if filtered || body.get("success") == Some(&serde_json::Value::Bool(false)) {
         return;
@@ -2353,6 +2402,7 @@ fn record_journey_snapshot(
         crate::journey::cursor::CursorKey::new(app_id, scope),
         app_version,
         Arc::clone(body),
+        requested_at,
     );
 }
 
@@ -2662,7 +2712,10 @@ async fn handle_element_action(
 async fn handle_snapshot(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // When this snapshot's request began — the journey ledger's evidence
+    // floor for a held navigation (D4).
+    let requested_at = std::time::Instant::now();
     // Phase 1 wrapper framework: if the active app registered via WebSocket,
     // dispatch getControlSnapshot over its socket.
     //
@@ -2737,7 +2790,15 @@ async fn handle_snapshot(
             Ok(data) => {
                 let version = app_version_for(&state, app_id).await;
                 let data = Arc::new(data);
-                record_journey_snapshot(&state, app_id, tab_id, version, &data, filtered);
+                record_journey_snapshot(
+                    &state,
+                    app_id,
+                    tab_id,
+                    version,
+                    &data,
+                    filtered,
+                    requested_at,
+                );
                 (StatusCode::OK, Json(data)).into_response()
             }
             Err(e) => (
@@ -2762,7 +2823,15 @@ async fn handle_snapshot(
         Ok(data) => {
             let data = Arc::new(data);
             if let Some((app_id, version)) = active_app {
-                record_journey_snapshot(&state, &app_id, tab_id, version, &data, filtered);
+                record_journey_snapshot(
+                    &state,
+                    &app_id,
+                    tab_id,
+                    version,
+                    &data,
+                    filtered,
+                    requested_at,
+                );
             }
             (StatusCode::OK, Json(data)).into_response()
         }
@@ -2786,6 +2855,7 @@ async fn handle_snapshot(
                         None,
                         &body,
                         false,
+                        requested_at,
                     );
                     (StatusCode::OK, Json(body)).into_response()
                 }
@@ -3106,13 +3176,14 @@ async fn handle_ai_search(
             }
         }
         Err(sdk_err) => {
-            // Only "no SDK app connected" may search the runner's own UI. Any
-            // other error means an app WAS the target, and the runner's own
-            // elements would answer as a successful search of the wrong
-            // surface — indistinguishable from the app's own SearchResponse.
-            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/search") {
-                return Json(refusal);
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview. Any other error means the app WAS the target, and
+            // answering with the runner's own UI would label it as the app's
+            // (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D5).
+            if let Some(refused) = refuse_ipc_fallback(&sdk_err, "ai/search") {
+                return refused;
             }
+            // No SDK app connected — fall back to the runner's own UI via IPC
             debug!("SDK ai/search unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_search", payload).await {
@@ -3548,8 +3619,12 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/snapshot") {
-                return Json(refusal);
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview. Any other error means the app WAS the target, and
+            // answering with the runner's own UI would label it as the app's
+            // (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D5).
+            if let Some(refused) = refuse_ipc_fallback(&sdk_err, "ai/snapshot") {
+                return refused;
             }
             debug!("SDK ai/snapshot unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
@@ -3574,8 +3649,12 @@ async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_jso
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/summary") {
-                return Json(refusal);
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview. Any other error means the app WAS the target, and
+            // answering with the runner's own UI would label it as the app's
+            // (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D5).
+            if let Some(refused) = refuse_ipc_fallback(&sdk_err, "ai/summary") {
+                return refused;
             }
             debug!("SDK ai/summary unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
@@ -3855,7 +3934,10 @@ async fn handle_page_refresh(
     let scope =
         crate::journey::capture::sdk_request_scope(&journey_query, body.as_ref().map(|b| &b.0));
     let response = handle_page_refresh_dispatch(State(Arc::clone(&state)), body).await;
-    crate::journey::capture::record_sdk_result(
+    // A relayed refresh answers `executed: false` before the page reloads, so
+    // the edge is held until the first snapshot taken after it (plan
+    // 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D4).
+    crate::journey::capture::record_sdk_navigation_result(
         &state,
         active_app,
         scope.as_deref(),
@@ -3865,6 +3947,7 @@ async fn handle_page_refresh(
             "refresh",
             qontinui_types::journey::NavigationTriggerKind::Initial,
         ),
+        crate::journey::cursor::HoldRule::UntilNextSnapshot,
     );
     response
 }
@@ -3924,13 +4007,18 @@ async fn handle_page_navigate(
         crate::journey::cursor::push_or_replace(&body),
     );
     let response = handle_page_navigate_dispatch(State(Arc::clone(&state)), Json(body)).await;
-    crate::journey::capture::record_sdk_result(
+    // A relayed navigate answers `executed: false` before the page loads, so
+    // the edge is held until a snapshot shows a change — or closes as
+    // `to_node_unobserved` when none does in time (plan
+    // 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D4).
+    crate::journey::capture::record_sdk_navigation_result(
         &state,
         active_app,
         scope.as_deref(),
         true,
         &response.0,
         action,
+        crate::journey::cursor::HoldRule::UntilChanged,
     );
     response
 }
@@ -6452,8 +6540,12 @@ async fn handle_ai_find(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/find") {
-                return Json(refusal);
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview. Any other error means the app WAS the target, and
+            // answering with the runner's own UI would label it as the app's
+            // (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern D5).
+            if let Some(refused) = refuse_ipc_fallback(&sdk_err, "ai/find") {
+                return refused;
             }
             debug!("SDK ai/find unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
@@ -9382,8 +9474,19 @@ mod tests {
             "handle_send_keys_to_page",
             "handle_find_by_text",
             "handle_navigate_by_adapter",
+            // The read-only fallbacks, gated by plan
+            // 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern
+            // D5: a read that falls back while an app was the target answers
+            // with the RUNNER's UI labelled as the app's success.
+            "handle_elements",
+            "handle_element",
+            "handle_snapshot",
+            "handle_discover",
+            "handle_components",
+            "handle_console_errors",
             "handle_ai_search",
-            "handle_ai_find",
+            "handle_forms",
+            "handle_network_requests",
             "handle_ai_snapshot",
             "handle_ai_summary",
             "handle_snapshot",
@@ -9413,16 +9516,21 @@ mod tests {
                 .next()
                 .unwrap_or_default();
             assert!(
-                body.contains("dispatch_app_request_typed("),
+                body.contains("dispatch_app_request_typed(") || body.contains("sdk_request_typed("),
                 "{handler} must keep the typed DispatchError"
             );
             assert!(
                 !body.contains("sdk_app_connected("),
                 "{handler} must not decide from the live connection state"
             );
-            let gate = body
-                .find("ipc_fallback_refusal(&")
-                .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
+            let gate = [
+                body.find("ipc_fallback_refusal(&"),
+                body.find("refuse_ipc_fallback(&"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
             // `handle_send_keys_to_page` falls back by delegating to the
             // canonical `/control/page/send-keys` handler instead.
             let fallback = body
@@ -9462,15 +9570,24 @@ mod tests {
                 "dispatch_app_request_by_id(",
                 "dispatch_active(",
                 "sdk_request(",
+                "sdk_request_typed(",
                 "try_ws_dispatch(",
                 "sdk_media_override_",
             ]
             .iter()
             .any(|d| chunk.contains(d));
-            let falls_back = chunk.contains("ui_bridge_request_sync(")
-                || (chunk.contains("crate::mcp::ui_bridge::")
-                    && (chunk.contains("_handler(") || chunk.contains("_handler_dispatch(")));
-            if !(dispatches && falls_back) {
+            let fallback = chunk.find("ui_bridge_request_sync(").or_else(|| {
+                chunk
+                    .contains("crate::mcp::ui_bridge::")
+                    .then(|| {
+                        chunk
+                            .find("_handler_dispatch(")
+                            .or_else(|| chunk.find("_handler("))
+                    })
+                    .flatten()
+            });
+            let Some(fallback) = fallback else { continue };
+            if !dispatches {
                 continue;
             }
             assert!(
@@ -9479,6 +9596,232 @@ mod tests {
                  without asking ipc_fallback_refusal"
             );
         }
+    }
+
+    // ---- D5, behaviourally: an ACTIVE-but-failing app ------------------------
+
+    /// The return type of a handler fn, read off its signature, so a test
+    /// answers a refusal through the HANDLER's own [`RefusalAnswer`] impl.
+    trait HandlerOutput<Args> {
+        type Out;
+    }
+    impl<F, A, Fut> HandlerOutput<(A,)> for F
+    where
+        F: Fn(A) -> Fut,
+        Fut: std::future::Future,
+    {
+        type Out = Fut::Output;
+    }
+    impl<F, A, B, Fut> HandlerOutput<(A, B)> for F
+    where
+        F: Fn(A, B) -> Fut,
+        Fut: std::future::Future,
+    {
+        type Out = Fut::Output;
+    }
+
+    /// What `handler` answers for `err` on its gated fallback, as an HTTP
+    /// response — `None` when it would fall back to the runner's UI.
+    fn handler_refusal<H, Args>(
+        _handler: H,
+        err: &DispatchError,
+        route: &str,
+    ) -> Option<axum::response::Response>
+    where
+        H: HandlerOutput<Args>,
+        H::Out: RefusalAnswer + IntoResponse,
+    {
+        refuse_ipc_fallback::<H::Out>(err, route).map(IntoResponse::into_response)
+    }
+
+    /// A local "app" that fails every request: `mode` 0 answers HTTP 500 with
+    /// a non-JSON body, 1 answers HTTP 200 `{success:false}`, 2 answers HTTP
+    /// 503 with a JSON error code.
+    async fn spawn_failing_app(mode: u8) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().fallback(move || async move {
+            match mode {
+                0 => (StatusCode::INTERNAL_SERVER_ERROR, "handler threw").into_response(),
+                1 => Json(serde_json::json!({ "success": false, "error": "element not found" }))
+                    .into_response(),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": { "code": "APP_BUSY" } })),
+                )
+                    .into_response(),
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn active_manager(url: &str) -> Arc<tokio::sync::Mutex<SdkConnectionManager>> {
+        let mut mgr = SdkConnectionManager::new();
+        mgr.connections.insert(
+            url.to_string(),
+            SdkConnection {
+                app_url: url.to_string(),
+                base_path: String::new(),
+                app_info: SdkAppInfo {
+                    app_id: "failing-app".into(),
+                    app_name: "Failing".into(),
+                    app_type: "web".into(),
+                    framework: None,
+                    version: None,
+                    capabilities: vec![],
+                    port: 0,
+                },
+                client: reqwest::Client::new(),
+                connected_at: 0,
+                transport_kind: None,
+                physical_device_id: None,
+                activated_by: None,
+            },
+        );
+        mgr.active_url = Some(url.to_string());
+        Arc::new(tokio::sync::Mutex::new(mgr))
+    }
+
+    /// Each of the 16 gated reads, with an app CONNECTED AND ACTIVE that fails:
+    /// the error comes from a real dispatch over the wire (not a hand-built
+    /// `DispatchError`), and the answer read is the refusal each handler's
+    /// return type produces ([`RefusalAnswer`]) — that the handler returns it
+    /// is held by the source scans above. `elements` and `snapshot` answer 502;
+    /// every other read answers 200 with `success:false`. None of them may
+    /// fall back to the runner's own UI. With NO app connected, the same
+    /// dispatch is `NotConnected` and every read falls back.
+    #[tokio::test]
+    async fn each_gated_read_refuses_over_the_wire_when_the_active_app_fails() {
+        use super::super::app_dispatch::AppDispatcher;
+        use super::super::app_registry::AppRegistry;
+        use super::super::command_relay::CommandRelay;
+        use super::super::ws_relay::WsConnectionManager;
+
+        let dispatcher = AppDispatcher::new(
+            AppRegistry::new(),
+            CommandRelay::new(WsConnectionManager::new()),
+        );
+        let mut errors = Vec::new();
+        for mode in [0u8, 1, 2] {
+            let url = spawn_failing_app(mode).await;
+            let err = dispatcher
+                .dispatch_active(
+                    &active_manager(&url),
+                    "getElements",
+                    Method::GET,
+                    "/control/elements",
+                    serde_json::Value::Null,
+                )
+                .await
+                .expect_err("a failing app must not answer Ok");
+            assert!(
+                !matches!(err, DispatchError::NotConnected),
+                "mode {mode}: an active app is never NotConnected"
+            );
+            errors.push(err);
+        }
+
+        type Answer = fn(&DispatchError) -> Option<axum::response::Response>;
+        let reads: [(&str, StatusCode, Answer); 16] = [
+            ("elements", StatusCode::BAD_GATEWAY, |e| {
+                handler_refusal(handle_elements, e, "elements")
+            }),
+            ("element", StatusCode::OK, |e| {
+                handler_refusal(handle_element, e, "element")
+            }),
+            ("snapshot", StatusCode::BAD_GATEWAY, |e| {
+                handler_refusal(handle_snapshot, e, "snapshot")
+            }),
+            ("discover", StatusCode::OK, |e| {
+                handler_refusal(handle_discover, e, "discover")
+            }),
+            ("components", StatusCode::OK, |e| {
+                handler_refusal(handle_components, e, "components")
+            }),
+            ("console-errors", StatusCode::OK, |e| {
+                handler_refusal(handle_console_errors, e, "console-errors")
+            }),
+            ("ai/search", StatusCode::OK, |e| {
+                handler_refusal(handle_ai_search, e, "ai/search")
+            }),
+            ("forms", StatusCode::OK, |e| {
+                handler_refusal(handle_forms, e, "forms")
+            }),
+            ("network-requests", StatusCode::OK, |e| {
+                handler_refusal(handle_network_requests, e, "network-requests")
+            }),
+            ("ai/snapshot", StatusCode::OK, |e| {
+                handler_refusal(handle_ai_snapshot, e, "ai/snapshot")
+            }),
+            ("ai/summary", StatusCode::OK, |e| {
+                handler_refusal(handle_ai_summary, e, "ai/summary")
+            }),
+            ("undo-state", StatusCode::OK, |e| {
+                handler_refusal(handle_undo_state, e, "undo-state")
+            }),
+            ("element-state", StatusCode::OK, |e| {
+                handler_refusal(handle_element_state, e, "element-state")
+            }),
+            ("ai/find", StatusCode::OK, |e| {
+                handler_refusal(handle_ai_find, e, "ai/find")
+            }),
+            ("diagnostics", StatusCode::OK, |e| {
+                handler_refusal(handle_diagnostics, e, "diagnostics")
+            }),
+            ("page/routes", StatusCode::OK, |e| {
+                handler_refusal(handle_page_routes, e, "page/routes")
+            }),
+        ];
+        let src = include_str!("sdk_client.rs");
+        for (route, status, answer) in reads {
+            // The handler answers through this very call.
+            assert!(
+                src.contains(&format!("refuse_ipc_fallback(&sdk_err, \"{route}\")")),
+                "{route}: the handler no longer asks refuse_ipc_fallback"
+            );
+            for err in &errors {
+                let resp = answer(err)
+                    .unwrap_or_else(|| panic!("{route}: {err:?} must NOT serve the runner's UI"));
+                assert_eq!(resp.status(), status, "{route}: {err:?}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["success"], serde_json::json!(false), "{route}: {body}");
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains(route)
+                            && e.contains("NOT retried on the runner's own UI")),
+                    "{route}: {body}"
+                );
+                assert!(
+                    matches!(body["failure_origin"].as_str(), Some("transport" | "app")),
+                    "{route}: {body}"
+                );
+                assert!(body["code"].is_string(), "{route}: {body}");
+            }
+            // No app connected: the runner's own UI is the target.
+            assert!(answer(&DispatchError::NotConnected).is_none(), "{route}");
+        }
+        // The app-reported code is handed on (mode 2).
+        let busy = ipc_fallback_refusal(&errors[2], "forms").unwrap();
+        assert_eq!(busy["code"], "APP_BUSY");
+        // And an empty manager really dispatches as NotConnected.
+        let none = dispatcher
+            .dispatch_active(
+                &Arc::new(tokio::sync::Mutex::new(SdkConnectionManager::new())),
+                "getElements",
+                Method::GET,
+                "/control/elements",
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(none, DispatchError::NotConnected));
     }
 
     // ------------------------------------------------------------------

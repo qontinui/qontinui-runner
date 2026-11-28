@@ -60,21 +60,12 @@ export const HOOK_CATEGORY_DESCRIPTIONS: Record<HookCategory, string> = {
 // Hook API Signatures (embedded from SDK source)
 // =============================================================================
 
-const HOOK_API_REFERENCE = `
-## UI Bridge Hook API Reference
-
-### useRouteAwareness(info: RouteInfo): void
-Provides framework-router integration for the navigation tracker.
-
-\`\`\`typescript
-interface RouteInfo {
-  pattern?: string;              // Route pattern (e.g., "/tasks/:id")
-  params?: Record<string, string>;  // Extracted route parameters
-  queryParams?: Record<string, string>;  // Query parameters
-  routeStack?: string[];         // Matched route stack / breadcrumb
-}
-\`\`\`
-
+/**
+ * The `usePageContext` entry of the API reference — WEB ONLY. The native SDK
+ * exports no `usePageContext` and its snapshot carries no page name (see
+ * `RN_NO_PAGE_CONTEXT`), so a React Native prompt never shows it.
+ */
+const PAGE_CONTEXT_API_REFERENCE = `
 ### usePageContext(context: DeveloperPageContext): void
 Annotates the current page with semantic context for AI automation.
 
@@ -87,7 +78,179 @@ interface DeveloperPageContext {
 }
 \`\`\`
 
-### useUIState(options: UseUIStateOptions): UseUIStateReturn
+**\`name\` is never derived from the pathname.** The runner slugs \`name\` into
+the journey ledger's page label, so a name taken from the pathname on \`/search/<what the user
+typed>\` stores \`search-<what the user typed>\`. Map each route you found to a
+FIXED name, and give every route you did not map the fixed fallback
+\`{ name: 'Unknown', section: 'unknown' }\` — never the pathname, raw or
+transformed.
+
+`;
+
+/**
+ * The hook API reference of a React Native prompt: ONLY what
+ * `@qontinui/ui-bridge-native` exports (ui-bridge d84bfa6
+ * `packages/ui-bridge-native/src/index.ts`), with the native types —
+ * `useRouteAwareness`'s `unmatched` is a plain boolean there
+ * (`src/react/useRouteAwareness.ts`), not the web `RouteUnmatchedSignal`.
+ */
+const RN_HOOK_API_REFERENCE = `
+## UI Bridge Native API Reference (\`@qontinui/ui-bridge-native\`)
+
+Import every hook and component below from \`@qontinui/ui-bridge-native\`, and
+only from there. It does NOT export \`useUIState\`, \`useUITransition\`, \`useUIStateGroup\`, \`useKeyboardShortcuts\`, \`useUndoRedo\`, \`useUIAnnotation\`, \`usePageContext\`, \`routePatternFromParams\`, \`useRouteUnmatchedSignal\`, \`useMarkRouteUnmatched\` or \`RouteUnmatchedContext\` — those are web APIs.
+
+### useRouteAwareness(info: RouteInfo, options?: { unmatched?: boolean }): void
+Reports the router's route TEMPLATE as the snapshot's \`page.route\`. Cleared
+when the component unmounts; a no-op outside \`UIBridgeNativeProvider\`.
+
+\`\`\`typescript
+interface RouteInfo {
+  pattern?: string | null;       // Route TEMPLATE ("/runner/[id]"), never the pathname
+  patternSource?: 'router';      // Asserts \`pattern\` came from the router
+  params?: Record<string, string>;
+  queryParams?: Record<string, string>;
+  routeStack?: string[];         // One cumulative template per depth, root first
+}
+\`\`\`
+
+Derive \`pattern\` with \`expoRouterPattern(useSegments())\` (Expo Router) or
+\`reactNavigationPattern(rootState)\` (React Navigation), and \`routeStack\` with
+\`expoRouterRouteStack(segments)\`. Each returns \`null\` / \`undefined\` rather than
+leak a concrete path. Pass \`{ unmatched: isExpoRouterUnmatched(segments) }\`:
+while it is true the hook reports \`pattern: null\` and drops \`params\`.
+
+### useUIElement(options): { ref, onLayout, bridgeProps, registered, getState, getIdentifier }
+Registers one interactive element. Spread \`bridgeProps\` onto the host
+component together with \`ref\` and \`onLayout\`. The options type is a union
+over \`type\`: for \`'button'\` and \`'pressable'\`, \`handlers.onPress\` is
+REQUIRED (UI Bridge invokes it on a \`press\` action); for every other type
+\`handlers\` is optional.
+
+\`\`\`typescript
+interface UseUIElementOptionsBase<T extends NativeElementType = NativeElementType> {
+  id: string;                    // Stable, unique
+  type?: T;                      // 'button' | 'input' | ... (default 'custom')
+  label?: string;                // What the element is, for an agent
+  value?: string;                // A text input's controlled value -> state.value
+  actions?: NativeStandardAction[];
+  customActions?: Record<string, NativeCustomAction>;
+}
+interface UseUIElementOptionsHandlersRequired<
+  T extends PressNeedingNativeElementType = PressNeedingNativeElementType, // 'button' | 'pressable'
+> extends UseUIElementOptionsBase<T> {
+  handlers: { onPress: PressHandler; [key: string]: ((...args: any[]) => any) | undefined };
+}
+interface UseUIElementOptionsHandlersOptional<
+  T extends NativeElementType = NativeElementType,
+> extends UseUIElementOptionsBase<T> {
+  handlers?: Record<string, ((...args: any[]) => any) | undefined>;
+}
+type UseUIElementOptions<T extends NativeElementType = NativeElementType> =
+  T extends PressNeedingNativeElementType
+    ? UseUIElementOptionsHandlersRequired<T>
+    : UseUIElementOptionsHandlersOptional<T>;
+\`\`\`
+
+### useUIComponent(options: UseUIComponentOptions): { registered, executeAction }
+Registers a screen-level action surface.
+
+\`\`\`typescript
+interface UseUIComponentOptions {
+  id: string;
+  name: string;
+  description?: string;
+  actions?: ComponentActionDef[]; // { id, label?, description?, paramSchema?, effect?, handler }
+  elementIds?: string[];
+  autoRegister?: boolean;
+}
+\`\`\`
+
+### State / TransitionTo (IR annotation components)
+Runtime no-ops that render their children; the build-time IR extractor
+(\`@qontinui/ui-bridge-auto\`) reads the JSX to derive the screen's states and
+transitions.
+
+\`\`\`typescript
+interface StateProps {
+  id: string;
+  name?: string;
+  description?: string;
+  requiredElements?: { role?: string; text?: string; testID?: string }[];
+  blocking?: boolean;
+}
+interface TransitionToProps {
+  id: string;
+  name?: string;
+  fromStates?: string[];
+  activateStates?: string[];
+  exitStates?: string[];
+  effect?: string;
+  description?: string;
+}
+\`\`\`
+
+### UndoTracker (from the provider context)
+\`useUIBridgeNative().undoTracker.setDeclaredState(state: DeclaredUndoState)\`
+declares the app's undo state; snapshots then carry it as \`undoRedo\`.
+
+\`\`\`typescript
+interface DeclaredUndoState {
+  canUndo: boolean;
+  canRedo: boolean;
+  undoDescription?: string;
+  redoDescription?: string;
+  undoDepth?: number;
+  redoDepth?: number;
+}
+\`\`\`
+`.trim();
+
+/** The hook API reference for a web (`false`) or React Native (`true`) prompt. */
+function hookApiReference(isRN: boolean): string {
+  return isRN
+    ? RN_HOOK_API_REFERENCE
+    : hookApiReferenceWith(PAGE_CONTEXT_API_REFERENCE.trimStart());
+}
+
+const hookApiReferenceWith = (PAGE_CONTEXT_API_SLOT: string): string =>
+  `
+## UI Bridge Hook API Reference
+
+### useRouteAwareness(info: RouteInfo, options?: { unmatched?: RouteUnmatchedSignal | null }): void
+Provides framework-router integration for the navigation tracker.
+
+\`\`\`typescript
+interface RouteInfo {
+  pattern?: string | null;       // Route PATTERN (e.g., "/tasks/[id]"), never the URL path
+  patternSource?: 'router';      // Asserts \`pattern\` came from the router
+  params?: Record<string, string>;  // Extracted route parameters
+  queryParams?: Record<string, string>;  // Query parameters
+  routeStack?: string[];         // Matched route stack / breadcrumb (route ids)
+}
+\`\`\`
+
+**\`pattern\` is never the pathname.** A concrete path such as \`/search/<what the
+user typed>\` carries user input, and the runner's journey ledger stores
+\`pattern\` ONLY when \`patternSource: 'router'\` asserts it came from the router.
+Derive it with \`routePatternFromParams(pathname, params, { matched })\` from
+\`@qontinui/ui-bridge/react\`: it puts every param value back in its \`[name]\`
+slot and returns \`null\` when the route is unmatched (\`matched: false\`, e.g. a
+404) or a value cannot be substituted. Pass the router's params RAW — never
+pre-join a catch-all array. If the installed SDK predates the helper, OMIT
+\`pattern\` (and \`patternSource\`) entirely; never fall back to the pathname.
+
+**A 404 needs the not-found signal.** On a 404 the router's params are \`{}\`,
+so \`routePatternFromParams(pathname, {}, { matched: true })\` returns the
+CONCRETE path. A layout cannot know it is rendering a 404, so the SDK's
+provider-owned signal does it: the layout creates
+\`const unmatched = useRouteUnmatchedSignal()\`, provides it through
+\`<RouteUnmatchedContext.Provider value={unmatched}>\`, and passes it to its ONE
+call, \`useRouteAwareness(info, { unmatched })\`; the not-found boundary calls
+\`useMarkRouteUnmatched()\` and never calls \`useRouteAwareness\` itself. While
+it is mounted the hook reports \`pattern: null\`.
+
+${PAGE_CONTEXT_API_SLOT}### useUIState(options: UseUIStateOptions): UseUIStateReturn
 Registers a UI state with UI Bridge for state management.
 
 \`\`\`typescript
@@ -213,7 +376,7 @@ interface IntentParam {
   default?: unknown;
 }
 \`\`\`
-`.trim();
+`;
 
 // =============================================================================
 // Framework-specific guidance
@@ -222,22 +385,58 @@ interface IntentParam {
 const NEXTJS_GUIDANCE = `
 ### Next.js App Router Integration
 
-For route awareness, use Next.js navigation hooks:
+For route awareness, mount ONE component in the root layout, and mark the
+not-found page:
 \`\`\`tsx
+// app/RouteAwareness.tsx — mounted once, in the root layout
+'use client';
 import { usePathname, useParams, useSearchParams } from 'next/navigation';
+import {
+  RouteUnmatchedContext,
+  routePatternFromParams,
+  useRouteAwareness,
+  useRouteUnmatchedSignal,
+} from '@qontinui/ui-bridge/react';
 
-// In a client component inside the layout:
-const pathname = usePathname();
-const params = useParams();
-const searchParams = useSearchParams();
+export function RouteAwareness({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const params = useParams(); // RAW: a catch-all is a string[] — do not join it
+  const searchParams = useSearchParams();
+  const unmatched = useRouteUnmatchedSignal();
 
-useRouteAwareness({
-  params: params as Record<string, string>,
-  queryParams: Object.fromEntries(searchParams),
-});
+  useRouteAwareness(
+    {
+      // "/search/abc" with { term: "abc" } -> "/search/[term]".
+      // matched: true is safe ONLY because \`unmatched\` overrides it on a 404.
+      pattern: routePatternFromParams(pathname, params, { matched: true }),
+      patternSource: 'router',
+      queryParams: Object.fromEntries(searchParams),
+    },
+    { unmatched },
+  );
+
+  return (
+    <RouteUnmatchedContext.Provider value={unmatched}>{children}</RouteUnmatchedContext.Provider>
+  );
+}
 \`\`\`
 
-For page context, derive the page name from the pathname:
+\`\`\`tsx
+// app/not-found.tsx — REQUIRED. Do NOT call useRouteAwareness here.
+'use client';
+import { useMarkRouteUnmatched } from '@qontinui/ui-bridge/react';
+
+export default function NotFound() {
+  useMarkRouteUnmatched();
+  return <p>Not found</p>;
+}
+\`\`\`
+
+Without \`not-found.tsx\` marking the signal, a 404 reports its concrete path
+as a router pattern. Never write \`pattern: pathname\` — the pathname is user
+input, not a pattern.
+
+For page context, map each known route to a FIXED semantic name:
 \`\`\`tsx
 const pathname = usePathname();
 
@@ -246,7 +445,8 @@ const pageInfo = useMemo(() => {
   if (pathname === '/') return { name: 'Home', section: 'main' };
   if (pathname.startsWith('/dashboard')) return { name: 'Dashboard', section: 'dashboard' };
   // ... more routes
-  return { name: pathname, section: 'unknown' };
+  // Unmapped: a FIXED name. Never the pathname — it carries user input.
+  return { name: 'Unknown', section: 'unknown' };
 }, [pathname]);
 
 usePageContext(pageInfo);
@@ -258,34 +458,137 @@ usePageContext(pageInfo);
 const REACT_ROUTER_GUIDANCE = `
 ### React Router Integration
 
-For route awareness, use React Router hooks:
+For route awareness, host the hook in a layout route's element (so
+\`useParams()\` returns the matched route's params) and give the router a
+\`path="*"\` route:
 \`\`\`tsx
-import { useLocation, useParams, useMatches } from 'react-router-dom';
+import { useLocation, useParams, Outlet } from 'react-router-dom';
+import {
+  RouteUnmatchedContext,
+  routePatternFromParams,
+  useMarkRouteUnmatched,
+  useRouteAwareness,
+  useRouteUnmatchedSignal,
+} from '@qontinui/ui-bridge/react';
 
-const location = useLocation();
-const params = useParams();
-const matches = useMatches();
+function AppLayout() {
+  const location = useLocation();
+  const params = useParams();
+  const unmatched = useRouteUnmatchedSignal();
 
-useRouteAwareness({
-  pattern: matches[matches.length - 1]?.pathname,
-  params: params as Record<string, string>,
-  queryParams: Object.fromEntries(new URLSearchParams(location.search)),
-  routeStack: matches.map(m => m.pathname),
-});
+  useRouteAwareness(
+    {
+      pattern: routePatternFromParams(location.pathname, params, { matched: true }),
+      patternSource: 'router',
+      queryParams: Object.fromEntries(new URLSearchParams(location.search)),
+    },
+    { unmatched },
+  );
+
+  return (
+    <RouteUnmatchedContext.Provider value={unmatched}>
+      <Outlet />
+    </RouteUnmatchedContext.Provider>
+  );
+}
+
+// The element of the REQUIRED \`path="*"\` route, below the provider.
+function NoMatch() {
+  useMarkRouteUnmatched();
+  return <p>Not found</p>;
+}
 \`\`\`
 
-For page context, derive from the current route:
+**A \`path="*"\` route is REQUIRED.** Without one, an unmatched URL renders the
+layout with \`params = {}\`, and the concrete path leaks as the pattern. With
+one, the \`*\` splat matches and templates the path as \`[...*]\`; its element
+marking the signal reports \`null\` instead. \`useMatches()\` is NOT a 404 test:
+in a data router an unmatched URL still yields \`[root]\`. If the root route's
+\`errorElement\` hosts the hook itself, it owns the signal and must call
+\`useMarkRouteUnmatched(is404 ? unmatched : null)\` with it explicitly.
+
+Never write \`pattern: location.pathname\` or a match's \`pathname\` — both are
+the URL the user is on, not a pattern.
+
+For page context, map each known route to a FIXED semantic name:
 \`\`\`tsx
 const location = useLocation();
 
 const pageInfo = useMemo(() => {
   if (location.pathname === '/') return { name: 'Home', section: 'main' };
   // ... map routes to semantic names
-  return { name: location.pathname, section: 'unknown' };
+  // Unmapped: a FIXED name. Never the pathname — it carries user input.
+  return { name: 'Unknown', section: 'unknown' };
 }, [location.pathname]);
 
 usePageContext(pageInfo);
 \`\`\`
+`.trim();
+
+/**
+ * The Expo Router route-awareness recipe, shared by the integration guidance
+ * and the RN route-awareness category. It teaches the SDK's own helpers
+ * (`@qontinui/ui-bridge-native` `react/routePattern.ts`): they derive the
+ * template from `useSegments()` and fail closed to `null`, so the generated
+ * code never builds a pattern by hand and never touches the pathname.
+ * The hook and helpers first shipped together in ui-bridge-native 0.6.16
+ * (ui-bridge 9e5515f / bbe7d7a).
+ */
+const EXPO_ROUTE_AWARENESS = `
+\`\`\`tsx
+// app/_layout.tsx — mount <RouteAwareness /> once, inside UIBridgeNativeProvider
+import { useSegments } from 'expo-router';
+import {
+  expoRouterPattern,
+  expoRouterRouteStack,
+  isExpoRouterUnmatched,
+  useRouteAwareness,
+} from '@qontinui/ui-bridge-native';
+
+function RouteAwareness() {
+  const segments = useSegments(); // the FILE route: ["runner", "[id]"], never "42"
+  useRouteAwareness(
+    {
+      // "/runner/[id]"; null on +not-found or a segment that is not a route name.
+      pattern: expoRouterPattern(segments),
+      patternSource: 'router',
+      routeStack: expoRouterRouteStack(segments),
+    },
+    // +not-found: the hook reports pattern: null and drops params.
+    { unmatched: isExpoRouterUnmatched(segments) },
+  );
+  return null;
+}
+\`\`\`
+
+Use the SDK helpers; do not build the pattern by hand. Never write
+\`pattern: pathname\` or \`pattern: usePathname()\` — the pathname is user input,
+not a pattern — and do not pass \`useLocalSearchParams()\` as \`params\` from the
+root layout. Do NOT import \`@qontinui/ui-bridge/react\` in a React Native app: it
+is the DOM barrel, and \`@qontinui/ui-bridge\` is only an optional peer of
+\`@qontinui/ui-bridge-native\`. \`useRouteAwareness\`, \`expoRouterPattern\`,
+\`expoRouterRouteStack\` and \`isExpoRouterUnmatched\` are all exported by
+\`@qontinui/ui-bridge-native\` 0.6.16 and later. If the installed version is
+older, upgrade it; if you cannot, skip route awareness and say so rather than
+hand-building a pattern or importing it from elsewhere.
+`.trim();
+
+/**
+ * Why the RN prompt teaches NO page context: `@qontinui/ui-bridge-native`
+ * exports no `usePageContext` (only the DOM barrel, `@qontinui/ui-bridge/react`,
+ * does), and the native snapshot's `page` is `NativeSnapshotPageContext`,
+ * which carries `route` only (ui-bridge `packages/ui-bridge-native/src/core/types.ts`).
+ * A page name would have nowhere to go, so the route template reported through
+ * `useRouteAwareness` is the screen's identity.
+ */
+const RN_NO_PAGE_CONTEXT = `
+**No page context on React Native.** \`@qontinui/ui-bridge-native\` does NOT
+export \`usePageContext\`, and a native snapshot's \`page\` carries route info only
+(\`route\`, reported through \`useRouteAwareness\`) — there is no page name,
+section or breadcrumb in it. Identify screens through route awareness: the
+route template (\`/connect\`, \`/(tabs)/prompts\`, \`/runner/[id]\`) IS the screen's
+identity. Generate no page-context call, and import nothing from
+\`@qontinui/ui-bridge/react\` (the DOM barrel).
 `.trim();
 
 const RN_EXPO_GUIDANCE = `
@@ -301,43 +604,18 @@ it onto the host component along with \`ref\` and \`onLayout\`.
 For route awareness, use Expo Router hooks (NOT \`react-router-dom\`, NOT
 \`next/navigation\`):
 
-\`\`\`tsx
-import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
-import { useRouteAwareness } from '@qontinui/ui-bridge-native';
+${EXPO_ROUTE_AWARENESS}
 
-const pathname = usePathname();
-const segments = useSegments();
-const params = useLocalSearchParams();
+${RN_NO_PAGE_CONTEXT}
 
-useRouteAwareness({
-  pattern: pathname,
-  params: params as Record<string, string>,
-  routeStack: segments,
-});
-\`\`\`
-
-For page context, map Expo Router file-based routes to semantic names:
-
-\`\`\`tsx
-// app/connect.tsx          → "/connect"
-// app/(tabs)/prompts.tsx   → "/(tabs)/prompts"
-// app/runner/[id].tsx      → "/runner/:id"
-const pathname = usePathname();
-const pageInfo = useMemo(() => {
-  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
-  // ... map routes to semantic names
-  return { name: pathname, section: 'unknown' };
-}, [pathname]);
-
-usePageContext(pageInfo);
-\`\`\`
-
-**Modal-presentation \`Stack.Screen\`s are still pages** — register them with
-\`usePageContext\` just like normal screens.
+**Modal-presentation \`Stack.Screen\`s are still pages** — their route template
+identifies them, exactly as for normal screens.
 
 **Imports:** Use \`@qontinui/ui-bridge-native\` (NOT \`@qontinui/ui-bridge/react\`)
-for all hooks in an Expo / React Native project. Types still come from
-\`@qontinui/ui-bridge\`.
+for all hooks in an Expo / React Native project, and its types from
+\`@qontinui/ui-bridge-native\` too. Only the \`Intent\` type comes from
+\`@qontinui/ui-bridge\` — an optional peer the app must add to its own
+dependencies before importing from it.
 `.trim();
 
 // =============================================================================
@@ -509,100 +787,79 @@ Look for:
 - Existing usage of \`usePathname\`, \`useSegments\`, \`useLocalSearchParams\`
 
 Generate: A single \`useRouteAwareness()\` call in a top-level component
-(typically \`app/_layout.tsx\` or a child of the \`UIBridgeProvider\`) that
+(typically \`app/_layout.tsx\`, inside \`UIBridgeNativeProvider\`) that
 provides the full route info from \`expo-router\` hooks.
 
-\`\`\`tsx
-import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
-import { useRouteAwareness } from '@qontinui/ui-bridge-native';
-
-const pathname = usePathname();
-const segments = useSegments();
-const params = useLocalSearchParams();
-
-useRouteAwareness({
-  pattern: pathname,
-  params: params as Record<string, string>,
-  routeStack: segments,
-});
-\`\`\`
+${EXPO_ROUTE_AWARENESS}
 
 **Do NOT use** \`useLocation()\` (that's react-router-dom) or
 \`next/navigation\` hooks — they don't exist in Expo.
 `.trim(),
 
   "page-context": `
-### Page Context (\`usePageContext\`) — React Native / Expo Router
+### Page Context — React Native / Expo Router (not available)
 
-Look for:
-- All files under \`app/\` and the routes they correspond to
-- File-based route conventions:
-  - \`app/foo.tsx\` → route \`/foo\`
-  - \`app/(tabs)/bar.tsx\` → route \`/(tabs)/bar\` (group prefix is part of the path)
-  - \`app/[id].tsx\` → dynamic route \`/:id\`
-  - \`app/index.tsx\` → \`/\`
-- Modal-presentation \`<Stack.Screen options={{ presentation: 'modal' }} />\`
-  declarations — these are still distinct pages, not state-machine modals.
-- Section grouping implied by route group folders (e.g., \`(tabs)\` is the
-  main app, \`(auth)\` is the auth flow).
+${RN_NO_PAGE_CONTEXT}
 
-Generate: A \`usePageContext()\` call that derives the page name and section
-from \`usePathname()\`. Use a \`useMemo\` keyed on \`pathname\` with a mapping
-of every real route the app exposes — not guessed routes.
-
-\`\`\`tsx
-import { usePathname } from 'expo-router';
-import { usePageContext } from '@qontinui/ui-bridge-native';
-
-const pathname = usePathname();
-const pageInfo = useMemo(() => {
-  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
-  if (pathname === '/(tabs)/prompts') return { name: 'Prompts', section: 'tabs' };
-  // ... cover every screen file you found in app/
-  return { name: pathname, section: 'unknown' };
-}, [pathname]);
-
-usePageContext(pageInfo);
-\`\`\`
-
-There is no \`document.title\` in React Native — derive everything from the
-file-based routes you found in \`app/\`.
+Generate NOTHING for this category, and say so in your response: page
+identity on React Native comes from the Route Awareness category.
 `.trim(),
 
   "state-machine": `
-### State Machine (\`useUIState\`, \`useUITransition\`, \`useUIStateGroup\`) — React Native / Expo Router
+### State Machine (\`State\`, \`TransitionTo\`) — React Native / Expo Router
+
+\`@qontinui/ui-bridge-native\` does NOT export \`useUIState\`, \`useUITransition\` or \`useUIStateGroup\` (those are web hooks). Its state vocabulary is the pair
+of IR annotation components \`State\` and \`TransitionTo\`: runtime no-ops that
+render their children and are read at BUILD time by the IR extractor
+(\`@qontinui/ui-bridge-auto\`). There is no runtime \`activeWhen\`: the state is
+the subtree the component wraps.
 
 Look for:
 - \`<Modal visible={…}>\` from \`react-native\` or any third-party modal lib
 - Bottom-sheet / drawer libraries (\`@gorhom/bottom-sheet\`, \`react-native-modal\`)
 - \`<Tabs>\` / \`<Tabs.Screen>\` from Expo Router (each tab is a page, not a state —
-  use \`usePageContext\` for those; only register a state group if there's
-  app-level UI gating)
+  route awareness identifies those)
 - Authentication states (logged-in vs logged-out gates around \`<Slot />\` or
   \`<Stack />\` in \`app/_layout.tsx\`)
 - Boolean state variables controlling visibility (\`isOpen\`, \`showSheet\`,
   \`isExpanded\`) and conditional rendering driven by them
 
-For each detected UI state, follow the same pattern as the web guide:
-- \`useUIState()\` with a meaningful ID, \`activeWhen\` referencing the real state
-- \`blocking: true\` for full-screen modals and bottom sheets that block
-  interaction with the underlying screen
-- \`group\` for related states (e.g., wizard steps in onboarding)
+For each detected UI state, wrap the subtree that IS the state in \`<State>\`:
+- \`id\`: meaningful and stable; \`name\` and \`description\` for an agent
+- \`blocking\` for full-screen modals and bottom sheets that block the screen
+- \`requiredElements\`: \`{ role, text, testID }\` entries the state must show
+
+For each transition, wrap the control that triggers it in \`<TransitionTo>\`
+with \`id\`, \`fromStates\`, \`activateStates\`, \`exitStates\` and, when the action's
+effect is known, \`effect\`.
 
 \`\`\`tsx
-const [sheetOpen, setSheetOpen] = useState(false);
+import { useState } from 'react';
+import { Pressable, Text } from 'react-native';
+import { State, TransitionTo } from '@qontinui/ui-bridge-native';
 
-useUIState({
-  id: 'filter-sheet',
-  name: 'Filter Bottom Sheet',
-  activeWhen: () => sheetOpen,
-  blocking: true,
-});
+function PromptsList() {
+  const [sheetOpen, setSheetOpen] = useState(false);
+  return (
+    <>
+      <TransitionTo id="open-filter-sheet" fromStates={['prompts-list']} activateStates={['filter-sheet']}>
+        <Pressable onPress={() => setSheetOpen(true)}>
+          <Text>Filter</Text>
+        </Pressable>
+      </TransitionTo>
+      {sheetOpen && (
+        <State id="filter-sheet" name="Filter Bottom Sheet" blocking>
+          <FilterSheet onClose={() => setSheetOpen(false)} />
+        </State>
+      )}
+    </>
+  );
+}
 \`\`\`
 
-Use \`useUITransition()\` to connect states (e.g., "open-filter-sheet" from
-the list page to the filter-sheet state). Use \`useUIStateGroup()\` with
-\`exclusive: true\` for wizard steps or radio-style state sets.
+There is no state-group component: express mutually exclusive states (wizard
+steps, radio-style sets) as separate \`State\`s whose transitions name the
+others in \`exitStates\`.
 `.trim(),
 
   components: `
@@ -621,8 +878,9 @@ measurement code (\`getBoundingClientRect\`, \`offsetTop\`, etc.).
 
 #### Pressable / Touchable
 
-Wrap with \`useUIElement({type: 'button', label: '…'})\`. The keys to attach
-are \`ref\`, \`onLayout\`, and the spread of \`bridgeProps\`:
+Wrap with \`useUIElement({ type: 'button', label: '…', handlers: { onPress } })\` —
+\`handlers.onPress\` is required for \`'button'\` and \`'pressable'\`. The keys to
+attach are \`ref\`, \`onLayout\`, and the spread of \`bridgeProps\`:
 
 \`\`\`tsx
 import { Pressable, Text } from 'react-native';
@@ -633,6 +891,7 @@ function CreateButton({ onPress }: { onPress: () => void }) {
     id: 'prompts-create-button',
     type: 'button',
     label: 'Create prompt',
+    handlers: { onPress },
   });
   return (
     <Pressable ref={ref} onLayout={onLayout} {...bridgeProps} onPress={onPress}>
@@ -644,9 +903,10 @@ function CreateButton({ onPress }: { onPress: () => void }) {
 
 #### TextInput
 
-\`useUIElement({type: 'input', label: '…'})\`. \`value\` and \`onChangeText\`
-stay on the \`<TextInput>\` itself; \`bridgeProps\` carries only the bridge
-metadata.
+\`useUIElement({ type: 'input', label: '…', value })\`. Pass the same \`value\`
+you bind to the \`<TextInput>\` so the registered element's \`state.value\` is what
+the user sees; \`onChangeText\` stays on the \`<TextInput>\` itself, and
+\`bridgeProps\` carries only the bridge metadata.
 
 \`\`\`tsx
 import { TextInput } from 'react-native';
@@ -657,6 +917,7 @@ function SearchInput({ value, onChange }: { value: string; onChange: (v: string)
     id: 'prompts-search-input',
     type: 'input',
     label: 'Search prompts',
+    value,
   });
   return (
     <TextInput
@@ -696,6 +957,7 @@ that wrap the same handlers the buttons do, so an automation agent can
 drive the screen with one HTTP call instead of fighting per-button IDs.
 
 \`\`\`tsx
+import { useState } from 'react';
 import { useUIComponent } from '@qontinui/ui-bridge-native';
 
 function PromptsScreen() {
@@ -705,15 +967,22 @@ function PromptsScreen() {
   useUIComponent({
     id: 'prompts-screen',
     name: 'Prompts',
-    state: () => ({ query, count: data?.length ?? 0 }),
     actions: [
       { id: 'refresh', label: 'Refresh', handler: () => refetch() },
       {
         id: 'select-item',
         label: 'Open prompt',
-        handler: ({ id }: { id: string }) => router.push(\`/prompts/\${id}\`),
+        // A handler receives \`params?: unknown\`: narrow it, never annotate it.
+        handler: (params) => {
+          const { id } = params as { id: string };
+          router.push(\`/prompts/\${id}\`);
+        },
       },
-      { id: 'set-query', label: 'Set search query', handler: ({ q }: { q: string }) => setQuery(q) },
+      {
+        id: 'set-query',
+        label: 'Set search query',
+        handler: (params) => setQuery((params as { q: string }).q),
+      },
     ],
   });
 
@@ -727,68 +996,57 @@ CTA). Use \`useUIComponent\` for the screen's full action surface.
 `.trim(),
 
   "keyboard-shortcuts": `
-### Keyboard Shortcuts (\`useKeyboardShortcuts\`) — React Native / Expo Router
+### Keyboard Shortcuts — React Native / Expo Router (not available)
 
-Mobile apps **typically do not have keyboard shortcuts** — touch is the
-primary input. Skip this category for mobile-only screens unless you find
-explicit hardware-keyboard handling in source. Specifically:
-
-- Look for \`Keyboard.addListener(...)\` from \`react-native\`
-- Look for \`HardwareBackPressEventHandler\` / \`BackHandler.addEventListener\`
-- Look for any third-party hardware keyboard libraries
-- iPad / Android-with-keyboard apps may declare key commands via
-  \`react-native-key-command\` or similar
-
-If you find none of the above, **do not generate a \`useKeyboardShortcuts\`
-call** — emit a one-line note explaining there are no keyboard shortcuts to
-register and skip this category. Do NOT fabricate shortcuts.
-
-Do NOT emit web event-listener code (\`addEventListener('keydown', ...)\`) —
-that's a no-op in React Native.
+\`@qontinui/ui-bridge-native\` does NOT export \`useKeyboardShortcuts\` or any other keyboard-shortcut API, and touch is the primary input on mobile.
+Generate NOTHING for this category, and say so in your response. Do NOT emit
+web event-listener code (\`addEventListener('keydown', ...)\`) — that's a no-op
+in React Native.
 `.trim(),
 
   "undo-redo": `
-### Undo/Redo (\`useUndoRedo\`) — React Native / Expo Router
+### Undo/Redo (\`UndoTracker\`) — React Native / Expo Router
 
-Same as the web guidance: only generate this if the app has an actual
-undo/redo system. Look for:
-- A history stack in Redux / Zustand / Jotai / Recoil store
+\`@qontinui/ui-bridge-native\` does NOT export \`useUndoRedo\`. Its undo surface is
+the provider's \`UndoTracker\`: read it from the context with
+\`useUIBridgeNative()\` (inside \`UIBridgeNativeProvider\`) and declare the app's
+undo state with \`undoTracker.setDeclaredState(state: DeclaredUndoState)\`;
+snapshots then carry it as \`undoRedo\`.
+
+Only generate this if the app has an actual undo/redo system. Look for:
+- A history stack in a Redux / Zustand / Jotai / Recoil store
 - An \`undo()\` / \`redo()\` function in a hook or store
 - \`canUndo\` / \`canRedo\` boolean state
 - Common RN libraries: \`zundo\` (Zustand middleware), \`redux-undo\`
 
-If found, wire \`useUndoRedo\` from \`@qontinui/ui-bridge-native\` to the
-store's undo functions exactly as you would on web. **Do not generate a
-stub.**
+\`\`\`tsx
+import { useEffect } from 'react';
+import { useUIBridgeNative } from '@qontinui/ui-bridge-native';
+
+// canUndo / canRedo come from the app's own undo store.
+function UndoStateReporter({ canUndo, canRedo }: { canUndo: boolean; canRedo: boolean }) {
+  const { undoTracker } = useUIBridgeNative();
+  useEffect(() => {
+    undoTracker.setDeclaredState({ canUndo, canRedo });
+  }, [undoTracker, canUndo, canRedo]);
+  return null;
+}
+\`\`\`
+
+**Do not generate a stub.**
 `.trim(),
 
   annotations: `
-### Element Annotations (\`useUIAnnotation\`) — React Native / Expo Router
+### Element Annotations — React Native / Expo Router (not available)
 
-Look for:
-- Key interactive elements where the React tree alone (component name +
-  props) doesn't convey purpose
-- Components with non-obvious validation or behavior (e.g., a \`<TextInput>\`
-  that auto-formats currency)
-- Navigation elements with specific roles (the primary CTA on a screen, a
-  destructive-action button hidden behind a long press)
-- Custom-drawn elements (\`Skia\`, \`Reanimated\` views) that don't have an
-  obvious role in the React tree
-
-Generate \`useUIAnnotation()\` calls for important elements, providing:
-- \`description\`: what the element is
-- \`purpose\`: why it exists and what it does
-- \`tags\`: searchable categories
-- \`relatedElements\`: IDs of related UI elements
-
-**Be selective.** Only annotate elements where the annotation adds value
-beyond what the React tree already communicates. Don't annotate every
-element. (The web guidance talks about "what the DOM already
-communicates" — the same principle applies, just substitute "React tree.")
+\`@qontinui/ui-bridge-native\` does NOT export \`useUIAnnotation\` or any other annotation API.
+Generate NOTHING for this category, and say so in your response: on React
+Native an element's purpose is carried by the \`label\` you give \`useUIElement\`
+and the \`name\` / \`description\` of a \`useUIComponent\` or \`State\`.
 `.trim(),
 
   intents: `
-### Intents (\`registerIntent\`) — React Native / Expo Router
+### Intents — React Native / Expo Router
 
 Same as the web guidance — intents describe named composite user actions,
 not framework specifics. Look for:
@@ -806,7 +1064,12 @@ should have:
 - \`params\` for any inputs the intent accepts
 - \`tags\` for discoverability
 
-Intents are registered via the API at startup, not as React hooks.
+Intents are registered via the API at startup, not as React hooks:
+\`@qontinui/ui-bridge-native\` has no intent hook, so generate the
+\`intents.ts\` data file only. Its \`Intent\` type comes from \`@qontinui/ui-bridge\`:
+\`@qontinui/ui-bridge\` is only an OPTIONAL peer of \`@qontinui/ui-bridge-native\`:
+if the app emits intents or imports a type from it, add \`@qontinui/ui-bridge\`
+to the app's own dependencies first.
 `.trim(),
 };
 
@@ -873,6 +1136,65 @@ output as text in the format above.
 3. Per-component files only when \`useUIComponent()\` or \`useUIAnnotation()\` must be colocated with a specific component.
 `.trim();
 
+/** The output format for a React Native / Expo prompt: native imports, no page context. */
+const RN_OUTPUT_FORMAT = `
+## Output Format
+
+**CRITICAL: Do NOT use file-writing tools (Write, Edit, etc.) to create or modify files.
+Your output will be parsed by a script that extracts code blocks. You MUST output
+all generated files as fenced code blocks in your text response.**
+
+Output each generated file as a fenced code block with \`// FILE: <relative-path>\` on the **first line** inside the fence. Use \`tsx\` or \`ts\` as the language tag.
+
+Example:
+\`\`\`tsx
+// FILE: src/lib/ui-bridge/UIBridgeHooks.tsx
+import { useSegments } from 'expo-router';
+import {
+  expoRouterPattern,
+  expoRouterRouteStack,
+  isExpoRouterUnmatched,
+  useRouteAwareness,
+} from '@qontinui/ui-bridge-native';
+
+export function UIBridgeHooks() {
+  // ... hook calls here
+  return null;
+}
+\`\`\`
+
+\`\`\`ts
+// FILE: src/lib/ui-bridge/intents.ts
+// Needs @qontinui/ui-bridge in the app's dependencies: an optional peer of ui-bridge-native.
+import type { Intent } from '@qontinui/ui-bridge';
+
+export const APP_INTENTS: Intent[] = [
+  // ... intent definitions
+];
+\`\`\`
+
+**If you do not output code blocks with \`// FILE:\` markers, the generation will fail.**
+You may use file-reading tools to explore the codebase, but all generated code must be
+output as text in the format above.
+
+### File Structure Rules
+
+1. **\`src/lib/ui-bridge/UIBridgeHooks.tsx\`** — Single component containing the global hooks:
+   - \`useRouteAwareness()\` with the Expo Router helpers (the route template is the screen's identity; there is no page context on React Native)
+   - Renders \`null\` — placed inside the UIBridgeNativeProvider tree
+
+2. **\`src/lib/ui-bridge/intents.ts\`** — Intent definitions (only if intents category selected)
+
+3. Per-component files only where \`useUIElement()\` or \`useUIComponent()\` must be colocated with a specific component.
+
+**Import only what \`@qontinui/ui-bridge-native\` exports.** It does NOT export
+\`useUIState\`, \`useUITransition\`, \`useUIStateGroup\`, \`useKeyboardShortcuts\`,
+\`useUndoRedo\` or \`usePageContext\` — those are web hooks from the DOM barrel
+\`@qontinui/ui-bridge/react\`, which must not be imported in a React Native app.
+Before importing any name from \`@qontinui/ui-bridge-native\`, check that the
+installed package's index exports it; if it does not, skip that hook and say so.
+`.trim();
+
 // =============================================================================
 // Quality rules
 // =============================================================================
@@ -895,6 +1217,22 @@ const QUALITY_RULES = `
 // =============================================================================
 // Exploration instructions
 // =============================================================================
+
+/** The quality rules of a React Native prompt: native APIs only. */
+const RN_QUALITY_RULES = `
+## Quality Rules
+
+1. **Only generate code for things found in actual source code.** Never guess or fabricate.
+2. **Use real component names, route templates, element IDs, and state variable names.**
+3. Every \`State\` must wrap the subtree that really is that state, with a stable \`id\`.
+4. Every \`TransitionTo\` must name real states in \`fromStates\` / \`activateStates\` / \`exitStates\`.
+5. Generate no keyboard-shortcut, annotation or page-context code: the native SDK has none.
+6. Do NOT declare undo state through the \`UndoTracker\` unless the app has an actual undo/redo system.
+7. Import hooks and components from \`'@qontinui/ui-bridge-native'\` (not from internal paths, and never from \`'@qontinui/ui-bridge/react'\`).
+8. Import types from \`'@qontinui/ui-bridge-native'\`, or type-only from \`'@qontinui/ui-bridge'\` — an optional peer the app must add to its own dependencies before importing from it.
+9. The UIBridgeHooks component must render \`null\` — it's a hook container, not a visual component.
+10. Spread \`bridgeProps\` together with \`ref\` and \`onLayout\` on every \`useUIElement\` host; never measure with web APIs.
+`.trim();
 
 const EXPLORATION_INSTRUCTIONS = `
 ## CRITICAL: Read the Source Code First
@@ -921,6 +1259,65 @@ Output brief progress notes as you explore. After each major discovery, write 1-
 - "No undo/redo system found — skipping useUndoRedo."
 `.trim();
 
+/**
+ * The exploration steps of a React Native prompt, built from the SELECTED
+ * categories: a step (or a sample progress note) for a category the prompt
+ * does not generate would send the session exploring for nothing. Page
+ * context, keyboard shortcuts and annotations generate nothing on React
+ * Native, so they contribute no step.
+ */
+const RN_EXPLORATION_STEPS: Partial<Record<HookCategory, string>> = {
+  "route-awareness":
+    "**Find the routes** — the Expo Router `app/` directory (or the React Navigation navigators)",
+  "state-machine":
+    "**Identify UI states** — modals, bottom sheets, drawers and the state that shows them",
+  "undo-redo":
+    "**Check for undo/redo** — look in state management (stores, reducers, context) for history/undo patterns",
+  components:
+    "**Identify major components** — screens and controls with significant actions or state",
+  intents: "**Look for multi-step flows** — user journeys that span multiple screens",
+};
+
+/** One sample progress note per selected category that has a step. */
+const RN_EXPLORATION_NOTES: Partial<Record<HookCategory, string>> = {
+  "route-awareness": '"Found 12 screens under app/, including /(tabs)/prompts and /runner/[id]..."',
+  "state-machine":
+    '"Detected a filter bottom sheet (sheetOpen state in PromptsScreen) and 3 modals..."',
+  "undo-redo": '"No undo/redo system found — skipping the undo category."',
+  components: '"PromptsScreen exposes refresh and select-item; registering it as one component..."',
+  intents: '"Found a 3-screen sign-up journey — one intent..."',
+};
+
+function rnExplorationInstructions(categories: HookCategory[]): string {
+  const steps = [
+    "**Read the layouts and screens** — understand the component tree, what wraps what",
+    ...ALL_HOOK_CATEGORIES.filter((c) => categories.includes(c)).flatMap((c) =>
+      RN_EXPLORATION_STEPS[c] ? [RN_EXPLORATION_STEPS[c]] : [],
+    ),
+  ];
+  const notes = ALL_HOOK_CATEGORIES.filter((c) => categories.includes(c)).flatMap((c) =>
+    RN_EXPLORATION_NOTES[c] ? [RN_EXPLORATION_NOTES[c]] : [],
+  );
+  return [
+    "## CRITICAL: Read the Source Code First",
+    "",
+    "You MUST explore the actual source code before generating any hooks. Do not guess at app structure.",
+    "",
+    "**IMPORTANT: Use file-reading tools to explore the code, but do NOT use file-writing",
+    "tools (Write, Edit, etc.) to create or modify any files. Your final output must be",
+    "code blocks in your text response with `// FILE:` markers — see the Output Format section.**",
+    "",
+    "### Code exploration steps:",
+    ...steps.map((step, i) => `${i + 1}. ${step}`),
+    "",
+    "### Progress communication",
+    "Output brief progress notes as you explore. After each major discovery, write 1-2 sentences:",
+    ...(notes.length > 0
+      ? notes.map((n) => `- ${n}`)
+      : ['- "Read the root layout and the screens it wraps..."']),
+  ].join("\n");
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -938,6 +1335,7 @@ export function buildHookGenPrompt(
   categories: HookCategory[],
 ): string {
   const lines: string[] = [];
+  const isRN = isReactNativeFramework(analysis.framework);
 
   lines.push("# UI Bridge Hook Generation");
   lines.push("");
@@ -957,14 +1355,13 @@ export function buildHookGenPrompt(
   lines.push("");
 
   // Exploration instructions
-  lines.push(EXPLORATION_INSTRUCTIONS);
+  lines.push(isRN ? rnExplorationInstructions(categories) : EXPLORATION_INSTRUCTIONS);
   lines.push("");
 
   // Framework-specific guidance.
   // RN / Expo Router gets a dedicated branch with native imports and
   // measurement guidance; web frameworks fall through to the existing
   // Next.js / React Router blocks.
-  const isRN = isReactNativeFramework(analysis.framework);
   const fw = analysis.framework.toLowerCase();
   if (isRN) {
     lines.push(RN_EXPO_GUIDANCE);
@@ -976,7 +1373,7 @@ export function buildHookGenPrompt(
   lines.push("");
 
   // Hook API reference
-  lines.push(HOOK_API_REFERENCE);
+  lines.push(hookApiReference(isRN));
   lines.push("");
 
   // Category-specific instructions (only for selected categories).
@@ -991,11 +1388,11 @@ export function buildHookGenPrompt(
   }
 
   // Output format
-  lines.push(OUTPUT_FORMAT);
+  lines.push(isRN ? RN_OUTPUT_FORMAT : OUTPUT_FORMAT);
   lines.push("");
 
   // Quality rules
-  lines.push(QUALITY_RULES);
+  lines.push(isRN ? RN_QUALITY_RULES : QUALITY_RULES);
 
   return lines.join("\n");
 }
@@ -1029,7 +1426,15 @@ generation. The system will apply the changes for you.**
 3. **NEVER reduce detail** — if an existing hook has detailed configuration, your replacement must be at least as detailed
 4. **Preserve working code** — if something works correctly, don't change it unnecessarily
 5. **Add hooks for new features** — if new routes, modals, or components have been added, include them
-
+${
+  isReactNativeFramework(analysis.framework)
+    ? `6. **Remove every page-context hook from the existing code** — its import and every call.
+   \`@qontinui/ui-bridge-native\` does NOT export \`usePageContext\`, and a native snapshot
+   carries route info only, so it never belongs in a React Native app. Remove every
+   import from the DOM barrel \`@qontinui/ui-bridge/react\` too.
+`
+    : ""
+}
 ### Existing Code:
 
 \`\`\`tsx
