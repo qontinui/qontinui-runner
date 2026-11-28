@@ -77,6 +77,8 @@ pub mod identity_stamp; // Reports every session id this machine can resolve (ac
 pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 pub mod intent;
 pub mod local_store;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod npm_claude_fixture; // A real-process npm-installed `claude` (`node`, registry-named) for tests that cross the real /proc table and registry read (plan 2026-11-18-runner-npm-claude-liveness-follow-ups-arming-through-population-entries-and-round-3-nits, Phase 1)
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;

@@ -5036,27 +5036,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // was N redundant PowerShell/`/proc` scans; `pid_alive`
                         // stays the only per-record syscall. FRESH, never the
                         // memo: this poll closes a record on an ABSENT `claude`.
-                        let asked_at_ms = chrono::Utc::now().timestamp_millis();
-                        let look_roots: Vec<u32> = std::iter::once(std::process::id())
-                            .chain(live.iter().filter_map(|i| i.pid).filter(|&p| p > 0))
-                            .collect();
-                        let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&look_roots).await;
+                        let live_terminal_pids: Vec<u32> =
+                            live.iter().filter_map(|i| i.pid).collect();
+                        let crate::session::tracking_health::PollTickLook {
+                            look,
+                            snap_captured_at_ms,
+                            tick_snapshot_ok,
+                        } = crate::session::tracking_health::poll_tick_look(&live_terminal_pids)
+                            .await;
                         let snap = look.snapshot();
-                        // Stamp the epoch with when the table's read began — a
-                        // lower bound on every row's observation — not with the
-                        // time it was asked for. A table no read produced
-                        // (observed_at_ms 0) is UNKNOWN and records nothing
-                        // (`tick_snapshot_ok` below).
-                        let snap_captured_at_ms = if snap.observed_at_ms > 0 {
-                            snap.observed_at_ms.min(asked_at_ms)
-                        } else {
-                            asked_at_ms
-                        };
-                        // A totally-empty system parent_map means the snapshot
-                        // helper failed, and a `stale` one is the last good
-                        // table, not this tick's → classify Skips every
-                        // matched record.
-                        let tick_snapshot_ok = !snap.is_unknown();
 
                         // D1 identity refresh. Claude Code's per-process
                         // registry is the ONLY source for the account + name an
